@@ -45,16 +45,11 @@ impl DatabaseReceipt {
             Some(effective_gas_price) => Some(effective_gas_price.as_u64() as i64),
         };
 
-        let gas_used: i64 = match receipt.gas_used {
-            None => 0,
-            Some(gas_used) => gas_used.as_u64() as i64,
-        };
-
         Self {
             contract_address,
             cumulative_gas_used: receipt.cumulative_gas_used.as_u64() as i64,
             effective_gas_price,
-            gas_used,
+            gas_used: receipt.gas_used.unwrap().as_u64() as i64,
             hash: format_hash(receipt.transaction_hash),
             status,
         }

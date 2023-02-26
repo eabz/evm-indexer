@@ -1,5 +1,5 @@
 use ethers::{
-    types::{Block, Transaction, H160},
+    types::{Block, Transaction},
     utils::format_units,
 };
 use field_count::FieldCount;
@@ -52,48 +52,6 @@ impl DatabaseBlock {
             ),
         };
 
-        let nonce: String = match block.nonce {
-            None => String::from("0"),
-            Some(nonce) => format_nonce(nonce),
-        };
-
-        let uncles = block
-            .uncles
-            .clone()
-            .into_iter()
-            .map(|uncle| format_hash(uncle))
-            .collect();
-
-        let mix_hash: String = match block.mix_hash {
-            None => String::from("0x"),
-            Some(mix_hash) => format_hash(mix_hash),
-        };
-
-        let hash: String = match block.hash {
-            None => String::from("0x"),
-            Some(hash) => format_hash(hash),
-        };
-
-        let number: i64 = match block.number {
-            None => 0,
-            Some(number) => number.as_u64() as i64,
-        };
-
-        let size: i32 = match block.size {
-            None => 0,
-            Some(size) => size.as_u32() as i32,
-        };
-
-        let total_difficulty: String = match block.total_difficulty {
-            None => String::from("0x"),
-            Some(total_difficulty) => format_number(total_difficulty),
-        };
-
-        let miner: String = match block.author {
-            None => format_address(H160::zero()),
-            Some(author) => format_address(author),
-        };
-
         Self {
             base_fee_per_gas,
             chain,
@@ -101,23 +59,28 @@ impl DatabaseBlock {
             extra_data: block.extra_data.to_vec(),
             gas_limit: block.gas_limit.as_u64() as i64,
             gas_used: block.gas_used.as_u64() as i64,
-            hash,
+            hash: format_hash(block.hash.unwrap()),
             logs_bloom: block.logs_bloom.unwrap().as_bytes().to_vec(),
-            miner,
-            mix_hash,
-            nonce,
-            number,
+            miner: format_address(block.author.unwrap()),
+            mix_hash: format_hash(block.mix_hash.unwrap()),
+            nonce: format_nonce(block.nonce.unwrap()),
+            number: block.number.unwrap().as_u64() as i64,
             parent_hash: format_hash(block.parent_hash),
             receipts_root: format_hash(block.receipts_root),
             sha3_uncles: format_hash(block.uncles_hash),
-            size,
+            size: block.size.unwrap().as_u32() as i32,
             status: BlockStatus::Unfinalized,
             state_root: format_hash(block.state_root),
             timestamp: block.timestamp.as_u64() as i64,
             transactions_root: format_hash(block.transactions_root),
-            total_difficulty,
+            total_difficulty: format_number(block.total_difficulty.unwrap()),
             transactions: block.transactions.len() as i32,
-            uncles,
+            uncles: block
+                .uncles
+                .clone()
+                .into_iter()
+                .map(|uncle| format_hash(uncle))
+                .collect(),
         }
     }
 }
