@@ -1,0 +1,35 @@
+[package]
+name = "indexer"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+array-bytes = "6.0.0"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+dotenv = "0.15"
+ethabi = "18"
+ethers = { version = "1", features = ["ws", "rustls"] }
+field_count = "0.1"
+futures = "0.3"
+hex = "0.4"
+jsonrpsee = { version = "0.16", features = ["macros", "server"] }
+jsonrpsee-http-client = "0.16"
+log = "0.4"
+rand = "0.8"
+redis = "0.22"
+reqwest = "0.11"
+serde = "1"
+serde_json = "1"
+sqlx = { version = "0.6", features = [ "runtime-tokio-native-tls" , "postgres" ] }
+tokio = { version = "1", features = ["full"] }
+
+[dependencies.simple_logger]
+version = "4.0.0"
+default-features = false
+features = ["colors"]
+
+[[bin]]
+path = "bin/streamer.rs"
+name = "streamer"
