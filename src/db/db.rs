@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+
 use crate::chains::chains::Chain;
 use anyhow::Result;
 use log::info;
+use redis::Commands;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
     ConnectOptions,
@@ -36,5 +39,17 @@ impl Database {
             redis,
             db_conn,
         })
+    }
+
+    pub fn get_connection(&self) -> &sqlx::Pool<sqlx::Postgres> {
+        return &self.db_conn;
+    }
+
+    pub async fn get_indexed_blocks(&self) -> Result<HashSet<i64>> {
+        let mut connection = self.redis.get_connection().unwrap();
+
+        let blocks: HashSet<i64> = connection.hgetall(self.chain.name).unwrap();
+
+        Ok(blocks)
     }
 }
