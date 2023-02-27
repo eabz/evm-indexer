@@ -1,12 +1,24 @@
-use std::time::Duration;
+use crate::{
+    chains::chains::Chain,
+    config::config::Config,
+    db::models::{
+        block::DatabaseBlock,
+        contract::DatabaseContract,
+        log::DatabaseLog,
+        receipt::{DatabaseReceipt, TransactionStatus},
+        transaction::DatabaseTransaction,
+    },
+};
+use ethers::types::{Block, Transaction, TransactionReceipt, U256};
 
-use crate::{chains::chains::Chain, config::config::Config};
 use anyhow::Result;
-use ethers::types::U256;
 use jsonrpsee::core::{client::ClientT, rpc_params};
 use jsonrpsee_http_client::{HttpClient, HttpClientBuilder};
 use log::info;
 use rand::seq::SliceRandom;
+use std::time::Duration;
+
+use serde_json::Error;
 
 #[derive(Debug, Clone)]
 pub struct Rpc {
@@ -76,6 +88,171 @@ impl Rpc {
                 Ok(block_number.as_u64() as i64)
             }
             Err(_) => Ok(0),
+        }
+    }
+
+    pub async fn get_block(
+        &self,
+        block_number: &i64,
+    ) -> Result<Option<(DatabaseBlock, Vec<DatabaseTransaction>)>> {
+        let client = self.get_client();
+
+        let raw_block = client
+            .request(
+                "eth_getBlockByNumber",
+                rpc_params![format!("0x{:x}", block_number), true],
+            )
+            .await;
+
+        match raw_block {
+            Ok(value) => {
+                let block: Result<Block<Transaction>, Error> = serde_json::from_value(value);
+
+                match block {
+                    Ok(block) => {
+                        let db_block = DatabaseBlock::from_rpc(&block, self.chain.id);
+
+                        let mut db_transactions = Vec::new();
+
+                        for transaction in block.transactions {
+                            let db_transaction = DatabaseTransaction::from_rpc(
+                                transaction,
+                                self.chain.id,
+                                db_block.timestamp.clone(),
+                            );
+
+                            db_transactions.push(db_transaction)
+                        }
+
+                        Ok(Some((db_block, db_transactions)))
+                    }
+                    Err(_) => Ok(None),
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub async fn get_transaction_receipt(
+        &self,
+        transaction: String,
+    ) -> Result<Option<(DatabaseReceipt, Vec<DatabaseLog>, Option<DatabaseContract>)>> {
+        let client = self.get_client();
+
+        let raw_receipt = client
+            .request("eth_getTransactionReceipt", rpc_params![transaction])
+            .await;
+
+        match raw_receipt {
+            Ok(value) => {
+                let receipt: Result<TransactionReceipt, Error> = serde_json::from_value(value);
+
+                match receipt {
+                    Ok(receipt) => {
+                        let db_receipt = DatabaseReceipt::from_rpc(&receipt);
+
+                        let mut db_transaction_logs: Vec<DatabaseLog> = Vec::new();
+
+                        let status: TransactionStatus = match receipt.status {
+                            None => TransactionStatus::Succeed,
+                            Some(status) => {
+                                let status_number = status.as_u64() as i64;
+
+                                if status_number == 0 {
+                                    TransactionStatus::Reverted
+                                } else {
+                                    TransactionStatus::Succeed
+                                }
+                            }
+                        };
+
+                        let mut db_contract: Option<DatabaseContract> = None;
+
+                        if status == TransactionStatus::Succeed {
+                            db_contract = match receipt.contract_address {
+                                Some(_) => {
+                                    Some(DatabaseContract::from_rpc(receipt.clone(), self.chain.id))
+                                }
+                                None => None,
+                            };
+                        }
+
+                        for log in receipt.logs {
+                            let db_log = DatabaseLog::from_rpc(log, self.chain.id);
+
+                            db_transaction_logs.push(db_log)
+                        }
+
+                        return Ok(Some((db_receipt, db_transaction_logs, db_contract)));
+                    }
+                    Err(_) => return Ok(None),
+                }
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+
+    pub async fn get_block_receipts(
+        &self,
+        block_number: &i64,
+    ) -> Result<
+        Option<(
+            Vec<DatabaseReceipt>,
+            Vec<DatabaseLog>,
+            Vec<DatabaseContract>,
+        )>,
+    > {
+        let client = self.get_client();
+
+        let raw_receipts = client
+            .request(
+                "eth_getBlockReceipts",
+                rpc_params![format!("0x{:x}", block_number)],
+            )
+            .await;
+
+        match raw_receipts {
+            Ok(value) => {
+                let receipts: Result<Vec<TransactionReceipt>, Error> =
+                    serde_json::from_value(value);
+
+                match receipts {
+                    Ok(receipts) => {
+                        let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
+
+                        let mut db_transaction_logs: Vec<DatabaseLog> = Vec::new();
+
+                        let mut db_contracts: Vec<DatabaseContract> = Vec::new();
+
+                        for receipt in receipts {
+                            let db_receipt = DatabaseReceipt::from_rpc(&receipt);
+
+                            db_receipts.push(db_receipt);
+
+                            let db_contract = match receipt.contract_address {
+                                Some(_) => {
+                                    Some(DatabaseContract::from_rpc(receipt.clone(), self.chain.id))
+                                }
+                                None => None,
+                            };
+
+                            if db_contract.is_some() {
+                                db_contracts.push(db_contract.unwrap())
+                            }
+
+                            for log in receipt.logs {
+                                let db_log = DatabaseLog::from_rpc(log, self.chain.id);
+
+                                db_transaction_logs.push(db_log)
+                            }
+                        }
+
+                        return Ok(Some((db_receipts, db_transaction_logs, db_contracts)));
+                    }
+                    Err(_) => return Ok(None),
+                }
+            }
+            Err(_) => return Ok(None),
         }
     }
 }

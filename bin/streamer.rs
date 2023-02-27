@@ -2,7 +2,20 @@ use std::{thread::sleep, time::Duration};
 
 use dotenv::dotenv;
 
-use indexer::{config::config::Config, db::db::Database, rpc::rpc::Rpc};
+use futures::future::join_all;
+use indexer::{
+    chains::chains::Chain,
+    config::config::Config,
+    db::{
+        db::Database,
+        models::{
+            block::DatabaseBlock, chain_state::DatabaseChainIndexedState,
+            contract::DatabaseContract, log::DatabaseLog, receipt::DatabaseReceipt,
+            transaction::DatabaseTransaction,
+        },
+    },
+    rpc::rpc::Rpc,
+};
 use log::*;
 use simple_logger::SimpleLogger;
 
@@ -12,7 +25,7 @@ async fn main() {
 
     let log = SimpleLogger::new().with_level(LevelFilter::Info);
 
-    let mut config = Config::new();
+    let config = Config::new();
 
     if config.debug {
         log.with_level(LevelFilter::Debug).init().unwrap();
@@ -35,19 +48,20 @@ async fn main() {
     .expect("Unable to start DB connection.");
 
     loop {
+        sync_chain(&rpc, &db, &config).await;
         sleep(Duration::from_millis(500))
     }
 }
 
-/* async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
+async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
     let last_block = rpc.get_last_block().await.unwrap();
 
     let full_block_range = config.start_block..last_block;
 
-    let mut indexed_blocks = db.get_indexed_blocks().await.unwrap();
+    let indexed_blocks = db.get_indexed_blocks().await.unwrap();
 
     let db_state = DatabaseChainIndexedState {
-        chain: config.chain.name.to_string(),
+        chain: config.chain.id,
         indexed_blocks_amount: indexed_blocks.len() as i64,
     };
 
@@ -92,20 +106,101 @@ async fn main() {
             }
         }
 
-        db.store_data(
-            &db_blocks,
-            &db_transactions,
-            &db_receipts,
-            &db_logs,
-            &db_contracts,
-        )
-        .await;
+        let stored_blocks: Vec<i64> = db_blocks.iter().map(|block| block.number).collect();
 
-        for block in db_blocks.into_iter() {
-            indexed_blocks.insert(block.number);
-        }
-
-        db.store_indexed_blocks(&indexed_blocks).await.unwrap();
+        db.store_indexed_blocks(&stored_blocks).await.unwrap();
     }
 }
- */
+
+async fn fetch_block(
+    rpc: &Rpc,
+    block_number: &i64,
+    chain: &Chain,
+) -> Option<(
+    DatabaseBlock,
+    Vec<DatabaseTransaction>,
+    Vec<DatabaseReceipt>,
+    Vec<DatabaseLog>,
+    Vec<DatabaseContract>,
+)> {
+    let block_data = rpc.get_block(block_number).await.unwrap();
+
+    match block_data {
+        Some((db_block, mut db_transactions)) => {
+            let total_block_transactions = db_transactions.len();
+
+            // Make sure all the transactions are correctly formatted.
+            if db_block.transactions != total_block_transactions as i32 {
+                warn!(
+                    "Missing {} transactions for block {}.",
+                    db_block.transactions - total_block_transactions as i32,
+                    db_block.number
+                );
+                return None;
+            }
+
+            let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
+            let mut db_logs: Vec<DatabaseLog> = Vec::new();
+            let mut db_contracts: Vec<DatabaseContract> = Vec::new();
+
+            if chain.supports_blocks_receipts {
+                let receipts_data = rpc.get_block_receipts(block_number).await.unwrap();
+                match receipts_data {
+                    Some((mut receipts, mut logs, mut contracts)) => {
+                        db_receipts.append(&mut receipts);
+                        db_logs.append(&mut logs);
+                        db_contracts.append(&mut contracts);
+                    }
+                    None => return None,
+                }
+            } else {
+                for transaction in db_transactions.iter_mut() {
+                    let receipt_data = rpc
+                        .get_transaction_receipt(transaction.hash.clone())
+                        .await
+                        .unwrap();
+
+                    match receipt_data {
+                        Some((receipt, mut logs, contract)) => {
+                            db_receipts.push(receipt);
+                            db_logs.append(&mut logs);
+                            match contract {
+                                Some(contract) => db_contracts.push(contract),
+                                None => continue,
+                            }
+                        }
+                        None => continue,
+                    }
+                }
+            }
+
+            if total_block_transactions != db_receipts.len() {
+                warn!(
+                    "Missing receipts for block {}. Transactions {} receipts {}",
+                    db_block.number,
+                    total_block_transactions,
+                    db_receipts.len()
+                );
+                return None;
+            }
+
+            info!(
+                "Found transactions {} receipts {} logs {} and contracts {} for block {}.",
+                total_block_transactions,
+                db_receipts.len(),
+                db_logs.len(),
+                db_contracts.len(),
+                block_number
+            );
+
+            return Some((
+                db_block,
+                db_transactions,
+                db_receipts,
+                db_logs,
+                db_contracts,
+            ));
+        }
+        None => return None,
+    }
+}

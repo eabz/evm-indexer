@@ -3,7 +3,7 @@ use field_count::FieldCount;
 
 use crate::utils::format::{format_address, format_hash};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionStatus {
     Reverted,
     Succeed,

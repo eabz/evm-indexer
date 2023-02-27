@@ -6,8 +6,10 @@ use log::info;
 use redis::Commands;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
-    ConnectOptions,
+    ConnectOptions, QueryBuilder,
 };
+
+use super::models::chain_state::DatabaseChainIndexedState;
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -48,8 +50,46 @@ impl Database {
     pub async fn get_indexed_blocks(&self) -> Result<HashSet<i64>> {
         let mut connection = self.redis.get_connection().unwrap();
 
-        let blocks: HashSet<i64> = connection.hgetall(self.chain.name).unwrap();
+        let blocks: HashSet<i64> = connection.smembers(self.chain.name).unwrap();
 
         Ok(blocks)
+    }
+
+    pub async fn store_indexed_blocks(&self, blocks: &Vec<i64>) -> Result<()> {
+        let mut connection = self.redis.get_connection().unwrap();
+
+        let _: () = connection.sadd(self.chain.name, blocks).unwrap();
+
+        let full_chain_set = self.get_indexed_blocks().await.unwrap();
+
+        self.update_indexed_blocks_number(&DatabaseChainIndexedState {
+            chain: self.chain.id,
+            indexed_blocks_amount: full_chain_set.len() as i64,
+        })
+        .await
+        .unwrap();
+
+        Ok(())
+    }
+
+    pub async fn update_indexed_blocks_number(
+        &self,
+        chain_state: &DatabaseChainIndexedState,
+    ) -> Result<()> {
+        let connection = self.get_connection();
+
+        let query = format!(
+            "UPSERT INTO chains_indexed_state (chain, indexed_blocks_amount) VALUES ('{}', {})",
+            chain_state.chain.clone(),
+            chain_state.indexed_blocks_amount
+        );
+
+        QueryBuilder::new(query)
+            .build()
+            .execute(connection)
+            .await
+            .expect("Unable to update indexed blocks number");
+
+        Ok(())
     }
 }
