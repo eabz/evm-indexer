@@ -77,8 +77,9 @@ impl Database {
         let connection = self.get_connection();
 
         let query = format!(
-            "UPSERT INTO chains_indexed_state (chain, indexed_blocks_amount) VALUES ('{}', {})",
+            "INSERT INTO chains_indexed_state (chain, indexed_blocks_amount) VALUES ({}, {}) ON CONFLICT (chain) DO UPDATE SET indexed_blocks_amount = {}",
             chain_state.chain.clone(),
+            chain_state.indexed_blocks_amount,
             chain_state.indexed_blocks_amount
         );
 

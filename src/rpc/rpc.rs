@@ -136,6 +136,7 @@ impl Rpc {
     pub async fn get_transaction_receipt(
         &self,
         transaction: String,
+        transaction_timestamp: i64,
     ) -> Result<Option<(DatabaseReceipt, Vec<DatabaseLog>, Option<DatabaseContract>)>> {
         let client = self.get_client();
 
@@ -178,7 +179,8 @@ impl Rpc {
                         }
 
                         for log in receipt.logs {
-                            let db_log = DatabaseLog::from_rpc(log, self.chain.id);
+                            let db_log =
+                                DatabaseLog::from_rpc(log, self.chain.id, transaction_timestamp);
 
                             db_transaction_logs.push(db_log)
                         }
@@ -195,6 +197,7 @@ impl Rpc {
     pub async fn get_block_receipts(
         &self,
         block_number: &i64,
+        block_timestamp: i64,
     ) -> Result<
         Option<(
             Vec<DatabaseReceipt>,
@@ -241,7 +244,8 @@ impl Rpc {
                             }
 
                             for log in receipt.logs {
-                                let db_log = DatabaseLog::from_rpc(log, self.chain.id);
+                                let db_log =
+                                    DatabaseLog::from_rpc(log, self.chain.id, block_timestamp);
 
                                 db_transaction_logs.push(db_log)
                             }

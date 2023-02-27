@@ -9,6 +9,6 @@ pub struct DatabaseERC721Transfer {
     pub to_address: String,
     pub token: String,
     pub transaction_log_index: Option<i32>,
-    pub id: i64,
+    pub id: String,
     pub timestamp: i64,
 }

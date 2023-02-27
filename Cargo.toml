@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+array-bytes = "6"
 clap = { version = "4", features = ["derive"] }
 dotenv = "0.15"
 ethabi = "18"

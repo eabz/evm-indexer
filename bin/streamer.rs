@@ -2,6 +2,8 @@ use std::{thread::sleep, time::Duration};
 
 use dotenv::dotenv;
 
+use ethabi::{ethereum_types::H256, ParamType};
+use ethers::utils::format_units;
 use futures::future::join_all;
 use indexer::{
     chains::chains::Chain,
@@ -10,11 +12,13 @@ use indexer::{
         db::Database,
         models::{
             block::DatabaseBlock, chain_state::DatabaseChainIndexedState,
-            contract::DatabaseContract, log::DatabaseLog, receipt::DatabaseReceipt,
+            contract::DatabaseContract, erc20_transfer::DatabaseERC20Transfer,
+            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog, receipt::DatabaseReceipt,
             transaction::DatabaseTransaction,
         },
     },
     rpc::rpc::Rpc,
+    utils::format::format_number,
 };
 use log::*;
 use simple_logger::SimpleLogger;
@@ -92,15 +96,27 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
         let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
         let mut db_logs: Vec<DatabaseLog> = Vec::new();
         let mut db_contracts: Vec<DatabaseContract> = Vec::new();
+        let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> = Vec::new();
+        let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> = Vec::new();
 
         for result in results {
             match result {
-                Some((block, mut transactions, mut receipts, mut logs, mut contracts)) => {
+                Some((
+                    block,
+                    mut transactions,
+                    mut receipts,
+                    mut logs,
+                    mut contracts,
+                    mut erc20_transfers,
+                    mut erc721_transfers,
+                )) => {
                     db_blocks.push(block);
                     db_transactions.append(&mut transactions);
                     db_receipts.append(&mut receipts);
                     db_logs.append(&mut logs);
                     db_contracts.append(&mut contracts);
+                    db_erc20_transfers.append(&mut erc20_transfers);
+                    db_erc721_transfers.append(&mut erc721_transfers)
                 }
                 None => continue,
             }
@@ -122,6 +138,8 @@ async fn fetch_block(
     Vec<DatabaseReceipt>,
     Vec<DatabaseLog>,
     Vec<DatabaseContract>,
+    Vec<DatabaseERC20Transfer>,
+    Vec<DatabaseERC721Transfer>,
 )> {
     let block_data = rpc.get_block(block_number).await.unwrap();
 
@@ -144,7 +162,10 @@ async fn fetch_block(
             let mut db_contracts: Vec<DatabaseContract> = Vec::new();
 
             if chain.supports_blocks_receipts {
-                let receipts_data = rpc.get_block_receipts(block_number).await.unwrap();
+                let receipts_data = rpc
+                    .get_block_receipts(block_number, db_block.timestamp)
+                    .await
+                    .unwrap();
                 match receipts_data {
                     Some((mut receipts, mut logs, mut contracts)) => {
                         db_receipts.append(&mut receipts);
@@ -156,7 +177,7 @@ async fn fetch_block(
             } else {
                 for transaction in db_transactions.iter_mut() {
                     let receipt_data = rpc
-                        .get_transaction_receipt(transaction.hash.clone())
+                        .get_transaction_receipt(transaction.hash.clone(), transaction.timestamp)
                         .await
                         .unwrap();
 
@@ -184,8 +205,210 @@ async fn fetch_block(
                 return None;
             }
 
+            let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> = Vec::new();
+            let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> = Vec::new();
+
+            let transfer_event = ethabi::Event {
+                name: "Transfer".to_owned(),
+                inputs: vec![
+                    ethabi::EventParam {
+                        name: "from".to_owned(),
+                        kind: ParamType::Address,
+                        indexed: true,
+                    },
+                    ethabi::EventParam {
+                        name: "to".to_owned(),
+                        kind: ParamType::Address,
+                        indexed: true,
+                    },
+                    ethabi::EventParam {
+                        name: "amount".to_owned(),
+                        kind: ParamType::Uint(256),
+                        indexed: false,
+                    },
+                ],
+                anonymous: false,
+            };
+
+            let erc1155_transfer_single_event = ethabi::Event {
+                name: "TransferSingle".to_owned(),
+                inputs: vec![
+                    ethabi::EventParam {
+                        name: "operator".to_owned(),
+                        kind: ParamType::Address,
+                        indexed: true,
+                    },
+                    ethabi::EventParam {
+                        name: "from".to_owned(),
+                        kind: ParamType::Address,
+                        indexed: true,
+                    },
+                    ethabi::EventParam {
+                        name: "to".to_owned(),
+                        kind: ParamType::Address,
+                        indexed: true,
+                    },
+                    ethabi::EventParam {
+                        name: "id".to_owned(),
+                        kind: ParamType::Uint(256),
+                        indexed: false,
+                    },
+                    ethabi::EventParam {
+                        name: "value".to_owned(),
+                        kind: ParamType::Uint(256),
+                        indexed: false,
+                    },
+                ],
+                anonymous: false,
+            };
+
+            let erc1155_transfer_batch_event = ethabi::Event {
+                name: "TransferBatch".to_owned(),
+                inputs: vec![
+                    ethabi::EventParam {
+                        name: "operator".to_owned(),
+                        kind: ParamType::Address,
+                        indexed: true,
+                    },
+                    ethabi::EventParam {
+                        name: "from".to_owned(),
+                        kind: ParamType::Address,
+                        indexed: true,
+                    },
+                    ethabi::EventParam {
+                        name: "to".to_owned(),
+                        kind: ParamType::Address,
+                        indexed: true,
+                    },
+                    ethabi::EventParam {
+                        name: "ids".to_owned(),
+                        kind: ParamType::Array(Box::new(ParamType::Uint(256))),
+                        indexed: false,
+                    },
+                    ethabi::EventParam {
+                        name: "values".to_owned(),
+                        kind: ParamType::Array(Box::new(ParamType::Uint(256))),
+                        indexed: false,
+                    },
+                ],
+                anonymous: false,
+            };
+
+            for log in db_logs.iter() {
+                if log.topics.len() < 3 {
+                    continue;
+                }
+
+                // Check the first topic matches the erc20, erc721 or erc1155 signatures
+                let topic_0 = log.topics[0].clone();
+
+                if topic_0 == format!("{:?}", transfer_event.signature()) {
+                    // Check if it is a erc20 or a erc721 based on the number of logs
+                    // erc20 token transfer events have only 2 indexed values while erc721 have 3.
+
+                    let from_address: String = match ethabi::decode(
+                        &[ParamType::Address],
+                        array_bytes::hex_n_into::<String, H256, 32>(log.topics[1].clone())
+                            .unwrap()
+                            .as_bytes(),
+                    ) {
+                        Ok(address) => {
+                            if address.len() == 0 {
+                                continue;
+                            } else {
+                                format!("{:?}", address[0].clone().into_address().unwrap())
+                            }
+                        }
+                        Err(_) => continue,
+                    };
+
+                    let to_address = match ethabi::decode(
+                        &[ParamType::Address],
+                        array_bytes::hex_n_into::<String, H256, 32>(log.topics[2].clone())
+                            .unwrap()
+                            .as_bytes(),
+                    ) {
+                        Ok(address) => {
+                            if address.len() == 0 {
+                                continue;
+                            } else {
+                                format!("{:?}", address[0].clone().into_address().unwrap())
+                            }
+                        }
+                        Err(_) => continue,
+                    };
+
+                    // Handle as ERC20
+                    if log.topics.len() == 3 {
+                        let value = match ethabi::decode(&[ParamType::Uint(256)], &log.data[..]) {
+                            Ok(value) => {
+                                if value.len() == 0 {
+                                    continue;
+                                } else {
+                                    value[0].clone().into_uint().unwrap()
+                                }
+                            }
+                            Err(_) => continue,
+                        };
+
+                        let db_erc20_transfer = DatabaseERC20Transfer {
+                            chain: chain.id,
+                            from_address: from_address.clone(),
+                            hash: log.hash.clone(),
+                            log_index: log.log_index,
+                            to_address: to_address.clone(),
+                            token: log.address.clone(),
+                            transaction_log_index: log.transaction_log_index,
+                            amount: format_units(value, 18).unwrap().parse::<f64>().unwrap(),
+                            timestamp: log.timestamp,
+                        };
+
+                        db_erc20_transfers.push(db_erc20_transfer);
+                    }
+
+                    // Handle as ERC721
+                    if log.topics.len() == 4 {
+                        let id = match ethabi::decode(
+                            &[ParamType::Uint(256)],
+                            array_bytes::hex_n_into::<String, H256, 32>(log.topics[3].clone())
+                                .unwrap()
+                                .as_bytes(),
+                        ) {
+                            Ok(address) => {
+                                if address.len() == 0 {
+                                    continue;
+                                } else {
+                                    address[0].clone().into_uint().unwrap()
+                                }
+                            }
+                            Err(_) => continue,
+                        };
+
+                        let db_erc721_transfer = DatabaseERC721Transfer {
+                            chain: chain.id,
+                            from_address,
+                            hash: log.hash.clone(),
+                            log_index: log.log_index,
+                            to_address,
+                            token: log.address.clone(),
+                            transaction_log_index: log.transaction_log_index,
+                            id: format_number(id),
+                            timestamp: log.timestamp,
+                        };
+
+                        db_erc721_transfers.push(db_erc721_transfer)
+                    }
+                }
+
+                if topic_0 == format!("{:?}", erc1155_transfer_single_event.signature()) {}
+
+                if topic_0 == format!("{:?}", erc1155_transfer_batch_event.signature()) {}
+            }
+
             info!(
-                "Found transactions {} receipts {} logs {} and contracts {} for block {}.",
+                "Found erc20 transfers {} erc721 transfers {} transactions {} receipts {} logs {} and contracts {} for block {}.",
+                db_erc20_transfers.len(),
+                db_erc721_transfers.len(),
                 total_block_transactions,
                 db_receipts.len(),
                 db_logs.len(),
@@ -199,6 +422,8 @@ async fn fetch_block(
                 db_receipts,
                 db_logs,
                 db_contracts,
+                db_erc20_transfers,
+                db_erc721_transfers,
             ));
         }
         None => return None,
