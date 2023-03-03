@@ -1,5 +1,6 @@
 use dotenv::dotenv;
-use evm_indexer::{
+use futures::future::join_all;
+use indexer::{
     chains::chains::Chain,
     configs::config::Config,
     db::{
@@ -21,7 +22,6 @@ use evm_indexer::{
         tokens::get_tokens_metadata,
     },
 };
-use futures::future::join_all;
 use log::*;
 use simple_logger::SimpleLogger;
 use std::{collections::HashSet, thread::sleep, time::Duration};
@@ -234,7 +234,7 @@ async fn fetch_block(
 
                     // erc20 token transfer events have 2 indexed values.
                     if log.topics.len() == 3 {
-                        let decimals = tokens_data.get(&log.address).unwrap().decimals.unwrap();
+                        let decimals = tokens_data.get(&log.address).unwrap().decimals;
 
                         let db_erc20_transfer =
                             DatabaseERC20Transfer::from_log(&log, chain.id, decimals as usize);
@@ -272,14 +272,12 @@ async fn fetch_block(
                     let token0_decimals = tokens_data
                         .get(&pair_data.token0.clone().unwrap())
                         .unwrap()
-                        .decimals
-                        .unwrap();
+                        .decimals;
 
                     let token1_decimals = tokens_data
                         .get(&pair_data.token1.clone().unwrap())
                         .unwrap()
-                        .decimals
-                        .unwrap();
+                        .decimals;
 
                     let db_dex_trade = DatabaseDexTrade::from_v2_log(
                         &log,
@@ -300,14 +298,12 @@ async fn fetch_block(
                     let token0_decimals = tokens_data
                         .get(&pair_data.token0.clone().unwrap())
                         .unwrap()
-                        .decimals
-                        .unwrap();
+                        .decimals;
 
                     let token1_decimals = tokens_data
                         .get(&pair_data.token1.clone().unwrap())
                         .unwrap()
-                        .decimals
-                        .unwrap();
+                        .decimals;
 
                     let db_dex_trade = DatabaseDexTrade::from_v3_log(
                         &log,

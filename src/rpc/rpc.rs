@@ -9,7 +9,7 @@ use crate::{
         token_detail::DatabaseTokenDetails,
         transaction::DatabaseTransaction,
     },
-    utils::format::format_address,
+    utils::format::{format_address, sanitize_string},
 };
 use ethabi::Address;
 use ethers::{
@@ -299,40 +299,18 @@ impl Rpc {
         let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
 
         let name: String = match token_contract.name().call().await {
-            Ok(name) => {
-                let token_name = format!("{}", name.trim_matches(char::from(0)));
-                let name_fixed: String = token_name.replace("'", "");
-                let name_bytes = name_fixed.as_bytes();
-                let name_parsed = String::from_utf8_lossy(name_bytes);
-                format!("'{}'", name_parsed)
-            }
+            Ok(name) => sanitize_string(name),
             Err(_) => String::from(""),
-        };
-
-        let decimals: Option<i16> = match token_contract.decimals().call().await {
-            Ok(decimals) => Some(decimals as i16),
-            Err(_) => Some(0),
         };
 
         let symbol: String = match token_contract.symbol().call().await {
-            Ok(symbol) => {
-                let token_symbol = format!("{}", symbol.trim_matches(char::from(0)));
-                let symbol_fixed: String = token_symbol.replace("'", "");
-                let symbol_bytes = symbol_fixed.as_bytes();
-                let symbol_parsed = String::from_utf8_lossy(symbol_bytes);
-                format!("'{}'", symbol_parsed)
-            }
+            Ok(symbol) => sanitize_string(symbol),
             Err(_) => String::from(""),
         };
 
-        let token0: Option<String> = match token_contract.token_0().call().await {
-            Ok(token0) => Some(format_address(token0)),
-            Err(_) => None,
-        };
-
-        let token1: Option<String> = match token_contract.token_1().call().await {
-            Ok(token1) => Some(format_address(token1)),
-            Err(_) => None,
+        let decimals = match token_contract.decimals().call().await {
+            Ok(decimals) => decimals as i16,
+            Err(_) => 0,
         };
 
         return Some(DatabaseTokenDetails {
@@ -341,8 +319,56 @@ impl Rpc {
             name,
             decimals,
             symbol,
-            token0,
-            token1,
+            token0: None,
+            token1: None,
+        });
+    }
+
+    pub async fn get_pair_token_metadata(&self, token: String) -> Option<DatabaseTokenDetails> {
+        let client = self.get_client_url();
+
+        let provider = match Provider::<Http>::try_from(client) {
+            Ok(provider) => provider,
+            Err(_) => return None,
+        };
+
+        let client = Arc::new(provider);
+
+        let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
+
+        let name: String = match token_contract.name().call().await {
+            Ok(name) => sanitize_string(name),
+            Err(_) => String::from(""),
+        };
+
+        let symbol: String = match token_contract.symbol().call().await {
+            Ok(symbol) => sanitize_string(symbol),
+            Err(_) => String::from(""),
+        };
+
+        let decimals = match token_contract.decimals().call().await {
+            Ok(decimals) => decimals as i16,
+            Err(_) => 0,
+        };
+
+        let token0: String = match token_contract.token_0().call().await {
+            Ok(token0) => format_address(token0),
+            Err(_) => panic!("unable to fetch pair token0"),
+        };
+
+        let token1: String = match token_contract.token_0().call().await {
+            Ok(token1) => format_address(token1),
+            Err(_) => panic!("unable to fetch pair token1"),
+        };
+
+        return Some(DatabaseTokenDetails {
+            token,
+            chain: self.chain.id,
+            name,
+            decimals,
+            symbol,
+            token0: Some(token0),
+            token1: Some(token1),
         });
     }
 }

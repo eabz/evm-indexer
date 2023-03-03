@@ -51,3 +51,15 @@ pub fn byte4_from_input(input: &String) -> [u8; 4] {
 
     return byte4;
 }
+
+pub fn sanitize_string(str: String) -> String {
+    let trim = format!("{}", str.trim_matches(char::from(0)));
+
+    let remove_single_quotes: String = trim.replace("'", "");
+
+    let to_bytes = remove_single_quotes.as_bytes();
+
+    let remove_non_utf8_chars = String::from_utf8_lossy(to_bytes);
+
+    return format!("'{}'", remove_non_utf8_chars);
+}
