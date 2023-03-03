@@ -1,0 +1,349 @@
+use dotenv::dotenv;
+use evm_indexer::{
+    chains::chains::Chain,
+    configs::config::Config,
+    db::{
+        db::Database,
+        models::{
+            block::DatabaseBlock, chain_state::DatabaseChainIndexedState,
+            contract::DatabaseContract, dex_trade::DatabaseDexTrade,
+            erc1155_transfer::DatabaseERC1155Transfer, erc20_transfer::DatabaseERC20Transfer,
+            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog, receipt::DatabaseReceipt,
+            transaction::DatabaseTransaction,
+        },
+    },
+    rpc::rpc::Rpc,
+    utils::{
+        events::{
+            ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
+            SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
+        },
+        tokens::get_tokens_metadata,
+    },
+};
+use futures::future::join_all;
+use log::*;
+use simple_logger::SimpleLogger;
+use std::{collections::HashSet, thread::sleep, time::Duration};
+
+#[tokio::main()]
+async fn main() {
+    dotenv().ok();
+
+    let log = SimpleLogger::new().with_level(LevelFilter::Info);
+
+    let config = Config::new();
+
+    if config.debug {
+        log.with_level(LevelFilter::Debug).init().unwrap();
+    } else {
+        log.init().unwrap();
+    }
+
+    info!("Starting EVM Indexer.");
+
+    info!("Syncing chain {}.", config.chain.name.clone());
+
+    let rpc = Rpc::new(&config)
+        .await
+        .expect("Unable to start RPC client.");
+
+    let db = Database::new(
+        config.db_url.clone(),
+        config.redis_url.clone(),
+        config.chain.clone(),
+    )
+    .await
+    .expect("Unable to start DB connection.");
+
+    let mut indexed_blocks = db.get_indexed_blocks().await.unwrap();
+
+    loop {
+        sync_chain(&rpc, &db, &config, &mut indexed_blocks).await;
+        sleep(Duration::from_millis(500))
+    }
+}
+
+async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &mut HashSet<i64>) {
+    let last_block = rpc.get_last_block().await.unwrap();
+
+    let full_block_range = HashSet::<i64>::from_iter(config.start_block..last_block);
+
+    let db_state = DatabaseChainIndexedState {
+        chain: config.chain.id,
+        indexed_blocks_amount: indexed_blocks.len() as i64,
+    };
+
+    db.update_indexed_blocks_number(&db_state).await.unwrap();
+
+    let missing_blocks: Vec<i64> = (&full_block_range - &indexed_blocks).into_iter().collect();
+
+    let total_missing_blocks = missing_blocks.len();
+
+    info!("Syncing {} blocks.", total_missing_blocks);
+
+    let missing_blocks_chunks = missing_blocks.chunks(config.batch_size);
+
+    for missing_blocks_chunk in missing_blocks_chunks {
+        let mut work = vec![];
+
+        for block_number in missing_blocks_chunk {
+            work.push(fetch_block(&rpc, &db, &block_number, &config.chain))
+        }
+
+        let results = join_all(work).await;
+        let mut db_blocks: Vec<DatabaseBlock> = Vec::new();
+        let mut db_transactions: Vec<DatabaseTransaction> = Vec::new();
+        let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
+        let mut db_logs: Vec<DatabaseLog> = Vec::new();
+        let mut db_contracts: Vec<DatabaseContract> = Vec::new();
+        let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> = Vec::new();
+        let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> = Vec::new();
+
+        for result in results {
+            match result {
+                Some((
+                    block,
+                    mut transactions,
+                    mut receipts,
+                    mut logs,
+                    mut contracts,
+                    mut erc20_transfers,
+                    mut erc721_transfers,
+                )) => {
+                    db_blocks.push(block);
+                    db_transactions.append(&mut transactions);
+                    db_receipts.append(&mut receipts);
+                    db_logs.append(&mut logs);
+                    db_contracts.append(&mut contracts);
+                    db_erc20_transfers.append(&mut erc20_transfers);
+                    db_erc721_transfers.append(&mut erc721_transfers)
+                }
+                None => continue,
+            }
+        }
+
+        // TODO: store in the db
+
+        for block in db_blocks.into_iter() {
+            indexed_blocks.insert(block.number);
+        }
+
+        let indexed_blocks_vector: Vec<i64> = indexed_blocks.clone().into_iter().collect();
+
+        db.store_indexed_blocks(&indexed_blocks_vector)
+            .await
+            .unwrap();
+    }
+}
+
+async fn fetch_block(
+    rpc: &Rpc,
+    db: &Database,
+    block_number: &i64,
+    chain: &Chain,
+) -> Option<(
+    DatabaseBlock,
+    Vec<DatabaseTransaction>,
+    Vec<DatabaseReceipt>,
+    Vec<DatabaseLog>,
+    Vec<DatabaseContract>,
+    Vec<DatabaseERC20Transfer>,
+    Vec<DatabaseERC721Transfer>,
+)> {
+    let block_data = rpc.get_block(block_number).await.unwrap();
+
+    match block_data {
+        Some((db_block, mut db_transactions)) => {
+            let total_block_transactions = db_transactions.len();
+
+            // Make sure all the transactions are correctly formatted.
+            if db_block.transactions != total_block_transactions as i32 {
+                warn!(
+                    "Missing {} transactions for block {}.",
+                    db_block.transactions - total_block_transactions as i32,
+                    db_block.number
+                );
+                return None;
+            }
+
+            let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
+            let mut db_logs: Vec<DatabaseLog> = Vec::new();
+            let mut db_contracts: Vec<DatabaseContract> = Vec::new();
+
+            if chain.supports_blocks_receipts {
+                let receipts_data = rpc
+                    .get_block_receipts(block_number, db_block.timestamp)
+                    .await
+                    .unwrap();
+                match receipts_data {
+                    Some((mut receipts, mut logs, mut contracts)) => {
+                        db_receipts.append(&mut receipts);
+                        db_logs.append(&mut logs);
+                        db_contracts.append(&mut contracts);
+                    }
+                    None => return None,
+                }
+            } else {
+                for transaction in db_transactions.iter_mut() {
+                    let receipt_data = rpc
+                        .get_transaction_receipt(transaction.hash.clone(), transaction.timestamp)
+                        .await
+                        .unwrap();
+
+                    match receipt_data {
+                        Some((receipt, mut logs, contract)) => {
+                            db_receipts.push(receipt);
+                            db_logs.append(&mut logs);
+                            match contract {
+                                Some(contract) => db_contracts.push(contract),
+                                None => continue,
+                            }
+                        }
+                        None => continue,
+                    }
+                }
+            }
+            if total_block_transactions != db_receipts.len() {
+                warn!(
+                    "Missing receipts for block {}. Transactions {} receipts {}",
+                    db_block.number,
+                    total_block_transactions,
+                    db_receipts.len()
+                );
+                return None;
+            }
+
+            let tokens_data = get_tokens_metadata(db, rpc, &db_logs).await;
+
+            let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> = Vec::new();
+            let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> = Vec::new();
+            let mut db_erc1155_transfers: Vec<DatabaseERC1155Transfer> = Vec::new();
+            let mut db_dex_trades: Vec<DatabaseDexTrade> = Vec::new();
+
+            for log in db_logs.iter() {
+                if log.topics.len() < 3 {
+                    continue;
+                }
+
+                // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
+                let topic0 = log.topics[0].clone();
+
+                if topic0 == TRANSFER_EVENTS_SIGNATURE {
+                    // Check if it is a erc20 or a erc721 based on the number of logs
+
+                    // erc20 token transfer events have 2 indexed values.
+                    if log.topics.len() == 3 {
+                        let decimals = tokens_data.get(&log.address).unwrap().decimals.unwrap();
+
+                        let db_erc20_transfer =
+                            DatabaseERC20Transfer::from_log(&log, chain.id, decimals as usize);
+
+                        db_erc20_transfers.push(db_erc20_transfer);
+                    }
+
+                    // erc721 token transfer events have 3 indexed values.
+                    if log.topics.len() == 4 {
+                        let db_erc721_transfer = DatabaseERC721Transfer::from_log(log, chain.id);
+
+                        db_erc721_transfers.push(db_erc721_transfer);
+                    }
+                }
+
+                if topic0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE {
+                    let db_erc1155_transfer =
+                        DatabaseERC1155Transfer::from_log(&log, chain.id, false);
+
+                    db_erc1155_transfers.push(db_erc1155_transfer)
+                }
+
+                if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE {
+                    let db_erc1155_transfer =
+                        DatabaseERC1155Transfer::from_log(&log, chain.id, true);
+
+                    db_erc1155_transfers.push(db_erc1155_transfer)
+                }
+
+                if topic0 == SWAP_EVENT_SIGNATURE {
+                    let token = log.address.clone();
+
+                    let pair_data = tokens_data.get(&token).unwrap();
+
+                    let token0_decimals = tokens_data
+                        .get(&pair_data.token0.clone().unwrap())
+                        .unwrap()
+                        .decimals
+                        .unwrap();
+
+                    let token1_decimals = tokens_data
+                        .get(&pair_data.token1.clone().unwrap())
+                        .unwrap()
+                        .decimals
+                        .unwrap();
+
+                    let db_dex_trade = DatabaseDexTrade::from_v2_log(
+                        &log,
+                        chain.id,
+                        pair_data,
+                        token0_decimals as usize,
+                        token1_decimals as usize,
+                    );
+
+                    db_dex_trades.push(db_dex_trade);
+                }
+
+                if topic0 == SWAPV3_EVENT_SIGNATURE {
+                    let token = log.address.clone();
+
+                    let pair_data = tokens_data.get(&token).unwrap();
+
+                    let token0_decimals = tokens_data
+                        .get(&pair_data.token0.clone().unwrap())
+                        .unwrap()
+                        .decimals
+                        .unwrap();
+
+                    let token1_decimals = tokens_data
+                        .get(&pair_data.token1.clone().unwrap())
+                        .unwrap()
+                        .decimals
+                        .unwrap();
+
+                    let db_dex_trade = DatabaseDexTrade::from_v3_log(
+                        &log,
+                        chain.id,
+                        &pair_data,
+                        token0_decimals as usize,
+                        token1_decimals as usize,
+                    );
+
+                    db_dex_trades.push(db_dex_trade);
+                }
+            }
+
+            info!(
+                "Found: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) for block {}.",
+                total_block_transactions,
+                db_receipts.len(),
+                db_logs.len(),
+                db_contracts.len(),
+                db_erc20_transfers.len(),
+                db_erc721_transfers.len(),
+                db_erc1155_transfers.len(),
+                db_dex_trades.len(),
+                block_number
+            );
+
+            return Some((
+                db_block,
+                db_transactions,
+                db_receipts,
+                db_logs,
+                db_contracts,
+                db_erc20_transfers,
+                db_erc721_transfers,
+            ));
+        }
+        None => return None,
+    }
+}

@@ -1,6 +1,7 @@
 pub mod block;
 pub mod chain_state;
 pub mod contract;
+pub mod contract_metadata;
 pub mod dex_trade;
 pub mod erc1155_transfer;
 pub mod erc20_transfer;
@@ -8,5 +9,5 @@ pub mod erc721_transfer;
 pub mod log;
 pub mod method;
 pub mod receipt;
-pub mod token_details;
+pub mod token_detail;
 pub mod transaction;

@@ -132,14 +132,15 @@ CREATE TABLE erc721_transfers (
 
 CREATE TABLE erc1155_transfers (
   chain BIGINT NOT NULL,
+  operator VARCHAR(42) NOT NULL,
   from_address VARCHAR(42) NOT NULL,
   hash VARCHAR(66) NOT NULL,
   log_index INT NOT NULL,
   to_address VARCHAR(42) NOT NULL,
   token VARCHAR(42) NOT NULL,
   transaction_log_index INT NOT NULL,
-  id BIGINT NOT NULL,
-  amount DECIMAL NOT NULL,
+  id TEXT[] NOT NULL,
+  amount DECIMAL[] NOT NULL,
   timestamp TIMESTAMP NOT NULL,
   PRIMARY KEY (hash, transaction_log_index)
 );
@@ -150,11 +151,13 @@ CREATE TABLE dex_trades (
   hash VARCHAR(66) NOT NULL,
   log_index INT NOT NULL,
   receiver VARCHAR(42) NOT NULL,
-  token_in VARCHAR(42) NOT NULL,
-  token_amount_in DECIMAL NOT NULL,
-  token_out VARCHAR(42) NOT NULL,
-  token_amount_out DECIMAL NOT NULL,
-  usd_value DECIMAL NOT NULL,
+  token0 VARCHAR(42) NOT NULL,
+  token1 VARCHAR(42) NOT NULL,
+  pair_address VARCHAR(42) NOT NULL,
+  token0_in DECIMAL NOT NULL,
+  token0_out DECIMAL NOT NULL,
+  token1_in DECIMAL NOT NULL,
+  token1_out DECIMAL NOT NULL,
   swap_rate DECIMAL NOT NULL,
   transaction_log_index INT NOT NULL,
   timestamp TIMESTAMP NOT NULL,
@@ -167,7 +170,9 @@ CREATE TABLE token_details (
   token VARCHAR(42) NOT NULL,
   name TEXT NOT NULL,
   symbol TEXT NOT NULL,
-  decimals SMALLINT,
+  decimals INT,
+  token0 VARCHAR(42),
+  token1 VARCHAR(42),
   PRIMARY KEY (token, chain)
 );
 
@@ -175,33 +180,3 @@ CREATE TABLE chains_indexed_state (
   chain BIGINT PRIMARY KEY,
   indexed_blocks_amount BIGINT NOT NULL
 );
-
-ALTER TABLE transactions ADD FOREIGN KEY (block_hash) REFERENCES blocks (hash);
-
-ALTER TABLE methods ADD FOREIGN KEY (method) REFERENCES transactions (method);
-
-ALTER TABLE receipts ADD FOREIGN KEY (hash) REFERENCES transactions (hash);
-
-ALTER TABLE contracts ADD FOREIGN KEY (hash) REFERENCES transactions (hash);
-
-ALTER TABLE contract_metadata ADD FOREIGN KEY (contract_address, chain) REFERENCES contracts (contract_address, chain);
-
-ALTER TABLE logs ADD FOREIGN KEY (hash) REFERENCES transactions (hash);
-
-ALTER TABLE erc20_transfers ADD FOREIGN KEY (hash) REFERENCES transactions (hash);
-
-ALTER TABLE erc721_transfers ADD FOREIGN KEY (hash) REFERENCES transactions (hash);
-
-ALTER TABLE erc1155_transfers ADD FOREIGN KEY (hash) REFERENCES transactions (hash);
-
-ALTER TABLE dex_trades ADD FOREIGN KEY (hash) REFERENCES transactions (hash);
-
-ALTER TABLE token_details ADD FOREIGN KEY (token, chain) REFERENCES erc20_transfers (token, chain);
-
-ALTER TABLE token_details ADD FOREIGN KEY (token, chain) REFERENCES erc721_transfers (token, chain);
-
-ALTER TABLE token_details ADD FOREIGN KEY (token, chain) REFERENCES erc1155_transfers (token, chain);
-
-ALTER TABLE token_details ADD FOREIGN KEY (token, chain) REFERENCES dex_trades (token_in, chain);
-
-ALTER TABLE token_details ADD FOREIGN KEY (token, chain) REFERENCES dex_trades (token_out, chain);

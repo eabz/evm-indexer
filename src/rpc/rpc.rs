@@ -1,28 +1,46 @@
 use crate::{
     chains::chains::Chain,
-    config::config::Config,
+    configs::config::Config,
     db::models::{
         block::DatabaseBlock,
         contract::DatabaseContract,
         log::DatabaseLog,
         receipt::{DatabaseReceipt, TransactionStatus},
+        token_detail::DatabaseTokenDetails,
         transaction::DatabaseTransaction,
     },
+    utils::format::format_address,
 };
-use ethers::types::{Block, Transaction, TransactionReceipt, U256};
+use ethabi::Address;
+use ethers::{
+    prelude::abigen,
+    providers::{Http, Provider},
+    types::{Block, Transaction, TransactionReceipt, U256},
+};
 
 use anyhow::Result;
 use jsonrpsee::core::{client::ClientT, rpc_params};
 use jsonrpsee_http_client::{HttpClient, HttpClientBuilder};
 use log::info;
 use rand::seq::SliceRandom;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use serde_json::Error;
 
+abigen!(
+    ERC20,
+    r#"[
+        function name() external view returns (string)
+        function symbol() external view returns (string)
+        function decimals() external view returns (uint8)
+        function token0() external view returns (address)
+        function token1() external view returns (address)
+    ]"#,
+);
 #[derive(Debug, Clone)]
 pub struct Rpc {
     pub clients: Vec<HttpClient>,
+    pub clients_urls: Vec<String>,
     pub chain: Chain,
 }
 
@@ -33,12 +51,13 @@ impl Rpc {
         let timeout = Duration::from_secs(60);
 
         let mut clients = Vec::new();
+        let mut clients_urls = Vec::new();
 
         for rpc in config.rpcs.clone() {
             let client = HttpClientBuilder::default()
                 .max_concurrent_requests(100000)
                 .request_timeout(timeout)
-                .build(rpc)
+                .build(rpc.clone())
                 .unwrap();
 
             let client_id = client.request("eth_chainId", rpc_params![]).await;
@@ -55,6 +74,7 @@ impl Rpc {
                     }
 
                     clients.push(client);
+                    clients_urls.push(rpc.clone());
                 }
                 Err(_) => continue,
             }
@@ -66,12 +86,18 @@ impl Rpc {
 
         Ok(Self {
             clients,
+            clients_urls,
             chain: config.chain,
         })
     }
 
     fn get_client(&self) -> &HttpClient {
         let client = self.clients.choose(&mut rand::thread_rng()).unwrap();
+        return client;
+    }
+
+    fn get_client_url(&self) -> &String {
+        let client = self.clients_urls.choose(&mut rand::thread_rng()).unwrap();
         return client;
     }
 
@@ -258,5 +284,65 @@ impl Rpc {
             }
             Err(_) => return Ok(None),
         }
+    }
+
+    pub async fn get_token_metadata(&self, token: String) -> Option<DatabaseTokenDetails> {
+        let client = self.get_client_url();
+
+        let provider = match Provider::<Http>::try_from(client) {
+            Ok(provider) => provider,
+            Err(_) => return None,
+        };
+
+        let client = Arc::new(provider);
+
+        let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
+
+        let name: String = match token_contract.name().call().await {
+            Ok(name) => {
+                let token_name = format!("{}", name.trim_matches(char::from(0)));
+                let name_fixed: String = token_name.replace("'", "");
+                let name_bytes = name_fixed.as_bytes();
+                let name_parsed = String::from_utf8_lossy(name_bytes);
+                format!("'{}'", name_parsed)
+            }
+            Err(_) => String::from(""),
+        };
+
+        let decimals: Option<i16> = match token_contract.decimals().call().await {
+            Ok(decimals) => Some(decimals as i16),
+            Err(_) => Some(0),
+        };
+
+        let symbol: String = match token_contract.symbol().call().await {
+            Ok(symbol) => {
+                let token_symbol = format!("{}", symbol.trim_matches(char::from(0)));
+                let symbol_fixed: String = token_symbol.replace("'", "");
+                let symbol_bytes = symbol_fixed.as_bytes();
+                let symbol_parsed = String::from_utf8_lossy(symbol_bytes);
+                format!("'{}'", symbol_parsed)
+            }
+            Err(_) => String::from(""),
+        };
+
+        let token0: Option<String> = match token_contract.token_0().call().await {
+            Ok(token0) => Some(format_address(token0)),
+            Err(_) => None,
+        };
+
+        let token1: Option<String> = match token_contract.token_1().call().await {
+            Ok(token1) => Some(format_address(token1)),
+            Err(_) => None,
+        };
+
+        return Some(DatabaseTokenDetails {
+            token,
+            chain: self.chain.id,
+            name,
+            decimals,
+            symbol,
+            token0,
+            token1,
+        });
     }
 }
