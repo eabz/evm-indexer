@@ -19,7 +19,7 @@ use indexer::{
             ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
             SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
         },
-        tokens::get_tokens_metadata,
+        tokens::get_tokens,
     },
 };
 use log::*;
@@ -214,7 +214,27 @@ async fn fetch_block(
                 return None;
             }
 
-            let tokens_data = get_tokens_metadata(db, rpc, &db_logs).await;
+            let mut tokens_metadata_required: HashSet<String> = HashSet::new();
+
+            // filter only logs with topic
+            let logs_scan: Vec<&DatabaseLog> =
+                db_logs.iter().filter(|log| log.topics.len() > 0).collect();
+
+            // insert all the tokens from the logs to metadata check
+            for log in logs_scan.iter() {
+                let topic_0 = log.topics.first().unwrap();
+
+                if topic_0 == TRANSFER_EVENTS_SIGNATURE
+                    || topic_0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
+                    || topic_0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
+                    || topic_0 == SWAPV3_EVENT_SIGNATURE
+                    || topic_0 == SWAP_EVENT_SIGNATURE
+                {
+                    tokens_metadata_required.insert(log.address.clone());
+                }
+            }
+
+            let tokens_data = get_tokens(db, rpc, &tokens_metadata_required).await;
 
             let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> = Vec::new();
             let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> = Vec::new();

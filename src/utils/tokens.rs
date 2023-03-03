@@ -3,56 +3,19 @@ use std::collections::{HashMap, HashSet};
 use futures::future::join_all;
 
 use crate::{
-    db::{
-        db::Database,
-        models::{log::DatabaseLog, token_detail::DatabaseTokenDetails},
-    },
+    db::{db::Database, models::token_detail::DatabaseTokenDetails},
     rpc::rpc::Rpc,
 };
 
-use super::events::{
-    ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
-    SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
-};
-
-pub async fn get_tokens_metadata(
+async fn get_tokens_metadata(
     db: &Database,
     rpc: &Rpc,
-    logs: &Vec<DatabaseLog>,
-) -> HashMap<String, DatabaseTokenDetails> {
-    let mut tokens_metadata_required: HashSet<String> = HashSet::new();
-
-    // filter only logs with topic
-    let logs_scan: Vec<&DatabaseLog> = logs.iter().filter(|log| log.topics.len() > 0).collect();
-
-    // get the logos that match a swap topic
-    let logs_swaps = logs_scan.iter().filter(|log| {
-        let topic_0 = log.topics.first().unwrap();
-        topic_0 == SWAPV3_EVENT_SIGNATURE || topic_0 == SWAP_EVENT_SIGNATURE
-    });
-
-    // insert all the tokens from the logs to metadata check
-    for log in logs_scan.iter() {
-        let topic_0 = log.topics.first().unwrap();
-
-        if topic_0 == TRANSFER_EVENTS_SIGNATURE
-            || topic_0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
-            || topic_0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
-        {
-            tokens_metadata_required.insert(log.address.clone());
-        }
-    }
-
-    // insert at the end the pairs from swap events (pairs at the end on purpose to fetch first the underlying tokens data)
-    for log in logs_swaps {
-        tokens_metadata_required.insert(log.address.clone());
-    }
-
-    let mut db_tokens = db.get_tokens(&tokens_metadata_required).await;
-
+    tokens: &HashSet<String>,
+) -> Vec<DatabaseTokenDetails> {
+    let mut db_tokens = db.get_tokens(&tokens).await;
     let db_token_address: Vec<String> = db_tokens.iter().map(|token| token.token.clone()).collect();
 
-    let missing_tokens: Vec<&String> = tokens_metadata_required
+    let missing_tokens: Vec<&String> = tokens
         .iter()
         .filter(|token| !db_token_address.contains(&token))
         .collect();
@@ -75,14 +38,42 @@ pub async fn get_tokens_metadata(
 
     db_tokens.append(&mut tokens_metadata);
 
+    return db_tokens;
+}
+
+pub async fn get_tokens(
+    db: &Database,
+    rpc: &Rpc,
+    tokens: &HashSet<String>,
+) -> HashMap<String, DatabaseTokenDetails> {
+    let db_tokens = get_tokens_metadata(db, rpc, tokens).await;
+
     let mut tokens_data: HashMap<String, DatabaseTokenDetails> = HashMap::new();
 
     for token in db_tokens.iter() {
         tokens_data.insert(token.token.clone(), token.to_owned());
     }
 
-    if tokens_data.len() != tokens_metadata_required.len() {
+    if tokens_data.len() != tokens.len() {
         panic!("inconsistent amount of tokens to parse the logs")
+    }
+
+    let mut underlying_tokens: HashSet<String> = HashSet::new();
+
+    for token in db_tokens.iter() {
+        if token.token0.is_some() {
+            underlying_tokens.insert(token.token0.clone().unwrap());
+        }
+
+        if token.token1.is_some() {
+            underlying_tokens.insert(token.token1.clone().unwrap());
+        }
+    }
+
+    let db_underlying_tokens = get_tokens_metadata(db, rpc, &underlying_tokens).await;
+
+    for token in db_underlying_tokens.iter() {
+        tokens_data.insert(token.token.clone(), token.to_owned());
     }
 
     return tokens_data;

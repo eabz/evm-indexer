@@ -13,7 +13,7 @@ use crate::{
 };
 use ethabi::Address;
 use ethers::{
-    prelude::abigen,
+    prelude::{abigen, Multicall},
     providers::{Http, Provider},
     types::{Block, Transaction, TransactionReceipt, U256},
 };
@@ -296,43 +296,7 @@ impl Rpc {
 
         let client = Arc::new(provider);
 
-        let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
-
-        let name: String = match token_contract.name().call().await {
-            Ok(name) => sanitize_string(name),
-            Err(_) => String::from(""),
-        };
-
-        let symbol: String = match token_contract.symbol().call().await {
-            Ok(symbol) => sanitize_string(symbol),
-            Err(_) => String::from(""),
-        };
-
-        let decimals = match token_contract.decimals().call().await {
-            Ok(decimals) => decimals as i16,
-            Err(_) => 0,
-        };
-
-        return Some(DatabaseTokenDetails {
-            token,
-            chain: self.chain.id,
-            name,
-            decimals,
-            symbol,
-            token0: None,
-            token1: None,
-        });
-    }
-
-    pub async fn get_pair_token_metadata(&self, token: String) -> Option<DatabaseTokenDetails> {
-        let client = self.get_client_url();
-
-        let provider = match Provider::<Http>::try_from(client) {
-            Ok(provider) => provider,
-            Err(_) => return None,
-        };
-
-        let client = Arc::new(provider);
+        let mut multicall = Multicall::new(client.clone(), None).await.unwrap();
 
         let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
 
@@ -351,14 +315,13 @@ impl Rpc {
             Err(_) => 0,
         };
 
-        let token0: String = match token_contract.token_0().call().await {
-            Ok(token0) => format_address(token0),
-            Err(_) => panic!("unable to fetch pair token0"),
-        };
+        multicall
+            .add_call(token_contract.token_0(), false)
+            .add_call(token_contract.token_1(), false);
 
-        let token1: String = match token_contract.token_0().call().await {
-            Ok(token1) => format_address(token1),
-            Err(_) => panic!("unable to fetch pair token1"),
+        let (token0, token1): (Option<String>, Option<String>) = match multicall.call().await {
+            Ok((token0, token1)) => (Some(format_address(token0)), Some(format_address(token1))),
+            Err(_) => (None, None),
         };
 
         return Some(DatabaseTokenDetails {
@@ -367,8 +330,8 @@ impl Rpc {
             name,
             decimals,
             symbol,
-            token0: Some(token0),
-            token1: Some(token1),
+            token0,
+            token1,
         });
     }
 }
