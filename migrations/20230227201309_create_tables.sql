@@ -46,7 +46,7 @@ CREATE TABLE transactions (
   block_number BIGINT NOT NULL,
   chain BIGINT NOT NULL,
   from_address VARCHAR(42) NOT NULL,
-  gas_limit BIGINT NOT NULL,
+  gas BIGINT NOT NULL,
   gas_price BIGINT NOT NULL,
   hash VARCHAR(66) UNIQUE PRIMARY KEY,
   input BYTEA NOT NULL,
@@ -56,8 +56,8 @@ CREATE TABLE transactions (
   nonce INT NOT NULL,
   timestamp TIMESTAMP NOT NULL,
   to_address VARCHAR(42),
-  transaction_index SMALLINT NOT NULL,
-  transaction_type SMALLINT NOT NULL,
+  transaction_index INT NOT NULL,
+  transaction_type INT NOT NULL,
   value DECIMAL NOT NULL
 );
 
@@ -76,6 +76,7 @@ CREATE TABLE receipts (
 );
 
 CREATE TABLE contracts (
+  block BIGINT NOT NULL,
   contract_address VARCHAR(42) NOT NULL,
   chain BIGINT NOT NULL,
   creator VARCHAR(42) NOT NULL,
@@ -100,21 +101,22 @@ CREATE TABLE logs (
   log_type SMALLINT,
   removed BOOLEAN NOT NULL,
   topics VARCHAR(66)[] NOT NULL,
+  timestamp TIMESTAMP NOT NULL,
   transaction_log_index INT,
-  PRIMARY KEY (hash, transaction_log_index)
+  PRIMARY KEY (hash, log_index)
 );
 
 CREATE TABLE erc20_transfers (
+  amount DECIMAL NOT NULL,
   chain BIGINT NOT NULL,
   from_address VARCHAR(42) NOT NULL,
   hash VARCHAR(66) NOT NULL,
   log_index INT NOT NULL,
   to_address VARCHAR(42) NOT NULL,
   token VARCHAR(42) NOT NULL,
-  transaction_log_index INT NOT NULL,
-  amount DECIMAL NOT NULL,
+  transaction_log_index INT,
   timestamp TIMESTAMP NOT NULL,
-  PRIMARY KEY (hash, transaction_log_index)
+  PRIMARY KEY (hash, log_index)
 );
 
 CREATE TABLE erc721_transfers (
@@ -124,10 +126,10 @@ CREATE TABLE erc721_transfers (
   log_index INT NOT NULL,
   to_address VARCHAR(42) NOT NULL,
   token VARCHAR(42) NOT NULL,
-  transaction_log_index INT NOT NULL,
+  transaction_log_index INT,
   id TEXT NOT NULL,
   timestamp TIMESTAMP NOT NULL,
-  PRIMARY KEY (hash, transaction_log_index)
+  PRIMARY KEY (hash, log_index)
 );
 
 CREATE TABLE erc1155_transfers (
@@ -138,11 +140,11 @@ CREATE TABLE erc1155_transfers (
   log_index INT NOT NULL,
   to_address VARCHAR(42) NOT NULL,
   token VARCHAR(42) NOT NULL,
-  transaction_log_index INT NOT NULL,
-  id TEXT[] NOT NULL,
-  amount DECIMAL[] NOT NULL,
+  transaction_log_index INT,
+  ids TEXT[] NOT NULL,
+  values DECIMAL[] NOT NULL,
   timestamp TIMESTAMP NOT NULL,
-  PRIMARY KEY (hash, transaction_log_index)
+  PRIMARY KEY (hash, log_index)
 );
 
 CREATE TABLE dex_trades (
@@ -154,15 +156,13 @@ CREATE TABLE dex_trades (
   token0 VARCHAR(42) NOT NULL,
   token1 VARCHAR(42) NOT NULL,
   pair_address VARCHAR(42) NOT NULL,
-  token0_in DECIMAL NOT NULL,
-  token0_out DECIMAL NOT NULL,
-  token1_in DECIMAL NOT NULL,
-  token1_out DECIMAL NOT NULL,
+  token0_amount DECIMAL NOT NULL,
+  token1_amount DECIMAL NOT NULL,
   swap_rate DECIMAL NOT NULL,
-  transaction_log_index INT NOT NULL,
+  transaction_log_index INT,
   timestamp TIMESTAMP NOT NULL,
   trade_type TRADE_TYPE NOT NULL,
-  PRIMARY KEY (hash, transaction_log_index)
+  PRIMARY KEY (hash, log_index)
 );
 
 CREATE TABLE token_details (

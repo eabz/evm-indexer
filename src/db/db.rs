@@ -3,6 +3,7 @@ use std::{cmp::min, collections::HashSet};
 use crate::chains::chains::Chain;
 use anyhow::Result;
 use field_count::FieldCount;
+use futures::future::join_all;
 use log::info;
 use redis::Commands;
 use sqlx::{
@@ -10,7 +11,13 @@ use sqlx::{
     ConnectOptions, QueryBuilder,
 };
 
-use super::models::{chain_state::DatabaseChainIndexedState, token_detail::DatabaseTokenDetails};
+use super::models::{
+    block::DatabaseBlock, chain_state::DatabaseChainIndexedState, contract::DatabaseContract,
+    dex_trade::DatabaseDexTrade, erc1155_transfer::DatabaseERC1155Transfer,
+    erc20_transfer::DatabaseERC20Transfer, erc721_transfer::DatabaseERC721Transfer,
+    log::DatabaseLog, receipt::DatabaseReceipt, token_detail::DatabaseTokenDetails,
+    transaction::DatabaseTransaction,
+};
 
 pub const MAX_PARAM_SIZE: u16 = u16::MAX;
 
@@ -98,6 +105,461 @@ impl Database {
         }
 
         return Vec::new();
+    }
+
+    pub async fn store_data(
+        &self,
+        blocks: &Vec<DatabaseBlock>,
+        transactions: &Vec<DatabaseTransaction>,
+        receipts: &Vec<DatabaseReceipt>,
+        logs: &Vec<DatabaseLog>,
+        contracts: &Vec<DatabaseContract>,
+        erc20_transfers: &Vec<DatabaseERC20Transfer>,
+        erc721_transfers: &Vec<DatabaseERC721Transfer>,
+        erc1155_transfers: &Vec<DatabaseERC1155Transfer>,
+        dex_trades: &Vec<DatabaseDexTrade>,
+    ) {
+        let mut stores = vec![];
+
+        if transactions.len() > 0 {
+            let work = tokio::spawn({
+                let transactions = transactions.clone();
+                let db = self.clone();
+                async move {
+                    db.store_transactions(&transactions)
+                        .await
+                        .expect("unable to store transactions")
+                }
+            });
+            stores.push(work);
+        }
+
+        if receipts.len() > 0 {
+            let work = tokio::spawn({
+                let receipts = receipts.clone();
+                let db = self.clone();
+                async move {
+                    db.store_receipts(&receipts)
+                        .await
+                        .expect("unable to store receipts")
+                }
+            });
+            stores.push(work);
+        }
+
+        if logs.len() > 0 {
+            let work = tokio::spawn({
+                let logs = logs.clone();
+                let db = self.clone();
+                async move { db.store_logs(&logs).await.expect("unable to store logs") }
+            });
+            stores.push(work);
+        }
+
+        if contracts.len() > 0 {
+            let work = tokio::spawn({
+                let contracts = contracts.clone();
+                let db = self.clone();
+                async move {
+                    db.store_contracts(&contracts)
+                        .await
+                        .expect("unable to store contracts")
+                }
+            });
+            stores.push(work);
+        }
+
+        if erc20_transfers.len() > 0 {
+            let work = tokio::spawn({
+                let erc20_transfers = erc20_transfers.clone();
+                let db = self.clone();
+                async move {
+                    db.store_erc20_transfers(&erc20_transfers)
+                        .await
+                        .expect("unable to store erc20 transfers")
+                }
+            });
+            stores.push(work);
+        }
+
+        if erc721_transfers.len() > 0 {
+            let work = tokio::spawn({
+                let erc721_transfers = erc721_transfers.clone();
+                let db = self.clone();
+                async move {
+                    db.store_erc721_transfers(&erc721_transfers)
+                        .await
+                        .expect("unable to erc721 transfers")
+                }
+            });
+            stores.push(work);
+        }
+
+        if erc1155_transfers.len() > 0 {
+            let work = tokio::spawn({
+                let erc1155_transfers = erc1155_transfers.clone();
+                let db = self.clone();
+                async move {
+                    db.store_erc1155_transfers(&erc1155_transfers)
+                        .await
+                        .expect("unable to store erc1155 transfers")
+                }
+            });
+            stores.push(work);
+        }
+
+        if dex_trades.len() > 0 {
+            let work = tokio::spawn({
+                let dex_trades = dex_trades.clone();
+                let db = self.clone();
+                async move {
+                    db.store_dex_trades(&dex_trades)
+                        .await
+                        .expect("unable to store dex trades")
+                }
+            });
+            stores.push(work);
+        }
+
+        let res = join_all(stores).await;
+
+        let errored: Vec<_> = res.iter().filter(|res| res.is_err()).collect();
+
+        if errored.len() > 0 {
+            panic!("failed to store all elements")
+        }
+
+        if blocks.len() > 0 {
+            self.store_blocks(&blocks).await.unwrap();
+        }
+
+        info!(
+            "Inserted: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) in ({}) blocks.",
+            transactions.len(),
+            receipts.len(),
+            logs.len(),
+            contracts.len(),
+            erc20_transfers.len(),
+            erc721_transfers.len(),
+            erc1155_transfers.len(),
+            dex_trades.len(),
+            blocks.len(),
+        );
+    }
+
+    async fn store_transactions(&self, transactions: &Vec<DatabaseTransaction>) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(transactions.len(), DatabaseTransaction::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder = QueryBuilder::new("UPSERT INTO transactions (block_hash, block_number, chain, from_address, gas, gas_price, hash, input, max_priority_fee_per_gas, max_fee_per_gas, method, nonce, timestamp, to_address, transaction_index, transaction_type, value) ");
+
+            query_builder.push_values(&transactions[start..end], |mut row, transaction| {
+                row.push_bind(transaction.block_hash.clone())
+                    .push_bind(transaction.block_number)
+                    .push_bind(transaction.chain)
+                    .push_bind(transaction.from_address.clone())
+                    .push_bind(transaction.gas)
+                    .push_bind(transaction.gas_price)
+                    .push_bind(transaction.hash.clone())
+                    .push_bind(transaction.input.clone())
+                    .push_bind(transaction.max_priority_fee_per_gas)
+                    .push_bind(transaction.max_fee_per_gas)
+                    .push_bind(transaction.method.clone())
+                    .push_bind(transaction.nonce)
+                    .push_bind(transaction.timestamp)
+                    .push_bind(transaction.to_address.clone())
+                    .push_bind(transaction.transaction_index)
+                    .push_bind(transaction.transaction_type)
+                    .push_bind(transaction.value);
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store transactions into database");
+        }
+
+        Ok(())
+    }
+
+    async fn store_receipts(&self, receipts: &Vec<DatabaseReceipt>) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(receipts.len(), DatabaseReceipt::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder = QueryBuilder::new("UPSERT INTO receipts (contract_address, cumulative_gas_used, effective_gas_price, gas_used, hash, status) ");
+
+            query_builder.push_values(&receipts[start..end], |mut row, receipt| {
+                row.push_bind(receipt.contract_address.clone())
+                    .push_bind(receipt.cumulative_gas_used)
+                    .push_bind(receipt.effective_gas_price)
+                    .push_bind(receipt.gas_used)
+                    .push_bind(receipt.hash.clone())
+                    .push_bind(receipt.status.as_str());
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store receipts into database");
+        }
+
+        Ok(())
+    }
+
+    async fn store_logs(&self, logs: &Vec<DatabaseLog>) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(logs.len(), DatabaseLog::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder = QueryBuilder::new(
+                "UPSERT INTO logs (address, chain, data, hash, log_index, removed, topics, transaction_log_index, timestamp) ",
+            );
+
+            query_builder.push_values(&logs[start..end], |mut row, log| {
+                row.push_bind(log.address.clone())
+                    .push_bind(log.chain)
+                    .push_bind(log.data.clone())
+                    .push_bind(log.hash.clone())
+                    .push_bind(log.log_index)
+                    .push_bind(log.removed)
+                    .push_bind(log.topics.clone())
+                    .push_bind(log.transaction_log_index)
+                    .push_bind(log.timestamp);
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store logs into database");
+        }
+
+        Ok(())
+    }
+
+    async fn store_contracts(&self, contracts: &Vec<DatabaseContract>) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(contracts.len(), DatabaseContract::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder = QueryBuilder::new(
+                "UPSERT INTO contracts (block, contract_address, chain, creator, hash) ",
+            );
+
+            query_builder.push_values(&contracts[start..end], |mut row, contract| {
+                row.push_bind(contract.block)
+                    .push_bind(contract.contract_address.clone())
+                    .push_bind(contract.chain)
+                    .push_bind(contract.creator.clone())
+                    .push_bind(contract.hash.clone());
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store contracts into database");
+        }
+
+        Ok(())
+    }
+
+    async fn store_erc20_transfers(&self, transfers: &Vec<DatabaseERC20Transfer>) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(transfers.len(), DatabaseERC20Transfer::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder = QueryBuilder::new(
+                "UPSERT INTO erc20_transfers (chain, from_address, hash, log_index, to_address, token, transaction_log_index, amount, timestamp) ",
+            );
+
+            query_builder.push_values(&transfers[start..end], |mut row, transfers| {
+                row.push_bind(transfers.chain)
+                    .push_bind(transfers.from_address.clone())
+                    .push_bind(transfers.hash.clone())
+                    .push_bind(transfers.log_index)
+                    .push_bind(transfers.to_address.clone())
+                    .push_bind(transfers.token.clone())
+                    .push_bind(transfers.transaction_log_index)
+                    .push_bind(transfers.amount)
+                    .push_bind(transfers.timestamp);
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store erc20 transfers into database");
+        }
+
+        Ok(())
+    }
+
+    async fn store_erc721_transfers(&self, transfers: &Vec<DatabaseERC721Transfer>) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(transfers.len(), DatabaseERC721Transfer::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder = QueryBuilder::new(
+                "UPSERT INTO erc721_transfers (chain, from_address, hash, log_index, to_address, token, transaction_log_index, id, timestamp) ",
+            );
+
+            query_builder.push_values(&transfers[start..end], |mut row, transfers| {
+                row.push_bind(transfers.chain)
+                    .push_bind(transfers.from_address.clone())
+                    .push_bind(transfers.hash.clone())
+                    .push_bind(transfers.log_index)
+                    .push_bind(transfers.to_address.clone())
+                    .push_bind(transfers.token.clone())
+                    .push_bind(transfers.transaction_log_index)
+                    .push_bind(transfers.id.clone())
+                    .push_bind(transfers.timestamp);
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store erc721 transfers into database");
+        }
+
+        Ok(())
+    }
+
+    async fn store_erc1155_transfers(
+        &self,
+        transfers: &Vec<DatabaseERC1155Transfer>,
+    ) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(transfers.len(), DatabaseERC1155Transfer::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder = QueryBuilder::new(
+                "UPSERT INTO erc1155_transfers (chain, operator, from_address, hash, log_index, to_address, token, transaction_log_index, ids, values, timestamp) ",
+            );
+
+            query_builder.push_values(&transfers[start..end], |mut row, transfers| {
+                row.push_bind(transfers.chain)
+                    .push_bind(transfers.operator.clone())
+                    .push_bind(transfers.from_address.clone())
+                    .push_bind(transfers.hash.clone())
+                    .push_bind(transfers.log_index)
+                    .push_bind(transfers.to_address.clone())
+                    .push_bind(transfers.token.clone())
+                    .push_bind(transfers.transaction_log_index)
+                    .push_bind(transfers.ids.clone())
+                    .push_bind(transfers.values.clone())
+                    .push_bind(transfers.timestamp);
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store erc1155 transfers into database");
+        }
+
+        Ok(())
+    }
+
+    async fn store_dex_trades(&self, trades: &Vec<DatabaseDexTrade>) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(trades.len(), DatabaseDexTrade::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder =
+                QueryBuilder::new("UPSERT INTO dex_trades (chain, maker, hash, log_index, receiver, token0, token1, pair_address, token0_amount, token1_amount, swap_rate, transaction_log_index, timestamp, trade_type) ");
+
+            query_builder.push_values(&trades[start..end], |mut row, transfers| {
+                row.push_bind(transfers.chain)
+                    .push_bind(transfers.maker.clone())
+                    .push_bind(transfers.hash.clone())
+                    .push_bind(transfers.log_index)
+                    .push_bind(transfers.receiver.clone())
+                    .push_bind(transfers.token0.clone())
+                    .push_bind(transfers.token1.clone())
+                    .push_bind(transfers.pair_address.clone())
+                    .push_bind(transfers.token0_amount)
+                    .push_bind(transfers.token1_amount)
+                    .push_bind(transfers.swap_rate)
+                    .push_bind(transfers.transaction_log_index)
+                    .push_bind(transfers.timestamp)
+                    .push_bind(transfers.trade_type.as_str());
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store dex trades into database");
+        }
+
+        Ok(())
+    }
+
+    async fn store_blocks(&self, blocks: &Vec<DatabaseBlock>) -> Result<()> {
+        let connection = self.get_connection();
+
+        let chunks = get_chunks(blocks.len(), DatabaseBlock::field_count());
+
+        for (start, end) in chunks {
+            let mut query_builder = QueryBuilder::new("UPSERT INTO blocks (base_fee_per_gas, chain, difficulty, extra_data, gas_limit, gas_used, hash, logs_bloom, miner, mix_hash, nonce, number, parent_hash, receipts_root, sha3_uncles, size, state_root, status, timestamp, total_difficulty, transactions, transactions_root, uncles) ");
+
+            query_builder.push_values(&blocks[start..end], |mut row, block| {
+                row.push_bind(block.base_fee_per_gas)
+                    .push_bind(block.chain)
+                    .push_bind(block.difficulty.clone())
+                    .push_bind(block.extra_data.clone())
+                    .push_bind(block.gas_limit)
+                    .push_bind(block.gas_used)
+                    .push_bind(block.hash.clone())
+                    .push_bind(block.logs_bloom.clone())
+                    .push_bind(block.miner.clone())
+                    .push_bind(block.mix_hash.clone())
+                    .push_bind(block.nonce.clone())
+                    .push_bind(block.number)
+                    .push_bind(block.parent_hash.clone())
+                    .push_bind(block.receipts_root.clone())
+                    .push_bind(block.sha3_uncles.clone())
+                    .push_bind(block.size)
+                    .push_bind(block.state_root.clone())
+                    .push_bind(block.status.as_str())
+                    .push_bind(block.timestamp)
+                    .push_bind(block.total_difficulty.clone())
+                    .push_bind(block.transactions)
+                    .push_bind(block.transactions_root.clone())
+                    .push_bind(block.uncles.clone());
+            });
+
+            let query = query_builder.build();
+
+            query
+                .execute(connection)
+                .await
+                .expect("Unable to store blocks into database");
+        }
+
+        Ok(())
     }
 
     pub async fn store_token_details(&self, tokens: &Vec<DatabaseTokenDetails>) -> Result<()> {

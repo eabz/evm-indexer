@@ -12,6 +12,15 @@ pub enum TradeType {
     Sell,
 }
 
+impl TradeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TradeType::Buy => "buy",
+            TradeType::Sell => "sell",
+        }
+    }
+}
+
 #[derive(Debug, Clone, FieldCount)]
 pub struct DatabaseDexTrade {
     pub chain: i64,

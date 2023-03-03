@@ -10,6 +10,16 @@ pub enum TransactionStatus {
     Pending,
 }
 
+impl TransactionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransactionStatus::Reverted => "reverted",
+            TransactionStatus::Succeed => "succeed",
+            TransactionStatus::Pending => "pending",
+        }
+    }
+}
+
 #[derive(Debug, Clone, FieldCount)]
 pub struct DatabaseReceipt {
     pub contract_address: Option<String>,

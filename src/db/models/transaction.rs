@@ -19,8 +19,8 @@ pub struct DatabaseTransaction {
     pub nonce: i32,
     pub timestamp: i64,
     pub to_address: Option<String>,
-    pub transaction_index: i8,
-    pub transaction_type: i8,
+    pub transaction_index: i16,
+    pub transaction_type: i16,
     pub value: f64,
 }
 
@@ -64,8 +64,8 @@ impl DatabaseTransaction {
             nonce: transaction.nonce.as_u32() as i32,
             timestamp,
             to_address,
-            transaction_index: transaction.transaction_index.unwrap().as_u32() as i8,
-            transaction_type: transaction.transaction_type.unwrap().as_u32() as i8,
+            transaction_index: transaction.transaction_index.unwrap().as_u32() as i16,
+            transaction_type: transaction.transaction_type.unwrap().as_u32() as i16,
             value: format_units(transaction.value, 18)
                 .unwrap()
                 .parse::<f64>()

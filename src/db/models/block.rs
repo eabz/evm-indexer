@@ -11,6 +11,16 @@ pub enum BlockStatus {
     Finalized,
 }
 
+impl BlockStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BlockStatus::Unfinalized => "unfinalized",
+            BlockStatus::Secure => "secure",
+            BlockStatus::Finalized => "finalized",
+        }
+    }
+}
+
 use crate::utils::format::{format_address, format_hash, format_nonce, format_number};
 
 #[derive(Debug, Clone, FieldCount)]

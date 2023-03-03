@@ -99,6 +99,8 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
         let mut db_contracts: Vec<DatabaseContract> = Vec::new();
         let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> = Vec::new();
         let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> = Vec::new();
+        let mut db_erc1155_transfers: Vec<DatabaseERC1155Transfer> = Vec::new();
+        let mut db_dex_trade: Vec<DatabaseDexTrade> = Vec::new();
 
         for result in results {
             match result {
@@ -110,6 +112,8 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
                     mut contracts,
                     mut erc20_transfers,
                     mut erc721_transfers,
+                    mut erc1155_transfers,
+                    mut dex_trades,
                 )) => {
                     db_blocks.push(block);
                     db_transactions.append(&mut transactions);
@@ -117,13 +121,28 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
                     db_logs.append(&mut logs);
                     db_contracts.append(&mut contracts);
                     db_erc20_transfers.append(&mut erc20_transfers);
-                    db_erc721_transfers.append(&mut erc721_transfers)
+                    db_erc721_transfers.append(&mut erc721_transfers);
+                    db_erc1155_transfers.append(&mut erc1155_transfers);
+                    db_dex_trade.append(&mut dex_trades)
                 }
                 None => continue,
             }
         }
 
-        // TODO: store in the db
+        db.store_data(
+            &db_blocks,
+            &db_transactions,
+            &db_receipts,
+            &db_logs,
+            &db_contracts,
+            &db_erc20_transfers,
+            &db_erc721_transfers,
+            &db_erc1155_transfers,
+            &db_dex_trade,
+        )
+        .await;
+
+        // TODO: aggregate data
 
         for block in db_blocks.into_iter() {
             indexed_blocks.insert(block.number);
@@ -150,6 +169,8 @@ async fn fetch_block(
     Vec<DatabaseContract>,
     Vec<DatabaseERC20Transfer>,
     Vec<DatabaseERC721Transfer>,
+    Vec<DatabaseERC1155Transfer>,
+    Vec<DatabaseDexTrade>,
 )> {
     let block_data = rpc.get_block(block_number).await.unwrap();
 
@@ -358,6 +379,8 @@ async fn fetch_block(
                 db_contracts,
                 db_erc20_transfers,
                 db_erc721_transfers,
+                db_erc1155_transfers,
+                db_dex_trades,
             ));
         }
         None => return None,
