@@ -43,6 +43,8 @@ impl DatabaseERC20Transfer {
 
         let token = log.address.clone();
 
+        println!("{:?}", value.to_owned().into_uint());
+
         Self {
             chain,
             from_address: format_address(from_address.to_owned().into_address().unwrap()),
