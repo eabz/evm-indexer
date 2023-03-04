@@ -32,10 +32,6 @@ async fn get_tokens_metadata(
         .map(|token| token.clone().unwrap())
         .collect();
 
-    if tokens_metadata.len() > 0 {
-        db.store_token_details(&tokens_metadata).await.unwrap();
-    }
-
     db_tokens.append(&mut tokens_metadata);
 
     return db_tokens;
@@ -74,6 +70,12 @@ pub async fn get_tokens(
 
     for token in db_underlying_tokens.iter() {
         tokens_data.insert(token.token.clone(), token.to_owned());
+    }
+
+    let tokens_data_vec: Vec<DatabaseTokenDetails> = tokens_data.values().cloned().collect();
+
+    if tokens_data_vec.len() > 0 {
+        db.store_token_details(&tokens_data_vec).await.unwrap();
     }
 
     return tokens_data;
