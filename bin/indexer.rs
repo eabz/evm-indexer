@@ -15,6 +15,7 @@ use indexer::{
     },
     rpc::rpc::Rpc,
     utils::{
+        aggregate::aggregate_data,
         events::{
             ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
             SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
@@ -51,6 +52,7 @@ async fn main() {
     let db = Database::new(
         config.db_url.clone(),
         config.redis_url.clone(),
+        config.agg_db_url.clone(),
         config.chain.clone(),
     )
     .await
@@ -145,9 +147,7 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
         )
         .await;
 
-        // TODO: aggregate data
-
-        for block in db_blocks.into_iter() {
+        for block in db_blocks.iter() {
             indexed_blocks.insert(block.number);
         }
 
@@ -156,6 +156,19 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
         db.store_indexed_blocks(&indexed_blocks_vector)
             .await
             .unwrap();
+
+        // TODO: aggregate data
+        let (db_native_balances, db_erc20_balances) = aggregate_data(
+            &db_blocks,
+            &db_transactions,
+            &db_erc20_transfers,
+            &db_erc721_transfers,
+            &db_erc1155_transfers,
+            &db_dex_trade,
+        );
+
+        println!("{}", db_native_balances.len());
+        println!("{}", db_erc20_balances.len());
     }
 }
 

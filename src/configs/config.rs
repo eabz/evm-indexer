@@ -31,6 +31,7 @@ pub struct IndexerArgs {
 pub struct Config {
     pub start_block: i64,
     pub db_url: String,
+    pub agg_db_url: String,
     pub redis_url: String,
     pub debug: bool,
     pub chain: Chain,
@@ -55,6 +56,8 @@ impl Config {
         Self {
             start_block: args.start_block,
             db_url: std::env::var("DATABASE_URL").expect("DATABASE_URL must be set."),
+            agg_db_url: std::env::var("AGGREGATED_DATABASE_URL")
+                .expect("AGGREGATED_DATABASE_URL must be set."),
             redis_url: std::env::var("REDIS_URL").expect("REDIS_URL must be set."),
             debug: args.debug,
             chain,

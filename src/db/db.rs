@@ -5,6 +5,7 @@ use anyhow::Result;
 use field_count::FieldCount;
 use futures::future::join_all;
 use log::info;
+use mongodb::{bson::doc, options::ClientOptions, Client};
 use redis::Commands;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -25,11 +26,17 @@ pub const MAX_PARAM_SIZE: u16 = u16::MAX;
 pub struct Database {
     pub chain: Chain,
     pub redis: redis::Client,
+    pub agg_database: mongodb::Database,
     pub db_conn: sqlx::Pool<sqlx::Postgres>,
 }
 
 impl Database {
-    pub async fn new(db_url: String, redis_url: String, chain: Chain) -> Result<Self> {
+    pub async fn new(
+        db_url: String,
+        redis_url: String,
+        agg_db_url: String,
+        chain: Chain,
+    ) -> Result<Self> {
         info!("Starting EVM database service");
 
         let mut connect_options: PgConnectOptions = db_url.parse().unwrap();
@@ -42,11 +49,24 @@ impl Database {
             .await
             .expect("Unable to connect to the database");
 
-        let redis = redis::Client::open(redis_url).expect("Unable to connect with Redis server");
+        let redis = redis::Client::open(redis_url).expect("Unable to connect with redis server");
+
+        let client_options = ClientOptions::parse(agg_db_url)
+            .await
+            .expect("Unable to connect with aggregated database");
+
+        let client = Client::with_options(client_options)?;
+
+        client
+            .database("indexer")
+            .run_command(doc! {"ping": 1}, None)
+            .await
+            .unwrap();
 
         Ok(Self {
             chain,
             redis,
+            agg_database: client.database("indexer"),
             db_conn,
         })
     }
