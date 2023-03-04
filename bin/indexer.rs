@@ -67,7 +67,7 @@ async fn main() {
 async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &mut HashSet<i64>) {
     let last_block = rpc.get_last_block().await.unwrap();
 
-    let full_block_range = HashSet::<i64>::from_iter(config.start_block..last_block);
+    let full_block_range: Vec<i64> = (config.start_block..last_block).collect();
 
     let db_state = DatabaseChainIndexedState {
         chain: config.chain.id,
@@ -76,7 +76,10 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
 
     db.update_indexed_blocks_number(&db_state).await.unwrap();
 
-    let missing_blocks: Vec<i64> = (&full_block_range - &indexed_blocks).into_iter().collect();
+    let missing_blocks: Vec<&i64> = full_block_range
+        .iter()
+        .filter(|block| !indexed_blocks.contains(&block))
+        .collect();
 
     let total_missing_blocks = missing_blocks.len();
 
