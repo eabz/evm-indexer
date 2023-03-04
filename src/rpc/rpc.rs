@@ -310,10 +310,14 @@ impl Rpc {
             Err(_) => String::from(""),
         };
 
-        let decimals = match token_contract.decimals().call().await {
+        let mut decimals = match token_contract.decimals().call().await {
             Ok(decimals) => decimals as i16,
             Err(_) => 0,
         };
+
+        if decimals > 18 {
+            decimals = 18;
+        }
 
         multicall
             .add_call(token_contract.token_0(), false)
