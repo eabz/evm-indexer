@@ -34,6 +34,17 @@ pub struct ERC1155BalancesChange {
     pub balance_change: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DexPairAggregatedData {
+    pub pair: String,
+    pub factory: String,
+    pub token0_volume: f64,
+    pub token1_volume: f64,
+    pub swap_rate: f64,
+    pub last_trade: i64,
+    pub last_trade_log_index: i32,
+}
+
 pub fn aggregate_data(
     blocks: &Vec<DatabaseBlock>,
     transactions: &Vec<DatabaseTransaction>,
@@ -46,6 +57,9 @@ pub fn aggregate_data(
     HashMap<(String, String), ERC20TokenBalanceChange>,
     HashMap<(String, String), ERC721OwnerChange>,
     HashMap<(String, String, String), ERC1155BalancesChange>,
+    HashMap<(String, String), DexPairAggregatedData>,
+    HashMap<(String, String), DexPairAggregatedData>,
+    HashMap<(String, String), DexPairAggregatedData>,
 ) {
     // first: calculate the rewards for each block and add it to the balance of the miner.
     let mut native_token_balance_changes: HashMap<String, NativeTokenBalanceChange> =
@@ -180,14 +194,111 @@ pub fn aggregate_data(
         }
     }
 
+    let mut dex_minute_aggregates: HashMap<(String, String), DexPairAggregatedData> =
+        HashMap::new();
+    let mut dex_hourly_aggregates: HashMap<(String, String), DexPairAggregatedData> =
+        HashMap::new();
+    let mut dex_daily_aggregates: HashMap<(String, String), DexPairAggregatedData> = HashMap::new();
+
     // six: aggregate all dex trades values.
-    for trade in dex_trades {}
+    for trade in dex_trades {
+        let trade_date_minutes = trade.trade_time_minutes();
+        let trade_date_hours = trade.trade_time_hours();
+        let trade_date_days = trade.trade_time_days();
+
+        let mut minute_aggregate = get_dex_aggregates(
+            &dex_minute_aggregates,
+            trade.pair_address.clone(),
+            trade.factory.clone(),
+            trade_date_minutes.clone(),
+            trade.timestamp,
+            trade.log_index,
+        );
+
+        if minute_aggregate.last_trade == trade.timestamp {
+            if minute_aggregate.last_trade_log_index < trade.log_index {
+                minute_aggregate.swap_rate = trade.swap_rate;
+            }
+        } else if minute_aggregate.last_trade < trade.timestamp {
+            minute_aggregate.swap_rate = trade.swap_rate;
+        }
+
+        minute_aggregate.last_trade = trade.timestamp;
+        minute_aggregate.last_trade_log_index = trade.log_index;
+
+        minute_aggregate.token0_volume += trade.token0_amount.abs();
+        minute_aggregate.token1_volume += trade.token1_amount.abs();
+
+        dex_minute_aggregates.insert(
+            (trade.pair_address.clone(), trade_date_minutes.clone()),
+            minute_aggregate,
+        );
+
+        let mut hour_aggregate = get_dex_aggregates(
+            &dex_hourly_aggregates,
+            trade.pair_address.clone(),
+            trade.factory.clone(),
+            trade_date_hours.clone(),
+            trade.timestamp,
+            trade.log_index,
+        );
+
+        if hour_aggregate.last_trade == trade.timestamp {
+            if hour_aggregate.last_trade_log_index < trade.log_index {
+                hour_aggregate.swap_rate = trade.swap_rate;
+            }
+        } else if hour_aggregate.last_trade < trade.timestamp {
+            hour_aggregate.swap_rate = trade.swap_rate;
+        }
+
+        hour_aggregate.last_trade = trade.timestamp;
+        hour_aggregate.last_trade_log_index = trade.log_index;
+
+        hour_aggregate.token0_volume += trade.token0_amount.abs();
+        hour_aggregate.token1_volume += trade.token1_amount.abs();
+
+        dex_hourly_aggregates.insert(
+            (trade.pair_address.clone(), trade_date_hours.clone()),
+            hour_aggregate,
+        );
+
+        let mut daily_aggregate = get_dex_aggregates(
+            &dex_daily_aggregates,
+            trade.pair_address.clone(),
+            trade.factory.clone(),
+            trade_date_days.clone(),
+            trade.timestamp,
+            trade.log_index,
+        );
+
+        if daily_aggregate.last_trade == trade.timestamp {
+            if daily_aggregate.last_trade_log_index < trade.log_index {
+                daily_aggregate.swap_rate = trade.swap_rate;
+            }
+        } else if daily_aggregate.last_trade < trade.timestamp {
+            daily_aggregate.swap_rate = trade.swap_rate;
+        }
+
+        daily_aggregate.last_trade = trade.timestamp;
+        daily_aggregate.last_trade_log_index = trade.log_index;
+
+        daily_aggregate.token0_volume += trade.token0_amount.abs();
+        daily_aggregate.token1_volume += trade.token1_amount.abs();
+
+        dex_daily_aggregates.insert(
+            (trade.pair_address.clone(), trade_date_days.clone()),
+            daily_aggregate,
+        );
+    }
 
     return (
         native_token_balance_changes,
         erc20_balance_changes,
         erc721_owner_changes,
         erc1155_balances_changes,
+        dex_minute_aggregates,
+        dex_hourly_aggregates,
+        dex_daily_aggregates,
     );
 }
 
@@ -278,4 +389,33 @@ fn get_erc1155_transfer_balance_stored(
     }
 
     return balance_change;
+}
+
+fn get_dex_aggregates(
+    storage: &HashMap<(String, String), DexPairAggregatedData>,
+    pair: String,
+    factory: String,
+    time_string: String,
+    timestamp: i64,
+    log_index: i32,
+) -> DexPairAggregatedData {
+    let stored_aggregated = storage.get(&(pair.clone(), time_string.clone()));
+
+    let dex_aggregated: DexPairAggregatedData;
+
+    if stored_aggregated.is_none() {
+        dex_aggregated = DexPairAggregatedData {
+            pair,
+            factory,
+            token0_volume: 0.0,
+            token1_volume: 0.0,
+            swap_rate: 0.0,
+            last_trade: timestamp,
+            last_trade_log_index: log_index,
+        };
+    } else {
+        dex_aggregated = stored_aggregated.unwrap().to_owned();
+    }
+
+    return dex_aggregated;
 }

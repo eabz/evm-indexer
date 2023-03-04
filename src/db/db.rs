@@ -5,7 +5,7 @@ use anyhow::Result;
 use field_count::FieldCount;
 use futures::future::join_all;
 use log::info;
-use mongodb::{bson::doc, options::ClientOptions, Client};
+use mongodb::{options::ClientOptions, Client};
 use redis::Commands;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},

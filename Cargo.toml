@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1"
 array-bytes = "6.0.0"
 async-trait = "0.1"
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 dotenv = "0.15"
 ethabi = "18"

@@ -1,3 +1,4 @@
+use chrono::{DateTime, NaiveDateTime, Utc};
 use ethabi::{ethereum_types::H256, ParamType};
 use ethers::utils::format_units;
 use field_count::FieldCount;
@@ -31,6 +32,7 @@ pub struct DatabaseDexTrade {
     pub token0: String,
     pub token1: String,
     pub pair_address: String,
+    pub factory: String,
     pub token0_amount: f64,
     pub token1_amount: f64,
     pub swap_rate: f64,
@@ -114,6 +116,7 @@ impl DatabaseDexTrade {
             token0: pair_token.token0.clone().unwrap(),
             token1: pair_token.token1.clone().unwrap(),
             pair_address: pair_token.token.clone(),
+            factory: pair_token.factory.clone().unwrap(),
             token0_amount: token0_in - token0_out,
             token1_amount: token1_in - token1_out,
             transaction_log_index: log.transaction_log_index,
@@ -183,6 +186,7 @@ impl DatabaseDexTrade {
             token0: pair_token.token0.clone().unwrap(),
             token1: pair_token.token1.clone().unwrap(),
             pair_address: pair_token.token.clone(),
+            factory: pair_token.factory.clone().unwrap(),
             token0_amount,
             token1_amount,
             transaction_log_index: log.transaction_log_index,
@@ -191,5 +195,37 @@ impl DatabaseDexTrade {
             trade_type: TradeType::Buy,
             swap_rate: 0.0,
         }
+    }
+
+    fn trade_time(&self) -> DateTime<Utc> {
+        let date = NaiveDateTime::from_timestamp_opt(self.timestamp, 0).unwrap();
+
+        let date_utc: DateTime<Utc> = DateTime::from_utc(date, Utc);
+
+        return date_utc;
+    }
+
+    pub fn trade_time_minutes(&self) -> String {
+        let date = self.trade_time();
+
+        let date_string = date.format("%d-%m-%y-%H-%M");
+
+        return date_string.to_string();
+    }
+
+    pub fn trade_time_hours(&self) -> String {
+        let date = self.trade_time();
+
+        let date_string = date.format("%d-%m-%y-%H");
+
+        return date_string.to_string();
+    }
+
+    pub fn trade_time_days(&self) -> String {
+        let date = self.trade_time();
+
+        let date_string = date.format("%d-%m-%y");
+
+        return date_string.to_string();
     }
 }
