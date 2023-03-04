@@ -57,12 +57,6 @@ impl Database {
 
         let client = Client::with_options(client_options)?;
 
-        client
-            .database("indexer")
-            .run_command(doc! {"ping": 1}, None)
-            .await
-            .unwrap();
-
         Ok(Self {
             chain,
             redis,

@@ -173,6 +173,7 @@ CREATE TABLE token_details (
   decimals INT,
   token0 VARCHAR(42),
   token1 VARCHAR(42),
+  factory VARCHAR(42),
   PRIMARY KEY (token, chain)
 );
 

@@ -158,7 +158,12 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
             .unwrap();
 
         // TODO: aggregate data
-        let (db_native_balances, db_erc20_balances) = aggregate_data(
+        let (
+            db_native_balances,
+            db_erc20_balances,
+            db_erc721_owner_changes,
+            db_erc1155_balances_changes,
+        ) = aggregate_data(
             &db_blocks,
             &db_transactions,
             &db_erc20_transfers,
@@ -169,6 +174,8 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
 
         println!("{}", db_native_balances.len());
         println!("{}", db_erc20_balances.len());
+        println!("{}", db_erc721_owner_changes.len());
+        println!("{}", db_erc1155_balances_changes.len());
     }
 }
 

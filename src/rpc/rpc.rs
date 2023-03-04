@@ -35,6 +35,7 @@ abigen!(
         function decimals() external view returns (uint8)
         function token0() external view returns (address)
         function token1() external view returns (address)
+        function factory() external view returns (address)
     ]"#,
 );
 #[derive(Debug, Clone)]
@@ -296,8 +297,6 @@ impl Rpc {
 
         let client = Arc::new(provider);
 
-        let mut multicall = Multicall::new(client.clone(), None).await.unwrap();
-
         let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
 
         let name: String = match token_contract.name().call().await {
@@ -319,14 +318,22 @@ impl Rpc {
             decimals = 18;
         }
 
+        let mut multicall = Multicall::new(client.clone(), None).await.unwrap();
+
         multicall
             .add_call(token_contract.token_0(), false)
-            .add_call(token_contract.token_1(), false);
+            .add_call(token_contract.token_1(), false)
+            .add_call(token_contract.factory(), false);
 
-        let (token0, token1): (Option<String>, Option<String>) = match multicall.call().await {
-            Ok((token0, token1)) => (Some(format_address(token0)), Some(format_address(token1))),
-            Err(_) => (None, None),
-        };
+        let (token0, token1, factory): (Option<String>, Option<String>, Option<String>) =
+            match multicall.call().await {
+                Ok((token0, token1, factory)) => (
+                    Some(format_address(token0)),
+                    Some(format_address(token1)),
+                    Some(format_address(factory)),
+                ),
+                Err(_) => (None, None, None),
+            };
 
         return Some(DatabaseTokenDetails {
             token,
@@ -336,6 +343,7 @@ impl Rpc {
             symbol,
             token0,
             token1,
+            factory,
         });
     }
 }

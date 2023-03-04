@@ -11,7 +11,7 @@ async fn get_tokens_metadata(
     db: &Database,
     rpc: &Rpc,
     tokens: &HashSet<String>,
-) -> Vec<DatabaseTokenDetails> {
+) -> (Vec<DatabaseTokenDetails>, Vec<DatabaseTokenDetails>) {
     let mut db_tokens = db.get_tokens(&tokens).await;
     let db_token_address: Vec<String> = db_tokens.iter().map(|token| token.token.clone()).collect();
 
@@ -20,21 +20,21 @@ async fn get_tokens_metadata(
         .filter(|token| !db_token_address.contains(&token))
         .collect();
 
-    let mut tokens_data = vec![];
+    let mut missing_tokens_data = vec![];
 
     for missing_token in missing_tokens.iter() {
-        tokens_data.push(rpc.get_token_metadata(missing_token.to_string()))
+        missing_tokens_data.push(rpc.get_token_metadata(missing_token.to_string()))
     }
 
-    let mut tokens_metadata: Vec<DatabaseTokenDetails> = join_all(tokens_data)
+    let mut missing_tokens_metadata: Vec<DatabaseTokenDetails> = join_all(missing_tokens_data)
         .await
         .iter()
         .map(|token| token.clone().unwrap())
         .collect();
 
-    db_tokens.append(&mut tokens_metadata);
+    db_tokens.append(&mut missing_tokens_metadata);
 
-    return db_tokens;
+    return (db_tokens, missing_tokens_metadata);
 }
 
 pub async fn get_tokens(
@@ -42,7 +42,7 @@ pub async fn get_tokens(
     rpc: &Rpc,
     tokens: &HashSet<String>,
 ) -> HashMap<String, DatabaseTokenDetails> {
-    let db_tokens = get_tokens_metadata(db, rpc, tokens).await;
+    let (db_tokens, mut missing_tokens) = get_tokens_metadata(db, rpc, tokens).await;
 
     let mut tokens_data: HashMap<String, DatabaseTokenDetails> = HashMap::new();
 
@@ -66,16 +66,17 @@ pub async fn get_tokens(
         }
     }
 
-    let db_underlying_tokens = get_tokens_metadata(db, rpc, &underlying_tokens).await;
+    let (db_underlying_tokens, mut missing_underlying_tokens) =
+        get_tokens_metadata(db, rpc, &underlying_tokens).await;
 
     for token in db_underlying_tokens.iter() {
         tokens_data.insert(token.token.clone(), token.to_owned());
     }
 
-    let tokens_data_vec: Vec<DatabaseTokenDetails> = tokens_data.values().cloned().collect();
+    missing_tokens.append(&mut missing_underlying_tokens);
 
-    if tokens_data_vec.len() > 0 {
-        db.store_token_details(&tokens_data_vec).await.unwrap();
+    if missing_tokens.len() > 0 {
+        db.store_token_details(&missing_tokens).await.unwrap();
     }
 
     return tokens_data;
