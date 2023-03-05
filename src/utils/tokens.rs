@@ -11,7 +11,7 @@ async fn get_tokens_metadata(
     db: &Database,
     rpc: &Rpc,
     tokens: &HashSet<String>,
-) -> (Vec<DatabaseTokenDetails>, Vec<DatabaseTokenDetails>) {
+) -> Vec<DatabaseTokenDetails> {
     let mut db_tokens = db.get_tokens(&tokens).await;
 
     let db_token_address: Vec<String> = db_tokens.iter().map(|token| token.token.clone()).collect();
@@ -33,9 +33,15 @@ async fn get_tokens_metadata(
         .map(|token| token.to_owned().unwrap())
         .collect();
 
+    if missing_tokens_metadata.len() > 0 {
+        db.store_token_details(&missing_tokens_metadata)
+            .await
+            .unwrap();
+    }
+
     db_tokens.append(&mut missing_tokens_metadata);
 
-    return (db_tokens, missing_tokens_metadata);
+    return db_tokens;
 }
 
 pub async fn get_tokens(
@@ -43,7 +49,7 @@ pub async fn get_tokens(
     rpc: &Rpc,
     tokens: &HashSet<String>,
 ) -> HashMap<String, DatabaseTokenDetails> {
-    let (db_tokens, mut missing_tokens) = get_tokens_metadata(db, rpc, tokens).await;
+    let db_tokens = get_tokens_metadata(db, rpc, tokens).await;
 
     let mut tokens_data: HashMap<String, DatabaseTokenDetails> = HashMap::new();
 
@@ -67,17 +73,10 @@ pub async fn get_tokens(
         }
     }
 
-    let (db_underlying_tokens, mut missing_underlying_tokens) =
-        get_tokens_metadata(db, rpc, &underlying_tokens).await;
+    let db_underlying_tokens = get_tokens_metadata(db, rpc, &underlying_tokens).await;
 
     for token in db_underlying_tokens.iter() {
         tokens_data.insert(token.token.clone(), token.to_owned());
-    }
-
-    missing_tokens.append(&mut missing_underlying_tokens);
-
-    if missing_tokens.len() > 0 {
-        db.store_token_details(&missing_tokens).await.unwrap();
     }
 
     return tokens_data;
