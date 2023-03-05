@@ -13,7 +13,7 @@ pub struct DatabaseContract {
 }
 
 impl DatabaseContract {
-    pub fn from_rpc(receipt: TransactionReceipt, chain: i64) -> Self {
+    pub fn from_rpc(receipt: &TransactionReceipt, chain: i64) -> Self {
         Self {
             block: receipt.block_number.unwrap().as_u64() as i64,
             chain: chain.to_owned(),

@@ -13,6 +13,7 @@ async fn get_tokens_metadata(
     tokens: &HashSet<String>,
 ) -> (Vec<DatabaseTokenDetails>, Vec<DatabaseTokenDetails>) {
     let mut db_tokens = db.get_tokens(&tokens).await;
+
     let db_token_address: Vec<String> = db_tokens.iter().map(|token| token.token.clone()).collect();
 
     let missing_tokens: Vec<&String> = tokens
@@ -29,7 +30,7 @@ async fn get_tokens_metadata(
     let mut missing_tokens_metadata: Vec<DatabaseTokenDetails> = join_all(missing_tokens_data)
         .await
         .iter()
-        .map(|token| token.clone().unwrap())
+        .map(|token| token.to_owned().unwrap())
         .collect();
 
     db_tokens.append(&mut missing_tokens_metadata);

@@ -17,7 +17,7 @@ pub struct DatabaseLog {
 }
 
 impl DatabaseLog {
-    pub fn from_rpc(log: Log, chain: i64, timestamp: i64) -> Self {
+    pub fn from_rpc(log: &Log, chain: i64, timestamp: i64) -> Self {
         let transaction_log_index = match log.transaction_log_index {
             None => None,
             Some(transaction_log_index) => Some(transaction_log_index.as_u32() as i32),

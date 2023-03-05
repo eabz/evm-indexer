@@ -292,11 +292,7 @@ async fn fetch_block(
             let mut db_erc1155_transfers: Vec<DatabaseERC1155Transfer> = Vec::new();
             let mut db_dex_trades: Vec<DatabaseDexTrade> = Vec::new();
 
-            for log in db_logs.iter() {
-                if log.topics.len() < 3 {
-                    continue;
-                }
-
+            for log in logs_scan.iter() {
                 // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
                 let topic0 = log.topics[0].clone();
 

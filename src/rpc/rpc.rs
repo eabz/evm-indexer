@@ -54,11 +54,11 @@ impl Rpc {
         let mut clients = Vec::new();
         let mut clients_urls = Vec::new();
 
-        for rpc in config.rpcs.clone() {
+        for rpc in config.rpcs.iter() {
             let client = HttpClientBuilder::default()
                 .max_concurrent_requests(100000)
                 .request_timeout(timeout)
-                .build(rpc.clone())
+                .build(rpc)
                 .unwrap();
 
             let client_id = client.request("eth_chainId", rpc_params![]).await;
@@ -75,7 +75,7 @@ impl Rpc {
                     }
 
                     clients.push(client);
-                    clients_urls.push(rpc.clone());
+                    clients_urls.push(rpc.to_owned());
                 }
                 Err(_) => continue,
             }
@@ -145,7 +145,7 @@ impl Rpc {
                             let db_transaction = DatabaseTransaction::from_rpc(
                                 transaction,
                                 self.chain.id,
-                                db_block.timestamp.clone(),
+                                db_block.timestamp,
                             );
 
                             db_transactions.push(db_transaction)
@@ -199,13 +199,13 @@ impl Rpc {
                         if status == TransactionStatus::Succeed {
                             db_contract = match receipt.contract_address {
                                 Some(_) => {
-                                    Some(DatabaseContract::from_rpc(receipt.clone(), self.chain.id))
+                                    Some(DatabaseContract::from_rpc(&receipt, self.chain.id))
                                 }
                                 None => None,
                             };
                         }
 
-                        for log in receipt.logs {
+                        for log in receipt.logs.iter() {
                             let db_log =
                                 DatabaseLog::from_rpc(log, self.chain.id, transaction_timestamp);
 
@@ -261,7 +261,7 @@ impl Rpc {
 
                             let db_contract = match receipt.contract_address {
                                 Some(_) => {
-                                    Some(DatabaseContract::from_rpc(receipt.clone(), self.chain.id))
+                                    Some(DatabaseContract::from_rpc(&receipt, self.chain.id))
                                 }
                                 None => None,
                             };
@@ -270,7 +270,7 @@ impl Rpc {
                                 db_contracts.push(db_contract.unwrap())
                             }
 
-                            for log in receipt.logs {
+                            for log in receipt.logs.iter() {
                                 let db_log =
                                     DatabaseLog::from_rpc(log, self.chain.id, block_timestamp);
 
