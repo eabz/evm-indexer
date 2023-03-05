@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use futures::future::join_all;
-
 use crate::{
     db::{db::Database, models::token_detail::DatabaseTokenDetails},
     rpc::rpc::Rpc,
@@ -21,17 +19,16 @@ async fn get_tokens_metadata(
         .filter(|token| !db_token_address.contains(&token))
         .collect();
 
-    let mut missing_tokens_data = vec![];
+    let mut missing_tokens_metadata: Vec<DatabaseTokenDetails> = Vec::new();
 
     for missing_token in missing_tokens.iter() {
-        missing_tokens_data.push(rpc.get_token_metadata(missing_token.to_string()))
-    }
+        let data = rpc
+            .get_token_metadata(missing_token.to_string())
+            .await
+            .unwrap();
 
-    let mut missing_tokens_metadata: Vec<DatabaseTokenDetails> = join_all(missing_tokens_data)
-        .await
-        .iter()
-        .map(|token| token.to_owned().unwrap())
-        .collect();
+        missing_tokens_metadata.push(data);
+    }
 
     if missing_tokens_metadata.len() > 0 {
         db.store_token_details(&missing_tokens_metadata)

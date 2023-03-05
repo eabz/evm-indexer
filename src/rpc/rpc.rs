@@ -13,12 +13,13 @@ use crate::{
 };
 use ethabi::Address;
 use ethers::{
-    prelude::{abigen, Multicall},
+    prelude::abigen,
     providers::{Http, Provider},
     types::{Block, Transaction, TransactionReceipt, U256},
 };
 
 use anyhow::Result;
+use futures::future::join_all;
 use jsonrpsee::core::{client::ClientT, rpc_params};
 use jsonrpsee_http_client::{HttpClient, HttpClientBuilder};
 use log::info;
@@ -299,15 +300,73 @@ impl Rpc {
 
         let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
 
-        let name: String = match token_contract.name().call().await {
-            Ok(name) => sanitize_string(name),
-            Err(_) => String::from(""),
-        };
+        let mut queries = vec![];
 
-        let symbol: String = match token_contract.symbol().call().await {
-            Ok(symbol) => sanitize_string(symbol),
-            Err(_) => String::from(""),
-        };
+        let name_work = tokio::spawn({
+            let token_contract = token_contract.clone();
+            async move {
+                let name: Option<String> = match token_contract.name().call().await {
+                    Ok(name) => Some(sanitize_string(name)),
+                    Err(_) => Some(String::from("")),
+                };
+
+                return name;
+            }
+        });
+
+        let symbol_work = tokio::spawn({
+            let token_contract = token_contract.clone();
+            async move {
+                let symbol: Option<String> = match token_contract.symbol().call().await {
+                    Ok(symbol) => Some(sanitize_string(symbol)),
+                    Err(_) => Some(String::from("")),
+                };
+
+                return symbol;
+            }
+        });
+
+        let token0_work = tokio::spawn({
+            let token_contract = token_contract.clone();
+            async move {
+                let token0: Option<String> = match token_contract.token_0().call().await {
+                    Ok(token0) => Some(format_address(token0)),
+                    Err(_) => None,
+                };
+
+                return token0;
+            }
+        });
+
+        let token1_work = tokio::spawn({
+            let token_contract = token_contract.clone();
+            async move {
+                let token1: Option<String> = match token_contract.token_1().call().await {
+                    Ok(token1) => Some(format_address(token1)),
+                    Err(_) => None,
+                };
+
+                return token1;
+            }
+        });
+
+        let factory_work = tokio::spawn({
+            let token_contract = token_contract.clone();
+            async move {
+                let factory: Option<String> = match token_contract.factory().call().await {
+                    Ok(factory) => Some(format_address(factory)),
+                    Err(_) => None,
+                };
+
+                return factory;
+            }
+        });
+
+        queries.push(name_work);
+        queries.push(symbol_work);
+        queries.push(token0_work);
+        queries.push(token1_work);
+        queries.push(factory_work);
 
         let mut decimals = match token_contract.decimals().call().await {
             Ok(decimals) => decimals as i16,
@@ -318,32 +377,19 @@ impl Rpc {
             decimals = 18;
         }
 
-        let mut multicall = Multicall::new(client.clone(), None).await.unwrap();
+        let results = join_all(queries).await;
 
-        multicall
-            .add_call(token_contract.token_0(), false)
-            .add_call(token_contract.token_1(), false)
-            .add_call(token_contract.factory(), false);
-
-        let (token0, token1, factory): (Option<String>, Option<String>, Option<String>) =
-            match multicall.call().await {
-                Ok((token0, token1, factory)) => (
-                    Some(format_address(token0)),
-                    Some(format_address(token1)),
-                    Some(format_address(factory)),
-                ),
-                Err(_) => (None, None, None),
-            };
+        let data: Vec<Option<String>> = results.into_iter().map(|res| res.unwrap()).collect();
 
         return Some(DatabaseTokenDetails {
             token,
             chain: self.chain.id,
-            name,
+            name: data[0].clone().unwrap(),
             decimals,
-            symbol,
-            token0,
-            token1,
-            factory,
+            symbol: data[1].clone().unwrap(),
+            token0: data[2].clone(),
+            token1: data[3].clone(),
+            factory: data[4].clone(),
         });
     }
 }

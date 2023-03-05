@@ -205,7 +205,7 @@ async fn fetch_block(
     let block_data = rpc.get_block(block_number).await.unwrap();
 
     match block_data {
-        Some((db_block, mut db_transactions)) => {
+        Some((db_block, db_transactions)) => {
             let total_block_transactions = db_transactions.len();
 
             // Make sure all the transactions are correctly formatted.
@@ -236,7 +236,7 @@ async fn fetch_block(
                     None => return None,
                 }
             } else {
-                for transaction in db_transactions.iter_mut() {
+                for transaction in db_transactions.iter() {
                     let receipt_data = rpc
                         .get_transaction_receipt(transaction.hash.clone(), transaction.timestamp)
                         .await
