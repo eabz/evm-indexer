@@ -5,9 +5,9 @@
 <strong>A scalable SQL indexer for EVM compatible blockchains</strong>
 </p>
 
-The indexer is ready and used in production. If you want to use it or contribute and need help you can [send me a DM on my personal twitter.](https://twitter.com/eaberrueta)
-
-You can track the indexer in action from https://dashboard.kindynos.mx or use it through the API at https://indexer.kindynos.mx
+<p align="center">
+<strong>🚧 🚨 🚧 🚨 This indexer is a work in progress don't use it for production 🚧 🚨 🚧 🚨</strong>
+</p>
 
 ## Requirements
 
