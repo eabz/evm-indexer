@@ -369,7 +369,7 @@ impl Rpc {
         queries.push(factory_work);
 
         let mut decimals = match token_contract.decimals().call().await {
-            Ok(decimals) => decimals as i16,
+            Ok(decimals) => decimals as i64,
             Err(_) => 0,
         };
 

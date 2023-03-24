@@ -175,7 +175,6 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
         );
 
         // TODO: store aggregates
-
         println!("{}", db_native_balances.len());
         println!("{}", db_erc20_balances.len());
         println!("{}", db_erc721_owner_changes.len());

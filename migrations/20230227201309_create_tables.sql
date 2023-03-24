@@ -170,7 +170,7 @@ CREATE TABLE token_details (
   token VARCHAR(42) NOT NULL,
   name TEXT NOT NULL,
   symbol TEXT NOT NULL,
-  decimals INT,
+  decimals BIGINT,
   token0 VARCHAR(42),
   token1 VARCHAR(42),
   factory VARCHAR(42),
