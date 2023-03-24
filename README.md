@@ -24,7 +24,7 @@ You can try the indexer locally or through Docker.
 1. Clone the repository
 
 ```
-git clone https://github.com/llamafolio/evm-indexer && cd evm-indexer
+git clone https://github.com/eabz/indexer && cd indexer
 ```
 
 2. Build the program
@@ -40,7 +40,7 @@ cargo build --release
 1. Clone the repository
 
 ```
-git clone https://github.com/llamafolio/evm-indexer && cd evm-indexer
+git clone https://github.com/eabz/indexer && cd indexer
 ```
 
 2. Build the image and tag it as `indexer`
