@@ -8,8 +8,7 @@ pub struct Chain {
     pub abi_source_api: &'static str,
     pub abi_source_require_auth: bool,
     pub supports_blocks_receipts: bool,
-    pub public_rpc: &'static str,
-    pub tokens_lists: &'static [&'static str],
+    pub multicall: &'static str,
 }
 
 impl Chain {
@@ -21,8 +20,7 @@ impl Chain {
             abi_source_api: chain.abi_source_api,
             abi_source_require_auth: chain.abi_source_require_auth,
             supports_blocks_receipts: chain.supports_blocks_receipts,
-            public_rpc: chain.public_rpc,
-            tokens_lists: chain.tokens_lists,
+            multicall: chain.multicall,
         }
     }
 }
@@ -34,8 +32,7 @@ pub const ETHEREUM: Chain = Chain {
     abi_source_api: "https://api.etherscan.io/",
     abi_source_require_auth: true,
     supports_blocks_receipts: true,
-    public_rpc: "https://eth.llamarpc.com",
-    tokens_lists: &["https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/ethereum/tokenlist.json", "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/ethereum.json"],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const POLYGON: Chain = Chain {
@@ -45,8 +42,7 @@ pub const POLYGON: Chain = Chain {
     abi_source_api: "https://api.polygonscan.com/",
     abi_source_require_auth: true,
     supports_blocks_receipts: true,
-    public_rpc: "https://polygon.llamarpc.com",
-    tokens_lists: &["https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/polygon/tokenlist.json", "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/polygon.json"],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const FANTOM: Chain = Chain {
@@ -56,8 +52,7 @@ pub const FANTOM: Chain = Chain {
     abi_source_api: "https://api.ftmscan.com/",
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
-    public_rpc: "https://rpc.ftm.tools",
-    tokens_lists: &["https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/fantom/tokenlist.json", "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/ftm.json"],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const BSC: Chain = Chain {
@@ -67,11 +62,7 @@ pub const BSC: Chain = Chain {
     abi_source_api: "https://api.bscscan.com/",
     abi_source_require_auth: true,
     supports_blocks_receipts: true,
-    public_rpc: "https://bscrpc.com",
-    tokens_lists: &[
-        "https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/bsc/tokenlist.json",
-        "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/bsc.json",
-    ],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const GNOSIS: Chain = Chain {
@@ -81,11 +72,7 @@ pub const GNOSIS: Chain = Chain {
     abi_source_api: "https://api.gnosisscan.io/",
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
-    public_rpc: "https://rpc.ankr.com/gnosis",
-    tokens_lists: &[
-        "https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/xdai/tokenlist.json",
-        "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/gnosis.json",
-    ],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const OPTIMISM: Chain = Chain {
@@ -95,11 +82,7 @@ pub const OPTIMISM: Chain = Chain {
     abi_source_api: "https://api-optimistic.etherscan.io/",
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
-    public_rpc: "https://rpc.ankr.com/optimism",
-    tokens_lists: &[
-        "https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/optimism/tokenlist.json",
-        "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/optimism.json",
-    ],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const ARBITRUM_ONE: Chain = Chain {
@@ -109,11 +92,7 @@ pub const ARBITRUM_ONE: Chain = Chain {
     abi_source_api: "https://api.arbiscan.io/",
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
-    public_rpc: "https://rpc.ankr.com/arbitrum",
-    tokens_lists: &[
-        "https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/arbitrum/tokenlist.json",
-        "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/arbitrum.json",
-    ],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const ARBITRUM_NOVA: Chain = Chain {
@@ -123,21 +102,7 @@ pub const ARBITRUM_NOVA: Chain = Chain {
     abi_source_api: "https://api-nova.arbiscan.io/",
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
-    public_rpc: "https://nova.arbitrum.io/rpc",
-    tokens_lists: &[],
-};
-
-pub const MOONBEAM: Chain = Chain {
-    id: 1284,
-    name: "moonbeam",
-    block_explorer: "https://moonscan.io/",
-    abi_source_api: "https://api.moonscan.io/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    public_rpc: "https://rpc.ankr.com/moonbeam",
-    tokens_lists: &[
-        "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/moonbeam.json",
-    ],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const AVALANCHE: Chain = Chain {
@@ -147,22 +112,7 @@ pub const AVALANCHE: Chain = Chain {
     abi_source_api: "https://api.snowtrace.io/",
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
-    public_rpc: "https://rpc.ankr.com/avalanche",
-    tokens_lists: &[
-        "https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/avax/tokenlist.json",
-        "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/avax.json",
-    ],
-};
-
-pub const BITTORRENT: Chain = Chain {
-    id: 199,
-    name: "bittorrent",
-    block_explorer: "https://bttcscan.com/",
-    abi_source_api: "https://api.bttcscan.com/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    public_rpc: "https://rpc.bittorrentchain.io",
-    tokens_lists: &[],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
 pub const CELO: Chain = Chain {
@@ -172,14 +122,10 @@ pub const CELO: Chain = Chain {
     abi_source_api: "https://api.celoscan.io/",
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
-    public_rpc: "https://rpc.ankr.com/celo",
-    tokens_lists: &[
-        "https://raw.githubusercontent.com/llamafolio/llamafolio-tokens/master/celo/tokenlist.json",
-        "https://raw.githubusercontent.com/viaprotocol/tokenlists/main/tokenlists/celo.json",
-    ],
+    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
 };
 
-pub static CHAINS: [Chain; 12] = [
+pub static CHAINS: [Chain; 10] = [
     ETHEREUM,
     POLYGON,
     FANTOM,
@@ -188,9 +134,7 @@ pub static CHAINS: [Chain; 12] = [
     OPTIMISM,
     ARBITRUM_ONE,
     ARBITRUM_NOVA,
-    MOONBEAM,
     AVALANCHE,
-    BITTORRENT,
     CELO,
 ];
 

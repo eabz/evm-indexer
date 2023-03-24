@@ -301,29 +301,29 @@ impl Rpc {
 
         let mut multicall = Multicall::new(
             client.clone(),
-            Some(H160::from_str("0x5e1eE626420A354BbC9a95FeA1BAd4492e3bcB86").unwrap()),
+            Some(H160::from_str(self.chain.multicall).unwrap()),
         )
         .await
         .unwrap()
-        .version(MulticallVersion::Multicall2);
+        .version(MulticallVersion::Multicall3);
 
         multicall
             .add_call(token_contract.name(), true)
             .add_call(token_contract.symbol(), true)
+            .add_call(token_contract.decimals(), true)
             .add_call(token_contract.token_0(), true)
             .add_call(token_contract.token_1(), true)
-            .add_call(token_contract.factory(), true)
-            .add_call(token_contract.decimals(), true);
+            .add_call(token_contract.factory(), true);
 
-        let data = multicall.call_raw().await.unwrap();
+        let response = multicall.call_raw().await.unwrap();
 
-        let name_tuple = data[0].clone().into_tuple().unwrap();
-        let symbol_tuple = data[1].clone().into_tuple().unwrap();
-        let decimals_tuple = data[5].clone().into_tuple().unwrap();
+        let name_tuple = response[0].clone().into_tuple().unwrap();
+        let symbol_tuple = response[1].clone().into_tuple().unwrap();
+        let decimals_tuple = response[2].clone().into_tuple().unwrap();
 
-        let token0_tuple = data[2].clone().into_tuple().unwrap();
-        let token1_tuple = data[3].clone().into_tuple().unwrap();
-        let factory_tuple = data[4].clone().into_tuple().unwrap();
+        let token0_tuple = response[3].clone().into_tuple().unwrap();
+        let token1_tuple = response[4].clone().into_tuple().unwrap();
+        let factory_tuple = response[5].clone().into_tuple().unwrap();
 
         let mut name = "".to_string();
 
