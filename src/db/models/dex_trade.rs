@@ -121,6 +121,7 @@ impl DatabaseDexTrade {
             token1_amount: token1_in - token1_out,
             transaction_log_index: log.transaction_log_index,
             timestamp: log.timestamp,
+
             // TODO: trade type and swap rate
             trade_type: TradeType::Buy,
             swap_rate: 0.0,

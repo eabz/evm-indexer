@@ -9,22 +9,21 @@ use crate::{
         token_detail::DatabaseTokenDetails,
         transaction::DatabaseTransaction,
     },
-    utils::format::{format_address, sanitize_string},
+    utils::format::format_address,
 };
-use ethabi::Address;
+use ethabi::{ethereum_types::H160, Address};
 use ethers::{
-    prelude::abigen,
+    prelude::{abigen, Multicall, MulticallVersion},
     providers::{Http, Provider},
     types::{Block, Transaction, TransactionReceipt, U256},
 };
 
 use anyhow::Result;
-use futures::future::join_all;
 use jsonrpsee::core::{client::ClientT, rpc_params};
 use jsonrpsee_http_client::{HttpClient, HttpClientBuilder};
 use log::info;
 use rand::seq::SliceRandom;
-use std::{sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use serde_json::Error;
 
@@ -300,96 +299,86 @@ impl Rpc {
 
         let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
 
-        let mut queries = vec![];
+        let mut multicall = Multicall::new(
+            client.clone(),
+            Some(H160::from_str("0x5e1eE626420A354BbC9a95FeA1BAd4492e3bcB86").unwrap()),
+        )
+        .await
+        .unwrap()
+        .version(MulticallVersion::Multicall2);
 
-        let name_work = tokio::spawn({
-            let token_contract = token_contract.clone();
-            async move {
-                let name: Option<String> = match token_contract.name().call().await {
-                    Ok(name) => Some(sanitize_string(name)),
-                    Err(_) => Some(String::from("")),
-                };
+        multicall
+            .add_call(token_contract.name(), true)
+            .add_call(token_contract.symbol(), true)
+            .add_call(token_contract.token_0(), true)
+            .add_call(token_contract.token_1(), true)
+            .add_call(token_contract.factory(), true)
+            .add_call(token_contract.decimals(), true);
 
-                return name;
-            }
-        });
+        let data = multicall.call_raw().await.unwrap();
 
-        let symbol_work = tokio::spawn({
-            let token_contract = token_contract.clone();
-            async move {
-                let symbol: Option<String> = match token_contract.symbol().call().await {
-                    Ok(symbol) => Some(sanitize_string(symbol)),
-                    Err(_) => Some(String::from("")),
-                };
+        let name_tuple = data[0].clone().into_tuple().unwrap();
+        let symbol_tuple = data[1].clone().into_tuple().unwrap();
+        let decimals_tuple = data[5].clone().into_tuple().unwrap();
 
-                return symbol;
-            }
-        });
+        let token0_tuple = data[2].clone().into_tuple().unwrap();
+        let token1_tuple = data[3].clone().into_tuple().unwrap();
+        let factory_tuple = data[4].clone().into_tuple().unwrap();
 
-        let token0_work = tokio::spawn({
-            let token_contract = token_contract.clone();
-            async move {
-                let token0: Option<String> = match token_contract.token_0().call().await {
-                    Ok(token0) => Some(format_address(token0)),
-                    Err(_) => None,
-                };
+        let mut name = "".to_string();
 
-                return token0;
-            }
-        });
-
-        let token1_work = tokio::spawn({
-            let token_contract = token_contract.clone();
-            async move {
-                let token1: Option<String> = match token_contract.token_1().call().await {
-                    Ok(token1) => Some(format_address(token1)),
-                    Err(_) => None,
-                };
-
-                return token1;
-            }
-        });
-
-        let factory_work = tokio::spawn({
-            let token_contract = token_contract.clone();
-            async move {
-                let factory: Option<String> = match token_contract.factory().call().await {
-                    Ok(factory) => Some(format_address(factory)),
-                    Err(_) => None,
-                };
-
-                return factory;
-            }
-        });
-
-        queries.push(name_work);
-        queries.push(symbol_work);
-        queries.push(token0_work);
-        queries.push(token1_work);
-        queries.push(factory_work);
-
-        let mut decimals = match token_contract.decimals().call().await {
-            Ok(decimals) => decimals as i64,
-            Err(_) => 0,
-        };
-
-        if decimals > 18 {
-            decimals = 18;
+        let name_success = name_tuple[0].clone().into_bool().unwrap();
+        if name_success {
+            name = name_tuple[1].clone().into_string().unwrap();
         }
 
-        let results = join_all(queries).await;
+        let mut symbol = "".to_string();
 
-        let data: Vec<Option<String>> = results.into_iter().map(|res| res.unwrap()).collect();
+        let symbol_success = symbol_tuple[0].clone().into_bool().unwrap();
+        if symbol_success {
+            symbol = symbol_tuple[1].clone().into_string().unwrap();
+        }
+
+        let mut decimals: i64 = 0;
+
+        let decimals_success = decimals_tuple[0].clone().into_bool().unwrap();
+        if decimals_success {
+            decimals = decimals_tuple[1].clone().into_uint().unwrap().as_u64() as i64;
+        }
+
+        let mut token0: Option<String> = None;
+        let token0_success = token0_tuple[0].clone().into_bool().unwrap();
+        if token0_success {
+            token0 = Some(format_address(
+                token0_tuple[1].clone().into_address().unwrap(),
+            ));
+        }
+
+        let mut token1: Option<String> = None;
+        let token1_success = token1_tuple[0].clone().into_bool().unwrap();
+        if token1_success {
+            token1 = Some(format_address(
+                token1_tuple[1].clone().into_address().unwrap(),
+            ));
+        }
+
+        let mut factory: Option<String> = None;
+        let factory_success = factory_tuple[0].clone().into_bool().unwrap();
+        if factory_success {
+            factory = Some(format_address(
+                factory_tuple[1].clone().into_address().unwrap(),
+            ));
+        }
 
         return Some(DatabaseTokenDetails {
             token,
             chain: self.chain.id,
-            name: data[0].clone().unwrap(),
+            name,
             decimals,
-            symbol: data[1].clone().unwrap(),
-            token0: data[2].clone(),
-            token1: data[3].clone(),
-            factory: data[4].clone(),
+            symbol,
+            token0,
+            token1,
+            factory,
         });
     }
 }

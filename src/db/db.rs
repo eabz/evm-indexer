@@ -583,7 +583,7 @@ impl Database {
 
         for (start, end) in chunks {
             let mut query_builder = QueryBuilder::new(
-                "UPSERT INTO token_details (chain, token, name, symbol, decimals, token0, token1) ",
+                "UPSERT INTO token_details (chain, token, name, symbol, decimals, token0, token1, factory) ",
             );
 
             query_builder.push_values(&tokens[start..end], |mut row, token| {
@@ -593,7 +593,8 @@ impl Database {
                     .push_bind(token.symbol.clone())
                     .push_bind(token.decimals)
                     .push_bind(token.token0.clone())
-                    .push_bind(token.token1.clone());
+                    .push_bind(token.token1.clone())
+                    .push_bind(token.factory.clone());
             });
 
             let query = query_builder.build();
