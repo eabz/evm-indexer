@@ -16,7 +16,7 @@ use futures::future::join_all;
 use log::info;
 use mongodb::{
     bson::doc,
-    options::{ClientOptions, FindOneAndUpdateOptions},
+    options::{ClientOptions, UpdateOptions},
     Client,
 };
 use redis::Commands;
@@ -769,9 +769,7 @@ impl Database {
             .agg_database
             .collection::<AggDatabaseNativeBalance>(NATIVE_BALANCES_KEY);
 
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(Some(true))
-            .build();
+        let options = UpdateOptions::builder().upsert(Some(true)).build();
 
         let mut stores = vec![];
 
@@ -784,7 +782,7 @@ impl Database {
                 "$inc": { "balance": changes.balance_change, "received": received, "sent": sent },
             };
 
-            stores.push(collection.find_one_and_update(
+            stores.push(collection.update_one(
                 doc! { "chain": self.chain.id,  "owner": changes.address.clone() },
                 update,
                 options.clone(),
@@ -804,9 +802,7 @@ impl Database {
             .agg_database
             .collection::<AggDatabaseERC20Balance>(ERC20_BALANCES_KEY);
 
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(Some(true))
-            .build();
+        let options = UpdateOptions::builder().upsert(Some(true)).build();
 
         let mut stores = vec![];
 
@@ -820,7 +816,7 @@ impl Database {
             };
 
             stores.push(collection
-                .find_one_and_update(
+                .update_one(
                     doc! { "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
                     update,
                     options.clone(),
@@ -841,9 +837,7 @@ impl Database {
             .agg_database
             .collection::<AggDatabaseERC721TokenOwner>(ERC721_BALANCES_KEY);
 
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(Some(true))
-            .build();
+        let options = UpdateOptions::builder().upsert(Some(true)).build();
 
         let mut stores = vec![];
 
@@ -853,7 +847,7 @@ impl Database {
                 "$inc": { "transactions": 1 },
             };
 
-            stores.push(collection.find_one_and_update(
+            stores.push(collection.update_one(
                 doc! { "id": changes.id.clone(), "chain": self.chain.id, "token": changes.token.clone() },
                 update,
                 options.clone(),
@@ -873,9 +867,7 @@ impl Database {
             .agg_database
             .collection::<AggDatabaseERC1155Balance>(ERC1155_BALANCES_KEY);
 
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(Some(true))
-            .build();
+        let options = UpdateOptions::builder().upsert(Some(true)).build();
 
         let mut stores = vec![];
 
@@ -888,7 +880,7 @@ impl Database {
                 "$inc": { "transactions": 1, "sent": sent, "received": received, "balance": changes.balance_change },
             };
 
-            stores.push(collection.find_one_and_update(
+            stores.push(collection.update_one(
             doc! { "id": changes.id.clone(), "chain": self.chain.id, "token": changes.token.clone(), "owner": changes.address.clone() },
             update,
             options.clone(),
