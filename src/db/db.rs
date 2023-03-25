@@ -16,9 +16,10 @@ use futures::future::join_all;
 use log::info;
 use mongodb::{
     bson::doc,
-    options::{ClientOptions, FindOneAndUpdateOptions},
+    options::{ClientOptions, UpdateOptions},
     Client,
 };
+use mongodm::{BulkUpdate, CollectionExt};
 use redis::Commands;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
@@ -769,29 +770,30 @@ impl Database {
             .agg_database
             .collection::<AggDatabaseNativeBalance>(NATIVE_BALANCES_KEY);
 
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(Some(true))
-            .build();
+        let options = UpdateOptions::builder().upsert(Some(true)).build();
 
-        let mut stores = vec![];
+        let mut updates = vec![];
 
         for (_, changes) in balances {
             let received = if changes.balance_change > 0.0 { 1 } else { 0 };
             let sent = if changes.balance_change > 0.0 { 0 } else { 1 };
 
-            let update = doc! {
-                "$set": { "owner": changes.address.clone(), "chain": self.chain.id },
-                "$inc": { "balance": changes.balance_change, "received": received, "sent": sent },
+            let update = BulkUpdate {
+                query: doc! { "chain": self.chain.id,  "owner": changes.address.clone() },
+                update: doc! {
+                    "$set": { "owner": changes.address.clone(), "chain": self.chain.id },
+                    "$inc": { "balance": changes.balance_change, "received": received, "sent": sent },
+                },
+                options: Some(options.clone()),
             };
 
-            stores.push(collection.find_one_and_update(
-                doc! { "chain": self.chain.id,  "owner": changes.address.clone() },
-                update,
-                options.clone(),
-            ));
+            updates.push(update)
         }
 
-        join_all(stores).await;
+        collection
+            .bulk_update(&self.agg_database, updates)
+            .await
+            .expect("unable to write native balances modifications");
 
         Ok(())
     }
@@ -804,31 +806,30 @@ impl Database {
             .agg_database
             .collection::<AggDatabaseERC20Balance>(ERC20_BALANCES_KEY);
 
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(Some(true))
-            .build();
+        let options = UpdateOptions::builder().upsert(Some(true)).build();
 
-        let mut stores = vec![];
+        let mut updates = vec![];
 
         for (_, changes) in balances {
             let received = if changes.balance_change > 0.0 { 1 } else { 0 };
             let sent = if changes.balance_change > 0.0 { 0 } else { 1 };
 
-            let update = doc! {
-                "$set": { "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
-                "$inc": { "balance": changes.balance_change, "received": received, "sent": sent },
+            let update = BulkUpdate {
+                query: doc! { "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                update: doc! {
+                    "$set": { "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                    "$inc": { "balance": changes.balance_change, "received": received, "sent": sent },
+                },
+                options: Some(options.clone()),
             };
 
-            stores.push(collection
-                .find_one_and_update(
-                    doc! { "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
-                    update,
-                    options.clone(),
-                )
-            )
+            updates.push(update);
         }
 
-        join_all(stores).await;
+        collection
+            .bulk_update(&self.agg_database, updates)
+            .await
+            .expect("unable to write erc20 balances modifications");
 
         Ok(())
     }
@@ -841,26 +842,27 @@ impl Database {
             .agg_database
             .collection::<AggDatabaseERC721TokenOwner>(ERC721_BALANCES_KEY);
 
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(Some(true))
-            .build();
+        let options = UpdateOptions::builder().upsert(Some(true)).build();
 
-        let mut stores = vec![];
+        let mut updates = vec![];
 
         for (_, changes) in balances {
-            let update = doc! {
-                "$set": { "id": changes.id.clone(), "owner": changes.to_owner.clone(), "chain": self.chain.id, "token": changes.token.clone() },
-                "$inc": { "transactions": 1 },
+            let update = BulkUpdate {
+                query: doc! { "id": changes.id.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                update: doc! {
+                    "$set": { "id": changes.id.clone(), "owner": changes.to_owner.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                    "$inc": { "transactions": 1 },
+                },
+                options: Some(options.clone()),
             };
 
-            stores.push(collection.find_one_and_update(
-                doc! { "id": changes.id.clone(), "chain": self.chain.id, "token": changes.token.clone() },
-                update,
-                options.clone(),
-            ))
+            updates.push(update);
         }
 
-        join_all(stores).await;
+        collection
+            .bulk_update(&self.agg_database, updates)
+            .await
+            .expect("unable to write erc721 owner modifications");
 
         Ok(())
     }
@@ -873,29 +875,30 @@ impl Database {
             .agg_database
             .collection::<AggDatabaseERC1155Balance>(ERC1155_BALANCES_KEY);
 
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(Some(true))
-            .build();
+        let options = UpdateOptions::builder().upsert(Some(true)).build();
 
-        let mut stores = vec![];
+        let mut updates = vec![];
 
         for (_, changes) in balances {
             let received = if changes.balance_change > 0.0 { 1 } else { 0 };
             let sent = if changes.balance_change > 0.0 { 0 } else { 1 };
 
-            let update = doc! {
-                "$set": { "id": changes.id.clone(), "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
-                "$inc": { "transactions": 1, "sent": sent, "received": received, "balance": changes.balance_change },
+            let update = BulkUpdate {
+                query: doc! { "id": changes.id.clone(), "chain": self.chain.id, "token": changes.token.clone(), "owner": changes.address.clone() },
+                update: doc! {
+                    "$set": { "id": changes.id.clone(), "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                    "$inc": { "transactions": 1, "sent": sent, "received": received, "balance": changes.balance_change },
+                },
+                options: Some(options.clone()),
             };
 
-            stores.push(collection.find_one_and_update(
-            doc! { "id": changes.id.clone(), "chain": self.chain.id, "token": changes.token.clone(), "owner": changes.address.clone() },
-            update,
-            options.clone(),
-        ))
+            updates.push(update);
         }
 
-        join_all(stores).await;
+        collection
+            .bulk_update(&self.agg_database, updates)
+            .await
+            .expect("unable to write erc1155 owner modifications");
 
         Ok(())
     }
