@@ -2141,7 +2141,6 @@ dependencies = [
  "jsonrpsee-http-client",
  "log",
  "mongodb",
- "mongodm",
  "rand",
  "redis",
  "reqwest",
@@ -2605,19 +2604,6 @@ dependencies = [
  "typed-builder",
  "uuid 1.3.0",
  "webpki-roots",
-]
-
-[[package]]
-name = "mongodm"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac21114e9f1106648aab7bc475b1da0f7effda69c64180f225c4eb1011fc3df0"
-dependencies = [
- "async-trait",
- "futures-core",
- "futures-util",
- "mongodb",
- "serde",
 ]
 
 [[package]]

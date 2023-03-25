@@ -19,7 +19,6 @@ jsonrpsee = { version = "0.16", features = ["macros", "server"] }
 jsonrpsee-http-client = "0.16"
 log = "0.4"
 mongodb = "2"
-mongodm = "0.9"
 rand = "0.8"
 redis = "0.22"
 reqwest = "0.11"
