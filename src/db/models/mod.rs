@@ -1,3 +1,4 @@
+pub mod balances;
 pub mod block;
 pub mod chain_state;
 pub mod contract;

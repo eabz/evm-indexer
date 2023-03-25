@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 
+use ethabi::ethereum_types::H160;
+
 use crate::db::models::{
     block::DatabaseBlock, dex_trade::DatabaseDexTrade, erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer, erc721_transfer::DatabaseERC721Transfer,
     transaction::DatabaseTransaction,
 };
+
+use super::format::format_address;
 
 #[derive(Debug, Clone)]
 pub struct NativeTokenBalanceChange {
@@ -113,12 +117,13 @@ pub fn aggregate_data(
             transfer.from_address.clone(),
         );
 
-        sender_balance.balance_change -= transfer.amount;
-
-        erc20_balance_changes.insert(
-            (transfer.token.clone(), transfer.from_address.clone()),
-            sender_balance,
-        );
+        if transfer.from_address != format_address(H160::zero()) {
+            sender_balance.balance_change -= transfer.amount;
+            erc20_balance_changes.insert(
+                (transfer.token.clone(), transfer.from_address.clone()),
+                sender_balance,
+            );
+        }
 
         let mut receiver_balance = get_erc20_token_balance_stored(
             &erc20_balance_changes,
@@ -126,7 +131,7 @@ pub fn aggregate_data(
             transfer.to_address.clone(),
         );
 
-        receiver_balance.balance_change -= transfer.amount;
+        receiver_balance.balance_change += transfer.amount;
 
         erc20_balance_changes.insert(
             (transfer.token.clone(), transfer.to_address.clone()),
@@ -163,16 +168,18 @@ pub fn aggregate_data(
                 id.clone(),
             );
 
-            sender_stored_balance.balance_change -= transfer.values[i];
+            if transfer.from_address != format_address(H160::zero()) {
+                sender_stored_balance.balance_change -= transfer.values[i];
 
-            erc1155_balances_changes.insert(
-                (
-                    transfer.token.clone(),
-                    transfer.from_address.clone(),
-                    id.clone(),
-                ),
-                sender_stored_balance,
-            );
+                erc1155_balances_changes.insert(
+                    (
+                        transfer.token.clone(),
+                        transfer.from_address.clone(),
+                        id.clone(),
+                    ),
+                    sender_stored_balance,
+                );
+            }
 
             let mut receiver_stored_balance = get_erc1155_transfer_balance_stored(
                 &erc1155_balances_changes,

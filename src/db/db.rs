@@ -1,23 +1,49 @@
-use std::{cmp::min, collections::HashSet};
+use std::{
+    cmp::min,
+    collections::{HashMap, HashSet},
+};
 
-use crate::chains::chains::Chain;
+use crate::{
+    chains::chains::Chain,
+    utils::aggregate::{
+        DexPairAggregatedData, ERC1155BalancesChange, ERC20TokenBalanceChange, ERC721OwnerChange,
+        NativeTokenBalanceChange,
+    },
+};
 use anyhow::Result;
 use field_count::FieldCount;
 use futures::future::join_all;
 use log::info;
-use mongodb::{options::ClientOptions, Client};
+use mongodb::{
+    bson::doc,
+    options::{ClientOptions, FindOneAndUpdateOptions},
+    Client,
+};
 use redis::Commands;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
     ConnectOptions, QueryBuilder,
 };
 
-use super::models::{
-    block::DatabaseBlock, chain_state::DatabaseChainIndexedState, contract::DatabaseContract,
-    dex_trade::DatabaseDexTrade, erc1155_transfer::DatabaseERC1155Transfer,
-    erc20_transfer::DatabaseERC20Transfer, erc721_transfer::DatabaseERC721Transfer,
-    log::DatabaseLog, receipt::DatabaseReceipt, token_detail::DatabaseTokenDetails,
-    transaction::DatabaseTransaction,
+use super::{
+    keys::{ERC1155_BALANCES_KEY, ERC20_BALANCES_KEY, ERC721_BALANCES_KEY, NATIVE_BALANCES_KEY},
+    models::{
+        balances::{
+            AggDatabaseERC1155Balance, AggDatabaseERC20Balance, AggDatabaseERC721TokenOwner,
+            AggDatabaseNativeBalance,
+        },
+        block::DatabaseBlock,
+        chain_state::DatabaseChainIndexedState,
+        contract::DatabaseContract,
+        dex_trade::DatabaseDexTrade,
+        erc1155_transfer::DatabaseERC1155Transfer,
+        erc20_transfer::DatabaseERC20Transfer,
+        erc721_transfer::DatabaseERC721Transfer,
+        log::DatabaseLog,
+        receipt::DatabaseReceipt,
+        token_detail::DatabaseTokenDetails,
+        transaction::DatabaseTransaction,
+    },
 };
 
 pub const MAX_PARAM_SIZE: u16 = u16::MAX;
@@ -240,7 +266,7 @@ impl Database {
         let errored: Vec<_> = res.iter().filter(|res| res.is_err()).collect();
 
         if errored.len() > 0 {
-            panic!("failed to store all elements")
+            panic!("failed to store all chain primitive elements")
         }
 
         if blocks.len() > 0 {
@@ -652,6 +678,270 @@ impl Database {
             .await
             .expect("Unable to update indexed blocks number");
 
+        Ok(())
+    }
+
+    pub async fn update_balances(
+        &self,
+        native: &HashMap<String, NativeTokenBalanceChange>,
+        erc20: &HashMap<(String, String), ERC20TokenBalanceChange>,
+        erc721: &HashMap<(String, String), ERC721OwnerChange>,
+        erc1155: &HashMap<(String, String, String), ERC1155BalancesChange>,
+    ) -> Result<()> {
+        let mut stores = vec![];
+
+        if native.len() > 0 {
+            let work = tokio::spawn({
+                let native = native.clone();
+                let db = self.clone();
+                async move {
+                    db.update_native_balances(&native)
+                        .await
+                        .expect("unable to update native balances")
+                }
+            });
+            stores.push(work);
+        }
+
+        if erc20.len() > 0 {
+            let work = tokio::spawn({
+                let erc20 = erc20.clone();
+                let db = self.clone();
+                async move {
+                    db.update_erc20_balances(&erc20)
+                        .await
+                        .expect("unable to update erc20 balances")
+                }
+            });
+            stores.push(work);
+        }
+
+        if erc721.len() > 0 {
+            let work = tokio::spawn({
+                let erc721 = erc721.clone();
+                let db = self.clone();
+                async move {
+                    db.update_erc721_balances(&erc721)
+                        .await
+                        .expect("unable to update erc721 balances")
+                }
+            });
+            stores.push(work);
+        }
+
+        if erc1155.len() > 0 {
+            let work = tokio::spawn({
+                let erc1155 = erc1155.clone();
+                let db = self.clone();
+                async move {
+                    db.update_erc1155_balances(&erc1155)
+                        .await
+                        .expect("unable to update erc1155 balances")
+                }
+            });
+            stores.push(work);
+        }
+
+        let res = join_all(stores).await;
+
+        let errored: Vec<_> = res.iter().filter(|res| res.is_err()).collect();
+
+        if errored.len() > 0 {
+            panic!("failed to store all balances")
+        }
+
+        info!(
+            "Updated balances: native ({}) erc20 ({}) erc721 ({}) erc1155 ({}).",
+            native.len(),
+            erc20.len(),
+            erc721.len(),
+            erc1155.len(),
+        );
+
+        Ok(())
+    }
+
+    pub async fn update_native_balances(
+        &self,
+        balances: &HashMap<String, NativeTokenBalanceChange>,
+    ) -> Result<()> {
+        let collection = self
+            .agg_database
+            .collection::<AggDatabaseNativeBalance>(NATIVE_BALANCES_KEY);
+
+        let options = FindOneAndUpdateOptions::builder()
+            .upsert(Some(true))
+            .build();
+
+        let mut stores = vec![];
+
+        for (_, changes) in balances {
+            let received = if changes.balance_change > 0.0 { 1 } else { 0 };
+            let sent = if changes.balance_change > 0.0 { 0 } else { 1 };
+
+            let update = doc! {
+                "$set": { "owner": changes.address.clone(), "chain": self.chain.id },
+                "$inc": { "balance": changes.balance_change, "received": received, "sent": sent },
+            };
+
+            stores.push(collection.find_one_and_update(
+                doc! { "chain": self.chain.id,  "owner": changes.address.clone() },
+                update,
+                options.clone(),
+            ));
+        }
+
+        join_all(stores).await;
+
+        Ok(())
+    }
+
+    pub async fn update_erc20_balances(
+        &self,
+        balances: &HashMap<(String, String), ERC20TokenBalanceChange>,
+    ) -> Result<()> {
+        let collection = self
+            .agg_database
+            .collection::<AggDatabaseERC20Balance>(ERC20_BALANCES_KEY);
+
+        let options = FindOneAndUpdateOptions::builder()
+            .upsert(Some(true))
+            .build();
+
+        let mut stores = vec![];
+
+        for (_, changes) in balances {
+            let received = if changes.balance_change > 0.0 { 1 } else { 0 };
+            let sent = if changes.balance_change > 0.0 { 0 } else { 1 };
+
+            let update = doc! {
+                "$set": { "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                "$inc": { "balance": changes.balance_change, "received": received, "sent": sent },
+            };
+
+            stores.push(collection
+                .find_one_and_update(
+                    doc! { "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                    update,
+                    options.clone(),
+                )
+            )
+        }
+
+        join_all(stores).await;
+
+        Ok(())
+    }
+
+    pub async fn update_erc721_balances(
+        &self,
+        balances: &HashMap<(String, String), ERC721OwnerChange>,
+    ) -> Result<()> {
+        let collection = self
+            .agg_database
+            .collection::<AggDatabaseERC721TokenOwner>(ERC721_BALANCES_KEY);
+
+        let options = FindOneAndUpdateOptions::builder()
+            .upsert(Some(true))
+            .build();
+
+        let mut stores = vec![];
+
+        for (_, changes) in balances {
+            let update = doc! {
+                "$set": { "id": changes.id.clone(), "owner": changes.to_owner.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                "$inc": { "transactions": 1 },
+            };
+
+            stores.push(collection.find_one_and_update(
+                doc! { "id": changes.id.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                update,
+                options.clone(),
+            ))
+        }
+
+        join_all(stores).await;
+
+        Ok(())
+    }
+
+    pub async fn update_erc1155_balances(
+        &self,
+        balances: &HashMap<(String, String, String), ERC1155BalancesChange>,
+    ) -> Result<()> {
+        let collection = self
+            .agg_database
+            .collection::<AggDatabaseERC1155Balance>(ERC1155_BALANCES_KEY);
+
+        let options = FindOneAndUpdateOptions::builder()
+            .upsert(Some(true))
+            .build();
+
+        let mut stores = vec![];
+
+        for (_, changes) in balances {
+            let received = if changes.balance_change > 0.0 { 1 } else { 0 };
+            let sent = if changes.balance_change > 0.0 { 0 } else { 1 };
+
+            let update = doc! {
+                "$set": { "id": changes.id.clone(), "owner": changes.address.clone(), "chain": self.chain.id, "token": changes.token.clone() },
+                "$inc": { "transactions": 1, "sent": sent, "received": received, "balance": changes.balance_change },
+            };
+
+            stores.push(collection.find_one_and_update(
+            doc! { "id": changes.id.clone(), "chain": self.chain.id, "token": changes.token.clone(), "owner": changes.address.clone() },
+            update,
+            options.clone(),
+        ))
+        }
+
+        join_all(stores).await;
+
+        Ok(())
+    }
+
+    pub async fn update_dex_aggregates(
+        &self,
+        minutes: &HashMap<(String, String), DexPairAggregatedData>,
+        hours: &HashMap<(String, String), DexPairAggregatedData>,
+        days: &HashMap<(String, String), DexPairAggregatedData>,
+    ) -> Result<()> {
+        let mut stores = vec![];
+
+        if minutes.len() > 0 {
+            stores.push(self.update_dex_aggregated_data(minutes))
+        }
+
+        if hours.len() > 0 {
+            stores.push(self.update_dex_aggregated_data(hours))
+        }
+
+        if days.len() > 0 {
+            stores.push(self.update_dex_aggregated_data(days))
+        }
+
+        let res = join_all(stores).await;
+
+        let errored: Vec<_> = res.iter().filter(|res| res.is_err()).collect();
+
+        if errored.len() > 0 {
+            panic!("failed to store all dex aggregates")
+        }
+
+        info!(
+            "Inserted dex aggregates: minutes ({}) hourly ({}) daily ({}).",
+            minutes.len(),
+            hours.len(),
+            days.len(),
+        );
+
+        Ok(())
+    }
+
+    pub async fn update_dex_aggregated_data(
+        &self,
+        data: &HashMap<(String, String), DexPairAggregatedData>,
+    ) -> Result<()> {
         Ok(())
     }
 }

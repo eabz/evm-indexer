@@ -174,14 +174,22 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
             &db_dex_trade,
         );
 
-        // TODO: store aggregates
-        println!("{}", db_native_balances.len());
-        println!("{}", db_erc20_balances.len());
-        println!("{}", db_erc721_owner_changes.len());
-        println!("{}", db_erc1155_balances_changes.len());
-        println!("{}", db_dex_minute_aggregates.len());
-        println!("{}", db_dex_hourly_aggregates.len());
-        println!("{}", db_dex_daily_aggregates.len());
+        db.update_balances(
+            &db_native_balances,
+            &db_erc20_balances,
+            &db_erc721_owner_changes,
+            &db_erc1155_balances_changes,
+        )
+        .await
+        .unwrap();
+
+        db.update_dex_aggregates(
+            &db_dex_minute_aggregates,
+            &db_dex_hourly_aggregates,
+            &db_dex_daily_aggregates,
+        )
+        .await
+        .unwrap();
     }
 }
 
