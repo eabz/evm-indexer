@@ -4,10 +4,11 @@
 <p align="center">
 <strong>A scalable SQL indexer for EVM compatible blockchains</strong>
 </p>
-
 <p align="center">
 <strong>🚧 🚨 🚧 🚨 This indexer is a work in progress don't use it for production 🚧 🚨 🚧 🚨</strong>
 </p>
+
+![build](https://github.com/eabz/indexer/actions/workflows/build.yml/badge.svg)
 
 ## Requirements
 
