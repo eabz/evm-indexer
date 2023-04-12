@@ -8,7 +8,7 @@ anyhow = "1"
 array-bytes = "6"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-clickhouse = { version = "0.11.3", features = ["test-util"] }
+clickhouse = "0.11"
 dotenv = "0.15"
 ethabi = "18"
 ethers = { version = "1", features = ["ws", "rustls"] }
