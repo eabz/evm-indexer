@@ -1,6 +1,7 @@
-use field_count::FieldCount;
+use clickhouse::Row;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseMethod {
     pub name: String,
     pub method: String,

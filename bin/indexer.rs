@@ -15,7 +15,6 @@ use indexer::{
     },
     rpc::rpc::Rpc,
     utils::{
-        aggregate::aggregate_data,
         events::{
             ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
             SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
@@ -50,9 +49,11 @@ async fn main() {
         .expect("Unable to start RPC client.");
 
     let db = Database::new(
-        config.db_url.clone(),
+        config.db_host.clone(),
+        config.db_username.clone(),
+        config.db_password.clone(),
+        config.db_name.clone(),
         config.redis_url.clone(),
-        config.agg_db_url.clone(),
         config.chain.clone(),
     )
     .await
@@ -157,39 +158,43 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
             .await
             .unwrap();
 
-        let (
-            db_native_balances,
-            db_erc20_balances,
-            db_erc721_owner_changes,
-            db_erc1155_balances_changes,
-            db_dex_minute_aggregates,
-            db_dex_hourly_aggregates,
-            db_dex_daily_aggregates,
-        ) = aggregate_data(
-            &db_blocks,
-            &db_transactions,
-            &db_erc20_transfers,
-            &db_erc721_transfers,
-            &db_erc1155_transfers,
-            &db_dex_trade,
-        );
+        /*
+        TODO: recover aggregations
 
-        db.update_balances(
-            &db_native_balances,
-            &db_erc20_balances,
-            &db_erc721_owner_changes,
-            &db_erc1155_balances_changes,
-        )
-        .await
-        .unwrap();
+            let (
+                db_native_balances,
+                db_erc20_balances,
+                db_erc721_owner_changes,
+                db_erc1155_balances_changes,
+                db_dex_minute_aggregates,
+                db_dex_hourly_aggregates,
+                db_dex_daily_aggregates,
+            ) = aggregate_data(
+                &db_blocks,
+                &db_transactions,
+                &db_erc20_transfers,
+                &db_erc721_transfers,
+                &db_erc1155_transfers,
+                &db_dex_trade,
+            );
 
-        db.update_dex_aggregates(
-            &db_dex_minute_aggregates,
-            &db_dex_hourly_aggregates,
-            &db_dex_daily_aggregates,
-        )
-        .await
-        .unwrap();
+            db.update_balances(
+                &db_native_balances,
+                &db_erc20_balances,
+                &db_erc721_owner_changes,
+                &db_erc1155_balances_changes,
+            )
+            .await
+            .unwrap();
+
+            db.update_dex_aggregates(
+                &db_dex_minute_aggregates,
+                &db_dex_hourly_aggregates,
+                &db_dex_daily_aggregates,
+            )
+            .await
+            .unwrap();
+        */
     }
 }
 

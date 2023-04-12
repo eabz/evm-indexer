@@ -1,15 +1,16 @@
+use clickhouse::Row;
 use ethabi::{
     ethereum_types::{H256, U256},
     ParamType,
 };
 use ethers::utils::format_units;
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
 
 use crate::utils::format::{format_address, format_number};
 
 use super::log::DatabaseLog;
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC1155Transfer {
     pub chain: i64,
     pub operator: String,

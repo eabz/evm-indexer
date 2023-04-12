@@ -1,10 +1,11 @@
+use clickhouse::Row;
 use ethers::{
     types::{Block, Transaction},
     utils::format_units,
 };
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BlockStatus {
     Unfinalized,
     Secure,
@@ -23,7 +24,7 @@ impl BlockStatus {
 
 use crate::utils::format::{format_address, format_hash, format_nonce, format_number};
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseBlock {
     pub base_fee_per_gas: Option<f64>,
     pub chain: i64,

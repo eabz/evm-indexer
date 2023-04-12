@@ -1,9 +1,10 @@
+use clickhouse::Row;
 use ethers::types::Log;
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
 
 use crate::utils::format::{format_address, format_hash};
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseLog {
     pub address: String,
     pub chain: i64,

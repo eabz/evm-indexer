@@ -1,12 +1,13 @@
+use clickhouse::Row;
 use ethabi::{ethereum_types::H256, ParamType};
 use ethers::utils::format_units;
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
 
 use crate::utils::format::format_address;
 
 use super::log::DatabaseLog;
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC20Transfer {
     pub chain: i64,
     pub from_address: String,

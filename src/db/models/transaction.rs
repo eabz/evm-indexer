@@ -1,9 +1,10 @@
+use clickhouse::Row;
 use ethers::{types::Transaction, utils::format_units};
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
 
 use crate::utils::format::{byte4_from_input, format_address, format_bytes, format_hash};
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTransaction {
     pub block_hash: String,
     pub block_number: i64,

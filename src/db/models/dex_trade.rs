@@ -1,13 +1,14 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
+use clickhouse::Row;
 use ethabi::{ethereum_types::H256, ParamType};
 use ethers::utils::format_units;
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
 
 use crate::utils::format::format_address;
 
 use super::{log::DatabaseLog, token_detail::DatabaseTokenDetails};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TradeType {
     Buy,
     Sell,
@@ -22,7 +23,7 @@ impl TradeType {
     }
 }
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseDexTrade {
     pub chain: i64,
     pub maker: String,

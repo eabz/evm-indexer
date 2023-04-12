@@ -1,183 +1,189 @@
-CREATE TYPE BLOCK_STATUS AS ENUM (
-  'unfinalized',
-  'secure',
-  'finalized'
-);
+CREATE DATABASE IF NOT EXISTS indexer;
 
-CREATE TYPE TRANSACTION_STATUS AS ENUM (
-  'reverted',
-  'succeed',
-  'pending'
-);
+CREATE TABLE indexer.blocks (
+  base_fee_per_gas Float64,
+  chain Int64 NOT NULL,
+  difficulty FixedString(66) NOT NULL,
+  extra_data String NOT NULL,
+  gas_limit Int64 NOT NULL,
+  gas_used Int64 NOT NULL,
+  hash FixedString(66),
+  logs_bloom String NOT NULL,
+  miner FixedString(42) NOT NULL,
+  mix_hash FixedString(66) NOT NULL,
+  nonce FixedString(42) NOT NULL,
+  number Int64 NOT NULL,
+  parent_hash FixedString(66) NOT NULL,
+  receipts_root FixedString(66) NOT NULL,
+  sha3_uncles FixedString(66) NOT NULL,
+  size Int32 NOT NULL,
+  state_root FixedString(66) NOT NULL,
+  status Enum('unfinalized', 'secure', 'finalized') NOT NULL,
+  timestamp Date NOT NULL,
+  total_difficulty FixedString(66) NOT NULL,
+  transactions Int32 NOT NULL,
+  transactions_root FixedString(66) NOT NULL,
+  uncles Array(FixedString(66)) NOT NULL
+)
+ENGINE = MergeTree()
+PRIMARY KEY (hash);
 
-CREATE TYPE TRADE_TYPE AS ENUM (
-  'buy',
-  'sell'
-);
+CREATE TABLE indexer.transactions (
+  block_hash FixedString(66) NOT NULL,
+  block_number Int64 NOT NULL,
+  chain Int64 NOT NULL,
+  from_address FixedString(42) NOT NULL,
+  gas Int64 NOT NULL,
+  gas_price Int64 NOT NULL,
+  hash FixedString(66),
+  input String NOT NULL,
+  max_fee_per_gas Int64,
+  max_priority_fee_per_gas Int64,
+  method FixedString(10) NOT NULL,
+  nonce Int32 NOT NULL,
+  timestamp Date NOT NULL,
+  to_address FixedString(42),
+  transaction_index Int32 NOT NULL,
+  transaction_type Int32 NOT NULL,
+  value Float64 NOT NULL
+)
+ENGINE = MergeTree()
+PRIMARY KEY (hash);
 
-CREATE TABLE blocks (
-  base_fee_per_gas DECIMAL,
-  chain BIGINT NOT NULL,
-  difficulty VARCHAR(66) NOT NULL,
-  extra_data BYTEA NOT NULL,
-  gas_limit BIGINT NOT NULL,
-  gas_used BIGINT NOT NULL,
-  hash VARCHAR(66) UNIQUE PRIMARY KEY,
-  logs_bloom BYTEA NOT NULL,
-  miner VARCHAR(42) NOT NULL,
-  mix_hash VARCHAR(66) NOT NULL,
-  nonce VARCHAR(42) NOT NULL,
-  number BIGINT NOT NULL,
-  parent_hash VARCHAR(66) NOT NULL,
-  receipts_root VARCHAR(66) NOT NULL,
-  sha3_uncles VARCHAR(66) NOT NULL,
-  size INT NOT NULL,
-  state_root VARCHAR(66) NOT NULL,
-  status BLOCK_STATUS,
-  timestamp TIMESTAMP NOT NULL,
-  total_difficulty VARCHAR(66) NOT NULL,
-  transactions INT NOT NULL,
-  transactions_root VARCHAR(66) NOT NULL,
-  uncles VARCHAR(66)[] NOT NULL
-);
+CREATE TABLE indexer.methods (
+  name String NOT NULL,
+  method FixedString(10)
+)
+ENGINE = MergeTree()
+PRIMARY KEY (method);
 
-CREATE TABLE transactions (
-  block_hash VARCHAR(66) NOT NULL,
-  block_number BIGINT NOT NULL,
-  chain BIGINT NOT NULL,
-  from_address VARCHAR(42) NOT NULL,
-  gas BIGINT NOT NULL,
-  gas_price BIGINT NOT NULL,
-  hash VARCHAR(66) UNIQUE PRIMARY KEY,
-  input BYTEA NOT NULL,
-  max_fee_per_gas BIGINT,
-  max_priority_fee_per_gas BIGINT,
-  method VARCHAR(10) NOT NULL,
-  nonce INT NOT NULL,
-  timestamp TIMESTAMP NOT NULL,
-  to_address VARCHAR(42),
-  transaction_index INT NOT NULL,
-  transaction_type INT NOT NULL,
-  value DECIMAL NOT NULL
-);
+CREATE TABLE indexer.receipts (
+  contract_address FixedString(42),
+  cumulative_gas_used Int64 NOT NULL,
+  effective_gas_price Int64,
+  gas_used Int64 NOT NULL,
+  hash FixedString(66),
+  status Enum('reverted', 'succeed', 'pending') NOT NULL,
+)
+ENGINE = MergeTree()
+PRIMARY KEY (hash);
 
-CREATE TABLE methods (
-  name TEXT NOT NULL,
-  method VARCHAR(10) PRIMARY KEY
-);
+CREATE TABLE indexer.contracts (
+  block Int64 NOT NULL,
+  contract_address FixedString(42) NOT NULL,
+  chain Int64 NOT NULL,
+  creator FixedString(42) NOT NULL,
+  hash FixedString(66) NOT NULL,
+)
+ENGINE = MergeTree()
+PRIMARY KEY (contract_address, chain);
 
-CREATE TABLE receipts (
-  contract_address VARCHAR(42),
-  cumulative_gas_used BIGINT NOT NULL,
-  effective_gas_price BIGINT,
-  gas_used BIGINT NOT NULL,
-  hash VARCHAR(66) UNIQUE PRIMARY KEY,
-  status TRANSACTION_STATUS
-);
+CREATE TABLE indexer.contract_metadata (
+  abi String NOT NULL,
+  chain Int64 NOT NULL,
+  contract_address FixedString(42) NOT NULL,
+  name String NOT NULL,
+)
+ENGINE = MergeTree()
+PRIMARY KEY (contract_address, chain);
 
-CREATE TABLE contracts (
-  block BIGINT NOT NULL,
-  contract_address VARCHAR(42) NOT NULL,
-  chain BIGINT NOT NULL,
-  creator VARCHAR(42) NOT NULL,
-  hash VARCHAR(66) NOT NULL,
-  PRIMARY KEY (contract_address, chain)
-);
+CREATE TABLE indexer.logs (
+  address FixedString(42) NOT NULL,
+  chain Int64 NOT NULL,
+  data String NOT NULL,
+  hash FixedString(66) NOT NULL,
+  log_index Int32 NOT NULL,
+  log_type Int8,
+  removed boolean NOT NULL,
+  topics Array(FixedString(66)) NOT NULL,
+  timestamp Date NOT NULL,
+  transaction_log_index Int32,
+)
+ENGINE = MergeTree()
+PRIMARY KEY (hash, log_index);
 
-CREATE TABLE contract_metadata (
-  abi JSONB NOT NULL,
-  chain BIGINT NOT NULL,
-  contract_address VARCHAR(42) NOT NULL,
-  name TEXT NOT NULL,
-  PRIMARY KEY (contract_address, chain)
-);
+CREATE TABLE indexer.erc20_transfers (
+  amount Float64 NOT NULL,
+  chain Int64 NOT NULL,
+  from_address FixedString(42) NOT NULL,
+  hash FixedString(66) NOT NULL,
+  log_index Int32 NOT NULL,
+  to_address FixedString(42) NOT NULL,
+  token FixedString(42) NOT NULL,
+  transaction_log_index Int32,
+  timestamp Date NOT NULL,
+)
+ENGINE = MergeTree()
+PRIMARY KEY (hash, log_index);
 
-CREATE TABLE logs (
-  address VARCHAR(42) NOT NULL,
-  chain BIGINT NOT NULL,
-  data BYTEA NOT NULL,
-  hash VARCHAR(66) NOT NULL,
-  log_index INT NOT NULL,
-  log_type SMALLINT,
-  removed BOOLEAN NOT NULL,
-  topics VARCHAR(66)[] NOT NULL,
-  timestamp TIMESTAMP NOT NULL,
+CREATE TABLE indexer.erc721_transfers (
+  chain Int64 NOT NULL,
+  from_address FixedString(42) NOT NULL,
+  hash FixedString(66) NOT NULL,
+  log_index Int32 NOT NULL,
+  to_address FixedString(42) NOT NULL,
+  token FixedString(42) NOT NULL,
   transaction_log_index INT,
-  PRIMARY KEY (hash, log_index)
-);
+  id String NOT NULL,
+  timestamp Date NOT NULL,
+)
+ENGINE = MergeTree()
+PRIMARY KEY (hash, log_index);
 
-CREATE TABLE erc20_transfers (
-  amount DECIMAL NOT NULL,
-  chain BIGINT NOT NULL,
-  from_address VARCHAR(42) NOT NULL,
-  hash VARCHAR(66) NOT NULL,
-  log_index INT NOT NULL,
-  to_address VARCHAR(42) NOT NULL,
-  token VARCHAR(42) NOT NULL,
+CREATE TABLE indexer.erc1155_transfers (
+  chain Int64 NOT NULL,
+  operator FixedString(42) NOT NULL,
+  from_address FixedString(42) NOT NULL,
+  hash FixedString(66) NOT NULL,
+  log_index Int32 NOT NULL,
+  to_address FixedString(42) NOT NULL,
+  token FixedString(42) NOT NULL,
   transaction_log_index INT,
-  timestamp TIMESTAMP NOT NULL,
-  PRIMARY KEY (hash, log_index)
-);
+  ids Array(String) NOT NULL,
+  values Array(Float64) NOT NULL,
+  timestamp Date NOT NULL,
+)
+ENGINE = MergeTree()
+PRIMARY KEY (hash, log_index);
 
-CREATE TABLE erc721_transfers (
-  chain BIGINT NOT NULL,
-  from_address VARCHAR(42) NOT NULL,
-  hash VARCHAR(66) NOT NULL,
-  log_index INT NOT NULL,
-  to_address VARCHAR(42) NOT NULL,
-  token VARCHAR(42) NOT NULL,
-  transaction_log_index INT,
-  id TEXT NOT NULL,
-  timestamp TIMESTAMP NOT NULL,
-  PRIMARY KEY (hash, log_index)
-);
+CREATE TABLE indexer.dex_trades (
+  chain Int64 NOT NULL,
+  maker FixedString(42) NOT NULL,
+  hash FixedString(66) NOT NULL,
+  log_index Int32 NOT NULL,
+  receiver FixedString(42) NOT NULL,
+  token0 FixedString(42) NOT NULL,
+  token1 FixedString(42) NOT NULL,
+  pair_address FixedString(42) NOT NULL,
+  token0_amount Float64 NOT NULL,
+  token1_amount Float64 NOT NULL,
+  swap_rate Float64 NOT NULL,
+  transaction_log_index Int32,
+  timestamp Date NOT NULL,
+  trade_type Enum('buy', 'sell') NOT NULL,
+)
+ENGINE = MergeTree()
+PRIMARY KEY (hash, log_index);
 
-CREATE TABLE erc1155_transfers (
-  chain BIGINT NOT NULL,
-  operator VARCHAR(42) NOT NULL,
-  from_address VARCHAR(42) NOT NULL,
-  hash VARCHAR(66) NOT NULL,
-  log_index INT NOT NULL,
-  to_address VARCHAR(42) NOT NULL,
-  token VARCHAR(42) NOT NULL,
-  transaction_log_index INT,
-  ids TEXT[] NOT NULL,
-  values DECIMAL[] NOT NULL,
-  timestamp TIMESTAMP NOT NULL,
-  PRIMARY KEY (hash, log_index)
-);
+CREATE TABLE indexer.token_details 
+(
+  chain Int64 NOT NULL,
+  token FixedString(42) NOT NULL,
+  name String NOT NULL,
+  symbol String NOT NULL,
+  decimals Int64,
+  token0 FixedString(42),
+  token1 FixedString(42),
+  factory FixedString(42),
+)
+ENGINE = MergeTree()
+PRIMARY KEY (token, chain);
 
-CREATE TABLE dex_trades (
-  chain BIGINT NOT NULL,
-  maker VARCHAR(42) NOT NULL,
-  hash VARCHAR(66) NOT NULL,
-  log_index INT NOT NULL,
-  receiver VARCHAR(42) NOT NULL,
-  token0 VARCHAR(42) NOT NULL,
-  token1 VARCHAR(42) NOT NULL,
-  pair_address VARCHAR(42) NOT NULL,
-  token0_amount DECIMAL NOT NULL,
-  token1_amount DECIMAL NOT NULL,
-  swap_rate DECIMAL NOT NULL,
-  transaction_log_index INT,
-  timestamp TIMESTAMP NOT NULL,
-  trade_type TRADE_TYPE NOT NULL,
-  PRIMARY KEY (hash, log_index)
-);
-
-CREATE TABLE token_details (
-  chain BIGINT NOT NULL,
-  token VARCHAR(42) NOT NULL,
-  name TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  decimals BIGINT,
-  token0 VARCHAR(42),
-  token1 VARCHAR(42),
-  factory VARCHAR(42),
-  PRIMARY KEY (token, chain)
-);
-
-CREATE TABLE chains_indexed_state (
-  chain BIGINT PRIMARY KEY,
-  indexed_blocks_amount BIGINT NOT NULL
-);
+CREATE TABLE indexer.chains_indexed_state
+(
+    chain Int64 NOT NULL,
+    indexed_blocks_amount Int64 NOT NULL
+)
+ENGINE = ReplacingMergeTree
+ORDER BY chain
+PRIMARY KEY chain;
