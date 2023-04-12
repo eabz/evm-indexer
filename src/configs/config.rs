@@ -34,7 +34,6 @@ pub struct Config {
     pub db_username: String,
     pub db_password: String,
     pub db_name: String,
-    pub redis_url: String,
     pub debug: bool,
     pub chain: Chain,
     pub batch_size: usize,
@@ -63,7 +62,6 @@ impl Config {
             db_password: std::env::var("DATABASE_PASSWORD")
                 .expect("DATABASE_PASSWORD must be set."),
             db_name: std::env::var("DATABASE_NAME").expect("DATABASE_NAME must be set."),
-            redis_url: std::env::var("REDIS_URL").expect("REDIS_URL must be set."),
             debug: args.debug,
             chain,
             batch_size: args.batch_size,

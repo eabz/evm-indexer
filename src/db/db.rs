@@ -12,14 +12,12 @@ use anyhow::Result;
 use clickhouse::Client;
 use futures::future::join_all;
 use log::info;
-use redis::Commands;
 
 pub const MAX_PARAM_SIZE: u16 = u16::MAX;
 
 #[derive(Clone)]
 pub struct Database {
     pub chain: Chain,
-    pub redis: redis::Client,
     pub db: Client,
 }
 
@@ -29,7 +27,6 @@ impl Database {
         db_username: String,
         db_password: String,
         db_name: String,
-        redis_url: String,
         chain: Chain,
     ) -> Result<Self> {
         info!("Starting EVM database service");
@@ -37,11 +34,10 @@ impl Database {
         let db = Client::default()
             .with_url(db_host)
             .with_user(db_username)
+            .with_password(db_password)
             .with_database(db_name);
 
-        let redis = redis::Client::open(redis_url).expect("Unable to connect with redis server");
-
-        Ok(Self { chain, redis, db })
+        Ok(Self { chain, db })
     }
 
     pub fn get_connection(&self) -> &Client {
@@ -49,25 +45,7 @@ impl Database {
     }
 
     pub async fn get_indexed_blocks(&self) -> Result<HashSet<i64>> {
-        let mut connection = self.redis.get_connection().unwrap();
-
-        let keys: Vec<String> = connection
-            .keys(format!("{}*", self.chain.name.to_string()))
-            .unwrap();
-
-        let mut blocks: HashSet<i64> = HashSet::new();
-
-        for key in keys {
-            let chunk_blocks: HashSet<i64> = match connection.get::<String, String>(key) {
-                Ok(blocks) => match serde_json::from_str(&blocks) {
-                    Ok(deserialized) => deserialized,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-
-            blocks.extend(&chunk_blocks);
-        }
+        let blocks: HashSet<i64> = HashSet::new();
 
         Ok(blocks)
     }
@@ -75,11 +53,10 @@ impl Database {
     pub async fn get_tokens(&self, tokens: &HashSet<String>) -> Vec<DatabaseTokenDetails> {
         let connection = self.get_connection();
 
-        let mut query =
-            String::from("SELECT * FROM token_details WHERE (token, chain) IN ( VALUES ");
+        let mut query = String::from("SELECT * FROM token_details WHERE (token, chain) IN (");
 
         for token in tokens {
-            let condition = format!("(('{}',{})),", token, self.chain.id);
+            let condition = format!("('{}',{}),", token, self.chain.id);
             query.push_str(&condition)
         }
 
@@ -397,7 +374,10 @@ impl Database {
     pub async fn store_token_details(&self, tokens: &Vec<DatabaseTokenDetails>) -> Result<()> {
         let connection = self.get_connection();
 
-        let mut inserter = connection.inserter("token_details").unwrap();
+        let mut inserter = connection
+            .inserter("token_details")
+            .unwrap()
+            .with_max_entries(tokens.len() as u64);
 
         for token in tokens {
             inserter.write(token).await.unwrap();
@@ -413,45 +393,16 @@ impl Database {
         Ok(())
     }
 
-    pub async fn store_indexed_blocks(&self, blocks: &Vec<i64>) -> Result<()> {
-        let mut connection = self.redis.get_connection().unwrap();
-
-        let chunks = blocks.chunks(30_000_000);
-
-        for (i, chunk) in chunks.enumerate() {
-            let chunk_vec = chunk.to_vec();
-
-            let serialized = serde_json::to_string(&chunk_vec).unwrap();
-
-            let _: () = connection
-                .set(format!("{}-{}", self.chain.name.to_owned(), i), serialized)
-                .unwrap();
-        }
-
-        self.update_indexed_blocks_number(&DatabaseChainIndexedState {
-            chain: self.chain.id,
-            indexed_blocks_amount: blocks.len() as i64,
-        })
-        .await
-        .unwrap();
-
-        Ok(())
-    }
-
     pub async fn update_indexed_blocks_number(
         &self,
         chain_state: &DatabaseChainIndexedState,
     ) -> Result<()> {
         let connection = self.get_connection();
 
-        let query = format!(
-            "INSERT INTO chains_indexed_state VALUES ({},{})",
-            chain_state.chain, chain_state.indexed_blocks_amount
-        );
-
         connection
-            .query(&query)
-            .execute()
+            .insert("chains_indexed_state")
+            .unwrap()
+            .write(chain_state)
             .await
             .expect("Unable to update indexed blocks number");
 

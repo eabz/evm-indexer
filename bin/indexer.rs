@@ -53,7 +53,6 @@ async fn main() {
         config.db_username.clone(),
         config.db_password.clone(),
         config.db_name.clone(),
-        config.redis_url.clone(),
         config.chain.clone(),
     )
     .await
@@ -151,12 +150,6 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
         for block in db_blocks.iter() {
             indexed_blocks.insert(block.number);
         }
-
-        let indexed_blocks_vector: Vec<i64> = indexed_blocks.clone().into_iter().collect();
-
-        db.store_indexed_blocks(&indexed_blocks_vector)
-            .await
-            .unwrap();
 
         /*
         TODO: recover aggregations
