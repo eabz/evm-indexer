@@ -3,12 +3,14 @@ use clickhouse::Row;
 use ethabi::{ethereum_types::H256, ParamType};
 use ethers::utils::format_units;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::utils::format::format_address;
 
 use super::{log::DatabaseLog, token_detail::DatabaseTokenDetails};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
+#[repr(u8)]
 pub enum TradeType {
     Buy,
     Sell,

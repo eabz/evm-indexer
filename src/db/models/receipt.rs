@@ -1,10 +1,12 @@
 use clickhouse::Row;
 use ethers::types::TransactionReceipt;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::utils::format::{format_address, format_hash};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
+#[repr(u8)]
 pub enum TransactionStatus {
     Reverted,
     Succeed,

@@ -3,27 +3,27 @@ CREATE DATABASE IF NOT EXISTS indexer;
 CREATE TABLE indexer.blocks (
   base_fee_per_gas Float64,
   chain Int64 NOT NULL,
-  difficulty FixedString(66) NOT NULL,
+  difficulty String NOT NULL,
   extra_data String NOT NULL,
   gas_limit Int64 NOT NULL,
   gas_used Int64 NOT NULL,
-  hash FixedString(66),
+  hash String,
   logs_bloom String NOT NULL,
-  miner FixedString(42) NOT NULL,
-  mix_hash FixedString(66) NOT NULL,
-  nonce FixedString(42) NOT NULL,
+  miner String NOT NULL,
+  mix_hash String NOT NULL,
+  nonce String NOT NULL,
   number Int64 NOT NULL,
-  parent_hash FixedString(66) NOT NULL,
-  receipts_root FixedString(66) NOT NULL,
-  sha3_uncles FixedString(66) NOT NULL,
+  parent_hash String NOT NULL,
+  receipts_root String NOT NULL,
+  sha3_uncles String NOT NULL,
   size Int32 NOT NULL,
-  state_root FixedString(66) NOT NULL,
+  state_root String NOT NULL,
   status Enum('unfinalized', 'secure', 'finalized') NOT NULL,
   timestamp Date NOT NULL,
-  total_difficulty FixedString(66) NOT NULL,
+  total_difficulty String NOT NULL,
   transactions Int32 NOT NULL,
-  transactions_root FixedString(66) NOT NULL,
-  uncles Array(FixedString(66)) NOT NULL
+  transactions_root String NOT NULL,
+  uncles Array(String) NOT NULL
 )
 ENGINE = MergeTree()
 PRIMARY KEY (hash);
@@ -168,13 +168,13 @@ PRIMARY KEY (hash, log_index);
 CREATE TABLE indexer.token_details 
 (
   chain Int64 NOT NULL,
-  token FixedString(42) NOT NULL,
+  token String NOT NULL,
   name String NOT NULL,
   symbol String NOT NULL,
   decimals Int64,
-  token0 FixedString(42),
-  token1 FixedString(42),
-  factory FixedString(42),
+  token0 String,
+  token1 String,
+  factory String,
 )
 ENGINE = MergeTree()
 PRIMARY KEY (token, chain);

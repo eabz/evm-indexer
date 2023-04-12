@@ -4,8 +4,10 @@ use ethers::{
     utils::format_units,
 };
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum BlockStatus {
     Unfinalized,
     Secure,
@@ -29,10 +31,12 @@ pub struct DatabaseBlock {
     pub base_fee_per_gas: Option<f64>,
     pub chain: i64,
     pub difficulty: String,
+    #[serde(with = "serde_bytes")]
     pub extra_data: Vec<u8>,
     pub gas_limit: i64,
     pub gas_used: i64,
     pub hash: String,
+    #[serde(with = "serde_bytes")]
     pub logs_bloom: Vec<u8>,
     pub miner: String,
     pub mix_hash: String,

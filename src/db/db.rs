@@ -37,7 +37,6 @@ impl Database {
         let db = Client::default()
             .with_url(db_host)
             .with_user(db_username)
-            .with_password(db_password)
             .with_database(db_name);
 
         let redis = redis::Client::open(redis_url).expect("Unable to connect with redis server");
@@ -444,18 +443,17 @@ impl Database {
         chain_state: &DatabaseChainIndexedState,
     ) -> Result<()> {
         let connection = self.get_connection();
-        println!("connection");
-        let mut inserter = connection.insert("chains_indexed_state").unwrap();
-        println!("inserter");
 
-        inserter.write(chain_state).await.unwrap();
-        println!("write");
+        let query = format!(
+            "INSERT INTO chains_indexed_state VALUES ({},{})",
+            chain_state.chain, chain_state.indexed_blocks_amount
+        );
 
-        inserter
-            .end()
+        connection
+            .query(&query)
+            .execute()
             .await
             .expect("Unable to update indexed blocks number");
-        println!("end");
 
         Ok(())
     }
