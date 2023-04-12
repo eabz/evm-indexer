@@ -13,6 +13,7 @@ pub struct DatabaseTransaction {
     pub gas: i64,
     pub gas_price: Option<i64>,
     pub hash: String,
+    #[serde(with = "serde_bytes")]
     pub input: Vec<u8>,
     pub max_fee_per_gas: Option<i64>,
     pub max_priority_fee_per_gas: Option<i64>,

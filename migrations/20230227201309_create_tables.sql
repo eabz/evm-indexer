@@ -1,67 +1,67 @@
 CREATE DATABASE IF NOT EXISTS indexer;
 
 CREATE TABLE indexer.blocks (
-  base_fee_per_gas Float64,
-  chain Int64 NOT NULL,
-  difficulty String NOT NULL,
-  extra_data String NOT NULL,
-  gas_limit Int64 NOT NULL,
-  gas_used Int64 NOT NULL,
+  base_fee_per_gas Nullable(Float64),
+  chain Int64,
+  difficulty String,
+  extra_data String,
+  gas_limit Int64,
+  gas_used Int64,
   hash String,
-  logs_bloom String NOT NULL,
-  miner String NOT NULL,
-  mix_hash String NOT NULL,
-  nonce String NOT NULL,
-  number Int64 NOT NULL,
-  parent_hash String NOT NULL,
-  receipts_root String NOT NULL,
-  sha3_uncles String NOT NULL,
-  size Int32 NOT NULL,
-  state_root String NOT NULL,
-  status Enum('unfinalized', 'secure', 'finalized') NOT NULL,
-  timestamp Date NOT NULL,
-  total_difficulty String NOT NULL,
-  transactions Int32 NOT NULL,
-  transactions_root String NOT NULL,
-  uncles Array(String) NOT NULL
+  logs_bloom String,
+  miner String,
+  mix_hash String,
+  nonce String,
+  number Int64,
+  parent_hash String,
+  receipts_root String,
+  sha3_uncles String,
+  size Int32,
+  state_root String,
+  status Enum('unfinalized', 'secure', 'finalized'),
+  timestamp Int64,
+  total_difficulty String,
+  transactions Int32,
+  transactions_root String,
+  uncles Array(String)
 )
 ENGINE = MergeTree()
 PRIMARY KEY (hash);
 
 CREATE TABLE indexer.transactions (
-  block_hash String NOT NULL,
-  block_number Int64 NOT NULL,
-  chain Int64 NOT NULL,
-  from_address String NOT NULL,
-  gas Int64 NOT NULL,
-  gas_price Int64 NOT NULL,
+  block_hash String,
+  block_number Int64,
+  chain Int64,
+  from_address String,
+  gas Int64,
+  gas_price Nullable(Int64),
   hash String,
-  input String NOT NULL,
-  max_fee_per_gas Int64,
-  max_priority_fee_per_gas Int64,
-  method String NOT NULL,
-  nonce Int32 NOT NULL,
-  timestamp Date NOT NULL,
-  to_address String,
-  transaction_index Int32 NOT NULL,
-  transaction_type Int32 NOT NULL,
-  value Float64 NOT NULL
+  input String,
+  max_fee_per_gas Nullable(Int64),
+  max_priority_fee_per_gas Nullable(Int64),
+  method String,
+  nonce Int32,
+  timestamp Int64,
+  to_address Nullable(String),
+  transaction_index Int16,
+  transaction_type Int16,
+  value Float64
 )
 ENGINE = MergeTree()
 PRIMARY KEY (hash);
 
 CREATE TABLE indexer.methods (
-  name String NOT NULL,
+  name String,
   method String
 )
 ENGINE = MergeTree()
 PRIMARY KEY (method);
 
 CREATE TABLE indexer.receipts (
-  contract_address String,
-  cumulative_gas_used Int64 NOT NULL,
-  effective_gas_price Int64,
-  gas_used Int64 NOT NULL,
+  contract_address Nullable(String),
+  cumulative_gas_used Int64,
+  effective_gas_price Nullable(Int64),
+  gas_used Int64,
   hash String,
   status Enum('reverted', 'succeed', 'pending') NOT NULL,
 )
@@ -69,120 +69,121 @@ ENGINE = MergeTree()
 PRIMARY KEY (hash);
 
 CREATE TABLE indexer.contracts (
-  block Int64 NOT NULL,
-  contract_address String NOT NULL,
-  chain Int64 NOT NULL,
-  creator String NOT NULL,
-  hash String NOT NULL,
+  block Int64,
+  contract_address String,
+  chain Int64,
+  creator String,
+  hash String,
 )
 ENGINE = MergeTree()
 PRIMARY KEY (contract_address, chain);
 
 CREATE TABLE indexer.contract_metadata (
-  abi String NOT NULL,
-  chain Int64 NOT NULL,
-  contract_address String NOT NULL,
-  name String NOT NULL,
+  abi String,
+  chain Int64,
+  contract_address String,
+  name String,
 )
 ENGINE = MergeTree()
 PRIMARY KEY (contract_address, chain);
 
 CREATE TABLE indexer.logs (
-  address String NOT NULL,
-  chain Int64 NOT NULL,
-  data String NOT NULL,
-  hash String NOT NULL,
-  log_index Int32 NOT NULL,
-  log_type Int8,
-  removed boolean NOT NULL,
-  topics Array(String) NOT NULL,
-  timestamp Date NOT NULL,
-  transaction_log_index Int32,
+  address String,
+  chain Int64,
+  data String,
+  hash String,
+  log_index Int32,
+  log_type Nullable(String),
+  removed boolean,
+  topics Array(String),
+  transaction_log_index Nullable(Int32),
+  timestamp Int64,
 )
 ENGINE = MergeTree()
 PRIMARY KEY (hash, log_index);
 
 CREATE TABLE indexer.erc20_transfers (
-  amount Float64 NOT NULL,
-  chain Int64 NOT NULL,
-  from_address String NOT NULL,
-  hash String NOT NULL,
-  log_index Int32 NOT NULL,
-  to_address String NOT NULL,
-  token String NOT NULL,
-  transaction_log_index Int32,
-  timestamp Date NOT NULL,
+  amount Float64,
+  chain Int64,
+  from_address String,
+  hash String,
+  log_index Int32,
+  to_address String,
+  token String,
+  transaction_log_index Nullable(Int32),
+  timestamp Int64,
 )
 ENGINE = MergeTree()
 PRIMARY KEY (hash, log_index);
 
 CREATE TABLE indexer.erc721_transfers (
-  chain Int64 NOT NULL,
-  from_address String NOT NULL,
-  hash String NOT NULL,
-  log_index Int32 NOT NULL,
-  to_address String NOT NULL,
-  token String NOT NULL,
-  transaction_log_index INT,
-  id String NOT NULL,
-  timestamp Date NOT NULL,
+  chain Int64,
+  from_address String,
+  hash String,
+  log_index Int32,
+  to_address String,
+  token String,
+  transaction_log_index Nullable(Int32),
+  id String,
+  timestamp Int64,
 )
 ENGINE = MergeTree()
 PRIMARY KEY (hash, log_index);
 
 CREATE TABLE indexer.erc1155_transfers (
-  chain Int64 NOT NULL,
-  operator String NOT NULL,
-  from_address String NOT NULL,
-  hash String NOT NULL,
-  log_index Int32 NOT NULL,
-  to_address String NOT NULL,
-  token String NOT NULL,
-  transaction_log_index INT,
-  ids Array(String) NOT NULL,
-  values Array(Float64) NOT NULL,
-  timestamp Date NOT NULL,
+  chain Int64,
+  operator String,
+  from_address String,
+  hash String,
+  log_index Int32,
+  to_address String,
+  token String ,
+  transaction_log_index Nullable(Int32),
+  ids Array(String),
+  values Array(Float64),
+  timestamp Int64,
 )
 ENGINE = MergeTree()
 PRIMARY KEY (hash, log_index);
 
 CREATE TABLE indexer.dex_trades (
-  chain Int64 NOT NULL,
-  maker String NOT NULL,
-  hash String NOT NULL,
-  log_index Int32 NOT NULL,
-  receiver String NOT NULL,
-  token0 String NOT NULL,
-  token1 String NOT NULL,
-  pair_address String NOT NULL,
-  token0_amount Float64 NOT NULL,
-  token1_amount Float64 NOT NULL,
-  swap_rate Float64 NOT NULL,
-  transaction_log_index Int32,
-  timestamp Date NOT NULL,
-  trade_type Enum('buy', 'sell') NOT NULL,
+  chain Int64,
+  maker String,
+  hash String,
+  log_index Int32,
+  receiver String,
+  token0 String,
+  token1 String,
+  pair_address String,
+  factory String,
+  token0_amount Float64,
+  token1_amount Float64,
+  swap_rate Float64,
+  transaction_log_index Nullable(Int32),
+  timestamp Int64,
+  trade_type Enum('buy', 'sell'),
 )
 ENGINE = MergeTree()
 PRIMARY KEY (hash, log_index);
 
 CREATE TABLE indexer.token_details 
 (
-  chain Int64 NOT NULL,
-  token String NOT NULL,
-  name String NOT NULL,
-  symbol String NOT NULL,
+  chain Int64,
+  token String,
+  name String,
+  symbol String,
   decimals Int64,
-  token0 String,
-  token1 String,
-  factory String,
+  token0 Nullable(String),
+  token1 Nullable(String),
+  factory Nullable(String),
 )
 ENGINE = MergeTree()
 PRIMARY KEY (token, chain);
 
 CREATE TABLE indexer.chains_indexed_state
 (
-    chain Int64 NOT NULL,
-    indexed_blocks_amount Int64 NOT NULL
+    chain Int64,
+    indexed_blocks_amount Int64
 )
 ENGINE = ReplacingMergeTree
 ORDER BY chain

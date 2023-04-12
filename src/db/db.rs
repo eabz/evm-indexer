@@ -45,7 +45,19 @@ impl Database {
     }
 
     pub async fn get_indexed_blocks(&self) -> Result<HashSet<i64>> {
-        let blocks: HashSet<i64> = HashSet::new();
+        let connection = self.get_connection();
+
+        let query = format!(
+            "SELECT number FROM blocks WHERE chain = '{}'",
+            self.chain.id
+        );
+
+        let tokens = match connection.query(&query).fetch_all::<i64>().await {
+            Ok(tokens) => tokens,
+            Err(_) => Vec::new(),
+        };
+
+        let blocks: HashSet<i64> = HashSet::from_iter(tokens.into_iter().clone());
 
         Ok(blocks)
     }
@@ -64,11 +76,14 @@ impl Database {
         query.push_str(")");
 
         if tokens.len() > 0 {
-            let tokens = connection
+            let tokens = match connection
                 .query(&query)
                 .fetch_all::<DatabaseTokenDetails>()
                 .await
-                .unwrap();
+            {
+                Ok(tokens) => tokens,
+                Err(_) => Vec::new(),
+            };
 
             return tokens;
         }
@@ -374,10 +389,7 @@ impl Database {
     pub async fn store_token_details(&self, tokens: &Vec<DatabaseTokenDetails>) -> Result<()> {
         let connection = self.get_connection();
 
-        let mut inserter = connection
-            .inserter("token_details")
-            .unwrap()
-            .with_max_entries(tokens.len() as u64);
+        let mut inserter = connection.inserter("token_details").unwrap();
 
         for token in tokens {
             inserter.write(token).await.unwrap();
