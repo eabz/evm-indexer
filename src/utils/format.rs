@@ -29,6 +29,15 @@ pub fn format_bytes(b: &Bytes) -> String {
     return format!("{}", serde_json::to_string(b).unwrap().replace("\"", ""));
 }
 
+pub fn decode_bytes(s: String) -> Vec<u8> {
+    let without_prefix = &s[2..];
+    return hex::decode(without_prefix).unwrap();
+}
+
+pub fn format_bytes_slice(b: &[u8]) -> String {
+    return format!("0x{}", hex::encode(b));
+}
+
 pub fn byte4_from_input(input: &String) -> [u8; 4] {
     let input_sanitized = input.strip_prefix("0x").unwrap();
 

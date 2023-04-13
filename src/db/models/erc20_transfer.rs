@@ -3,7 +3,7 @@ use ethabi::{ethereum_types::H256, ParamType};
 use ethers::utils::format_units;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::format::format_address;
+use crate::utils::format::{decode_bytes, format_address};
 
 use super::log::DatabaseLog;
 
@@ -38,7 +38,9 @@ impl DatabaseERC20Transfer {
 
         let to_address = to_address_tokens.first().unwrap();
 
-        let value_tokens = ethabi::decode(&[ParamType::Uint(256)], &log.data[..]).unwrap();
+        let log_data = decode_bytes(log.data.clone());
+
+        let value_tokens = ethabi::decode(&[ParamType::Uint(256)], &log_data[..]).unwrap();
 
         let value = value_tokens.first().unwrap();
 

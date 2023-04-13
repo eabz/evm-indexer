@@ -2,14 +2,13 @@ use clickhouse::Row;
 use ethers::types::Log;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::format::{format_address, format_hash};
+use crate::utils::format::{format_address, format_bytes, format_hash};
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseLog {
     pub address: String,
     pub chain: i64,
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
+    pub data: String,
     pub hash: String,
     pub log_index: i32,
     pub log_type: Option<String>,
@@ -40,7 +39,7 @@ impl DatabaseLog {
                 .into_iter()
                 .map(|topic| format_hash(topic))
                 .collect(),
-            data: log.data.to_vec(),
+            data: format_bytes(&log.data),
             hash: format_hash(log.transaction_hash.unwrap()),
             removed: log.removed.unwrap(),
             log_index: log.log_index.unwrap().as_u32() as i32,

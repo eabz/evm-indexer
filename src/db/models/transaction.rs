@@ -13,8 +13,7 @@ pub struct DatabaseTransaction {
     pub gas: i64,
     pub gas_price: Option<i64>,
     pub hash: String,
-    #[serde(with = "serde_bytes")]
-    pub input: Vec<u8>,
+    pub input: String,
     pub max_fee_per_gas: Option<i64>,
     pub max_priority_fee_per_gas: Option<i64>,
     pub method: String,
@@ -62,7 +61,7 @@ impl DatabaseTransaction {
                 "0x{}",
                 hex::encode(byte4_from_input(&format_bytes(&transaction.input)))
             ),
-            input: transaction.input.to_vec(),
+            input: format_bytes(&transaction.input),
             nonce: transaction.nonce.as_u32() as i32,
             timestamp,
             to_address,
