@@ -11,6 +11,7 @@ use crate::chains::chains::Chain;
 use anyhow::Result;
 use clickhouse::Client;
 use futures::future::join_all;
+use hyper_tls::HttpsConnector;
 use log::info;
 
 pub const MAX_PARAM_SIZE: u16 = u16::MAX;
@@ -31,7 +32,11 @@ impl Database {
     ) -> Result<Self> {
         info!("Starting EVM database service");
 
-        let db = Client::default()
+        let https = HttpsConnector::new();
+
+        let client = hyper::Client::builder().build::<_, hyper::Body>(https);
+
+        let db = Client::with_http_client(client)
             .with_url(db_host)
             .with_user(db_username)
             .with_password(db_password)

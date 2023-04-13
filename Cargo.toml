@@ -14,6 +14,8 @@ ethabi = "18"
 ethers = { version = "1", features = ["ws", "rustls"] }
 futures = "0.3"
 hex = "0.4"
+hyper = "0.14"
+hyper-tls = "0.5"
 jsonrpsee = { version = "0.16", features = ["macros", "server"] }
 jsonrpsee-http-client = "0.16"
 log = "0.4"
@@ -29,7 +31,6 @@ tokio = { version = "1", features = ["full"] }
 version = "4.0.0"
 default-features = false
 features = ["colors"]
-
 
 [[bin]]
 path = "bin/indexer.rs"

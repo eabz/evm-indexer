@@ -1926,6 +1926,8 @@ dependencies = [
  "ethers",
  "futures",
  "hex",
+ "hyper",
+ "hyper-tls",
  "jsonrpsee",
  "jsonrpsee-http-client",
  "log",
