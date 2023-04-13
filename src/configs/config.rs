@@ -30,9 +30,10 @@ pub struct IndexerArgs {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub start_block: i64,
-    pub db_url: String,
-    pub agg_db_url: String,
-    pub redis_url: String,
+    pub db_host: String,
+    pub db_username: String,
+    pub db_password: String,
+    pub db_name: String,
     pub debug: bool,
     pub chain: Chain,
     pub batch_size: usize,
@@ -55,10 +56,12 @@ impl Config {
 
         Self {
             start_block: args.start_block,
-            db_url: std::env::var("DATABASE_URL").expect("DATABASE_URL must be set."),
-            agg_db_url: std::env::var("AGGREGATED_DATABASE_URL")
-                .expect("AGGREGATED_DATABASE_URL must be set."),
-            redis_url: std::env::var("REDIS_URL").expect("REDIS_URL must be set."),
+            db_host: std::env::var("DATABASE_HOST").expect("DATABASE_HOST must be set."),
+            db_username: std::env::var("DATABASE_USERNAME")
+                .expect("DATABASE_USERNAME must be set."),
+            db_password: std::env::var("DATABASE_PASSWORD")
+                .expect("DATABASE_PASSWORD must be set."),
+            db_name: std::env::var("DATABASE_NAME").expect("DATABASE_NAME must be set."),
             debug: args.debug,
             chain,
             batch_size: args.batch_size,

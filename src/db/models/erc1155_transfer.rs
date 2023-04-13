@@ -1,15 +1,16 @@
+use clickhouse::Row;
 use ethabi::{
     ethereum_types::{H256, U256},
     ParamType,
 };
 use ethers::utils::format_units;
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
 
-use crate::utils::format::{format_address, format_number};
+use crate::utils::format::{decode_bytes, format_address, format_number};
 
 use super::log::DatabaseLog;
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC1155Transfer {
     pub chain: i64,
     pub operator: String,
@@ -54,12 +55,14 @@ impl DatabaseERC1155Transfer {
         let mut values: Vec<f64> = Vec::new();
 
         if batch {
+            let log_data = decode_bytes(log.data.clone());
+
             let transfer_values = ethabi::decode(
                 &[
                     ParamType::Array(Box::new(ParamType::Uint(256))),
                     ParamType::Array(Box::new(ParamType::Uint(256))),
                 ],
-                &log.data[..],
+                &log_data[..],
             )
             .unwrap();
 
@@ -93,8 +96,10 @@ impl DatabaseERC1155Transfer {
             ids.append(&mut transfer_ids);
             values.append(&mut values_parsed);
         } else {
+            let log_data = decode_bytes(log.data.clone());
+
             let transfer_values =
-                ethabi::decode(&[ParamType::Uint(256), ParamType::Uint(256)], &log.data[..])
+                ethabi::decode(&[ParamType::Uint(256), ParamType::Uint(256)], &log_data[..])
                     .unwrap();
 
             let id = format_number(transfer_values[0].clone().into_uint().unwrap());

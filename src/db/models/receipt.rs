@@ -1,9 +1,12 @@
+use clickhouse::Row;
 use ethers::types::TransactionReceipt;
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::utils::format::{format_address, format_hash};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
+#[repr(u8)]
 pub enum TransactionStatus {
     Reverted,
     Succeed,
@@ -20,7 +23,7 @@ impl TransactionStatus {
     }
 }
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseReceipt {
     pub contract_address: Option<String>,
     pub cumulative_gas_used: i64,

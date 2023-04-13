@@ -1,10 +1,13 @@
+use clickhouse::Row;
 use ethers::{
     types::{Block, Transaction},
     utils::format_units,
 };
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum BlockStatus {
     Unfinalized,
     Secure,
@@ -21,18 +24,20 @@ impl BlockStatus {
     }
 }
 
-use crate::utils::format::{format_address, format_hash, format_nonce, format_number};
+use crate::utils::format::{
+    format_address, format_bytes, format_bytes_slice, format_hash, format_nonce, format_number,
+};
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseBlock {
     pub base_fee_per_gas: Option<f64>,
     pub chain: i64,
     pub difficulty: String,
-    pub extra_data: Vec<u8>,
+    pub extra_data: String,
     pub gas_limit: i64,
     pub gas_used: i64,
     pub hash: String,
-    pub logs_bloom: Vec<u8>,
+    pub logs_bloom: String,
     pub miner: String,
     pub mix_hash: String,
     pub nonce: String,
@@ -66,11 +71,11 @@ impl DatabaseBlock {
             base_fee_per_gas,
             chain,
             difficulty: format_number(block.difficulty),
-            extra_data: block.extra_data.to_vec(),
+            extra_data: format_bytes(&block.extra_data),
             gas_limit: block.gas_limit.as_u64() as i64,
             gas_used: block.gas_used.as_u64() as i64,
             hash: format_hash(block.hash.unwrap()),
-            logs_bloom: block.logs_bloom.unwrap().as_bytes().to_vec(),
+            logs_bloom: format_bytes_slice(block.logs_bloom.unwrap().as_bytes()),
             miner: format_address(block.author.unwrap()),
             mix_hash: format_hash(block.mix_hash.unwrap()),
             nonce: format_nonce(block.nonce.unwrap()),

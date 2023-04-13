@@ -13,8 +13,7 @@
 ## Requirements
 
 - [Rust](https://www.rust-lang.org/tools/install)
-- [CockroachDB](https://www.cockroachlabs.com/)
-- [Redis](https://redis.io/)
+- [ClickHouse](https://clickhouse.com/)
 
 ## Install
 

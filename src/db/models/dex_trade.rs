@@ -1,13 +1,16 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
+use clickhouse::Row;
 use ethabi::{ethereum_types::H256, ParamType};
 use ethers::utils::format_units;
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
-use crate::utils::format::format_address;
+use crate::utils::format::{decode_bytes, format_address};
 
 use super::{log::DatabaseLog, token_detail::DatabaseTokenDetails};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
+#[repr(u8)]
 pub enum TradeType {
     Buy,
     Sell,
@@ -22,7 +25,7 @@ impl TradeType {
     }
 }
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseDexTrade {
     pub chain: i64,
     pub maker: String,
@@ -64,6 +67,8 @@ impl DatabaseDexTrade {
 
         let receiver = receiver_tokens.first().unwrap();
 
+        let log_data = decode_bytes(log.data.clone());
+
         let values_tokens = ethabi::decode(
             &[
                 ParamType::Uint(256),
@@ -71,7 +76,7 @@ impl DatabaseDexTrade {
                 ParamType::Uint(256),
                 ParamType::Uint(256),
             ],
-            &log.data[..],
+            &log_data[..],
         )
         .unwrap();
 
@@ -150,6 +155,8 @@ impl DatabaseDexTrade {
 
         let receiver = receiver_tokens.first().unwrap();
 
+        let log_data = decode_bytes(log.data.clone());
+
         let values_tokens = ethabi::decode(
             &[
                 ParamType::Int(256),
@@ -158,7 +165,7 @@ impl DatabaseDexTrade {
                 ParamType::Uint(128),
                 ParamType::Int(24),
             ],
-            &log.data[..],
+            &log_data[..],
         )
         .unwrap();
 

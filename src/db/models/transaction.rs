@@ -1,9 +1,10 @@
+use clickhouse::Row;
 use ethers::{types::Transaction, utils::format_units};
-use field_count::FieldCount;
+use serde::{Deserialize, Serialize};
 
 use crate::utils::format::{byte4_from_input, format_address, format_bytes, format_hash};
 
-#[derive(Debug, Clone, FieldCount)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTransaction {
     pub block_hash: String,
     pub block_number: i64,
@@ -12,7 +13,7 @@ pub struct DatabaseTransaction {
     pub gas: i64,
     pub gas_price: Option<i64>,
     pub hash: String,
-    pub input: Vec<u8>,
+    pub input: String,
     pub max_fee_per_gas: Option<i64>,
     pub max_priority_fee_per_gas: Option<i64>,
     pub method: String,
@@ -60,7 +61,7 @@ impl DatabaseTransaction {
                 "0x{}",
                 hex::encode(byte4_from_input(&format_bytes(&transaction.input)))
             ),
-            input: transaction.input.to_vec(),
+            input: format_bytes(&transaction.input),
             nonce: transaction.nonce.as_u32() as i32,
             timestamp,
             to_address,
