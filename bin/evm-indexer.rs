@@ -8,16 +8,19 @@ use indexer::{
         models::{
             block::DatabaseBlock, chain_state::DatabaseChainIndexedState,
             contract::DatabaseContract, dex_trade::DatabaseDexTrade,
-            erc1155_transfer::DatabaseERC1155Transfer, erc20_transfer::DatabaseERC20Transfer,
-            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog, receipt::DatabaseReceipt,
-            transaction::DatabaseTransaction,
+            erc1155_transfer::DatabaseERC1155Transfer,
+            erc20_transfer::DatabaseERC20Transfer,
+            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
+            receipt::DatabaseReceipt, transaction::DatabaseTransaction,
         },
     },
     rpc::rpc::Rpc,
     utils::{
         events::{
-            ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
-            SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
+            ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
+            ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
+            SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE,
+            TRANSFER_EVENTS_SIGNATURE,
         },
         tokens::get_tokens,
     },
@@ -44,9 +47,8 @@ async fn main() {
 
     info!("Syncing chain {}.", config.chain.name.clone());
 
-    let rpc = Rpc::new(&config)
-        .await
-        .expect("Unable to start RPC client.");
+    let rpc =
+        Rpc::new(&config).await.expect("Unable to start RPC client.");
 
     let db = Database::new(
         config.db_host.clone(),
@@ -66,10 +68,16 @@ async fn main() {
     }
 }
 
-async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &mut HashSet<i64>) {
+async fn sync_chain(
+    rpc: &Rpc,
+    db: &Database,
+    config: &Config,
+    indexed_blocks: &mut HashSet<i64>,
+) {
     let last_block = rpc.get_last_block().await.unwrap();
 
-    let full_block_range: Vec<i64> = (config.start_block..last_block).collect();
+    let full_block_range: Vec<i64> =
+        (config.start_block..last_block).collect();
 
     let db_state = DatabaseChainIndexedState {
         chain: config.chain.id,
@@ -102,9 +110,12 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config, indexed_blocks: &
         let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
         let mut db_logs: Vec<DatabaseLog> = Vec::new();
         let mut db_contracts: Vec<DatabaseContract> = Vec::new();
-        let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> = Vec::new();
-        let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> = Vec::new();
-        let mut db_erc1155_transfers: Vec<DatabaseERC1155Transfer> = Vec::new();
+        let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
+            Vec::new();
+        let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> =
+            Vec::new();
+        let mut db_erc1155_transfers: Vec<DatabaseERC1155Transfer> =
+            Vec::new();
         let mut db_dex_trade: Vec<DatabaseDexTrade> = Vec::new();
 
         for result in results {
@@ -217,7 +228,8 @@ async fn fetch_block(
             if db_block.transactions != total_block_transactions as i32 {
                 warn!(
                     "Missing {} transactions for block {}.",
-                    db_block.transactions - total_block_transactions as i32,
+                    db_block.transactions
+                        - total_block_transactions as i32,
                     db_block.number
                 );
                 return None;
@@ -243,7 +255,10 @@ async fn fetch_block(
             } else {
                 for transaction in db_transactions.iter() {
                     let receipt_data = rpc
-                        .get_transaction_receipt(transaction.hash.clone(), transaction.timestamp)
+                        .get_transaction_receipt(
+                            transaction.hash.clone(),
+                            transaction.timestamp,
+                        )
                         .await
                         .unwrap();
 
@@ -252,7 +267,9 @@ async fn fetch_block(
                             db_receipts.push(receipt);
                             db_logs.append(&mut logs);
                             match contract {
-                                Some(contract) => db_contracts.push(contract),
+                                Some(contract) => {
+                                    db_contracts.push(contract)
+                                }
                                 None => continue,
                             }
                         }
@@ -270,11 +287,14 @@ async fn fetch_block(
                 return None;
             }
 
-            let mut tokens_metadata_required: HashSet<String> = HashSet::new();
+            let mut tokens_metadata_required: HashSet<String> =
+                HashSet::new();
 
             // filter only logs with topic
-            let logs_scan: Vec<&DatabaseLog> =
-                db_logs.iter().filter(|log| log.topics.len() > 0).collect();
+            let logs_scan: Vec<&DatabaseLog> = db_logs
+                .iter()
+                .filter(|log| log.topics.len() > 0)
+                .collect();
 
             // insert all the tokens from the logs to metadata check
             for log in logs_scan.iter() {
@@ -290,11 +310,15 @@ async fn fetch_block(
                 }
             }
 
-            let tokens_data = get_tokens(db, rpc, &tokens_metadata_required).await;
+            let tokens_data =
+                get_tokens(db, rpc, &tokens_metadata_required).await;
 
-            let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> = Vec::new();
-            let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> = Vec::new();
-            let mut db_erc1155_transfers: Vec<DatabaseERC1155Transfer> = Vec::new();
+            let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
+                Vec::new();
+            let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> =
+                Vec::new();
+            let mut db_erc1155_transfers: Vec<DatabaseERC1155Transfer> =
+                Vec::new();
             let mut db_dex_trades: Vec<DatabaseDexTrade> = Vec::new();
 
             for log in logs_scan.iter() {
@@ -306,17 +330,27 @@ async fn fetch_block(
 
                     // erc20 token transfer events have 2 indexed values.
                     if log.topics.len() == 3 {
-                        let decimals = tokens_data.get(&log.address).unwrap().decimals;
+                        let decimals = tokens_data
+                            .get(&log.address)
+                            .unwrap()
+                            .decimals;
 
                         let db_erc20_transfer =
-                            DatabaseERC20Transfer::from_log(&log, chain.id, decimals as usize);
+                            DatabaseERC20Transfer::from_log(
+                                &log,
+                                chain.id,
+                                decimals as usize,
+                            );
 
                         db_erc20_transfers.push(db_erc20_transfer);
                     }
 
                     // erc721 token transfer events have 3 indexed values.
                     if log.topics.len() == 4 {
-                        let db_erc721_transfer = DatabaseERC721Transfer::from_log(log, chain.id);
+                        let db_erc721_transfer =
+                            DatabaseERC721Transfer::from_log(
+                                log, chain.id,
+                            );
 
                         db_erc721_transfers.push(db_erc721_transfer);
                     }
@@ -324,14 +358,18 @@ async fn fetch_block(
 
                 if topic0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE {
                     let db_erc1155_transfer =
-                        DatabaseERC1155Transfer::from_log(&log, chain.id, false);
+                        DatabaseERC1155Transfer::from_log(
+                            &log, chain.id, false,
+                        );
 
                     db_erc1155_transfers.push(db_erc1155_transfer)
                 }
 
                 if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE {
                     let db_erc1155_transfer =
-                        DatabaseERC1155Transfer::from_log(&log, chain.id, true);
+                        DatabaseERC1155Transfer::from_log(
+                            &log, chain.id, true,
+                        );
 
                     db_erc1155_transfers.push(db_erc1155_transfer)
                 }

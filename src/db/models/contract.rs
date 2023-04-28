@@ -14,11 +14,13 @@ pub struct DatabaseContract {
 }
 
 impl DatabaseContract {
-    pub fn from_rpc(receipt: &TransactionReceipt, chain: i64) -> Self {
+    pub fn from_rpc(receipt: &TransactionReceipt, chain: u64) -> Self {
         Self {
-            block: receipt.block_number.unwrap().as_u64() as i64,
+            block: receipt.block_number.unwrap().as_u64(),
             chain: chain.to_owned(),
-            contract_address: format_address(receipt.contract_address.unwrap()),
+            contract_address: format_address(
+                receipt.contract_address.unwrap(),
+            ),
             creator: format_address(receipt.from),
             hash: format_hash(receipt.transaction_hash),
         }

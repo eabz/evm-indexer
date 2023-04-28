@@ -27,10 +27,16 @@ pub struct IndexerArgs {
     )]
     pub batch_size: usize,
 
-    #[arg(long, help = "Comma separated list of rpcs to use to fetch blocks.")]
+    #[arg(
+        long,
+        help = "Comma separated list of rpcs to use to fetch blocks."
+    )]
     pub rpcs: String,
 
-    #[arg(long, help = "Clickhouse database string with username and password.")]
+    #[arg(
+        long,
+        help = "Clickhouse database string with username and password."
+    )]
     pub database: String,
 }
 
@@ -59,7 +65,8 @@ impl Config {
 
         let chain = get_chain(chainname.clone());
 
-        let rpcs: Vec<String> = args.rpcs.split(",").map(|rpc| rpc.to_string()).collect();
+        let rpcs: Vec<String> =
+            args.rpcs.split(",").map(|rpc| rpc.to_string()).collect();
 
         Self {
             start_block: args.start_block,

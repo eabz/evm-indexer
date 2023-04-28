@@ -1,9 +1,12 @@
 use clickhouse::Row;
-use ethabi::ethereum_types::U256;
-use ethers::{types::Transaction, utils::format_units};
+use ethabi::ethereum_types::{H160, U256};
+use ethers::types::Transaction;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::format::{byte4_from_input, format_address, format_bytes, format_hash};
+use crate::utils::format::{
+    byte4_from_input, format_address, format_bytes, format_hash,
+    opt_serialize_u256, serialize_u256,
+};
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTransaction {
@@ -12,67 +15,92 @@ pub struct DatabaseTransaction {
     pub block_number: u64,
     pub chain: u64,
     pub from: String,
+    #[serde(with = "serialize_u256")]
     pub gas: U256,
+    #[serde(with = "opt_serialize_u256")]
     pub gas_price: Option<U256>,
     pub hash: String,
     pub input: String,
+    #[serde(with = "opt_serialize_u256")]
     pub max_fee_per_gas: Option<U256>,
+    #[serde(with = "opt_serialize_u256")]
     pub max_priority_fee_per_gas: Option<U256>,
     pub method: String,
+    #[serde(with = "serialize_u256")]
     pub nonce: U256,
     pub timestamp: u64,
-    pub to: Option<String>,
+    pub to: String,
     pub transaction_index: u16,
     pub transaction_type: u16,
+    #[serde(with = "serialize_u256")]
     pub value: U256,
 }
 
 impl DatabaseTransaction {
-    pub fn from_rpc(transaction: Transaction, chain: i64, timestamp: i64) -> Self {
-        let max_fee_per_gas: Option<i64> = match transaction.max_fee_per_gas {
-            None => None,
-            Some(max_fee_per_gas) => Some(max_fee_per_gas.as_u64() as i64),
+    pub fn from_rpc(
+        transaction: Transaction,
+        chain: u64,
+        timestamp: u64,
+    ) -> Self {
+        let to: String = match transaction.to {
+            Some(address) => format_address(address),
+            None => format_address(H160::zero()),
         };
 
-        let max_priority_fee_per_gas: Option<i64> = match transaction.max_priority_fee_per_gas {
-            None => None,
-            Some(max_priority_fee_per_gas) => Some(max_priority_fee_per_gas.as_u64() as i64),
+        let transaction_type: u16 = match transaction.transaction_type {
+            Some(transaction_type) => transaction_type.as_u64() as u16,
+            None => 0,
         };
 
-        let to_address: Option<String> = match transaction.to {
-            None => None,
-            Some(to) => Some(format_address(to)),
-        };
+        let access_list: Vec<(String, Vec<String>)> = match transaction
+            .access_list
+        {
+            Some(access_list_items) => {
+                let mut access_list: Vec<(String, Vec<String>)> =
+                    Vec::new();
 
-        let gas_price: Option<i64> = match transaction.gas_price {
-            None => None,
-            Some(gas_price) => Some(gas_price.as_u64() as i64),
+                for item in access_list_items.0 {
+                    let keys: Vec<String> = item
+                        .storage_keys
+                        .into_iter()
+                        .map(format_hash)
+                        .collect();
+
+                    access_list.push((format_address(item.address), keys))
+                }
+
+                access_list
+            }
+            None => Vec::new(),
         };
 
         Self {
+            access_list,
             block_hash: format_hash(transaction.block_hash.unwrap()),
-            block_number: transaction.block_number.unwrap().as_u64() as i64,
+            block_number: transaction.block_number.unwrap().as_u64(),
             chain: chain.to_owned(),
-            from_address: format_address(transaction.from),
-            gas: transaction.gas.as_u64() as i64,
-            gas_price,
-            max_priority_fee_per_gas,
-            max_fee_per_gas,
+            from: format_address(transaction.from),
+            gas: transaction.gas,
+            gas_price: transaction.gas_price,
+            max_priority_fee_per_gas: transaction.max_priority_fee_per_gas,
+            max_fee_per_gas: transaction.max_fee_per_gas,
             hash: format_hash(transaction.hash),
             method: format!(
                 "0x{}",
-                hex::encode(byte4_from_input(&format_bytes(&transaction.input)))
+                hex::encode(byte4_from_input(&format_bytes(
+                    &transaction.input
+                )))
             ),
             input: format_bytes(&transaction.input),
-            nonce: transaction.nonce.as_u32() as i32,
+            nonce: transaction.nonce,
             timestamp,
-            to_address,
-            transaction_index: transaction.transaction_index.unwrap().as_u32() as i16,
-            transaction_type: transaction.transaction_type.unwrap().as_u32() as i16,
-            value: format_units(transaction.value, 18)
+            to,
+            transaction_index: transaction
+                .transaction_index
                 .unwrap()
-                .parse::<f64>()
-                .unwrap(),
+                .as_u64() as u16,
+            transaction_type,
+            value: transaction.value,
         }
     }
 }

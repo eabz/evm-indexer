@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 
 use super::models::{
-    block::DatabaseBlock, chain_state::DatabaseChainIndexedState, contract::DatabaseContract,
-    dex_trade::DatabaseDexTrade, erc1155_transfer::DatabaseERC1155Transfer,
-    erc20_transfer::DatabaseERC20Transfer, erc721_transfer::DatabaseERC721Transfer,
-    log::DatabaseLog, receipt::DatabaseReceipt, token::DatabaseTokenDetails,
+    block::DatabaseBlock, chain_state::DatabaseChainIndexedState,
+    contract::DatabaseContract, dex_trade::DatabaseDexTrade,
+    erc1155_transfer::DatabaseERC1155Transfer,
+    erc20_transfer::DatabaseERC20Transfer,
+    erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
+    receipt::DatabaseReceipt, token::DatabaseTokenDetails,
     transaction::DatabaseTransaction,
 };
 use crate::chains::chains::Chain;
@@ -62,20 +64,27 @@ impl Database {
             self.chain.id
         );
 
-        let tokens = match connection.query(&query).fetch_all::<i64>().await {
-            Ok(tokens) => tokens,
-            Err(_) => Vec::new(),
-        };
+        let tokens =
+            match connection.query(&query).fetch_all::<i64>().await {
+                Ok(tokens) => tokens,
+                Err(_) => Vec::new(),
+            };
 
-        let blocks: HashSet<i64> = HashSet::from_iter(tokens.into_iter().clone());
+        let blocks: HashSet<i64> =
+            HashSet::from_iter(tokens.into_iter().clone());
 
         Ok(blocks)
     }
 
-    pub async fn get_tokens(&self, tokens: &HashSet<String>) -> Vec<DatabaseTokenDetails> {
+    pub async fn get_tokens(
+        &self,
+        tokens: &HashSet<String>,
+    ) -> Vec<DatabaseTokenDetails> {
         let connection = self.get_connection();
 
-        let mut query = String::from("SELECT * FROM token_details WHERE (token, chain) IN (");
+        let mut query = String::from(
+            "SELECT * FROM token_details WHERE (token, chain) IN (",
+        );
 
         for token in tokens {
             let condition = format!("('{}',{}),", token, self.chain.id);
@@ -145,7 +154,11 @@ impl Database {
             let work = tokio::spawn({
                 let logs = logs.clone();
                 let db = self.clone();
-                async move { db.store_logs(&logs).await.expect("unable to store logs") }
+                async move {
+                    db.store_logs(&logs)
+                        .await
+                        .expect("unable to store logs")
+                }
             });
             stores.push(work);
         }
@@ -217,7 +230,8 @@ impl Database {
 
         let res = join_all(stores).await;
 
-        let errored: Vec<_> = res.iter().filter(|res| res.is_err()).collect();
+        let errored: Vec<_> =
+            res.iter().filter(|res| res.is_err()).collect();
 
         if errored.len() > 0 {
             panic!("failed to store all chain primitive elements")
@@ -241,7 +255,10 @@ impl Database {
         );
     }
 
-    async fn store_transactions(&self, transactions: &Vec<DatabaseTransaction>) -> Result<()> {
+    async fn store_transactions(
+        &self,
+        transactions: &Vec<DatabaseTransaction>,
+    ) -> Result<()> {
         let connection = self.get_connection();
 
         let mut inserter = connection.inserter("transactions").unwrap();
@@ -257,7 +274,10 @@ impl Database {
         Ok(())
     }
 
-    async fn store_receipts(&self, receipts: &Vec<DatabaseReceipt>) -> Result<()> {
+    async fn store_receipts(
+        &self,
+        receipts: &Vec<DatabaseReceipt>,
+    ) -> Result<()> {
         let connection = self.get_connection();
 
         let mut inserter = connection.inserter("receipts").unwrap();
@@ -283,15 +303,15 @@ impl Database {
             inserter.write(log).await.unwrap();
         }
 
-        inserter
-            .end()
-            .await
-            .expect("Unable to store logs into database");
+        inserter.end().await.expect("Unable to store logs into database");
 
         Ok(())
     }
 
-    async fn store_contracts(&self, contracts: &Vec<DatabaseContract>) -> Result<()> {
+    async fn store_contracts(
+        &self,
+        contracts: &Vec<DatabaseContract>,
+    ) -> Result<()> {
         let connection = self.get_connection();
 
         let mut inserter = connection.inserter("contracts").unwrap();
@@ -308,7 +328,10 @@ impl Database {
         Ok(())
     }
 
-    async fn store_erc20_transfers(&self, transfers: &Vec<DatabaseERC20Transfer>) -> Result<()> {
+    async fn store_erc20_transfers(
+        &self,
+        transfers: &Vec<DatabaseERC20Transfer>,
+    ) -> Result<()> {
         let connection = self.get_connection();
 
         let mut inserter = connection.inserter("erc20_transfers").unwrap();
@@ -325,10 +348,14 @@ impl Database {
         Ok(())
     }
 
-    async fn store_erc721_transfers(&self, transfers: &Vec<DatabaseERC721Transfer>) -> Result<()> {
+    async fn store_erc721_transfers(
+        &self,
+        transfers: &Vec<DatabaseERC721Transfer>,
+    ) -> Result<()> {
         let connection = self.get_connection();
 
-        let mut inserter = connection.inserter("erc721_transfers").unwrap();
+        let mut inserter =
+            connection.inserter("erc721_transfers").unwrap();
 
         for transfer in transfers {
             inserter.write(transfer).await.unwrap();
@@ -348,7 +375,8 @@ impl Database {
     ) -> Result<()> {
         let connection = self.get_connection();
 
-        let mut inserter = connection.inserter("erc1155_transfers").unwrap();
+        let mut inserter =
+            connection.inserter("erc1155_transfers").unwrap();
 
         for transfer in transfers {
             inserter.write(transfer).await.unwrap();
@@ -362,7 +390,10 @@ impl Database {
         Ok(())
     }
 
-    async fn store_dex_trades(&self, trades: &Vec<DatabaseDexTrade>) -> Result<()> {
+    async fn store_dex_trades(
+        &self,
+        trades: &Vec<DatabaseDexTrade>,
+    ) -> Result<()> {
         let connection = self.get_connection();
 
         let mut inserter = connection.inserter("dex_trades").unwrap();
@@ -379,7 +410,10 @@ impl Database {
         Ok(())
     }
 
-    async fn store_blocks(&self, blocks: &Vec<DatabaseBlock>) -> Result<()> {
+    async fn store_blocks(
+        &self,
+        blocks: &Vec<DatabaseBlock>,
+    ) -> Result<()> {
         let connection = self.get_connection();
 
         let mut inserter = connection.inserter("blocks").unwrap();
@@ -396,7 +430,10 @@ impl Database {
         Ok(())
     }
 
-    pub async fn store_token_details(&self, tokens: &Vec<DatabaseTokenDetails>) -> Result<()> {
+    pub async fn store_token_details(
+        &self,
+        tokens: &Vec<DatabaseTokenDetails>,
+    ) -> Result<()> {
         let connection = self.get_connection();
 
         let mut inserter = connection.inserter("token_details").unwrap();

@@ -61,14 +61,16 @@ impl Rpc {
                 .build(rpc)
                 .unwrap();
 
-            let client_id = client.request("eth_chainId", rpc_params![]).await;
+            let client_id =
+                client.request("eth_chainId", rpc_params![]).await;
 
             match client_id {
                 Ok(value) => {
-                    let chain_id: U256 = match serde_json::from_value(value) {
-                        Ok(value) => value,
-                        Err(_) => continue,
-                    };
+                    let chain_id: U256 =
+                        match serde_json::from_value(value) {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        };
 
                     if chain_id.as_u64() as i64 != config.chain.id {
                         continue;
@@ -85,11 +87,7 @@ impl Rpc {
             panic!("No valid rpc client found");
         }
 
-        Ok(Self {
-            clients,
-            clients_urls,
-            chain: config.chain,
-        })
+        Ok(Self { clients, clients_urls, chain: config.chain })
     }
 
     fn get_client(&self) -> &HttpClient {
@@ -98,19 +96,23 @@ impl Rpc {
     }
 
     fn get_client_url(&self) -> &String {
-        let client = self.clients_urls.choose(&mut rand::thread_rng()).unwrap();
+        let client =
+            self.clients_urls.choose(&mut rand::thread_rng()).unwrap();
         return client;
     }
 
     pub async fn get_last_block(&self) -> Result<i64> {
         let client = self.get_client();
 
-        let last_block = client.request("eth_blockNumber", rpc_params![]).await;
+        let last_block =
+            client.request("eth_blockNumber", rpc_params![]).await;
 
         match last_block {
             Ok(value) => {
                 let block_number: U256 = serde_json::from_value(value)
-                    .expect("Unable to deserialize eth_blockNumber response");
+                    .expect(
+                        "Unable to deserialize eth_blockNumber response",
+                    );
 
                 Ok(block_number.as_u64() as i64)
             }
@@ -133,20 +135,23 @@ impl Rpc {
 
         match raw_block {
             Ok(value) => {
-                let block: Result<Block<Transaction>, Error> = serde_json::from_value(value);
+                let block: Result<Block<Transaction>, Error> =
+                    serde_json::from_value(value);
 
                 match block {
                     Ok(block) => {
-                        let db_block = DatabaseBlock::from_rpc(&block, self.chain.id);
+                        let db_block =
+                            DatabaseBlock::from_rpc(&block, self.chain.id);
 
                         let mut db_transactions = Vec::new();
 
                         for transaction in block.transactions {
-                            let db_transaction = DatabaseTransaction::from_rpc(
-                                transaction,
-                                self.chain.id,
-                                db_block.timestamp,
-                            );
+                            let db_transaction =
+                                DatabaseTransaction::from_rpc(
+                                    transaction,
+                                    self.chain.id,
+                                    db_block.timestamp,
+                                );
 
                             db_transactions.push(db_transaction)
                         }
@@ -164,7 +169,13 @@ impl Rpc {
         &self,
         transaction: String,
         transaction_timestamp: i64,
-    ) -> Result<Option<(DatabaseReceipt, Vec<DatabaseLog>, Option<DatabaseContract>)>> {
+    ) -> Result<
+        Option<(
+            DatabaseReceipt,
+            Vec<DatabaseLog>,
+            Option<DatabaseContract>,
+        )>,
+    > {
         let client = self.get_client();
 
         let raw_receipt = client
@@ -173,15 +184,20 @@ impl Rpc {
 
         match raw_receipt {
             Ok(value) => {
-                let receipt: Result<TransactionReceipt, Error> = serde_json::from_value(value);
+                let receipt: Result<TransactionReceipt, Error> =
+                    serde_json::from_value(value);
 
                 match receipt {
                     Ok(receipt) => {
-                        let db_receipt = DatabaseReceipt::from_rpc(&receipt);
+                        let db_receipt =
+                            DatabaseReceipt::from_rpc(&receipt);
 
-                        let mut db_transaction_logs: Vec<DatabaseLog> = Vec::new();
+                        let mut db_transaction_logs: Vec<DatabaseLog> =
+                            Vec::new();
 
-                        let status: TransactionStatus = match receipt.status {
+                        let status: TransactionStatus = match receipt
+                            .status
+                        {
                             None => TransactionStatus::Succeed,
                             Some(status) => {
                                 let status_number = status.as_u64() as i64;
@@ -194,25 +210,36 @@ impl Rpc {
                             }
                         };
 
-                        let mut db_contract: Option<DatabaseContract> = None;
+                        let mut db_contract: Option<DatabaseContract> =
+                            None;
 
                         if status == TransactionStatus::Succeed {
                             db_contract = match receipt.contract_address {
                                 Some(_) => {
-                                    Some(DatabaseContract::from_rpc(&receipt, self.chain.id))
+                                    Some(DatabaseContract::from_rpc(
+                                        &receipt,
+                                        self.chain.id,
+                                    ))
                                 }
                                 None => None,
                             };
                         }
 
                         for log in receipt.logs.iter() {
-                            let db_log =
-                                DatabaseLog::from_rpc(log, self.chain.id, transaction_timestamp);
+                            let db_log = DatabaseLog::from_rpc(
+                                log,
+                                self.chain.id,
+                                transaction_timestamp,
+                            );
 
                             db_transaction_logs.push(db_log)
                         }
 
-                        return Ok(Some((db_receipt, db_transaction_logs, db_contract)));
+                        return Ok(Some((
+                            db_receipt,
+                            db_transaction_logs,
+                            db_contract,
+                        )));
                     }
                     Err(_) => return Ok(None),
                 }
@@ -248,37 +275,52 @@ impl Rpc {
 
                 match receipts {
                     Ok(receipts) => {
-                        let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
+                        let mut db_receipts: Vec<DatabaseReceipt> =
+                            Vec::new();
 
-                        let mut db_transaction_logs: Vec<DatabaseLog> = Vec::new();
+                        let mut db_transaction_logs: Vec<DatabaseLog> =
+                            Vec::new();
 
-                        let mut db_contracts: Vec<DatabaseContract> = Vec::new();
+                        let mut db_contracts: Vec<DatabaseContract> =
+                            Vec::new();
 
                         for receipt in receipts {
-                            let db_receipt = DatabaseReceipt::from_rpc(&receipt);
+                            let db_receipt =
+                                DatabaseReceipt::from_rpc(&receipt);
 
                             db_receipts.push(db_receipt);
 
-                            let db_contract = match receipt.contract_address {
-                                Some(_) => {
-                                    Some(DatabaseContract::from_rpc(&receipt, self.chain.id))
-                                }
-                                None => None,
-                            };
+                            let db_contract =
+                                match receipt.contract_address {
+                                    Some(_) => {
+                                        Some(DatabaseContract::from_rpc(
+                                            &receipt,
+                                            self.chain.id,
+                                        ))
+                                    }
+                                    None => None,
+                                };
 
                             if db_contract.is_some() {
                                 db_contracts.push(db_contract.unwrap())
                             }
 
                             for log in receipt.logs.iter() {
-                                let db_log =
-                                    DatabaseLog::from_rpc(log, self.chain.id, block_timestamp);
+                                let db_log = DatabaseLog::from_rpc(
+                                    log,
+                                    self.chain.id,
+                                    block_timestamp,
+                                );
 
                                 db_transaction_logs.push(db_log)
                             }
                         }
 
-                        return Ok(Some((db_receipts, db_transaction_logs, db_contracts)));
+                        return Ok(Some((
+                            db_receipts,
+                            db_transaction_logs,
+                            db_contracts,
+                        )));
                     }
                     Err(_) => return Ok(None),
                 }
@@ -287,7 +329,10 @@ impl Rpc {
         }
     }
 
-    pub async fn get_token_metadata(&self, token: String) -> Option<DatabaseTokenDetails> {
+    pub async fn get_token_metadata(
+        &self,
+        token: String,
+    ) -> Option<DatabaseTokenDetails> {
         let client = self.get_client_url();
 
         let provider = match Provider::<Http>::try_from(client) {
@@ -297,7 +342,10 @@ impl Rpc {
 
         let client = Arc::new(provider);
 
-        let token_contract = ERC20::new(token.parse::<Address>().unwrap(), Arc::clone(&client));
+        let token_contract = ERC20::new(
+            token.parse::<Address>().unwrap(),
+            Arc::clone(&client),
+        );
 
         let mut multicall = Multicall::new(
             client.clone(),
@@ -341,9 +389,12 @@ impl Rpc {
 
         let mut decimals: i64 = 0;
 
-        let decimals_success = decimals_tuple[0].clone().into_bool().unwrap();
+        let decimals_success =
+            decimals_tuple[0].clone().into_bool().unwrap();
         if decimals_success {
-            decimals = decimals_tuple[1].clone().into_uint().unwrap().as_u64() as i64;
+            decimals =
+                decimals_tuple[1].clone().into_uint().unwrap().as_u64()
+                    as i64;
         }
 
         let mut token0: Option<String> = None;
@@ -363,7 +414,8 @@ impl Rpc {
         }
 
         let mut factory: Option<String> = None;
-        let factory_success = factory_tuple[0].clone().into_bool().unwrap();
+        let factory_success =
+            factory_tuple[0].clone().into_bool().unwrap();
         if factory_success {
             factory = Some(format_address(
                 factory_tuple[1].clone().into_address().unwrap(),

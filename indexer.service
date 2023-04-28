@@ -1,0 +1,14 @@
+[Unit]
+Description=Indexer
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+ExecStart=/usr/local/bin/indexer --rpcs "https://eth.llamarpc.com:443" 
+WorkingDirectory=/root/indexer/
+StandardOutput=append:/var/log/indexer.log
+
+[Install]
+WantedBy=multi-user.target

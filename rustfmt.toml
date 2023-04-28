@@ -1,0 +1,6 @@
+# Basic
+max_width = 75
+use_small_heuristics = "Max"
+
+# Imports
+reorder_imports = true
