@@ -4,27 +4,30 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(
     name = "EVM Indexer",
-    about = "Scalable SQL indexer for EVM based blockchains."
+    about = "Scalable SQL indexer for EVM compatible blockchains."
 )]
 pub struct IndexerArgs {
     #[arg(long, help = "Start log with debug.", default_value_t = false)]
     pub debug: bool,
 
-    #[arg(long, help = "Chain name to sync.", default_value_t = String::from("mainnet"))]
-    pub chain: String,
+    #[arg(long, help = "Number identifying the chain id to sync.", default_value_t = 1)]
+    pub chain: usize,
 
     #[arg(long, help = "Block to start syncing.", default_value_t = 0)]
     pub start_block: i64,
 
     #[arg(
         long,
-        help = "Amount of blocks to fetch at the same time.",
+        help = " Amount of blocks to fetch in parallel.",
         default_value_t = 200
     )]
     pub batch_size: usize,
 
     #[arg(long, help = "Comma separated list of rpcs to use to fetch blocks.")]
     pub rpcs: String,
+
+    #[arg(long, help = "Clickhouse database string with username and password.")]
+    pub database: String,
 }
 
 #[derive(Debug, Clone)]
@@ -56,12 +59,10 @@ impl Config {
 
         Self {
             start_block: args.start_block,
-            db_host: std::env::var("DATABASE_HOST").expect("DATABASE_HOST must be set."),
-            db_username: std::env::var("DATABASE_USERNAME")
-                .expect("DATABASE_USERNAME must be set."),
-            db_password: std::env::var("DATABASE_PASSWORD")
-                .expect("DATABASE_PASSWORD must be set."),
-            db_name: std::env::var("DATABASE_NAME").expect("DATABASE_NAME must be set."),
+            db_host: "",
+            db_username: "",
+            db_password: s"",
+            db_name: "",
             debug: args.debug,
             chain,
             batch_size: args.batch_size,
