@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    db::{db::Database, models::token::DatabaseTokenDetails},
-    rpc::rpc::Rpc,
+    db::{models::token::DatabaseToken, Database},
+    rpc::Rpc,
 };
 
 async fn get_tokens_metadata(
     db: &Database,
     rpc: &Rpc,
     tokens: &HashSet<String>,
-) -> Vec<DatabaseTokenDetails> {
+) -> Vec<DatabaseToken> {
     let mut db_tokens = db.get_tokens(&tokens).await;
 
     let db_token_address: Vec<String> =
@@ -20,8 +20,7 @@ async fn get_tokens_metadata(
         .filter(|token| !db_token_address.contains(&token))
         .collect();
 
-    let mut missing_tokens_metadata: Vec<DatabaseTokenDetails> =
-        Vec::new();
+    let mut missing_tokens_metadata: Vec<DatabaseToken> = Vec::new();
 
     for missing_token in missing_tokens.iter() {
         let data = rpc
@@ -45,11 +44,10 @@ pub async fn get_tokens(
     db: &Database,
     rpc: &Rpc,
     tokens: &HashSet<String>,
-) -> HashMap<String, DatabaseTokenDetails> {
+) -> HashMap<String, DatabaseToken> {
     let db_tokens = get_tokens_metadata(db, rpc, tokens).await;
 
-    let mut tokens_data: HashMap<String, DatabaseTokenDetails> =
-        HashMap::new();
+    let mut tokens_data: HashMap<String, DatabaseToken> = HashMap::new();
 
     for token in db_tokens.iter() {
         tokens_data.insert(token.token.clone(), token.to_owned());

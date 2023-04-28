@@ -1,10 +1,8 @@
 use dotenv::dotenv;
-use futures::future::join_all;
-use indexer::{
-    chains::chains::Chain,
-    configs::config::Config,
+use evm_indexer::{
+    chains::Chain,
+    configs::Config,
     db::{
-        db::Database,
         models::{
             block::DatabaseBlock, chain_state::DatabaseChainIndexedState,
             contract::DatabaseContract, dex_trade::DatabaseDexTrade,
@@ -13,8 +11,9 @@ use indexer::{
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
             receipt::DatabaseReceipt, transaction::DatabaseTransaction,
         },
+        Database,
     },
-    rpc::rpc::Rpc,
+    rpc::Rpc,
     utils::{
         events::{
             ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
@@ -25,6 +24,7 @@ use indexer::{
         tokens::get_tokens,
     },
 };
+use futures::future::join_all;
 use log::*;
 use simple_logger::SimpleLogger;
 use std::{collections::HashSet, thread::sleep, time::Duration};
