@@ -11,7 +11,7 @@ clap = { version = "4", features = ["derive"] }
 clickhouse = "0.11"
 dotenv = "0.15"
 ethabi = "18"
-ethers = { version = "1", features = ["ws", "rustls"] }
+ethers = { version = "2", features = ["rustls"] }
 futures = "0.3"
 hex = "0.4"
 hyper = "0.14"

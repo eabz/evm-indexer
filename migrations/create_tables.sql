@@ -129,7 +129,7 @@ CREATE TABLE indexer.receipts (
   contract_address Nullable(String),
   cumulative_gas_used UInt256,
   effective_gas_price Nullable(UInt256),
-  gas_used Nullable(UInt256),,
+  gas_used Nullable(UInt256),
   hash String,
   status UInt64,
 )

@@ -72,3 +72,4 @@ docker build . -t indexer
 | --batch-size  |   200   | Amount of blocks to fetch in parallel.                 |
 | --rpcs        | `empty` | Comma separated list of rpcs to use to fetch blocks.   |
 | --database    | `empty` | Clickhouse database string with username and password. |
+| --ws          | `empty` | Url of the websocket endpoint to fetch new blocks.     |

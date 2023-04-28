@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use clickhouse::Row;
 use ethabi::{
     ethereum_types::{H256, U256},
@@ -9,7 +11,7 @@ use crate::utils::format::{
     decode_bytes, format_address, opt_serialize_u256, serialize_u256,
 };
 
-use super::log::DatabaseLog;
+use super::{log::DatabaseLog, token::DatabaseToken};
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseDexTrade {
@@ -33,7 +35,11 @@ pub struct DatabaseDexTrade {
 }
 
 impl DatabaseDexTrade {
-    pub fn from_v2_log(log: &DatabaseLog, chain: u64) -> Self {
+    pub fn from_v2_log(
+        log: &DatabaseLog,
+        chain: u64,
+        tokens_metadata: &HashMap<String, DatabaseToken>,
+    ) -> Self {
         let maker_bytes = array_bytes::hex_n_into::<String, H256, 32>(
             log.topic1.clone().unwrap(),
         )
@@ -75,6 +81,10 @@ impl DatabaseDexTrade {
 
         let token1_out = values_tokens[3].to_owned().into_uint().unwrap();
 
+        let pair_address = log.address.clone();
+
+        let pair_metadata = tokens_metadata.get(&pair_address).unwrap();
+
         Self {
             chain,
             maker: format_address(
@@ -89,16 +99,18 @@ impl DatabaseDexTrade {
             token1_amount: token1_out,
             transaction_log_index: log.transaction_log_index,
             timestamp: log.timestamp,
-
-            // TODO: fetch pair data
-            token0: "".to_string(),
-            token1: "".to_string(),
-            pair_address: "".to_string(),
-            factory: "".to_string(),
+            token0: pair_metadata.token0.clone().unwrap(),
+            token1: pair_metadata.token1.clone().unwrap(),
+            pair_address,
+            factory: pair_metadata.factory.clone().unwrap(),
         }
     }
 
-    pub fn from_v3_log(log: &DatabaseLog, chain: u64) -> Self {
+    pub fn from_v3_log(
+        log: &DatabaseLog,
+        chain: u64,
+        tokens_metadata: &HashMap<String, DatabaseToken>,
+    ) -> Self {
         let maker_bytes = array_bytes::hex_n_into::<String, H256, 32>(
             log.topic1.clone().unwrap(),
         )
@@ -143,6 +155,10 @@ impl DatabaseDexTrade {
         let token1_amount =
             values_tokens[1].to_owned().into_int().unwrap();
 
+        let pair_address = log.address.clone();
+
+        let pair_metadata = tokens_metadata.get(&pair_address).unwrap();
+
         Self {
             chain,
             maker: format_address(
@@ -158,11 +174,10 @@ impl DatabaseDexTrade {
             transaction_log_index: log.transaction_log_index,
             timestamp: log.timestamp,
 
-            // TODO: fetch pair data
-            token0: "".to_string(),
-            token1: "".to_string(),
-            pair_address: "".to_string(),
-            factory: "".to_string(),
+            token0: pair_metadata.token0.clone().unwrap(),
+            token1: pair_metadata.token1.clone().unwrap(),
+            pair_address,
+            factory: pair_metadata.factory.clone().unwrap(),
         }
     }
 }

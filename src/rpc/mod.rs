@@ -21,6 +21,7 @@ use crate::{
             TRANSFER_EVENTS_SIGNATURE,
         },
         format::{decode_bytes, format_address},
+        tokens::get_tokens,
     },
 };
 use ethabi::{ethereum_types::H160, Address, ParamType};
@@ -42,7 +43,10 @@ use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 
 use log::{info, warn};
 use rand::seq::SliceRandom;
-use std::{str::FromStr, sync::Arc, thread::sleep, time::Duration};
+use std::{
+    collections::HashSet, str::FromStr, sync::Arc, thread::sleep,
+    time::Duration,
+};
 
 use serde_json::Error;
 
@@ -170,63 +174,46 @@ impl Rpc {
 
         let response = multicall.call_raw().await.unwrap();
 
-        let name_tuple = response[0].clone().into_tuple().unwrap();
-        let symbol_tuple = response[1].clone().into_tuple().unwrap();
-        let decimals_tuple = response[2].clone().into_tuple().unwrap();
+        let name: String = match response[0].clone() {
+            Ok(response) => match response.into_string() {
+                Some(data) => data,
+                None => "".to_string(),
+            },
+            Err(_) => "".to_string(),
+        };
 
-        let token0_tuple = response[3].clone().into_tuple().unwrap();
-        let token1_tuple = response[4].clone().into_tuple().unwrap();
-        let factory_tuple = response[5].clone().into_tuple().unwrap();
+        let symbol: String = match response[1].clone() {
+            Ok(response) => match response.into_string() {
+                Some(data) => data,
+                None => "".to_string(),
+            },
+            Err(_) => "".to_string(),
+        };
 
-        let mut name = "".to_string();
+        let decimals: u64 = match response[2].clone() {
+            Ok(response) => match response.into_uint() {
+                Some(data) => data.as_u64(),
+                None => 0,
+            },
+            Err(_) => 0,
+        };
 
-        let name_success = name_tuple[0].clone().into_bool().unwrap();
-        if name_success {
-            name = name_tuple[1].clone().into_string().unwrap();
-        }
+        let token0: Option<String> = match response[3].clone() {
+            Ok(response) => response.into_address().map(format_address),
+            Err(_) => None,
+        };
 
-        let mut symbol = "".to_string();
+        let token1: Option<String> = match response[4].clone() {
+            Ok(response) => response.into_address().map(format_address),
+            Err(_) => None,
+        };
 
-        let symbol_success = symbol_tuple[0].clone().into_bool().unwrap();
-        if symbol_success {
-            symbol = symbol_tuple[1].clone().into_string().unwrap();
-        }
+        let factory: Option<String> = match response[5].clone() {
+            Ok(response) => response.into_address().map(format_address),
+            Err(_) => None,
+        };
 
-        let mut decimals: u64 = 0;
-
-        let decimals_success =
-            decimals_tuple[0].clone().into_bool().unwrap();
-        if decimals_success {
-            decimals =
-                decimals_tuple[1].clone().into_uint().unwrap().as_u64();
-        }
-
-        let mut token0: Option<String> = None;
-        let token0_success = token0_tuple[0].clone().into_bool().unwrap();
-        if token0_success {
-            token0 = Some(format_address(
-                token0_tuple[1].clone().into_address().unwrap(),
-            ));
-        }
-
-        let mut token1: Option<String> = None;
-        let token1_success = token1_tuple[0].clone().into_bool().unwrap();
-        if token1_success {
-            token1 = Some(format_address(
-                token1_tuple[1].clone().into_address().unwrap(),
-            ));
-        }
-
-        let mut factory: Option<String> = None;
-        let factory_success =
-            factory_tuple[0].clone().into_bool().unwrap();
-        if factory_success {
-            factory = Some(format_address(
-                factory_tuple[1].clone().into_address().unwrap(),
-            ));
-        }
-
-        Some(DatabaseToken {
+        let token = DatabaseToken {
             token,
             chain: self.chain.id,
             name,
@@ -235,11 +222,14 @@ impl Rpc {
             token0,
             token1,
             factory,
-        })
+        };
+
+        Some(token)
     }
 
     pub async fn fetch_block(
         &self,
+        db: &Database,
         block_number: &u64,
         chain: &Chain,
     ) -> Option<(
@@ -328,11 +318,34 @@ impl Rpc {
                     return None;
                 }
 
+                let mut tokens_metadata_required: HashSet<String> =
+                    HashSet::new();
+
                 // filter only logs with topic
                 let logs_scan: Vec<&DatabaseLog> = db_logs
                     .iter()
                     .filter(|log| log.topic0.is_some())
                     .collect();
+
+                // insert all the tokens from the logs to metadata check
+                for log in logs_scan.iter() {
+                    let topic_0 = log.topic0.clone().unwrap();
+
+                    if topic_0 == TRANSFER_EVENTS_SIGNATURE
+                        || topic_0
+                            == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
+                        || topic_0
+                            == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
+                        || topic_0 == SWAPV3_EVENT_SIGNATURE
+                        || topic_0 == SWAP_EVENT_SIGNATURE
+                    {
+                        tokens_metadata_required
+                            .insert(log.address.clone());
+                    }
+                }
+
+                let tokens_data =
+                    get_tokens(db, self, &tokens_metadata_required).await;
 
                 let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
                     Vec::new();
@@ -446,15 +459,21 @@ impl Rpc {
                     }
 
                     if topic0 == SWAP_EVENT_SIGNATURE {
-                        let db_dex_trade =
-                            DatabaseDexTrade::from_v2_log(log, chain.id);
+                        let db_dex_trade = DatabaseDexTrade::from_v2_log(
+                            log,
+                            chain.id,
+                            &tokens_data,
+                        );
 
                         db_dex_trades.push(db_dex_trade);
                     }
 
                     if topic0 == SWAPV3_EVENT_SIGNATURE {
-                        let db_dex_trade =
-                            DatabaseDexTrade::from_v3_log(log, chain.id);
+                        let db_dex_trade = DatabaseDexTrade::from_v3_log(
+                            log,
+                            chain.id,
+                            &tokens_data,
+                        );
 
                         db_dex_trades.push(db_dex_trade);
                     }
@@ -532,8 +551,9 @@ impl Rpc {
                         sleep(Duration::from_secs(4))
                     }
 
-                    let block_data =
-                        rpc.fetch_block(&block_number, &rpc.chain).await;
+                    let block_data = rpc
+                        .fetch_block(&db, &block_number, &rpc.chain)
+                        .await;
 
                     if let Some((
                         block,

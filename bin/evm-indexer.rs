@@ -84,7 +84,7 @@ async fn sync_chain(
         let mut work = vec![];
 
         for block_number in missing_blocks_chunk {
-            work.push(rpc.fetch_block(block_number, &config.chain))
+            work.push(rpc.fetch_block(db, block_number, &config.chain))
         }
 
         let results = join_all(work).await;

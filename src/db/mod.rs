@@ -407,7 +407,7 @@ impl Database {
         &self,
         tokens: &Vec<DatabaseToken>,
     ) -> Result<()> {
-        let mut inserter = self.db.inserter("token_details").unwrap();
+        let mut inserter = self.db.inserter("tokens").unwrap();
 
         for token in tokens {
             inserter.write(token).await.unwrap();
@@ -416,7 +416,7 @@ impl Database {
         inserter
             .end()
             .await
-            .expect("Unable to store token_details into database");
+            .expect("Unable to store tokens into database");
 
         info!("Inserted: token details ({})", tokens.len());
 
