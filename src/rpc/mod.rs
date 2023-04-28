@@ -517,6 +517,25 @@ impl Rpc {
         info!("Starting new blocks listener.");
 
         let client = self.get_ws_client().await;
+
+        let client_id = client.request("eth_chainId", rpc_params![]).await;
+
+        match client_id {
+            Ok(value) => {
+                let chain_id: U256 = match serde_json::from_value(value) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        panic!("unable to get chain id from websocket")
+                    }
+                };
+
+                if chain_id.as_u64() != self.chain.id {
+                    panic!("websocket chain id doesn't match with configured chain id")
+                }
+            }
+            Err(_) => panic!("unable to access websocket"),
+        }
+
         let mut subscription: Subscription<Block<TxHash>> = client
             .subscribe(
                 "eth_subscribe",
