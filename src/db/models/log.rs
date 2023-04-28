@@ -1,4 +1,5 @@
 use clickhouse::Row;
+use ethabi::ethereum_types::U256;
 use ethers::types::Log;
 use serde::{Deserialize, Serialize};
 
@@ -7,15 +8,18 @@ use crate::utils::format::{format_address, format_bytes, format_hash};
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseLog {
     pub address: String,
-    pub chain: i64,
+    pub chain: u64,
     pub data: String,
     pub hash: String,
-    pub log_index: i32,
+    pub log_index: U256,
     pub log_type: Option<String>,
     pub removed: bool,
-    pub topics: Vec<String>,
-    pub transaction_log_index: Option<i32>,
-    pub timestamp: i64,
+    pub topic0: String,
+    pub topic1: String,
+    pub topic2: String,
+    pub topic3: String,
+    pub transaction_log_index: Option<U256>,
+    pub timestamp: u64,
 }
 
 impl DatabaseLog {

@@ -6,7 +6,7 @@ use crate::{
         contract::DatabaseContract,
         log::DatabaseLog,
         receipt::{DatabaseReceipt, TransactionStatus},
-        token_detail::DatabaseTokenDetails,
+        token::DatabaseTokenDetails,
         transaction::DatabaseTransaction,
     },
     utils::format::format_address,

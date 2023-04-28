@@ -1,36 +1,18 @@
 use clickhouse::Row;
+use ethabi::ethereum_types::U256;
 use ethers::types::TransactionReceipt;
 use serde::{Deserialize, Serialize};
-use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::utils::format::{format_address, format_hash};
-
-#[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TransactionStatus {
-    Reverted,
-    Succeed,
-    Pending,
-}
-
-impl TransactionStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TransactionStatus::Reverted => "reverted",
-            TransactionStatus::Succeed => "succeed",
-            TransactionStatus::Pending => "pending",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseReceipt {
     pub contract_address: Option<String>,
-    pub cumulative_gas_used: i64,
-    pub effective_gas_price: Option<i64>,
-    pub gas_used: i64,
+    pub cumulative_gas_used: U256,
+    pub effective_gas_price: Option<U256>,
+    pub gas_used: U256,
     pub hash: String,
-    pub status: TransactionStatus,
+    pub status: u64,
 }
 
 impl DatabaseReceipt {

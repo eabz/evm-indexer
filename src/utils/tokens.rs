@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    db::{db::Database, models::token_detail::DatabaseTokenDetails},
+    db::{db::Database, models::token::DatabaseTokenDetails},
     rpc::rpc::Rpc,
 };
 

@@ -12,17 +12,17 @@ use super::log::DatabaseLog;
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC1155Transfer {
-    pub chain: i64,
+    pub chain: u64,
     pub operator: String,
-    pub from_address: String,
-    pub hash: String,
-    pub log_index: i32,
-    pub to_address: String,
+    pub from: String,
+    pub transaction_hash: String,
+    pub log_index: U256,
+    pub to: String,
     pub token: String,
-    pub transaction_log_index: Option<i32>,
-    pub ids: Vec<String>,
-    pub values: Vec<f64>,
-    pub timestamp: i64,
+    pub transaction_log_index: Option<U256>,
+    pub id: U256,
+    pub value: U256,
+    pub timestamp: u64,
 }
 
 impl DatabaseERC1155Transfer {

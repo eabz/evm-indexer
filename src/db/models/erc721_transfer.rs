@@ -1,5 +1,8 @@
 use clickhouse::Row;
-use ethabi::{ethereum_types::H256, ParamType};
+use ethabi::{
+    ethereum_types::{H256, U256},
+    ParamType,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::format::{format_address, format_number};
@@ -8,15 +11,15 @@ use super::log::DatabaseLog;
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC721Transfer {
-    pub chain: i64,
-    pub from_address: String,
-    pub hash: String,
-    pub log_index: i32,
-    pub to_address: String,
+    pub chain: u64,
+    pub from: String,
+    pub transaction_hash: String,
+    pub log_index: U256,
+    pub to: String,
     pub token: String,
-    pub transaction_log_index: Option<i32>,
-    pub id: String,
-    pub timestamp: i64,
+    pub transaction_log_index: Option<U256>,
+    pub id: U256,
+    pub timestamp: u64,
 }
 
 impl DatabaseERC721Transfer {

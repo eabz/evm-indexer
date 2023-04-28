@@ -1,4 +1,5 @@
 use clickhouse::Row;
+use ethabi::ethereum_types::U256;
 use ethers::{types::Transaction, utils::format_units};
 use serde::{Deserialize, Serialize};
 
@@ -6,23 +7,24 @@ use crate::utils::format::{byte4_from_input, format_address, format_bytes, forma
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTransaction {
+    pub access_list: Vec<(String, Vec<String>)>,
     pub block_hash: String,
-    pub block_number: i64,
-    pub chain: i64,
-    pub from_address: String,
-    pub gas: i64,
-    pub gas_price: Option<i64>,
+    pub block_number: u64,
+    pub chain: u64,
+    pub from: String,
+    pub gas: U256,
+    pub gas_price: Option<U256>,
     pub hash: String,
     pub input: String,
-    pub max_fee_per_gas: Option<i64>,
-    pub max_priority_fee_per_gas: Option<i64>,
+    pub max_fee_per_gas: Option<U256>,
+    pub max_priority_fee_per_gas: Option<U256>,
     pub method: String,
-    pub nonce: i32,
-    pub timestamp: i64,
-    pub to_address: Option<String>,
-    pub transaction_index: i16,
-    pub transaction_type: i16,
-    pub value: f64,
+    pub nonce: U256,
+    pub timestamp: u64,
+    pub to: Option<String>,
+    pub transaction_index: u16,
+    pub transaction_type: u16,
+    pub value: U256,
 }
 
 impl DatabaseTransaction {

@@ -6,9 +6,9 @@ use crate::utils::format::{format_address, format_hash};
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseContract {
-    pub block: i64,
+    pub block: u64,
     pub contract_address: String,
-    pub chain: i64,
+    pub chain: u64,
     pub creator: String,
     pub hash: String,
 }

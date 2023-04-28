@@ -4,7 +4,7 @@ use super::models::{
     block::DatabaseBlock, chain_state::DatabaseChainIndexedState, contract::DatabaseContract,
     dex_trade::DatabaseDexTrade, erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer, erc721_transfer::DatabaseERC721Transfer,
-    log::DatabaseLog, receipt::DatabaseReceipt, token_detail::DatabaseTokenDetails,
+    log::DatabaseLog, receipt::DatabaseReceipt, token::DatabaseTokenDetails,
     transaction::DatabaseTransaction,
 };
 use crate::chains::chains::Chain;

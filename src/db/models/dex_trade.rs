@@ -1,29 +1,31 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clickhouse::Row;
-use ethabi::{ethereum_types::H256, ParamType};
+use ethabi::{
+    ethereum_types::{H256, U256},
+    ParamType,
+};
 use ethers::utils::format_units;
 use serde::{Deserialize, Serialize};
-use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::utils::format::{decode_bytes, format_address};
 
-use super::{log::DatabaseLog, token_detail::DatabaseTokenDetails};
+use super::{log::DatabaseLog, token::DatabaseTokenDetails};
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseDexTrade {
-    pub chain: i64,
+    pub chain: u64,
     pub maker: String,
-    pub hash: String,
-    pub log_index: i32,
+    pub transaction_hash: String,
+    pub log_index: U256,
     pub receiver: String,
     pub token0: String,
     pub token1: String,
     pub pair_address: String,
     pub factory: String,
-    pub token0_amount: f64,
-    pub token1_amount: f64,
-    pub transaction_log_index: Option<i32>,
-    pub timestamp: i64,
+    pub token0_amount: U256,
+    pub token1_amount: U256,
+    pub transaction_log_index: Option<U256>,
+    pub timestamp: u64,
 }
 
 impl DatabaseDexTrade {
