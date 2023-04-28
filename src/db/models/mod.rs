@@ -1,5 +1,4 @@
 pub mod block;
-pub mod chain_state;
 pub mod contract;
 pub mod dex_trade;
 pub mod erc1155_transfer;

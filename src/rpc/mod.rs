@@ -345,8 +345,7 @@ impl Rpc {
                     }
                 }
 
-                let tokens_data =
-                    get_tokens(db, self, &tokens_metadata_required).await;
+                get_tokens(db, self, &tokens_metadata_required).await;
 
                 let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
                     Vec::new();
@@ -462,21 +461,15 @@ impl Rpc {
                     }
 
                     if topic0 == SWAP_EVENT_SIGNATURE {
-                        let db_dex_trade = DatabaseDexTrade::from_v2_log(
-                            log,
-                            chain.id,
-                            &tokens_data,
-                        );
+                        let db_dex_trade =
+                            DatabaseDexTrade::from_v2_log(log, chain.id);
 
                         db_dex_trades.push(db_dex_trade);
                     }
 
                     if topic0 == SWAPV3_EVENT_SIGNATURE {
-                        let db_dex_trade = DatabaseDexTrade::from_v3_log(
-                            log,
-                            chain.id,
-                            &tokens_data,
-                        );
+                        let db_dex_trade =
+                            DatabaseDexTrade::from_v3_log(log, chain.id);
 
                         db_dex_trades.push(db_dex_trade);
                     }

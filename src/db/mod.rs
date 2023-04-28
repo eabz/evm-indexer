@@ -6,8 +6,8 @@ use futures::future::join_all;
 use hyper_tls::HttpsConnector;
 use log::info;
 use models::{
-    block::DatabaseBlock, chain_state::DatabaseChainIndexedState,
-    contract::DatabaseContract, dex_trade::DatabaseDexTrade,
+    block::DatabaseBlock, contract::DatabaseContract,
+    dex_trade::DatabaseDexTrade,
     erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
@@ -357,17 +357,5 @@ impl Database {
             .expect("Unable to store tokens into database");
 
         info!("Inserted: token details ({})", tokens.len());
-    }
-
-    pub async fn update_indexed_blocks_number(
-        &self,
-        chain_state: &DatabaseChainIndexedState,
-    ) {
-        self.db
-            .insert("chains_indexed_state")
-            .unwrap()
-            .write(chain_state)
-            .await
-            .expect("Unable to update indexed blocks number");
     }
 }

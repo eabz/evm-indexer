@@ -1,9 +1,6 @@
 use evm_indexer::{
     configs::Config,
-    db::{
-        models::chain_state::DatabaseChainIndexedState, BlockFetchedData,
-        Database,
-    },
+    db::{BlockFetchedData, Database},
     rpc::Rpc,
 };
 use futures::future::join_all;
@@ -71,13 +68,6 @@ async fn sync_chain(
 
     let full_block_range: Vec<u64> =
         (config.start_block..last_block).collect();
-
-    let db_state = DatabaseChainIndexedState {
-        chain: config.chain.id,
-        indexed_blocks_amount: indexed_blocks.len() as u64,
-    };
-
-    db.update_indexed_blocks_number(&db_state).await;
 
     let missing_blocks: Vec<&u64> = full_block_range
         .iter()

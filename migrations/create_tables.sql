@@ -26,15 +26,6 @@ CREATE TABLE indexer.blocks (
 ENGINE = MergeTree()
 PRIMARY KEY (hash);
 
-CREATE TABLE indexer.chains_indexed_state
-(
-  chain UInt64,
-  indexed_blocks_amount UInt64
-)
-ENGINE = ReplacingMergeTree
-ORDER BY chain
-PRIMARY KEY chain;
-
 CREATE TABLE indexer.contracts (
   block UInt64,
   contract_address String,
@@ -51,10 +42,7 @@ CREATE TABLE indexer.dex_trades (
   transaction_hash String,
   log_index UInt256,
   receiver String,
-  token0 String,
-  token1 String,
   pair_address String,
-  factory String,
   token0_amount UInt256,
   token1_amount UInt256,
   transaction_log_index Nullable(UInt256),
