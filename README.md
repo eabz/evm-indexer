@@ -8,7 +8,7 @@
 <strong>🚧 🚨 🚧 🚨 This indexer is a work in progress don't use it for production 🚧 🚨 🚧 🚨</strong>
 </p>
 
-![build](https://github.com/eabz/indexer/actions/workflows/build.yml/badge.svg)
+![build](https://github.com/kindynosmx/evm-indexer/actions/workflows/build.yml/badge.svg)
 
 ## Requirements
 
@@ -24,7 +24,7 @@ You can try the indexer locally or through Docker.
 1. Clone the repository
 
 ```
-git clone https://github.com/eabz/indexer && cd indexer
+git clone https://github.com/kindynosmx/evm-indexer && cd evm-indexer
 ```
 
 2. Build the program
@@ -40,7 +40,7 @@ cargo build --release
 1. Clone the repository
 
 ```
-git clone https://github.com/eabz/indexer && cd indexer
+git clone https://github.com/kindynosmx/evm-indexer && cd evm-indexer
 ```
 
 2. Build the image and tag it as `indexer`

@@ -1366,6 +1366,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "evm-indexer"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "array-bytes",
+ "chrono",
+ "clap 4.1.13",
+ "clickhouse",
+ "dotenv",
+ "ethabi",
+ "ethers",
+ "futures",
+ "hex",
+ "hyper",
+ "hyper-tls",
+ "jsonrpsee",
+ "jsonrpsee-http-client",
+ "log",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "serde_repr",
+ "simple_logger",
+ "tokio",
+]
+
+[[package]]
 name = "eyre"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1911,35 +1940,6 @@ name = "indenter"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce23b50ad8242c51a442f3ff322d56b02f08852c77e4c0b4d3fd684abc89c683"
-
-[[package]]
-name = "indexer"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "array-bytes",
- "chrono",
- "clap 4.1.13",
- "clickhouse",
- "dotenv",
- "ethabi",
- "ethers",
- "futures",
- "hex",
- "hyper",
- "hyper-tls",
- "jsonrpsee",
- "jsonrpsee-http-client",
- "log",
- "rand",
- "reqwest",
- "serde",
- "serde_bytes",
- "serde_json",
- "serde_repr",
- "simple_logger",
- "tokio",
-]
 
 [[package]]
 name = "indexmap"
