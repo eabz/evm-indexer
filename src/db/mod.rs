@@ -17,6 +17,18 @@ use models::{
 };
 use std::{collections::HashSet, time::Duration};
 
+pub struct BlockFetchedData {
+    pub blocks: Vec<DatabaseBlock>,
+    pub transactions: Vec<DatabaseTransaction>,
+    pub receipts: Vec<DatabaseReceipt>,
+    pub logs: Vec<DatabaseLog>,
+    pub contracts: Vec<DatabaseContract>,
+    pub erc20_transfers: Vec<DatabaseERC20Transfer>,
+    pub erc721_transfers: Vec<DatabaseERC721Transfer>,
+    pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
+    pub dex_trades: Vec<DatabaseDexTrade>,
+}
+
 // Ref: https://github.com/loyd/clickhouse.rs/blob/master/src/lib.rs#L51
 // ClickHouse uses 3s by default.
 // See https://github.com/ClickHouse/ClickHouse/blob/368cb74b4d222dc5472a7f2177f6bb154ebae07a/programs/server/config.xml#L201
@@ -83,7 +95,7 @@ impl Database {
         }
 
         query.pop();
-        query.push_str(")");
+        query.push(')');
 
         if !tokens.is_empty() {
             let tokens = match self
@@ -99,26 +111,15 @@ impl Database {
             return tokens;
         }
 
-        return Vec::new();
+        Vec::new()
     }
 
-    pub async fn store_data(
-        &self,
-        blocks: &Vec<DatabaseBlock>,
-        transactions: &Vec<DatabaseTransaction>,
-        receipts: &Vec<DatabaseReceipt>,
-        logs: &Vec<DatabaseLog>,
-        contracts: &Vec<DatabaseContract>,
-        erc20_transfers: &Vec<DatabaseERC20Transfer>,
-        erc721_transfers: &Vec<DatabaseERC721Transfer>,
-        erc1155_transfers: &Vec<DatabaseERC1155Transfer>,
-        dex_trades: &Vec<DatabaseDexTrade>,
-    ) {
+    pub async fn store_data(&self, data: &BlockFetchedData) {
         let mut stores = vec![];
 
-        if transactions.len() > 0 {
+        if !data.transactions.is_empty() {
             let work = tokio::spawn({
-                let transactions = transactions.clone();
+                let transactions = data.transactions.clone();
                 let db = self.clone();
                 async move {
                     db.store_transactions(&transactions)
@@ -129,9 +130,9 @@ impl Database {
             stores.push(work);
         }
 
-        if receipts.len() > 0 {
+        if !data.receipts.is_empty() {
             let work = tokio::spawn({
-                let receipts = receipts.clone();
+                let receipts = data.receipts.clone();
                 let db = self.clone();
                 async move {
                     db.store_receipts(&receipts)
@@ -142,9 +143,9 @@ impl Database {
             stores.push(work);
         }
 
-        if !logs.is_empty() {
+        if !data.logs.is_empty() {
             let work = tokio::spawn({
-                let logs = logs.clone();
+                let logs = data.logs.clone();
                 let db = self.clone();
                 async move {
                     db.store_logs(&logs)
@@ -155,9 +156,9 @@ impl Database {
             stores.push(work);
         }
 
-        if contracts.len() > 0 {
+        if !data.contracts.is_empty() {
             let work = tokio::spawn({
-                let contracts = contracts.clone();
+                let contracts = data.contracts.clone();
                 let db = self.clone();
                 async move {
                     db.store_contracts(&contracts)
@@ -168,9 +169,9 @@ impl Database {
             stores.push(work);
         }
 
-        if erc20_transfers.len() > 0 {
+        if !data.erc20_transfers.is_empty() {
             let work = tokio::spawn({
-                let erc20_transfers = erc20_transfers.clone();
+                let erc20_transfers = data.erc20_transfers.clone();
                 let db = self.clone();
                 async move {
                     db.store_erc20_transfers(&erc20_transfers)
@@ -181,9 +182,9 @@ impl Database {
             stores.push(work);
         }
 
-        if erc721_transfers.len() > 0 {
+        if !data.erc721_transfers.is_empty() {
             let work = tokio::spawn({
-                let erc721_transfers = erc721_transfers.clone();
+                let erc721_transfers = data.erc721_transfers.clone();
                 let db = self.clone();
                 async move {
                     db.store_erc721_transfers(&erc721_transfers)
@@ -194,9 +195,9 @@ impl Database {
             stores.push(work);
         }
 
-        if erc1155_transfers.len() > 0 {
+        if !data.erc1155_transfers.is_empty() {
             let work = tokio::spawn({
-                let erc1155_transfers = erc1155_transfers.clone();
+                let erc1155_transfers = data.erc1155_transfers.clone();
                 let db = self.clone();
                 async move {
                     db.store_erc1155_transfers(&erc1155_transfers)
@@ -207,9 +208,9 @@ impl Database {
             stores.push(work);
         }
 
-        if dex_trades.len() > 0 {
+        if !data.dex_trades.is_empty() {
             let work = tokio::spawn({
-                let dex_trades = dex_trades.clone();
+                let dex_trades = data.dex_trades.clone();
                 let db = self.clone();
                 async move {
                     db.store_dex_trades(&dex_trades)
@@ -225,25 +226,25 @@ impl Database {
         let errored: Vec<_> =
             res.iter().filter(|res| res.is_err()).collect();
 
-        if errored.len() > 0 {
+        if !errored.is_empty() {
             panic!("failed to store all chain primitive elements")
         }
 
-        if blocks.len() > 0 {
-            self.store_blocks(&blocks).await.unwrap();
+        if !data.blocks.is_empty() {
+            self.store_blocks(&data.blocks).await.unwrap();
         }
 
         info!(
             "Inserted: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) in ({}) blocks.",
-            transactions.len(),
-            receipts.len(),
-            logs.len(),
-            contracts.len(),
-            erc20_transfers.len(),
-            erc721_transfers.len(),
-            erc1155_transfers.len(),
-            dex_trades.len(),
-            blocks.len(),
+            data.transactions.len(),
+            data.receipts.len(),
+            data.logs.len(),
+            data.contracts.len(),
+            data.erc20_transfers.len(),
+            data.erc721_transfers.len(),
+            data.erc1155_transfers.len(),
+            data.dex_trades.len(),
+            data.blocks.len(),
         );
     }
 

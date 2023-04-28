@@ -145,7 +145,7 @@ pub fn get_chains() -> HashMap<u64, Chain> {
         chains.insert(chain.id, chain);
     }
 
-    return chains;
+    chains
 }
 
 pub fn get_chain(chain_id: u64) -> Chain {
@@ -153,5 +153,5 @@ pub fn get_chain(chain_id: u64) -> Chain {
 
     let selected_chain = chains.get(&chain_id).expect("chain not found.");
 
-    return Chain::new_from_borrowed(selected_chain);
+    Chain::new_from_borrowed(selected_chain)
 }

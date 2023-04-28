@@ -10,14 +10,14 @@ async fn get_tokens_metadata(
     rpc: &Rpc,
     tokens: &HashSet<String>,
 ) -> Vec<DatabaseToken> {
-    let mut db_tokens = db.get_tokens(&tokens).await;
+    let mut db_tokens = db.get_tokens(tokens).await;
 
     let db_token_address: Vec<String> =
         db_tokens.iter().map(|token| token.token.clone()).collect();
 
     let missing_tokens: Vec<&String> = tokens
         .iter()
-        .filter(|token| !db_token_address.contains(&token))
+        .filter(|token| !db_token_address.contains(token))
         .collect();
 
     let mut missing_tokens_metadata: Vec<DatabaseToken> = Vec::new();
@@ -31,13 +31,13 @@ async fn get_tokens_metadata(
         missing_tokens_metadata.push(data);
     }
 
-    if missing_tokens_metadata.len() > 0 {
+    if !missing_tokens_metadata.is_empty() {
         db.store_token_details(&missing_tokens_metadata).await.unwrap();
     }
 
     db_tokens.append(&mut missing_tokens_metadata);
 
-    return db_tokens;
+    db_tokens
 }
 
 pub async fn get_tokens(
@@ -76,5 +76,5 @@ pub async fn get_tokens(
         tokens_data.insert(token.token.clone(), token.to_owned());
     }
 
-    return tokens_data;
+    tokens_data
 }

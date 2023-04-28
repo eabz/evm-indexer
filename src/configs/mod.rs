@@ -35,6 +35,13 @@ pub struct IndexerArgs {
 
     #[arg(
         long,
+        help = "Url of the websocket endpoint to fetch new blocks.",
+        default_value_t = String::from("")
+    )]
+    pub ws: String,
+
+    #[arg(
+        long,
         help = "Clickhouse database string with username and password."
     )]
     pub database: String,
@@ -51,6 +58,7 @@ pub struct Config {
     pub chain: Chain,
     pub batch_size: usize,
     pub rpcs: Vec<String>,
+    pub ws_url: Option<String>,
 }
 
 impl Default for Config {
@@ -68,6 +76,9 @@ impl Config {
         let rpcs: Vec<String> =
             args.rpcs.split(',').map(|rpc| rpc.to_string()).collect();
 
+        let ws_url: Option<String> =
+            if args.ws.is_empty() { None } else { Some(args.ws) };
+
         Self {
             start_block: args.start_block,
             db_host: "".to_string(),
@@ -78,6 +89,7 @@ impl Config {
             chain,
             batch_size: args.batch_size,
             rpcs,
+            ws_url,
         }
     }
 }
