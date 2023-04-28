@@ -1,7 +1,6 @@
 pub mod models;
 
 use crate::chains::Chain;
-use anyhow::Result;
 use clickhouse::Client;
 use futures::future::join_all;
 use hyper_tls::HttpsConnector;
@@ -47,7 +46,7 @@ impl Database {
         db_password: String,
         db_name: String,
         chain: Chain,
-    ) -> Result<Self> {
+    ) -> Self {
         info!("Starting EVM database service");
 
         let https = HttpsConnector::new();
@@ -62,10 +61,10 @@ impl Database {
             .with_password(db_password)
             .with_database(db_name);
 
-        Ok(Self { chain, db })
+        Self { chain, db }
     }
 
-    pub async fn get_indexed_blocks(&self) -> Result<HashSet<u64>> {
+    pub async fn get_indexed_blocks(&self) -> HashSet<u64> {
         let query = format!(
             "SELECT number FROM blocks WHERE chain = '{}'",
             self.chain.id
@@ -78,7 +77,7 @@ impl Database {
 
         let blocks: HashSet<u64> = HashSet::from_iter(tokens.into_iter());
 
-        Ok(blocks)
+        blocks
     }
 
     pub async fn get_tokens(
@@ -121,11 +120,7 @@ impl Database {
             let work = tokio::spawn({
                 let transactions = data.transactions.clone();
                 let db = self.clone();
-                async move {
-                    db.store_transactions(&transactions)
-                        .await
-                        .expect("unable to store transactions")
-                }
+                async move { db.store_transactions(&transactions).await }
             });
             stores.push(work);
         }
@@ -134,11 +129,7 @@ impl Database {
             let work = tokio::spawn({
                 let receipts = data.receipts.clone();
                 let db = self.clone();
-                async move {
-                    db.store_receipts(&receipts)
-                        .await
-                        .expect("unable to store receipts")
-                }
+                async move { db.store_receipts(&receipts).await }
             });
             stores.push(work);
         }
@@ -147,11 +138,7 @@ impl Database {
             let work = tokio::spawn({
                 let logs = data.logs.clone();
                 let db = self.clone();
-                async move {
-                    db.store_logs(&logs)
-                        .await
-                        .expect("unable to store logs")
-                }
+                async move { db.store_logs(&logs).await }
             });
             stores.push(work);
         }
@@ -160,11 +147,7 @@ impl Database {
             let work = tokio::spawn({
                 let contracts = data.contracts.clone();
                 let db = self.clone();
-                async move {
-                    db.store_contracts(&contracts)
-                        .await
-                        .expect("unable to store contracts")
-                }
+                async move { db.store_contracts(&contracts).await }
             });
             stores.push(work);
         }
@@ -173,11 +156,7 @@ impl Database {
             let work = tokio::spawn({
                 let erc20_transfers = data.erc20_transfers.clone();
                 let db = self.clone();
-                async move {
-                    db.store_erc20_transfers(&erc20_transfers)
-                        .await
-                        .expect("unable to store erc20 transfers")
-                }
+                async move { db.store_erc20_transfers(&erc20_transfers).await }
             });
             stores.push(work);
         }
@@ -187,9 +166,7 @@ impl Database {
                 let erc721_transfers = data.erc721_transfers.clone();
                 let db = self.clone();
                 async move {
-                    db.store_erc721_transfers(&erc721_transfers)
-                        .await
-                        .expect("unable to erc721 transfers")
+                    db.store_erc721_transfers(&erc721_transfers).await
                 }
             });
             stores.push(work);
@@ -200,9 +177,7 @@ impl Database {
                 let erc1155_transfers = data.erc1155_transfers.clone();
                 let db = self.clone();
                 async move {
-                    db.store_erc1155_transfers(&erc1155_transfers)
-                        .await
-                        .expect("unable to store erc1155 transfers")
+                    db.store_erc1155_transfers(&erc1155_transfers).await
                 }
             });
             stores.push(work);
@@ -212,11 +187,7 @@ impl Database {
             let work = tokio::spawn({
                 let dex_trades = data.dex_trades.clone();
                 let db = self.clone();
-                async move {
-                    db.store_dex_trades(&dex_trades)
-                        .await
-                        .expect("unable to store dex trades")
-                }
+                async move { db.store_dex_trades(&dex_trades).await }
             });
             stores.push(work);
         }
@@ -231,7 +202,7 @@ impl Database {
         }
 
         if !data.blocks.is_empty() {
-            self.store_blocks(&data.blocks).await.unwrap();
+            self.store_blocks(&data.blocks).await;
         }
 
         info!(
@@ -251,7 +222,7 @@ impl Database {
     async fn store_transactions(
         &self,
         transactions: &Vec<DatabaseTransaction>,
-    ) -> Result<()> {
+    ) {
         let mut inserter = self.db.inserter("transactions").unwrap();
 
         for transaction in transactions {
@@ -261,14 +232,9 @@ impl Database {
             .end()
             .await
             .expect("Unable to store transactions into database");
-
-        Ok(())
     }
 
-    async fn store_receipts(
-        &self,
-        receipts: &Vec<DatabaseReceipt>,
-    ) -> Result<()> {
+    async fn store_receipts(&self, receipts: &Vec<DatabaseReceipt>) {
         let mut inserter = self.db.inserter("receipts").unwrap();
 
         for receipt in receipts {
@@ -279,11 +245,9 @@ impl Database {
             .end()
             .await
             .expect("Unable to store receipts into database");
-
-        Ok(())
     }
 
-    async fn store_logs(&self, logs: &Vec<DatabaseLog>) -> Result<()> {
+    async fn store_logs(&self, logs: &Vec<DatabaseLog>) {
         let mut inserter = self.db.inserter("logs").unwrap();
 
         for log in logs {
@@ -291,14 +255,9 @@ impl Database {
         }
 
         inserter.end().await.expect("Unable to store logs into database");
-
-        Ok(())
     }
 
-    async fn store_contracts(
-        &self,
-        contracts: &Vec<DatabaseContract>,
-    ) -> Result<()> {
+    async fn store_contracts(&self, contracts: &Vec<DatabaseContract>) {
         let mut inserter = self.db.inserter("contracts").unwrap();
 
         for contract in contracts {
@@ -309,14 +268,12 @@ impl Database {
             .end()
             .await
             .expect("Unable to store contracts into database");
-
-        Ok(())
     }
 
     async fn store_erc20_transfers(
         &self,
         transfers: &Vec<DatabaseERC20Transfer>,
-    ) -> Result<()> {
+    ) {
         let mut inserter = self.db.inserter("erc20_transfers").unwrap();
 
         for transfer in transfers {
@@ -327,14 +284,12 @@ impl Database {
             .end()
             .await
             .expect("Unable to store erc20_transfers into database");
-
-        Ok(())
     }
 
     async fn store_erc721_transfers(
         &self,
         transfers: &Vec<DatabaseERC721Transfer>,
-    ) -> Result<()> {
+    ) {
         let mut inserter = self.db.inserter("erc721_transfers").unwrap();
 
         for transfer in transfers {
@@ -345,14 +300,12 @@ impl Database {
             .end()
             .await
             .expect("Unable to store erc721_transfers into database");
-
-        Ok(())
     }
 
     async fn store_erc1155_transfers(
         &self,
         transfers: &Vec<DatabaseERC1155Transfer>,
-    ) -> Result<()> {
+    ) {
         let mut inserter = self.db.inserter("erc1155_transfers").unwrap();
 
         for transfer in transfers {
@@ -363,14 +316,9 @@ impl Database {
             .end()
             .await
             .expect("Unable to store erc1155_transfers into database");
-
-        Ok(())
     }
 
-    async fn store_dex_trades(
-        &self,
-        trades: &Vec<DatabaseDexTrade>,
-    ) -> Result<()> {
+    async fn store_dex_trades(&self, trades: &Vec<DatabaseDexTrade>) {
         let mut inserter = self.db.inserter("dex_trades").unwrap();
 
         for trade in trades {
@@ -381,14 +329,9 @@ impl Database {
             .end()
             .await
             .expect("Unable to store dex_trades into database");
-
-        Ok(())
     }
 
-    async fn store_blocks(
-        &self,
-        blocks: &Vec<DatabaseBlock>,
-    ) -> Result<()> {
+    async fn store_blocks(&self, blocks: &Vec<DatabaseBlock>) {
         let mut inserter = self.db.inserter("blocks").unwrap();
 
         for block in blocks {
@@ -399,14 +342,9 @@ impl Database {
             .end()
             .await
             .expect("Unable to store blocks into database");
-
-        Ok(())
     }
 
-    pub async fn store_token_details(
-        &self,
-        tokens: &Vec<DatabaseToken>,
-    ) -> Result<()> {
+    pub async fn store_token_details(&self, tokens: &Vec<DatabaseToken>) {
         let mut inserter = self.db.inserter("tokens").unwrap();
 
         for token in tokens {
@@ -419,21 +357,17 @@ impl Database {
             .expect("Unable to store tokens into database");
 
         info!("Inserted: token details ({})", tokens.len());
-
-        Ok(())
     }
 
     pub async fn update_indexed_blocks_number(
         &self,
         chain_state: &DatabaseChainIndexedState,
-    ) -> Result<()> {
+    ) {
         self.db
             .insert("chains_indexed_state")
             .unwrap()
             .write(chain_state)
             .await
             .expect("Unable to update indexed blocks number");
-
-        Ok(())
     }
 }

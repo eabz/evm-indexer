@@ -1,4 +1,3 @@
-use dotenv::dotenv;
 use evm_indexer::{
     configs::Config,
     db::{
@@ -14,8 +13,6 @@ use std::{collections::HashSet, thread::sleep, time::Duration};
 
 #[tokio::main()]
 async fn main() {
-    dotenv().ok();
-
     let log = SimpleLogger::new().with_level(LevelFilter::Info);
 
     let config = Config::new();
@@ -30,8 +27,7 @@ async fn main() {
 
     info!("Syncing chain {}.", config.chain.name);
 
-    let rpc =
-        Rpc::new(&config).await.expect("Unable to start RPC client.");
+    let rpc = Rpc::new(&config).await;
 
     let db = Database::new(
         config.db_host.clone(),
@@ -40,8 +36,7 @@ async fn main() {
         config.db_name.clone(),
         config.chain,
     )
-    .await
-    .expect("Unable to start DB connection.");
+    .await;
 
     if config.ws_url.is_some() {
         tokio::spawn({
@@ -58,7 +53,7 @@ async fn main() {
         });
     }
 
-    let mut indexed_blocks = db.get_indexed_blocks().await.unwrap();
+    let mut indexed_blocks = db.get_indexed_blocks().await;
 
     loop {
         sync_chain(&rpc, &db, &config, &mut indexed_blocks).await;
@@ -72,7 +67,7 @@ async fn sync_chain(
     config: &Config,
     indexed_blocks: &mut HashSet<u64>,
 ) {
-    let last_block = rpc.get_last_block().await.unwrap();
+    let last_block = rpc.get_last_block().await;
 
     let full_block_range: Vec<u64> =
         (config.start_block..last_block).collect();
@@ -82,7 +77,7 @@ async fn sync_chain(
         indexed_blocks_amount: indexed_blocks.len() as u64,
     };
 
-    db.update_indexed_blocks_number(&db_state).await.unwrap();
+    db.update_indexed_blocks_number(&db_state).await;
 
     let missing_blocks: Vec<&u64> = full_block_range
         .iter()

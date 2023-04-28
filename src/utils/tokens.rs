@@ -36,7 +36,7 @@ async fn get_tokens_metadata(
     }
 
     if !missing_tokens_metadata.is_empty() {
-        db.store_token_details(&missing_tokens_metadata).await.unwrap();
+        db.store_token_details(&missing_tokens_metadata).await;
     }
 
     db_tokens.append(&mut missing_tokens_metadata);

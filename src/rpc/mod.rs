@@ -31,7 +31,6 @@ use ethers::{
     types::{Block, Transaction, TransactionReceipt, TxHash, U256},
 };
 
-use anyhow::Result;
 use jsonrpsee::core::{
     client::{ClientT, Subscription, SubscriptionClientT},
     rpc_params,
@@ -70,7 +69,7 @@ pub struct Rpc {
 }
 
 impl Rpc {
-    pub async fn new(config: &Config) -> Result<Self> {
+    pub async fn new(config: &Config) -> Self {
         info!("Starting rpc service");
 
         let timeout = Duration::from_secs(60);
@@ -111,15 +110,15 @@ impl Rpc {
             panic!("No valid rpc client found");
         }
 
-        Ok(Self {
+        Self {
             clients,
             clients_urls,
             chain: config.chain,
             ws_url: config.ws_url.clone(),
-        })
+        }
     }
 
-    pub async fn get_last_block(&self) -> Result<u64> {
+    pub async fn get_last_block(&self) -> u64 {
         let client = self.get_client();
 
         let last_block =
@@ -132,9 +131,9 @@ impl Rpc {
                         "Unable to deserialize eth_blockNumber response",
                     );
 
-                Ok(block_number.as_u64())
+                block_number.as_u64()
             }
-            Err(_) => Ok(0),
+            Err(_) => 0,
         }
     }
 
@@ -247,7 +246,7 @@ impl Rpc {
         Vec<DatabaseDexTrade>,
     )> {
         let block_data: Option<(DatabaseBlock, Vec<DatabaseTransaction>)> =
-            self.get_block(block_number).await.unwrap();
+            self.get_block(block_number).await;
 
         match block_data {
             Some((db_block, db_transactions)) => {
@@ -275,8 +274,8 @@ impl Rpc {
                             block_number,
                             db_block.timestamp,
                         )
-                        .await
-                        .unwrap();
+                        .await;
+
                     match receipts_data {
                         Some((mut receipts, mut logs, mut contracts)) => {
                             db_receipts.append(&mut receipts);
@@ -292,8 +291,7 @@ impl Rpc {
                                 transaction.hash.clone(),
                                 transaction.timestamp,
                             )
-                            .await
-                            .unwrap();
+                            .await;
 
                         match receipt_data {
                             Some((receipt, mut logs, contract)) => {
@@ -635,7 +633,7 @@ impl Rpc {
     async fn get_block(
         &self,
         block_number: &u64,
-    ) -> Result<Option<(DatabaseBlock, Vec<DatabaseTransaction>)>> {
+    ) -> Option<(DatabaseBlock, Vec<DatabaseTransaction>)> {
         let client = self.get_client();
 
         let raw_block = client
@@ -668,12 +666,12 @@ impl Rpc {
                             db_transactions.push(db_transaction)
                         }
 
-                        Ok(Some((db_block, db_transactions)))
+                        Some((db_block, db_transactions))
                     }
-                    Err(_) => Ok(None),
+                    Err(_) => None,
                 }
             }
-            Err(_) => Ok(None),
+            Err(_) => None,
         }
     }
 
@@ -681,13 +679,11 @@ impl Rpc {
         &self,
         transaction: String,
         transaction_timestamp: u64,
-    ) -> Result<
-        Option<(
-            DatabaseReceipt,
-            Vec<DatabaseLog>,
-            Option<DatabaseContract>,
-        )>,
-    > {
+    ) -> Option<(
+        DatabaseReceipt,
+        Vec<DatabaseLog>,
+        Option<DatabaseContract>,
+    )> {
         let client = self.get_client();
 
         let raw_receipt = client
@@ -739,16 +735,16 @@ impl Rpc {
                             db_transaction_logs.push(db_log)
                         }
 
-                        Ok(Some((
+                        Some((
                             db_receipt,
                             db_transaction_logs,
                             db_contract,
-                        )))
+                        ))
                     }
-                    Err(_) => Ok(None),
+                    Err(_) => None,
                 }
             }
-            Err(_) => Ok(None),
+            Err(_) => None,
         }
     }
 
@@ -756,13 +752,11 @@ impl Rpc {
         &self,
         block_number: &u64,
         block_timestamp: u64,
-    ) -> Result<
-        Option<(
-            Vec<DatabaseReceipt>,
-            Vec<DatabaseLog>,
-            Vec<DatabaseContract>,
-        )>,
-    > {
+    ) -> Option<(
+        Vec<DatabaseReceipt>,
+        Vec<DatabaseLog>,
+        Vec<DatabaseContract>,
+    )> {
         let client = self.get_client();
 
         let raw_receipts = client
@@ -817,16 +811,16 @@ impl Rpc {
                             }
                         }
 
-                        Ok(Some((
+                        Some((
                             db_receipts,
                             db_transaction_logs,
                             db_contracts,
-                        )))
+                        ))
                     }
-                    Err(_) => Ok(None),
+                    Err(_) => None,
                 }
             }
-            Err(_) => Ok(None),
+            Err(_) => None,
         }
     }
 }
