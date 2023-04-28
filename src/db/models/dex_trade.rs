@@ -9,22 +9,6 @@ use crate::utils::format::{decode_bytes, format_address};
 
 use super::{log::DatabaseLog, token_detail::DatabaseTokenDetails};
 
-#[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TradeType {
-    Buy,
-    Sell,
-}
-
-impl TradeType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TradeType::Buy => "buy",
-            TradeType::Sell => "sell",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseDexTrade {
     pub chain: i64,
@@ -38,10 +22,8 @@ pub struct DatabaseDexTrade {
     pub factory: String,
     pub token0_amount: f64,
     pub token1_amount: f64,
-    pub swap_rate: f64,
     pub transaction_log_index: Option<i32>,
     pub timestamp: i64,
-    pub trade_type: TradeType,
 }
 
 impl DatabaseDexTrade {
@@ -126,10 +108,6 @@ impl DatabaseDexTrade {
             token1_amount: token1_in - token1_out,
             transaction_log_index: log.transaction_log_index,
             timestamp: log.timestamp,
-
-            // TODO: trade type and swap rate
-            trade_type: TradeType::Buy,
-            swap_rate: 0.0,
         }
     }
 
@@ -199,9 +177,6 @@ impl DatabaseDexTrade {
             token1_amount,
             transaction_log_index: log.transaction_log_index,
             timestamp: log.timestamp,
-            // TODO: trade type and swap rate
-            trade_type: TradeType::Buy,
-            swap_rate: 0.0,
         }
     }
 

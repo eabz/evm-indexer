@@ -14,7 +14,10 @@ use futures::future::join_all;
 use hyper_tls::HttpsConnector;
 use log::info;
 
-pub const MAX_PARAM_SIZE: u16 = u16::MAX;
+// Ref: https://github.com/loyd/clickhouse.rs/blob/master/src/lib.rs#L51
+// ClickHouse uses 3s by default.
+// See https://github.com/ClickHouse/ClickHouse/blob/368cb74b4d222dc5472a7f2177f6bb154ebae07a/programs/server/config.xml#L201
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct Database {
@@ -34,7 +37,9 @@ impl Database {
 
         let https = HttpsConnector::new();
 
-        let client = hyper::Client::builder().build::<_, hyper::Body>(https);
+        let client = hyper::Client::builder()
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .build::<_, hyper::Body>(https);
 
         let db = Client::with_http_client(client)
             .with_url(db_host)

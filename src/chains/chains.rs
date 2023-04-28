@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Chain {
-    pub id: i64,
+    pub id: u64,
     pub name: &'static str,
     pub block_explorer: &'static str,
     pub abi_source_api: &'static str,
@@ -138,20 +138,20 @@ pub static CHAINS: [Chain; 10] = [
     CELO,
 ];
 
-pub fn get_chains() -> HashMap<String, Chain> {
-    let mut chains: HashMap<String, Chain> = HashMap::new();
+pub fn get_chains() -> HashMap<u64, Chain> {
+    let mut chains: HashMap<u64, Chain> = HashMap::new();
 
     for chain in CHAINS.into_iter() {
-        chains.insert(String::from(chain.name), chain);
+        chains.insert(String::from(chain.id), chain);
     }
 
     return chains;
 }
 
-pub fn get_chain(chain: String) -> Chain {
+pub fn get_chain(chain_id: u64) -> Chain {
     let chains = get_chains();
 
-    let selected_chain = chains.get(&chain).expect("Chain not found");
+    let selected_chain = chains.get(&chain_id).expect("chain not found.");
 
     return Chain::new_from_borrowed(selected_chain);
 }

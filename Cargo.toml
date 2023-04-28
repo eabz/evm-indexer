@@ -33,5 +33,5 @@ default-features = false
 features = ["colors"]
 
 [[bin]]
-path = "bin/indexer.rs"
-name = "indexer"
+path = "bin/evm-indexer.rs"
+name = "evm-indexer"

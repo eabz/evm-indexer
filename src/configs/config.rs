@@ -10,7 +10,11 @@ pub struct IndexerArgs {
     #[arg(long, help = "Start log with debug.", default_value_t = false)]
     pub debug: bool,
 
-    #[arg(long, help = "Number identifying the chain id to sync.", default_value_t = 1)]
+    #[arg(
+        long,
+        help = "Number identifying the chain id to sync.",
+        default_value_t = 1
+    )]
     pub chain: usize,
 
     #[arg(long, help = "Block to start syncing.", default_value_t = 0)]
@@ -59,10 +63,10 @@ impl Config {
 
         Self {
             start_block: args.start_block,
-            db_host: "",
-            db_username: "",
-            db_password: s"",
-            db_name: "",
+            db_host: "".to_string(),
+            db_username: "".to_string(),
+            db_password: "".to_string(),
+            db_name: "".to_string(),
             debug: args.debug,
             chain,
             batch_size: args.batch_size,
