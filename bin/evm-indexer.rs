@@ -1,28 +1,11 @@
 use dotenv::dotenv;
 use evm_indexer::{
-    chains::Chain,
     configs::Config,
     db::{
-        models::{
-            block::DatabaseBlock, chain_state::DatabaseChainIndexedState,
-            contract::DatabaseContract, dex_trade::DatabaseDexTrade,
-            erc1155_transfer::DatabaseERC1155Transfer,
-            erc20_transfer::DatabaseERC20Transfer,
-            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            receipt::DatabaseReceipt, transaction::DatabaseTransaction,
-        },
-        BlockFetchedData, Database,
+        models::chain_state::DatabaseChainIndexedState, BlockFetchedData,
+        Database,
     },
     rpc::Rpc,
-    utils::{
-        events::{
-            ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
-            ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
-            SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE,
-            TRANSFER_EVENTS_SIGNATURE,
-        },
-        tokens::get_tokens,
-    },
 };
 use futures::future::join_all;
 use log::*;
@@ -88,7 +71,7 @@ async fn sync_chain(
 
     let missing_blocks: Vec<&u64> = full_block_range
         .iter()
-        .filter(|block| !indexed_blocks.contains(&block))
+        .filter(|block| !indexed_blocks.contains(block))
         .collect();
 
     let total_missing_blocks = missing_blocks.len();
@@ -101,7 +84,7 @@ async fn sync_chain(
         let mut work = vec![];
 
         for block_number in missing_blocks_chunk {
-            work.push(rpc.fetch_block(&block_number, &config.chain))
+            work.push(rpc.fetch_block(block_number, &config.chain))
         }
 
         let results = join_all(work).await;
