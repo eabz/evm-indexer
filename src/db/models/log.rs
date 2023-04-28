@@ -1,50 +1,73 @@
 use clickhouse::Row;
+use ethabi::ethereum_types::U256;
 use ethers::types::Log;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::format::{format_address, format_bytes, format_hash};
+use crate::utils::format::{
+    format_address, format_bytes, format_hash, opt_serialize_u256,
+    serialize_u256,
+};
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseLog {
     pub address: String,
-    pub chain: i64,
+    pub chain: u64,
     pub data: String,
-    pub hash: String,
-    pub log_index: i32,
+    pub transaction_hash: String,
+    #[serde(with = "serialize_u256")]
+    pub log_index: U256,
     pub log_type: Option<String>,
     pub removed: bool,
-    pub topics: Vec<String>,
-    pub transaction_log_index: Option<i32>,
-    pub timestamp: i64,
+    pub topic0: Option<String>,
+    pub topic1: Option<String>,
+    pub topic2: Option<String>,
+    pub topic3: Option<String>,
+    #[serde(with = "opt_serialize_u256")]
+    pub transaction_log_index: Option<U256>,
+    pub timestamp: u64,
 }
 
 impl DatabaseLog {
-    pub fn from_rpc(log: &Log, chain: i64, timestamp: i64) -> Self {
-        let transaction_log_index = match log.transaction_log_index.clone() {
-            None => None,
-            Some(transaction_log_index) => Some(transaction_log_index.as_u32() as i32),
+    pub fn from_rpc(log: &Log, chain: u64, timestamp: u64) -> Self {
+        let topic0 = if log.topics.is_empty() {
+            None
+        } else {
+            Some(format_hash(log.topics[0]))
         };
 
-        let log_type = match log.log_type.clone() {
-            None => None,
-            Some(log_type) => Some(log_type),
+        let topics = log.topics.len();
+
+        let topic1 = if topics < 2 {
+            None
+        } else {
+            Some(format_hash(log.topics[1]))
+        };
+
+        let topic2 = if topics < 3 {
+            None
+        } else {
+            Some(format_hash(log.topics[2]))
+        };
+
+        let topic3 = if topics < 4 {
+            None
+        } else {
+            Some(format_hash(log.topics[3]))
         };
 
         Self {
             address: format_address(log.address),
             chain,
-            topics: log
-                .topics
-                .clone()
-                .into_iter()
-                .map(|topic| format_hash(topic))
-                .collect(),
             data: format_bytes(&log.data),
-            hash: format_hash(log.transaction_hash.unwrap()),
+            transaction_hash: format_hash(log.transaction_hash.unwrap()),
             removed: log.removed.unwrap(),
-            log_index: log.log_index.unwrap().as_u32() as i32,
-            log_type,
-            transaction_log_index,
+            log_index: log.log_index.unwrap(),
+            topic0,
+            topic1,
+            topic2,
+            topic3,
+            log_type: log.log_type.clone(),
+            transaction_log_index: log.transaction_log_index,
             timestamp,
         }
     }

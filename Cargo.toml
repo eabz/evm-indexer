@@ -1,7 +1,10 @@
 [package]
 name = "evm-indexer"
 version = "1.0.0"
+license = "MIT"
 edition = "2021"
+repository = "https://github.com/kindynosmx/evm-indexer"
+description = "Scalable SQL indexer for EVM compatible blockchains"
 
 [dependencies]
 anyhow = "1"
@@ -11,21 +14,22 @@ clap = { version = "4", features = ["derive"] }
 clickhouse = "0.11"
 dotenv = "0.15"
 ethabi = "18"
-ethers = { version = "1", features = ["ws", "rustls"] }
+ethers = { version = "2", features = ["rustls"] }
 futures = "0.3"
 hex = "0.4"
 hyper = "0.14"
 hyper-tls = "0.5"
-jsonrpsee = { version = "0.16", features = ["macros", "server"] }
-jsonrpsee-http-client = "0.16"
+jsonrpsee = { version = "0.17", features = ["macros", "server"] }
+jsonrpsee-http-client = "0.17"
+jsonrpsee-ws-client = "0.17"
 log = "0.4"
 rand = "0.8"
 reqwest = "0.11"
 serde = "1"
 serde_bytes = "0.11"
 serde_json = "1"
-serde_repr = "0.1"
 tokio = { version = "1", features = ["full"] }
+url = "2.3.1"
 
 [dependencies.simple_logger]
 version = "4.0.0"
@@ -33,5 +37,5 @@ default-features = false
 features = ["colors"]
 
 [[bin]]
-path = "bin/indexer.rs"
-name = "indexer"
+path = "bin/evm-indexer.rs"
+name = "evm-indexer"

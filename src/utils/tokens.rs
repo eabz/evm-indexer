@@ -1,61 +1,60 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    db::{db::Database, models::token_detail::DatabaseTokenDetails},
-    rpc::rpc::Rpc,
+    db::{models::token::DatabaseToken, Database},
+    rpc::Rpc,
 };
 
 async fn get_tokens_metadata(
     db: &Database,
     rpc: &Rpc,
     tokens: &HashSet<String>,
-) -> Vec<DatabaseTokenDetails> {
-    let mut db_tokens = db.get_tokens(&tokens).await;
+) -> Vec<DatabaseToken> {
+    let mut db_tokens = db.get_tokens(tokens).await;
 
-    let db_token_address: Vec<String> = db_tokens.iter().map(|token| token.token.clone()).collect();
+    let db_token_address: Vec<String> =
+        db_tokens.iter().map(|token| token.token.clone()).collect();
 
     let missing_tokens: Vec<&String> = tokens
         .iter()
-        .filter(|token| !db_token_address.contains(&token))
+        .filter(|token| !db_token_address.contains(token))
         .collect();
 
-    let mut missing_tokens_metadata: Vec<DatabaseTokenDetails> = Vec::new();
+    let mut missing_tokens_metadata: Vec<DatabaseToken> = Vec::new();
 
     for missing_token in missing_tokens.iter() {
-        let data = rpc
-            .get_token_metadata(missing_token.to_string())
-            .await
-            .unwrap();
+        let token_data =
+            rpc.get_token_metadata(missing_token.to_string()).await;
+
+        let data = if token_data.is_some() {
+            token_data.unwrap()
+        } else {
+            continue;
+        };
 
         missing_tokens_metadata.push(data);
     }
 
-    if missing_tokens_metadata.len() > 0 {
-        db.store_token_details(&missing_tokens_metadata)
-            .await
-            .unwrap();
+    if !missing_tokens_metadata.is_empty() {
+        db.store_token_details(&missing_tokens_metadata).await.unwrap();
     }
 
     db_tokens.append(&mut missing_tokens_metadata);
 
-    return db_tokens;
+    db_tokens
 }
 
 pub async fn get_tokens(
     db: &Database,
     rpc: &Rpc,
     tokens: &HashSet<String>,
-) -> HashMap<String, DatabaseTokenDetails> {
+) -> HashMap<String, DatabaseToken> {
     let db_tokens = get_tokens_metadata(db, rpc, tokens).await;
 
-    let mut tokens_data: HashMap<String, DatabaseTokenDetails> = HashMap::new();
+    let mut tokens_data: HashMap<String, DatabaseToken> = HashMap::new();
 
     for token in db_tokens.iter() {
         tokens_data.insert(token.token.clone(), token.to_owned());
-    }
-
-    if tokens_data.len() != tokens.len() {
-        panic!("inconsistent amount of tokens to parse the logs")
     }
 
     let mut underlying_tokens: HashSet<String> = HashSet::new();
@@ -70,11 +69,12 @@ pub async fn get_tokens(
         }
     }
 
-    let db_underlying_tokens = get_tokens_metadata(db, rpc, &underlying_tokens).await;
+    let db_underlying_tokens =
+        get_tokens_metadata(db, rpc, &underlying_tokens).await;
 
     for token in db_underlying_tokens.iter() {
         tokens_data.insert(token.token.clone(), token.to_owned());
     }
 
-    return tokens_data;
+    tokens_data
 }
