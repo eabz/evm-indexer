@@ -148,7 +148,7 @@ CREATE TABLE indexer.tokens
   token1 Nullable(String),
   factory Nullable(String),
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (token, chain);
 
 CREATE TABLE indexer.transactions (

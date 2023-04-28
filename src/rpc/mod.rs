@@ -172,7 +172,10 @@ impl Rpc {
             .add_call(token_contract.token_1(), true)
             .add_call(token_contract.factory(), true);
 
-        let response = multicall.call_raw().await.unwrap();
+        let response = match multicall.call_raw().await {
+            Ok(response) => response,
+            Err(_) => return None,
+        };
 
         let name: String = match response[0].clone() {
             Ok(response) => match response.into_string() {
@@ -371,7 +374,9 @@ impl Rpc {
                                 );
 
                             db_erc721_transfers.push(db_erc721_transfer);
-                        } else {
+                        } else if log.topic1.is_some()
+                            && log.topic2.is_some()
+                        {
                             // erc20 token transfer events have 2 indexed values.
 
                             let db_erc20_transfer =

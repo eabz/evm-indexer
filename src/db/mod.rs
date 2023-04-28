@@ -95,7 +95,7 @@ impl Database {
         }
 
         query.pop();
-        query.push(')');
+        query.push_str(") FINAL");
 
         if !tokens.is_empty() {
             let tokens = match self

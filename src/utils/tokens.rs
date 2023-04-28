@@ -23,10 +23,14 @@ async fn get_tokens_metadata(
     let mut missing_tokens_metadata: Vec<DatabaseToken> = Vec::new();
 
     for missing_token in missing_tokens.iter() {
-        let data = rpc
-            .get_token_metadata(missing_token.to_string())
-            .await
-            .unwrap();
+        let token_data =
+            rpc.get_token_metadata(missing_token.to_string()).await;
+
+        let data = if token_data.is_some() {
+            token_data.unwrap()
+        } else {
+            continue;
+        };
 
         missing_tokens_metadata.push(data);
     }
@@ -51,10 +55,6 @@ pub async fn get_tokens(
 
     for token in db_tokens.iter() {
         tokens_data.insert(token.token.clone(), token.to_owned());
-    }
-
-    if tokens_data.len() != tokens.len() {
-        panic!("inconsistent amount of tokens to parse the logs")
     }
 
     let mut underlying_tokens: HashSet<String> = HashSet::new();
