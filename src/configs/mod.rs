@@ -1,5 +1,6 @@
 use crate::chains::{get_chain, Chain};
 use clap::Parser;
+use url::Url;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -79,12 +80,28 @@ impl Config {
         let ws_url: Option<String> =
             if args.ws.is_empty() { None } else { Some(args.ws) };
 
+        let url = Url::parse(&args.database).expect("unable to parse database url expected: scheme://username:password@host/database");
+
+        let username = url.username();
+
+        let password =
+            url.password().expect("no password provided for database");
+
+        let db_host =
+            url.host().expect("no host provided for database").to_string();
+
+        let url_paths =
+            url.path_segments().map(|c| c.collect::<Vec<_>>()).unwrap();
+
+        let db_name =
+            url_paths.first().expect("no database name provided on path");
+
         Self {
             start_block: args.start_block,
-            db_host: "".to_string(),
-            db_username: "".to_string(),
-            db_password: "".to_string(),
-            db_name: "".to_string(),
+            db_host: format!("{}://{}", url.scheme(), db_host),
+            db_username: username.to_string(),
+            db_password: password.to_string(),
+            db_name: db_name.to_string(),
             debug: args.debug,
             chain,
             batch_size: args.batch_size,
