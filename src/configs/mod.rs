@@ -18,7 +18,7 @@ pub struct IndexerArgs {
     pub chain: usize,
 
     #[arg(long, help = "Block to start syncing.", default_value_t = 0)]
-    pub start_block: i64,
+    pub start_block: u64,
 
     #[arg(
         long,
@@ -42,7 +42,7 @@ pub struct IndexerArgs {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub start_block: i64,
+    pub start_block: u64,
     pub db_host: String,
     pub db_username: String,
     pub db_password: String,
@@ -53,6 +53,12 @@ pub struct Config {
     pub rpcs: Vec<String>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Config {
     pub fn new() -> Self {
         let args = IndexerArgs::parse();
@@ -60,7 +66,7 @@ impl Config {
         let chain = get_chain(args.chain as u64);
 
         let rpcs: Vec<String> =
-            args.rpcs.split(",").map(|rpc| rpc.to_string()).collect();
+            args.rpcs.split(',').map(|rpc| rpc.to_string()).collect();
 
         Self {
             start_block: args.start_block,

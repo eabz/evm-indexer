@@ -100,7 +100,7 @@ impl Rpc {
         client
     }
 
-    pub async fn get_last_block(&self) -> Result<i64> {
+    pub async fn get_last_block(&self) -> Result<u64> {
         let client = self.get_client();
 
         let last_block =
@@ -113,7 +113,7 @@ impl Rpc {
                         "Unable to deserialize eth_blockNumber response",
                     );
 
-                Ok(block_number.as_u64() as i64)
+                Ok(block_number.as_u64())
             }
             Err(_) => Ok(0),
         }

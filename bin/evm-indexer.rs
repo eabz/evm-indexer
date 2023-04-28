@@ -72,21 +72,21 @@ async fn sync_chain(
     rpc: &Rpc,
     db: &Database,
     config: &Config,
-    indexed_blocks: &mut HashSet<i64>,
+    indexed_blocks: &mut HashSet<u64>,
 ) {
     let last_block = rpc.get_last_block().await.unwrap();
 
-    let full_block_range: Vec<i64> =
+    let full_block_range: Vec<u64> =
         (config.start_block..last_block).collect();
 
     let db_state = DatabaseChainIndexedState {
         chain: config.chain.id,
-        indexed_blocks_amount: indexed_blocks.len() as i64,
+        indexed_blocks_amount: indexed_blocks.len() as u64,
     };
 
     db.update_indexed_blocks_number(&db_state).await.unwrap();
 
-    let missing_blocks: Vec<&i64> = full_block_range
+    let missing_blocks: Vec<&u64> = full_block_range
         .iter()
         .filter(|block| !indexed_blocks.contains(&block))
         .collect();
@@ -161,44 +161,6 @@ async fn sync_chain(
         for block in db_blocks.iter() {
             indexed_blocks.insert(block.number);
         }
-
-        /*
-        TODO: recover aggregations
-
-            let (
-                db_native_balances,
-                db_erc20_balances,
-                db_erc721_owner_changes,
-                db_erc1155_balances_changes,
-                db_dex_minute_aggregates,
-                db_dex_hourly_aggregates,
-                db_dex_daily_aggregates,
-            ) = aggregate_data(
-                &db_blocks,
-                &db_transactions,
-                &db_erc20_transfers,
-                &db_erc721_transfers,
-                &db_erc1155_transfers,
-                &db_dex_trade,
-            );
-
-            db.update_balances(
-                &db_native_balances,
-                &db_erc20_balances,
-                &db_erc721_owner_changes,
-                &db_erc1155_balances_changes,
-            )
-            .await
-            .unwrap();
-
-            db.update_dex_aggregates(
-                &db_dex_minute_aggregates,
-                &db_dex_hourly_aggregates,
-                &db_dex_daily_aggregates,
-            )
-            .await
-            .unwrap();
-        */
     }
 }
 
