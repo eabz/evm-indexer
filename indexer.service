@@ -6,8 +6,7 @@ StartLimitIntervalSec=0
 Type=simple
 Restart=always
 RestartSec=1
-ExecStart=/usr/local/bin/indexer --rpcs "https://eth.llamarpc.com:443" 
-WorkingDirectory=/root/indexer/
+ExecStart=/root/.cargo/bin/evm-indexer --rpcs "https://eth.llamarpc.com:443" 
 StandardOutput=append:/var/log/indexer.log
 
 [Install]

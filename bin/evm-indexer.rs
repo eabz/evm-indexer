@@ -43,11 +43,26 @@ async fn main() {
     .await
     .expect("Unable to start DB connection.");
 
+    if config.ws_url.is_some() {
+        tokio::spawn({
+            let rpc: Rpc = rpc.clone();
+            let db: Database = db.clone();
+
+            async move {
+                loop {
+                    rpc.listen_blocks(&db).await;
+
+                    sleep(Duration::from_millis(500))
+                }
+            }
+        });
+    }
+
     let mut indexed_blocks = db.get_indexed_blocks().await.unwrap();
 
     loop {
         sync_chain(&rpc, &db, &config, &mut indexed_blocks).await;
-        sleep(Duration::from_millis(500))
+        sleep(Duration::from_secs(30))
     }
 }
 
