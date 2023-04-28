@@ -13,7 +13,7 @@ pub struct DatabaseLog {
     pub address: String,
     pub chain: u64,
     pub data: String,
-    pub hash: String,
+    pub transaction_hash: String,
     #[serde(with = "serialize_u256")]
     pub log_index: U256,
     pub log_type: Option<String>,
@@ -59,7 +59,7 @@ impl DatabaseLog {
             address: format_address(log.address),
             chain,
             data: format_bytes(&log.data),
-            hash: format_hash(log.transaction_hash.unwrap()),
+            transaction_hash: format_hash(log.transaction_hash.unwrap()),
             removed: log.removed.unwrap(),
             log_index: log.log_index.unwrap(),
             topic0,

@@ -86,7 +86,7 @@ impl DatabaseERC1155Transfer {
             from: format_address(
                 from_address.to_owned().into_address().unwrap(),
             ),
-            transaction_hash: log.hash.clone(),
+            transaction_hash: log.transaction_hash.clone(),
             log_index: log.log_index,
             to: format_address(
                 to_address.to_owned().into_address().unwrap(),

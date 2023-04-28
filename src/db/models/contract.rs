@@ -10,7 +10,7 @@ pub struct DatabaseContract {
     pub contract_address: String,
     pub chain: u64,
     pub creator: String,
-    pub hash: String,
+    pub transaction_hash: String,
 }
 
 impl DatabaseContract {
@@ -22,7 +22,7 @@ impl DatabaseContract {
                 receipt.contract_address.unwrap(),
             ),
             creator: format_address(receipt.from),
-            hash: format_hash(receipt.transaction_hash),
+            transaction_hash: format_hash(receipt.transaction_hash),
         }
     }
 }

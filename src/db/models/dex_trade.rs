@@ -90,7 +90,7 @@ impl DatabaseDexTrade {
             maker: format_address(
                 maker.to_owned().into_address().unwrap(),
             ),
-            transaction_hash: log.hash.clone(),
+            transaction_hash: log.transaction_hash.clone(),
             log_index: log.log_index,
             receiver: format_address(
                 receiver.to_owned().into_address().unwrap(),
@@ -164,7 +164,7 @@ impl DatabaseDexTrade {
             maker: format_address(
                 maker.to_owned().into_address().unwrap(),
             ),
-            transaction_hash: log.hash.clone(),
+            transaction_hash: log.transaction_hash.clone(),
             log_index: log.log_index,
             receiver: format_address(
                 receiver.to_owned().into_address().unwrap(),
