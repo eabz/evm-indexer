@@ -1,7 +1,10 @@
 [package]
 name = "evm-indexer"
 version = "1.0.0"
+license = "MIT"
 edition = "2021"
+repository = "https://github.com/kindynosmx/evm-indexer"
+description = "Scalable SQL indexer for EVM compatible blockchains"
 
 [dependencies]
 anyhow = "1"
