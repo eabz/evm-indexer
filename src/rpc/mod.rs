@@ -8,8 +8,7 @@ use crate::{
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            receipt::DatabaseReceipt, token::DatabaseToken,
-            transaction::DatabaseTransaction,
+            receipt::DatabaseReceipt, transaction::DatabaseTransaction,
         },
         BlockFetchedData, Database,
     },
@@ -20,14 +19,12 @@ use crate::{
             SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE,
             TRANSFER_EVENTS_SIGNATURE,
         },
-        format::{decode_bytes, format_address},
-        tokens::get_tokens,
+        format::decode_bytes,
     },
 };
-use ethabi::{ethereum_types::H160, Address, ParamType};
+use ethabi::ParamType;
 use ethers::{
-    prelude::{abigen, Multicall, MulticallVersion},
-    providers::{Http, Provider},
+    prelude::abigen,
     types::{Block, Transaction, TransactionReceipt, TxHash, U256},
 };
 
@@ -42,10 +39,7 @@ use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 
 use log::{info, warn};
 use rand::seq::SliceRandom;
-use std::{
-    collections::HashSet, str::FromStr, sync::Arc, thread::sleep,
-    time::Duration,
-};
+use std::{collections::HashSet, thread::sleep, time::Duration};
 
 use serde_json::Error;
 
@@ -137,101 +131,8 @@ impl Rpc {
         }
     }
 
-    pub async fn get_token_metadata(
-        &self,
-        token: String,
-    ) -> Option<DatabaseToken> {
-        let client = self.get_client_url();
-
-        let provider = match Provider::<Http>::try_from(client) {
-            Ok(provider) => provider,
-            Err(_) => return None,
-        };
-
-        let client = Arc::new(provider);
-
-        let token_contract = ERC20::new(
-            token.parse::<Address>().unwrap(),
-            Arc::clone(&client),
-        );
-
-        let mut multicall = Multicall::new(
-            client.clone(),
-            Some(H160::from_str(self.chain.multicall).unwrap()),
-        )
-        .await
-        .unwrap()
-        .version(MulticallVersion::Multicall3);
-
-        multicall
-            .add_call(token_contract.name(), true)
-            .add_call(token_contract.symbol(), true)
-            .add_call(token_contract.decimals(), true)
-            .add_call(token_contract.token_0(), true)
-            .add_call(token_contract.token_1(), true)
-            .add_call(token_contract.factory(), true);
-
-        let response = match multicall.call_raw().await {
-            Ok(response) => response,
-            Err(_) => return None,
-        };
-
-        let name: String = match response[0].clone() {
-            Ok(response) => match response.into_string() {
-                Some(data) => data,
-                None => "".to_string(),
-            },
-            Err(_) => "".to_string(),
-        };
-
-        let symbol: String = match response[1].clone() {
-            Ok(response) => match response.into_string() {
-                Some(data) => data,
-                None => "".to_string(),
-            },
-            Err(_) => "".to_string(),
-        };
-
-        let decimals: u64 = match response[2].clone() {
-            Ok(response) => match response.into_uint() {
-                Some(data) => data.as_u64(),
-                None => 0,
-            },
-            Err(_) => 0,
-        };
-
-        let token0: Option<String> = match response[3].clone() {
-            Ok(response) => response.into_address().map(format_address),
-            Err(_) => None,
-        };
-
-        let token1: Option<String> = match response[4].clone() {
-            Ok(response) => response.into_address().map(format_address),
-            Err(_) => None,
-        };
-
-        let factory: Option<String> = match response[5].clone() {
-            Ok(response) => response.into_address().map(format_address),
-            Err(_) => None,
-        };
-
-        let token = DatabaseToken {
-            token,
-            chain: self.chain.id,
-            name,
-            decimals,
-            symbol,
-            token0,
-            token1,
-            factory,
-        };
-
-        Some(token)
-    }
-
     pub async fn fetch_block(
         &self,
-        db: &Database,
         block_number: &u64,
         chain: &Chain,
     ) -> Option<(
@@ -344,8 +245,6 @@ impl Rpc {
                             .insert(log.address.clone());
                     }
                 }
-
-                get_tokens(db, self, &tokens_metadata_required).await;
 
                 let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
                     Vec::new();
@@ -556,9 +455,9 @@ impl Rpc {
                     // Right now this is tested for ETH (1) and BSC (56)
                     // These values can change depending on network load
 
-                    // ETH requires 100ms
+                    // ETH requires 300ms
                     if rpc.chain.id == 1 {
-                        sleep(Duration::from_millis(100))
+                        sleep(Duration::from_millis(300))
                     }
 
                     // BSC requires 4s
@@ -566,9 +465,8 @@ impl Rpc {
                         sleep(Duration::from_secs(4))
                     }
 
-                    let block_data = rpc
-                        .fetch_block(&db, &block_number, &rpc.chain)
-                        .await;
+                    let block_data =
+                        rpc.fetch_block(&block_number, &rpc.chain).await;
 
                     if let Some((
                         block,
@@ -614,13 +512,6 @@ impl Rpc {
             WsClientBuilder::default().build(url).await.unwrap();
 
         client_wss
-    }
-
-    fn get_client_url(&self) -> &String {
-        let client =
-            self.clients_urls.choose(&mut rand::thread_rng()).unwrap();
-
-        client
     }
 
     async fn get_block(

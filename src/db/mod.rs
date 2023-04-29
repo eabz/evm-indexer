@@ -11,8 +11,7 @@ use models::{
     erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-    receipt::DatabaseReceipt, token::DatabaseToken,
-    transaction::DatabaseTransaction,
+    receipt::DatabaseReceipt, transaction::DatabaseTransaction,
 };
 use std::{collections::HashSet, time::Duration};
 
@@ -78,39 +77,6 @@ impl Database {
         let blocks: HashSet<u64> = HashSet::from_iter(tokens.into_iter());
 
         blocks
-    }
-
-    pub async fn get_tokens(
-        &self,
-        tokens: &HashSet<String>,
-    ) -> Vec<DatabaseToken> {
-        let mut query = String::from(
-            "SELECT * FROM token_details WHERE (token, chain) IN (",
-        );
-
-        for token in tokens {
-            let condition = format!("('{}',{}),", token, self.chain.id);
-            query.push_str(&condition)
-        }
-
-        query.pop();
-        query.push_str(") FINAL");
-
-        if !tokens.is_empty() {
-            let tokens = match self
-                .db
-                .query(&query)
-                .fetch_all::<DatabaseToken>()
-                .await
-            {
-                Ok(tokens) => tokens,
-                Err(_) => Vec::new(),
-            };
-
-            return tokens;
-        }
-
-        Vec::new()
     }
 
     pub async fn store_data(&self, data: &BlockFetchedData) {
@@ -342,20 +308,5 @@ impl Database {
             .end()
             .await
             .expect("Unable to store blocks into database");
-    }
-
-    pub async fn store_token_details(&self, tokens: &Vec<DatabaseToken>) {
-        let mut inserter = self.db.inserter("tokens").unwrap();
-
-        for token in tokens {
-            inserter.write(token).await.unwrap();
-        }
-
-        inserter
-            .end()
-            .await
-            .expect("Unable to store tokens into database");
-
-        info!("Inserted: token details ({})", tokens.len());
     }
 }

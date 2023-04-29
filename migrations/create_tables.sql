@@ -23,7 +23,7 @@ CREATE TABLE indexer.blocks (
   transactions_root String,
   uncles Array(String),
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);
 
 CREATE TABLE indexer.contracts (
@@ -33,7 +33,7 @@ CREATE TABLE indexer.contracts (
   creator String,
   transaction_hash String,
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (contract_address, chain);
 
 CREATE TABLE indexer.dex_trades (
@@ -48,7 +48,7 @@ CREATE TABLE indexer.dex_trades (
   transaction_log_index Nullable(UInt256),
   timestamp UInt64
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
 
 CREATE TABLE indexer.erc1155_transfers (
@@ -64,7 +64,7 @@ CREATE TABLE indexer.erc1155_transfers (
   value UInt256,
   timestamp UInt64,
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
 
 CREATE TABLE indexer.erc20_transfers (
@@ -78,7 +78,7 @@ CREATE TABLE indexer.erc20_transfers (
   transaction_log_index Nullable(UInt256),
   timestamp UInt64,
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
 
 CREATE TABLE indexer.erc721_transfers (
@@ -92,7 +92,7 @@ CREATE TABLE indexer.erc721_transfers (
   id UInt256,
   timestamp UInt64,
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
 
 CREATE TABLE indexer.logs (
@@ -110,7 +110,7 @@ CREATE TABLE indexer.logs (
   transaction_log_index Nullable(UInt256),
   timestamp UInt64,
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
 
 CREATE TABLE indexer.receipts (
@@ -121,23 +121,8 @@ CREATE TABLE indexer.receipts (
   hash String,
   status UInt64,
 )
-ENGINE = MergeTree()
-PRIMARY KEY (hash);
-
-
-CREATE TABLE indexer.tokens 
-(
-  chain UInt64,
-  token String,
-  name String,
-  symbol String,
-  decimals UInt64,
-  token0 Nullable(String),
-  token1 Nullable(String),
-  factory Nullable(String),
-)
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (token, chain);
+PRIMARY KEY (hash);
 
 CREATE TABLE indexer.transactions (
   access_list Array(Tuple(String, Array(String))),
@@ -159,5 +144,5 @@ CREATE TABLE indexer.transactions (
   transaction_type UInt16,
   value UInt256
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);
