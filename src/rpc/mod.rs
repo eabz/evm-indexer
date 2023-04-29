@@ -582,8 +582,10 @@ impl Rpc {
 
                 match receipt {
                     Ok(receipt) => {
-                        let db_receipt =
-                            DatabaseReceipt::from_rpc(&receipt);
+                        let db_receipt = DatabaseReceipt::from_rpc(
+                            &receipt,
+                            self.chain.id,
+                        );
 
                         let mut db_transaction_logs: Vec<DatabaseLog> =
                             Vec::new();
@@ -668,8 +670,10 @@ impl Rpc {
                             Vec::new();
 
                         for receipt in receipts {
-                            let db_receipt =
-                                DatabaseReceipt::from_rpc(&receipt);
+                            let db_receipt = DatabaseReceipt::from_rpc(
+                                &receipt,
+                                self.chain.id,
+                            );
 
                             db_receipts.push(db_receipt);
 

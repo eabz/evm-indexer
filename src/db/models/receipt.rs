@@ -9,6 +9,7 @@ use crate::utils::format::{
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseReceipt {
+    pub chain: u64,
     pub contract_address: Option<String>,
     #[serde(with = "serialize_u256")]
     pub cumulative_gas_used: U256,
@@ -21,7 +22,7 @@ pub struct DatabaseReceipt {
 }
 
 impl DatabaseReceipt {
-    pub fn from_rpc(receipt: &TransactionReceipt) -> Self {
+    pub fn from_rpc(receipt: &TransactionReceipt, chain: u64) -> Self {
         let contract_address: Option<String> =
             receipt.contract_address.map(format_address);
 
@@ -31,6 +32,7 @@ impl DatabaseReceipt {
         };
 
         Self {
+            chain,
             contract_address,
             cumulative_gas_used: receipt.cumulative_gas_used,
             effective_gas_price: receipt.effective_gas_price,
