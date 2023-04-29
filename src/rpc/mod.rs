@@ -39,7 +39,8 @@ use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 
 use log::{info, warn};
 use rand::seq::SliceRandom;
-use std::{collections::HashSet, thread::sleep, time::Duration};
+use std::{collections::HashSet, time::Duration};
+use tokio::time::sleep;
 
 use serde_json::Error;
 
@@ -457,12 +458,12 @@ impl Rpc {
 
                     // ETH requires 300ms
                     if rpc.chain.id == 1 {
-                        sleep(Duration::from_millis(300))
+                        sleep(Duration::from_millis(300)).await;
                     }
 
                     // BSC requires 4s
                     if rpc.chain.id == 56 {
-                        sleep(Duration::from_secs(4))
+                        sleep(Duration::from_secs(4)).await;
                     }
 
                     let block_data =

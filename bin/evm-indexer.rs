@@ -6,7 +6,8 @@ use evm_indexer::{
 use futures::future::join_all;
 use log::*;
 use simple_logger::SimpleLogger;
-use std::{collections::HashSet, thread::sleep, time::Duration};
+use std::{collections::HashSet, time::Duration};
+use tokio::time::sleep;
 
 #[tokio::main()]
 async fn main() {
@@ -44,7 +45,7 @@ async fn main() {
                 loop {
                     rpc.listen_blocks(&db).await;
 
-                    sleep(Duration::from_millis(500))
+                    sleep(Duration::from_millis(500)).await;
                 }
             }
         });
@@ -54,7 +55,7 @@ async fn main() {
 
     loop {
         sync_chain(&rpc, &db, &config, &mut indexed_blocks).await;
-        sleep(Duration::from_secs(30))
+        sleep(Duration::from_secs(30)).await;
     }
 }
 
