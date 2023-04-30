@@ -8,6 +8,7 @@ pub struct Chain {
     pub abi_source_api: &'static str,
     pub abi_source_require_auth: bool,
     pub supports_blocks_receipts: bool,
+    pub supports_trace_block: bool,
     pub multicall: &'static str,
 }
 
@@ -21,6 +22,7 @@ impl Chain {
             abi_source_require_auth: chain.abi_source_require_auth,
             supports_blocks_receipts: chain.supports_blocks_receipts,
             multicall: chain.multicall,
+            supports_trace_block: chain.supports_trace_block,
         }
     }
 }
@@ -33,6 +35,7 @@ pub const ETHEREUM: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: true,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: true,
 };
 
 pub const POLYGON: Chain = Chain {
@@ -43,6 +46,7 @@ pub const POLYGON: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: true,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: true,
 };
 
 pub const FANTOM: Chain = Chain {
@@ -53,6 +57,7 @@ pub const FANTOM: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: true,
 };
 
 pub const BSC: Chain = Chain {
@@ -63,6 +68,7 @@ pub const BSC: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: true,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: true,
 };
 
 pub const GNOSIS: Chain = Chain {
@@ -73,6 +79,7 @@ pub const GNOSIS: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: true,
 };
 
 pub const OPTIMISM: Chain = Chain {
@@ -83,6 +90,7 @@ pub const OPTIMISM: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: false,
 };
 
 pub const ARBITRUM_ONE: Chain = Chain {
@@ -93,6 +101,7 @@ pub const ARBITRUM_ONE: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: false,
 };
 
 pub const ARBITRUM_NOVA: Chain = Chain {
@@ -103,6 +112,7 @@ pub const ARBITRUM_NOVA: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: false,
 };
 
 pub const AVALANCHE: Chain = Chain {
@@ -113,6 +123,7 @@ pub const AVALANCHE: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: false,
 };
 
 pub const CELO: Chain = Chain {
@@ -123,6 +134,7 @@ pub const CELO: Chain = Chain {
     abi_source_require_auth: true,
     supports_blocks_receipts: false,
     multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
+    supports_trace_block: false,
 };
 
 pub static CHAINS: [Chain; 10] = [
