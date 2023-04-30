@@ -149,7 +149,30 @@ ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);
 
 CREATE TABLE indexer.traces (
-  
+  from Nullable(String),
+  to Nullable(String),
+  value Nullable(UInt256),
+  gas Nullable(UInt256),
+  input Nullable(String),
+  call_type Nullable(String),
+  init Nullable(String),
+  address Nullable(String),
+  refund_address Nullable(String),
+  balance Nullable(UInt256),
+  author Nullable(String),
+  reward_type Nullable(String),
+  gas_used Nullable(UInt256),
+  output Nullable(String),
+  code Nullable(String),
+  trace_address Array(UInt64),
+  subtraces UInt64,
+  transaction_position Nullable(UInt64),
+  transaction_hash Nullable(String),
+  block_number UInt64,
+  block_hash String,
+  action_type String,
+  chain UInt64,
+  error Nullable(String),
 )
-ENGINE = ReplacingMergeTree()
+ENGINE = MergeTree()
 PRIMARY KEY (hash);
