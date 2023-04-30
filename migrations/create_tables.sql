@@ -175,4 +175,4 @@ CREATE TABLE indexer.traces (
   error Nullable(String),
 )
 ENGINE = MergeTree()
-PRIMARY KEY (hash);
+PRIMARY KEY (block_hash);
