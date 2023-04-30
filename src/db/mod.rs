@@ -11,7 +11,8 @@ use models::{
     erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-    receipt::DatabaseReceipt, transaction::DatabaseTransaction,
+    receipt::DatabaseReceipt, trace::DatabaseTrace,
+    transaction::DatabaseTransaction,
 };
 use std::{collections::HashSet, time::Duration};
 
@@ -25,6 +26,7 @@ pub struct BlockFetchedData {
     pub erc721_transfers: Vec<DatabaseERC721Transfer>,
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
     pub dex_trades: Vec<DatabaseDexTrade>,
+    pub traces: Vec<DatabaseTrace>,
 }
 
 // Ref: https://github.com/loyd/clickhouse.rs/blob/master/src/lib.rs#L51
@@ -167,12 +169,16 @@ impl Database {
             panic!("failed to store all chain primitive elements")
         }
 
+        if !data.traces.is_empty() {
+            self.store_traces(&data.traces).await;
+        }
+
         if !data.blocks.is_empty() {
             self.store_blocks(&data.blocks).await;
         }
 
         info!(
-            "Inserted: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) in ({}) blocks.",
+            "Inserted: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) traces ({}) in ({}) blocks.",
             data.transactions.len(),
             data.receipts.len(),
             data.logs.len(),
@@ -181,6 +187,7 @@ impl Database {
             data.erc721_transfers.len(),
             data.erc1155_transfers.len(),
             data.dex_trades.len(),
+            data.traces.len(),
             data.blocks.len(),
         );
     }
@@ -295,6 +302,19 @@ impl Database {
             .end()
             .await
             .expect("Unable to store dex_trades into database");
+    }
+
+    async fn store_traces(&self, traces: &Vec<DatabaseTrace>) {
+        let mut inserter = self.db.inserter("traces").unwrap();
+
+        for trace in traces {
+            inserter.write(trace).await.unwrap();
+        }
+
+        inserter
+            .end()
+            .await
+            .expect("Unable to store traces into database");
     }
 
     async fn store_blocks(&self, blocks: &Vec<DatabaseBlock>) {

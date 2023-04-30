@@ -8,7 +8,8 @@ use crate::{
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            receipt::DatabaseReceipt, transaction::DatabaseTransaction,
+            receipt::DatabaseReceipt, trace::DatabaseTrace,
+            transaction::DatabaseTransaction,
         },
         BlockFetchedData, Database,
     },
@@ -25,7 +26,7 @@ use crate::{
 use ethabi::ParamType;
 use ethers::{
     prelude::abigen,
-    types::{Block, Transaction, TransactionReceipt, TxHash, U256},
+    types::{Block, Trace, Transaction, TransactionReceipt, TxHash, U256},
 };
 
 use jsonrpsee::core::{
@@ -146,9 +147,13 @@ impl Rpc {
         Vec<DatabaseERC721Transfer>,
         Vec<DatabaseERC1155Transfer>,
         Vec<DatabaseDexTrade>,
+        Vec<DatabaseTrace>,
     )> {
         let block_data: Option<(DatabaseBlock, Vec<DatabaseTransaction>)> =
             self.get_block(block_number).await;
+
+        let traces: Vec<DatabaseTrace> =
+            self.get_block_traces(block_number).await;
 
         match block_data {
             Some((db_block, db_transactions)) => {
@@ -398,6 +403,7 @@ impl Rpc {
                     db_erc721_transfers,
                     db_erc1155_transfers,
                     db_dex_trades,
+                    traces,
                 ))
             }
             None => None,
@@ -479,6 +485,7 @@ impl Rpc {
                         erc721_transfers,
                         erc1155_transfers,
                         dex_trades,
+                        traces,
                     )) = block_data
                     {
                         let fetched_data = BlockFetchedData {
@@ -491,6 +498,7 @@ impl Rpc {
                             erc721_transfers,
                             erc1155_transfers,
                             dex_trades,
+                            traces,
                         };
 
                         db.store_data(&fetched_data).await;
@@ -557,6 +565,46 @@ impl Rpc {
                 }
             }
             Err(_) => None,
+        }
+    }
+
+    async fn get_block_traces(
+        &self,
+        block_number: &u64,
+    ) -> Vec<DatabaseTrace> {
+        let client = self.get_client();
+
+        let raw_block = client
+            .request(
+                "trace_block",
+                rpc_params![format!("0x{:x}", block_number), true],
+            )
+            .await;
+
+        match raw_block {
+            Ok(value) => {
+                let traces: Result<Vec<Trace>, Error> =
+                    serde_json::from_value(value);
+
+                match traces {
+                    Ok(traces) => {
+                        let mut db_traces = Vec::new();
+
+                        for trace in traces.iter() {
+                            let db_trace = DatabaseTrace::from_rpc(
+                                trace,
+                                self.chain.id,
+                            );
+
+                            db_traces.push(db_trace)
+                        }
+
+                        db_traces
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
         }
     }
 

@@ -6,4 +6,5 @@ pub mod erc20_transfer;
 pub mod erc721_transfer;
 pub mod log;
 pub mod receipt;
+pub mod trace;
 pub mod transaction;

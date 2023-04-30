@@ -147,3 +147,9 @@ CREATE TABLE indexer.transactions (
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);
+
+CREATE TABLE indexer.traces (
+  
+)
+ENGINE = ReplacingMergeTree()
+PRIMARY KEY (hash);
