@@ -628,7 +628,7 @@ impl Rpc {
         let raw_block = client
             .request(
                 "trace_block",
-                rpc_params![format!("0x{:x}", block_number), true],
+                rpc_params![format!("0x{:x}", block_number)],
             )
             .await;
 

@@ -160,6 +160,15 @@ impl Database {
             stores.push(work);
         }
 
+        if !data.traces.is_empty() {
+            let work = tokio::spawn({
+                let traces = data.traces.clone();
+                let db = self.clone();
+                async move { db.store_traces(&traces).await }
+            });
+            stores.push(work);
+        }
+
         let res = join_all(stores).await;
 
         let errored: Vec<_> =
@@ -167,10 +176,6 @@ impl Database {
 
         if !errored.is_empty() {
             panic!("failed to store all chain primitive elements")
-        }
-
-        if !data.traces.is_empty() {
-            self.store_traces(&data.traces).await;
         }
 
         if !data.blocks.is_empty() {
