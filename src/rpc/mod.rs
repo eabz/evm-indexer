@@ -40,7 +40,10 @@ use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 
 use log::{info, warn};
 use rand::seq::SliceRandom;
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tokio::time::sleep;
 
 use serde_json::Error;
@@ -173,7 +176,8 @@ impl Rpc {
 
                 let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
                 let mut db_logs: Vec<DatabaseLog> = Vec::new();
-                let mut db_contracts: Vec<DatabaseContract> = Vec::new();
+                let mut contracts_map: HashMap<String, DatabaseContract> =
+                    HashMap::new();
 
                 if chain.supports_blocks_receipts {
                     let receipts_data = self
@@ -184,10 +188,15 @@ impl Rpc {
                         .await;
 
                     match receipts_data {
-                        Some((mut receipts, mut logs, mut contracts)) => {
+                        Some((mut receipts, mut logs, contracts)) => {
                             db_receipts.append(&mut receipts);
                             db_logs.append(&mut logs);
-                            db_contracts.append(&mut contracts);
+                            for contract in contracts {
+                                contracts_map.insert(
+                                    contract.contract_address.clone(),
+                                    contract.clone(),
+                                );
+                            }
                         }
                         None => return None,
                     }
@@ -206,7 +215,12 @@ impl Rpc {
                                 db_logs.append(&mut logs);
                                 match contract {
                                     Some(contract) => {
-                                        db_contracts.push(contract)
+                                        contracts_map.insert(
+                                            contract
+                                                .contract_address
+                                                .clone(),
+                                            contract.clone(),
+                                        );
                                     }
                                     None => continue,
                                 }
@@ -214,6 +228,37 @@ impl Rpc {
                             None => continue,
                         }
                     }
+                }
+
+                // Insert contracts created through the traces
+                let create_traces: Vec<&DatabaseTrace> = traces
+                    .iter()
+                    .filter(|trace| trace.action_type == "create")
+                    .collect();
+
+                for trace in create_traces {
+                    let contract_address = match &trace.address {
+                        Some(contract_address) => contract_address,
+                        None => continue,
+                    };
+
+                    if contracts_map.contains_key(contract_address) {
+                        continue;
+                    }
+
+                    let contract = DatabaseContract {
+                        block: trace.block_number,
+                        contract_address: contract_address.to_string(),
+                        chain: self.chain.id,
+                        creator: trace.from.clone().unwrap(),
+                        transaction_hash: trace
+                            .transaction_hash
+                            .clone()
+                            .unwrap(),
+                    };
+
+                    contracts_map
+                        .insert(contract_address.to_string(), contract);
                 }
 
                 if total_block_transactions != db_receipts.len() {
@@ -379,6 +424,11 @@ impl Rpc {
                         db_dex_trades.push(db_dex_trade);
                     }
                 }
+
+                let db_contracts: Vec<DatabaseContract> = contracts_map
+                    .values()
+                    .map(|value| value.to_owned())
+                    .collect();
 
                 info!(
                     "Found: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) for block {}.",
