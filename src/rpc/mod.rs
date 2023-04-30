@@ -431,7 +431,7 @@ impl Rpc {
                     .collect();
 
                 info!(
-                    "Found: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) for block {}.",
+                    "Found: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) traces ({}) for block {}.",
                     total_block_transactions,
                     db_receipts.len(),
                     db_logs.len(),
@@ -440,7 +440,8 @@ impl Rpc {
                     db_erc721_transfers.len(),
                     db_erc1155_transfers.len(),
                     db_dex_trades.len(),
-                    block_number
+                    traces.len(),
+                    block_number,
                 );
 
                 Some((
