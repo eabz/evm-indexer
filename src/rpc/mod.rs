@@ -335,7 +335,11 @@ impl Rpc {
                         }
                     }
 
-                    if topic0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE {
+                    if topic0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
+                        && log.topic1.is_some()
+                        && log.topic2.is_some()
+                        && log.topic3.is_some()
+                    {
                         let log_data = decode_bytes(log.data.clone());
 
                         let transfer_values = ethabi::decode(
@@ -361,7 +365,11 @@ impl Rpc {
                         db_erc1155_transfers.push(db_erc1155_transfer)
                     }
 
-                    if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE {
+                    if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
+                        && log.topic1.is_some()
+                        && log.topic2.is_some()
+                        && log.topic3.is_some()
+                    {
                         let log_data = decode_bytes(log.data.clone());
 
                         let transfer_values = ethabi::decode(
@@ -398,21 +406,15 @@ impl Rpc {
 
                         for (i, id) in transfer_ids.into_iter().enumerate()
                         {
-                            if log.topic1.is_some()
-                                && log.topic2.is_some()
-                                && log.topic3.is_some()
-                            {
-                                let db_erc1155_transfer =
-                                    DatabaseERC1155Transfer::from_log(
-                                        log,
-                                        chain.id,
-                                        id,
-                                        transfer_values[i],
-                                    );
+                            let db_erc1155_transfer =
+                                DatabaseERC1155Transfer::from_log(
+                                    log,
+                                    chain.id,
+                                    id,
+                                    transfer_values[i],
+                                );
 
-                                db_erc1155_transfers
-                                    .push(db_erc1155_transfer)
-                            }
+                            db_erc1155_transfers.push(db_erc1155_transfer)
                         }
                     }
 
