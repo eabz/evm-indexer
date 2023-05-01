@@ -398,26 +398,38 @@ impl Rpc {
 
                         for (i, id) in transfer_ids.into_iter().enumerate()
                         {
-                            let db_erc1155_transfer =
-                                DatabaseERC1155Transfer::from_log(
-                                    log,
-                                    chain.id,
-                                    id,
-                                    transfer_values[i],
-                                );
+                            if log.topic1.is_some()
+                                && log.topic2.is_some()
+                                && log.topic3.is_some()
+                            {
+                                let db_erc1155_transfer =
+                                    DatabaseERC1155Transfer::from_log(
+                                        log,
+                                        chain.id,
+                                        id,
+                                        transfer_values[i],
+                                    );
 
-                            db_erc1155_transfers.push(db_erc1155_transfer)
+                                db_erc1155_transfers
+                                    .push(db_erc1155_transfer)
+                            }
                         }
                     }
 
-                    if topic0 == SWAP_EVENT_SIGNATURE {
+                    if topic0 == SWAP_EVENT_SIGNATURE
+                        && log.topic1.is_some()
+                        && log.topic2.is_some()
+                    {
                         let db_dex_trade =
                             DatabaseDexTrade::from_v2_log(log, chain.id);
 
                         db_dex_trades.push(db_dex_trade);
                     }
 
-                    if topic0 == SWAPV3_EVENT_SIGNATURE {
+                    if topic0 == SWAPV3_EVENT_SIGNATURE
+                        && log.topic1.is_some()
+                        && log.topic2.is_some()
+                    {
                         let db_dex_trade =
                             DatabaseDexTrade::from_v3_log(log, chain.id);
 
