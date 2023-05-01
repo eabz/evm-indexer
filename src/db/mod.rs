@@ -67,7 +67,7 @@ impl Database {
 
     pub async fn get_indexed_blocks(&self) -> HashSet<u64> {
         let query = format!(
-            "SELECT number FROM blocks WHERE chain = '{}'",
+            "SELECT number FROM blocks WHERE chain = {}",
             self.chain.id
         );
 
