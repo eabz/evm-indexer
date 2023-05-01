@@ -197,7 +197,7 @@ impl Database {
         );
     }
 
-    async fn store_transactions(
+    pub async fn store_transactions(
         &self,
         transactions: &Vec<DatabaseTransaction>,
     ) {

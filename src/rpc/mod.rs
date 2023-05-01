@@ -112,7 +112,7 @@ impl Rpc {
         Self {
             clients,
             clients_urls,
-            chain: config.chain,
+            chain: config.chain.clone(),
             ws_url: config.ws_url.clone(),
         }
     }

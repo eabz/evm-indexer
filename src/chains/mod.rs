@@ -1,160 +1,57 @@
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy)]
+use ethabi::ethereum_types::U256;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BalanceAllocation {
+    balance: U256,
+}
+
+#[derive(Debug, Clone)]
 pub struct Chain {
     pub id: u64,
     pub name: &'static str,
-    pub block_explorer: &'static str,
-    pub abi_source_api: &'static str,
-    pub abi_source_require_auth: bool,
+    pub genesis_timestamp: u64,
+    pub genesis_hash: &'static str,
     pub supports_blocks_receipts: bool,
     pub supports_trace_block: bool,
-    pub multicall: &'static str,
-}
-
-impl Chain {
-    pub fn new_from_borrowed(chain: &Chain) -> Self {
-        Self {
-            id: chain.id,
-            name: chain.name,
-            block_explorer: chain.block_explorer,
-            abi_source_api: chain.abi_source_api,
-            abi_source_require_auth: chain.abi_source_require_auth,
-            supports_blocks_receipts: chain.supports_blocks_receipts,
-            multicall: chain.multicall,
-            supports_trace_block: chain.supports_trace_block,
-        }
-    }
 }
 
 pub const ETHEREUM: Chain = Chain {
     id: 1,
     name: "ethereum",
-    block_explorer: "https://etherscan.io/",
-    abi_source_api: "https://api.etherscan.io/",
-    abi_source_require_auth: true,
+    genesis_timestamp: 1438249573,
+    genesis_hash: "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
     supports_blocks_receipts: true,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
     supports_trace_block: true,
 };
 
 pub const POLYGON: Chain = Chain {
     id: 137,
     name: "polygon",
-    block_explorer: "https://polygonscan.com/",
-    abi_source_api: "https://api.polygonscan.com/",
-    abi_source_require_auth: true,
+    genesis_timestamp: 1590814036,
+    genesis_hash: "0xa9c28ce2141b56c474f1dc504bee9b01eb1bd7d1a507580d5519d4437a97de1b",
     supports_blocks_receipts: true,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
-    supports_trace_block: true,
-};
-
-pub const FANTOM: Chain = Chain {
-    id: 250,
-    name: "fantom",
-    block_explorer: "https://ftmscan.com/",
-    abi_source_api: "https://api.ftmscan.com/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
     supports_trace_block: true,
 };
 
 pub const BSC: Chain = Chain {
     id: 56,
     name: "bsc",
-    block_explorer: "https://bscscan.com/",
-    abi_source_api: "https://api.bscscan.com/",
-    abi_source_require_auth: true,
+    genesis_timestamp: 1598687048,
+    genesis_hash: "0x0d21840abff46b96c84b2ac9e10e4f5cdaeb5693cb665db62a2f3b02d2d57b5b",
     supports_blocks_receipts: true,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
     supports_trace_block: true,
 };
 
-pub const GNOSIS: Chain = Chain {
-    id: 100,
-    name: "gnosis",
-    block_explorer: "https://gnosisscan.io/",
-    abi_source_api: "https://api.gnosisscan.io/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
-    supports_trace_block: true,
-};
-
-pub const OPTIMISM: Chain = Chain {
-    id: 10,
-    name: "optimism",
-    block_explorer: "https://optimistic.etherscan.io/",
-    abi_source_api: "https://api-optimistic.etherscan.io/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
-    supports_trace_block: false,
-};
-
-pub const ARBITRUM_ONE: Chain = Chain {
-    id: 42161,
-    name: "arbitrum",
-    block_explorer: "https://arbiscan.io/",
-    abi_source_api: "https://api.arbiscan.io/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
-    supports_trace_block: false,
-};
-
-pub const ARBITRUM_NOVA: Chain = Chain {
-    id: 42170,
-    name: "arbitrum-nova",
-    block_explorer: "https://nova.arbiscan.io/",
-    abi_source_api: "https://api-nova.arbiscan.io/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
-    supports_trace_block: false,
-};
-
-pub const AVALANCHE: Chain = Chain {
-    id: 43114,
-    name: "avalanche",
-    block_explorer: "https://snowtrace.io/",
-    abi_source_api: "https://api.snowtrace.io/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
-    supports_trace_block: false,
-};
-
-pub const CELO: Chain = Chain {
-    id: 42220,
-    name: "celo",
-    block_explorer: "https://celoscan.io/",
-    abi_source_api: "https://api.celoscan.io/",
-    abi_source_require_auth: true,
-    supports_blocks_receipts: false,
-    multicall: "0xcA11bde05977b3631167028862bE2a173976CA11",
-    supports_trace_block: false,
-};
-
-pub static CHAINS: [Chain; 10] = [
-    ETHEREUM,
-    POLYGON,
-    FANTOM,
-    BSC,
-    GNOSIS,
-    OPTIMISM,
-    ARBITRUM_ONE,
-    ARBITRUM_NOVA,
-    AVALANCHE,
-    CELO,
-];
+pub static CHAINS: [Chain; 3] = [ETHEREUM, POLYGON, BSC];
 
 pub fn get_chains() -> HashMap<u64, Chain> {
     let mut chains: HashMap<u64, Chain> = HashMap::new();
 
-    for chain in CHAINS.into_iter() {
-        chains.insert(chain.id, chain);
+    for chain in CHAINS.iter() {
+        chains.insert(chain.id, chain.to_owned());
     }
 
     chains
@@ -165,5 +62,5 @@ pub fn get_chain(chain_id: u64) -> Chain {
 
     let selected_chain = chains.get(&chain_id).expect("chain not found.");
 
-    Chain::new_from_borrowed(selected_chain)
+    selected_chain.to_owned()
 }
