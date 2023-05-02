@@ -6,37 +6,23 @@ services:
     env_file:
       - ./.env
     restart: always
-    command: evm-indexer --chain 56 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 7000000 --end-block 11000000
+    command: evm-indexer --chain 56 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 7000000 --end-block 15000000
   
   indexer-2:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: always
-    command: evm-indexer --chain 56 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 11000000 --end-block 15000000
+    command: evm-indexer --chain 56 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 15000000 --end-block 18000000
 
   indexer-3:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: always
-    command: evm-indexer --chain 56 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 15000000 --end-block 18000000
+    command: evm-indexer --chain 56 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 18000000 --end-block 24000000
 
   indexer-4:
-    image: ghcr.io/kindynosmx/evm-indexer:main
-    env_file:
-      - ./.env
-    restart: always
-    command: evm-indexer --chain 56 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 18000000 --end-block 21000000
-
-  indexer-5:
-    image: ghcr.io/kindynosmx/evm-indexer:main
-    env_file:
-      - ./.env
-    restart: always
-    command: evm-indexer --chain 56 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 21000000 --end-block 24000000
-
-  indexer-6:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
