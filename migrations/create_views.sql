@@ -19,7 +19,7 @@ ENGINE = MergeTree()
 ORDER BY chain
 AS
     SELECT number, chain
-    FROM blocks
+    FROM blocks;
     
 INSERT INTO indexer.blocks_by_chain
 SELECT
