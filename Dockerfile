@@ -30,4 +30,4 @@ FROM debian:stable AS runtime
 
 RUN apt update && apt install -y libpq5 ca-certificates
 
-COPY --from=builder /app/target/release/indexer /usr/local/bin/
+COPY --from=builder /app/target/release/evm-indexer /usr/local/bin/
