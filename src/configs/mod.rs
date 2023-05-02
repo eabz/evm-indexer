@@ -21,6 +21,9 @@ pub struct IndexerArgs {
     #[arg(long, help = "Block to start syncing.", default_value_t = 0)]
     pub start_block: u64,
 
+    #[arg(long, help = "Last block to sync.", default_value_t = 0)]
+    pub end_block: u64,
+
     #[arg(
         long,
         help = " Amount of blocks to fetch in parallel.",
@@ -51,6 +54,7 @@ pub struct IndexerArgs {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub start_block: u64,
+    pub end_block: u64,
     pub db_host: String,
     pub db_username: String,
     pub db_password: String,
@@ -98,6 +102,7 @@ impl Config {
 
         Self {
             start_block: args.start_block,
+            end_block: args.end_block,
             db_host: format!("{}://{}", url.scheme(), db_host),
             db_username: username.to_string(),
             db_password: password.to_string(),

@@ -37,7 +37,7 @@ async fn main() {
     )
     .await;
 
-    if config.ws_url.is_some() {
+    if config.ws_url.is_some() && config.end_block == 0 {
         tokio::spawn({
             let rpc: Rpc = rpc.clone();
             let db: Database = db.clone();
@@ -61,9 +61,13 @@ async fn main() {
         db.store_transactions(&genesis_transactions).await;
     }
 
-    loop {
+    if config.end_block != 0 {
         sync_chain(&rpc, &db, &config, &mut indexed_blocks).await;
-        sleep(Duration::from_secs(30)).await;
+    } else {
+        loop {
+            sync_chain(&rpc, &db, &config, &mut indexed_blocks).await;
+            sleep(Duration::from_secs(30)).await;
+        }
     }
 }
 
@@ -73,7 +77,11 @@ async fn sync_chain(
     config: &Config,
     indexed_blocks: &mut HashSet<u64>,
 ) {
-    let last_block = rpc.get_last_block().await;
+    let last_block = if config.end_block != 0 {
+        config.end_block
+    } else {
+        rpc.get_last_block().await
+    };
 
     let full_block_range: Vec<u64> =
         (config.start_block..last_block).collect();
