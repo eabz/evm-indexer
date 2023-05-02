@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  indexer-1:
+    image: ghcr.io/kindynosmx/evm-indexer:main
+    env_file:
+      - ./.env
+    restart: always
+    command: evm-indxer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 11000000 --end-block 12000000
+  
+  indexer-2:
+    image: ghcr.io/kindynosmx/evm-indexer:main
+    env_file:
+      - ./.env
+    restart: always
+    command: evm-indxer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 12000000 --end-block 13000000
+
+  indexer-3:
+    image: ghcr.io/kindynosmx/evm-indexer:main
+    env_file:
+      - ./.env
+    restart: always
+    command: evm-indxer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 13000000 --end-block 14000000
+
+  indexer-4:
+    image: ghcr.io/kindynosmx/evm-indexer:main
+    env_file:
+      - ./.env
+    restart: always
+    command: evm-indxer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 15000000 --end-block 16000000
+
+  indexer-5:
+    image: ghcr.io/kindynosmx/evm-indexer:main
+    env_file:
+      - ./.env
+    restart: always
+    command: evm-indxer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 16000000 --end-block 17000000
+
+  indexer-6:
+    image: ghcr.io/kindynosmx/evm-indexer:main
+    env_file:
+      - ./.env
+    restart: always
+    command: evm-indxer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --ws ${WS_URL} --start-block 17000000
