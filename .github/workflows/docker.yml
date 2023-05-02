@@ -32,4 +32,5 @@ jobs:
         with:
           context: .
           push: true
-          tags: kindynosmx/evm-indexer:latest
+          cache-from: type=registry,ref=kindynosmx/evm-indexer:buildcache
+          cache-to: type=registry,ref=kindynosmx/evm-indexer:buildcache,mode=max
