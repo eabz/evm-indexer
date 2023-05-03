@@ -11,7 +11,7 @@ An indexer is a program that fetches and stores blockchain data for later analys
 
 This indexer is specifically created to parse known data for EVM compatible chains.
 
-It stores all the blockchain primitives (blocks, trnasactions, receipts, logs) and some other useful information (contracts created, tokens data, dex trades, erc20 transfers, erc721 transfers, erc1155 transfers)
+It stores all the blockchain primitives (blocks, transactions, receipts, logs, traces) and some other useful information (contracts, dex trades, erc20 transfers, erc721 transfers, erc1155 transfers)
 
 ## Requirements
 
