@@ -191,6 +191,7 @@ impl Rpc {
                 if chain.supports_blocks_receipts {
                     let receipts_data = self
                         .get_block_receipts(
+                            db_block.base_fee_per_gas,
                             block_number,
                             db_block.timestamp,
                         )
@@ -213,6 +214,7 @@ impl Rpc {
                     for transaction in db_transactions.iter() {
                         let receipt_data = self
                             .get_transaction_receipt(
+                                db_block.base_fee_per_gas,
                                 transaction.hash.clone(),
                                 transaction.timestamp,
                             )
@@ -720,6 +722,7 @@ impl Rpc {
 
     async fn get_transaction_receipt(
         &self,
+        base_fee_per_gas: Option<U256>,
         transaction: String,
         transaction_timestamp: u64,
     ) -> Option<(
@@ -741,6 +744,7 @@ impl Rpc {
                 match receipt {
                     Ok(receipt) => {
                         let db_receipt = DatabaseReceipt::from_rpc(
+                            base_fee_per_gas,
                             &receipt,
                             self.chain.id,
                         );
@@ -795,6 +799,7 @@ impl Rpc {
 
     async fn get_block_receipts(
         &self,
+        base_fee_per_gas: Option<U256>,
         block_number: &u64,
         block_timestamp: u64,
     ) -> Option<(
@@ -829,6 +834,7 @@ impl Rpc {
 
                         for receipt in receipts {
                             let db_receipt = DatabaseReceipt::from_rpc(
+                                base_fee_per_gas,
                                 &receipt,
                                 self.chain.id,
                             );

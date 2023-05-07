@@ -37,8 +37,8 @@ pub const ETHEREUM: Chain = Chain {
 
 fn calculate_ethereum_block_reward(
     block: &DatabaseBlock,
-    receipts: &Vec<DatabaseReceipt>,
-) -> (U256, U256, U256) {
+    receipts: &[DatabaseReceipt],
+) -> (U256, U256) {
     // The ETH base reward is 5 ETH
     let mut base_block_reward =
         U256::from_str("0x4563918244f40000").unwrap();
@@ -58,26 +58,7 @@ fn calculate_ethereum_block_reward(
         base_block_reward = U256::from_str("0x0").unwrap();
     }
 
-    let mut fees_reward = U256::from_str("0x0").unwrap();
-
-    let burned = U256::from_str("0x0").unwrap();
-
-    let is_above_london = block.number > 12_965_000;
-
-    for receipt in receipts.iter() {
-        // If the block is above the London fork fees are calculated different
-        if is_above_london {
-        } else {
-            let reward = receipt
-                .gas_used
-                .unwrap()
-                .mul(receipt.effective_gas_price.unwrap());
-
-            fees_reward.add(reward);
-        }
-    }
-
-    (base_block_reward, fees_reward, burned)
+    (base_block_reward, get_total_fees(receipts))
 }
 
 pub const POLYGON: Chain = Chain {
@@ -91,14 +72,10 @@ pub const POLYGON: Chain = Chain {
 };
 
 fn calculate_polygon_block_reward(
-    block: &DatabaseBlock,
-    receipts: &Vec<DatabaseReceipt>,
-) -> (U256, U256, U256) {
-    (
-        U256::from_dec_str("0").unwrap(),
-        U256([0, 0, 0, 0]),
-        U256([0, 0, 0, 0]),
-    )
+    _block: &DatabaseBlock,
+    receipts: &[DatabaseReceipt],
+) -> (U256, U256) {
+    (U256::from_dec_str("0").unwrap(), get_total_fees(receipts))
 }
 
 pub const BSC: Chain = Chain {
@@ -112,14 +89,10 @@ pub const BSC: Chain = Chain {
 };
 
 fn calculate_bsc_block_reward(
-    block: &DatabaseBlock,
-    receipts: &Vec<DatabaseReceipt>,
-) -> (U256, U256, U256) {
-    (
-        U256::from_dec_str("0").unwrap(),
-        U256([0, 0, 0, 0]),
-        U256([0, 0, 0, 0]),
-    )
+    _block: &DatabaseBlock,
+    receipts: &[DatabaseReceipt],
+) -> (U256, U256) {
+    (U256::from_dec_str("0").unwrap(), get_total_fees(receipts))
 }
 
 pub static CHAINS: [Chain; 3] = [ETHEREUM, POLYGON, BSC];
@@ -142,11 +115,26 @@ pub fn get_chain(chain: u64) -> Chain {
     selected_chain.to_owned()
 }
 
+fn get_total_fees(receipts: &[DatabaseReceipt]) -> U256 {
+    let mut fees_reward = U256::from_str("0x0").unwrap();
+
+    for receipt in receipts {
+        let reward = receipt
+            .gas_used
+            .unwrap()
+            .mul(receipt.effective_gas_price.unwrap());
+
+        fees_reward = fees_reward.add(reward);
+    }
+
+    fees_reward
+}
+
 pub fn get_block_reward(
     chain: u64,
     block: &DatabaseBlock,
-    receipts: &Vec<DatabaseReceipt>,
-) -> (U256, U256, U256) {
+    receipts: &[DatabaseReceipt],
+) -> (U256, U256) {
     match chain {
         1 => calculate_ethereum_block_reward(block, receipts),
         56 => calculate_bsc_block_reward(block, receipts),

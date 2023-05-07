@@ -128,6 +128,8 @@ ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
 
 CREATE TABLE indexer.receipts (
+  base_fee_per_gas Nullable(UInt256),
+  burned_fees UInt256,
   chain UInt64,
   contract_address Nullable(String),
   cumulative_gas_used UInt256,

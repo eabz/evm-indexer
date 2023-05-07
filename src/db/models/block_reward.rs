@@ -1,3 +1,5 @@
+use std::{ops::Mul, str::FromStr};
+
 use clickhouse::Row;
 use ethabi::ethereum_types::U256;
 use serde::{Deserialize, Serialize};
@@ -19,11 +21,16 @@ pub struct DatabaseBlockReward {
 impl DatabaseBlockReward {
     pub fn calculate(
         block: &DatabaseBlock,
-        receipts: &Vec<DatabaseReceipt>,
+        receipts: &[DatabaseReceipt],
         chain: u64,
     ) -> Self {
-        let (base_block_reward, total_fee_reward, burned) =
+        let (base_block_reward, total_fee_reward) =
             get_block_reward(chain, block, receipts);
+
+        let burned = match block.base_fee_per_gas {
+            Some(base_fee_per_gas) => base_fee_per_gas.mul(block.gas_used),
+            None => U256::from_str("0x0").unwrap(),
+        };
 
         Self {
             base_block_reward,
