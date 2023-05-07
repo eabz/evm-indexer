@@ -12,12 +12,10 @@ use models::{
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
     receipt::DatabaseReceipt, trace::DatabaseTrace,
-    transaction::DatabaseTransaction,
+    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
 };
 use serde::Serialize;
 use std::{collections::HashSet, time::Duration};
-
-use self::models::withdrawals::DatabaseWithdrawal;
 
 pub struct BlockFetchedData {
     pub blocks: Vec<DatabaseBlock>,

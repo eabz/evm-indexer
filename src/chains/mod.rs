@@ -30,8 +30,10 @@ pub const ETHEREUM: Chain = Chain {
     has_miner_rewards: true,
 };
 
-fn calculate_ethereum_block_reward(block: &Block<Transaction>) -> U256 {
-    U256([0, 0, 0, 0])
+fn calculate_ethereum_block_reward(
+    block: &Block<Transaction>,
+) -> (U256, U256, U256) {
+    (U256([0, 0, 0, 0]), U256([0, 0, 0, 0]), U256([0, 0, 0, 0]))
 }
 
 pub const POLYGON: Chain = Chain {
@@ -44,8 +46,10 @@ pub const POLYGON: Chain = Chain {
     has_miner_rewards: true,
 };
 
-fn calculate_polygon_block_reward(block: &Block<Transaction>) -> U256 {
-    U256([0, 0, 0, 0])
+fn calculate_polygon_block_reward(
+    block: &Block<Transaction>,
+) -> (U256, U256, U256) {
+    (U256([0, 0, 0, 0]), U256([0, 0, 0, 0]), U256([0, 0, 0, 0]))
 }
 
 pub const BSC: Chain = Chain {
@@ -58,8 +62,10 @@ pub const BSC: Chain = Chain {
     has_miner_rewards: true,
 };
 
-fn calculate_bsc_block_reward(block: &Block<Transaction>) -> U256 {
-    U256([0, 0, 0, 0])
+fn calculate_bsc_block_reward(
+    block: &Block<Transaction>,
+) -> (U256, U256, U256) {
+    (U256([0, 0, 0, 0]), U256([0, 0, 0, 0]), U256([0, 0, 0, 0]))
 }
 
 pub static CHAINS: [Chain; 3] = [ETHEREUM, POLYGON, BSC];
@@ -74,19 +80,19 @@ pub fn get_chains() -> HashMap<u64, Chain> {
     chains
 }
 
-pub fn get_chain(chain_id: u64) -> Chain {
+pub fn get_chain(chain: u64) -> Chain {
     let chains = get_chains();
 
-    let selected_chain = chains.get(&chain_id).expect("chain not found.");
+    let selected_chain = chains.get(&chain).expect("chain not found.");
 
     selected_chain.to_owned()
 }
 
 pub fn get_block_reward(
-    chain_id: u64,
+    chain: u64,
     block: &Block<Transaction>,
-) -> U256 {
-    match chain_id {
+) -> (U256, U256, U256) {
+    match chain {
         1 => calculate_ethereum_block_reward(block),
         56 => calculate_bsc_block_reward(block),
         137 => calculate_polygon_block_reward(block),

@@ -10,7 +10,7 @@ use crate::{
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
             receipt::DatabaseReceipt, trace::DatabaseTrace,
             transaction::DatabaseTransaction,
-            withdrawals::DatabaseWithdrawal,
+            withdrawal::DatabaseWithdrawal,
         },
         BlockFetchedData, Database,
     },
@@ -453,16 +453,16 @@ impl Rpc {
                     .collect();
 
                 debug!(
-                    "Found: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) traces ({}) withdrawals ({}) for block {}.",
-                    total_block_transactions,
-                    db_receipts.len(),
-                    db_logs.len(),
+                    "Found: contracts ({}) trades ({}) erc1155 ({}) erc20 ({}) erc721 ({}) logs ({}) receipts ({}) traces ({}) transactions ({}) withdrawals ({}) for ({}) block.",
                     db_contracts.len(),
+                    db_dex_trades.len(),
+                    db_erc1155_transfers.len(),
                     db_erc20_transfers.len(),
                     db_erc721_transfers.len(),
-                    db_erc1155_transfers.len(),
-                    db_dex_trades.len(),
+                    db_logs.len(),
+                    db_receipts.len(),
                     traces.len(),
+                    total_block_transactions,
                     db_withdrawals.len(),
                     block_number,
                 );
