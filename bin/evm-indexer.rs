@@ -117,6 +117,7 @@ async fn sync_chain(
             erc1155_transfers: Vec::new(),
             dex_trades: Vec::new(),
             traces: Vec::new(),
+            withdrawals: Vec::new(),
         };
 
         for result in results {
@@ -132,6 +133,7 @@ async fn sync_chain(
                     mut erc1155_transfers,
                     mut dex_trades,
                     mut traces,
+                    mut withdrawals,
                 )) => {
                     fetched_data.blocks.push(block);
                     fetched_data.transactions.append(&mut transactions);
@@ -148,7 +150,8 @@ async fn sync_chain(
                         .erc1155_transfers
                         .append(&mut erc1155_transfers);
                     fetched_data.dex_trades.append(&mut dex_trades);
-                    fetched_data.traces.append(&mut traces)
+                    fetched_data.traces.append(&mut traces);
+                    fetched_data.withdrawals.append(&mut withdrawals)
                 }
                 None => continue,
             }

@@ -8,3 +8,4 @@ pub mod log;
 pub mod receipt;
 pub mod trace;
 pub mod transaction;
+pub mod withdrawals;

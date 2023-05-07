@@ -22,6 +22,8 @@ CREATE TABLE indexer.blocks (
   transactions UInt64,
   transactions_root String,
   uncles Array(String),
+  withdrawals_root Nullable(String),
+  excess_data_gas Nullable(UInt256),
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);

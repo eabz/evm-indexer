@@ -11,14 +11,14 @@ array-bytes = "6"
 clap = { version = "4", features = ["derive"] }
 clickhouse = "0.11"
 ethabi = "18"
-ethers = { version = "2", features = ["rustls"] }
+ethers = { version = "2.0.4", features = ["rustls"] }
 futures = "0.3"
 hex = "0.4"
 hyper = "0.14"
 hyper-tls = "0.5"
-jsonrpsee = { version = "0.17", features = ["macros", "server"] }
-jsonrpsee-http-client = "0.17"
-jsonrpsee-ws-client = "0.17"
+jsonrpsee = { version = "0.18", features = ["macros", "server"] }
+jsonrpsee-http-client = "0.18"
+jsonrpsee-ws-client = "0.18"
 log = "0.4"
 rand = "0.8"
 serde = "1"

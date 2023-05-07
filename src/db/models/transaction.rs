@@ -38,7 +38,7 @@ pub struct DatabaseTransaction {
 
 impl DatabaseTransaction {
     pub fn from_rpc(
-        transaction: Transaction,
+        transaction: &Transaction,
         chain: u64,
         timestamp: u64,
     ) -> Self {
@@ -52,27 +52,27 @@ impl DatabaseTransaction {
             None => 0,
         };
 
-        let access_list: Vec<(String, Vec<String>)> = match transaction
-            .access_list
-        {
-            Some(access_list_items) => {
-                let mut access_list: Vec<(String, Vec<String>)> =
-                    Vec::new();
+        let access_list: Vec<(String, Vec<String>)> =
+            match transaction.access_list.to_owned() {
+                Some(access_list_items) => {
+                    let mut access_list: Vec<(String, Vec<String>)> =
+                        Vec::new();
 
-                for item in access_list_items.0 {
-                    let keys: Vec<String> = item
-                        .storage_keys
-                        .into_iter()
-                        .map(format_hash)
-                        .collect();
+                    for item in access_list_items.0 {
+                        let keys: Vec<String> = item
+                            .storage_keys
+                            .into_iter()
+                            .map(format_hash)
+                            .collect();
 
-                    access_list.push((format_address(item.address), keys))
+                        access_list
+                            .push((format_address(item.address), keys))
+                    }
+
+                    access_list
                 }
-
-                access_list
-            }
-            None => Vec::new(),
-        };
+                None => Vec::new(),
+            };
 
         Self {
             access_list,

@@ -16,6 +16,8 @@ use models::{
 };
 use std::{collections::HashSet, time::Duration};
 
+use self::models::withdrawals::DatabaseWithdrawal;
+
 pub struct BlockFetchedData {
     pub blocks: Vec<DatabaseBlock>,
     pub transactions: Vec<DatabaseTransaction>,
@@ -27,6 +29,7 @@ pub struct BlockFetchedData {
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
     pub dex_trades: Vec<DatabaseDexTrade>,
     pub traces: Vec<DatabaseTrace>,
+    pub withdrawals: Vec<DatabaseWithdrawal>,
 }
 
 // Ref: https://github.com/loyd/clickhouse.rs/blob/master/src/lib.rs#L51
