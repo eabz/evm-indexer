@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use ethabi::ethereum_types::U256;
+use ethers::types::{Block, Transaction};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,7 @@ pub struct Chain {
     pub name: &'static str,
     pub supports_blocks_receipts: bool,
     pub supports_trace_block: bool,
+    pub has_miner_rewards: bool,
 }
 
 pub const ETHEREUM: Chain = Chain {
@@ -25,7 +27,12 @@ pub const ETHEREUM: Chain = Chain {
     name: "ethereum",
     supports_blocks_receipts: true,
     supports_trace_block: true,
+    has_miner_rewards: true,
 };
+
+fn calculate_ethereum_block_reward(block: &Block<Transaction>) -> U256 {
+    U256([0, 0, 0, 0])
+}
 
 pub const POLYGON: Chain = Chain {
     genesis_hash: "0xa9c28ce2141b56c474f1dc504bee9b01eb1bd7d1a507580d5519d4437a97de1b",
@@ -34,7 +41,12 @@ pub const POLYGON: Chain = Chain {
     name: "polygon",
     supports_blocks_receipts: true,
     supports_trace_block: true,
+    has_miner_rewards: true,
 };
+
+fn calculate_polygon_block_reward(block: &Block<Transaction>) -> U256 {
+    U256([0, 0, 0, 0])
+}
 
 pub const BSC: Chain = Chain {
     genesis_hash: "0x0d21840abff46b96c84b2ac9e10e4f5cdaeb5693cb665db62a2f3b02d2d57b5b",
@@ -43,7 +55,12 @@ pub const BSC: Chain = Chain {
     name: "bsc",
     supports_blocks_receipts: true,
     supports_trace_block: true,
+    has_miner_rewards: true,
 };
+
+fn calculate_bsc_block_reward(block: &Block<Transaction>) -> U256 {
+    U256([0, 0, 0, 0])
+}
 
 pub static CHAINS: [Chain; 3] = [ETHEREUM, POLYGON, BSC];
 
@@ -63,4 +80,16 @@ pub fn get_chain(chain_id: u64) -> Chain {
     let selected_chain = chains.get(&chain_id).expect("chain not found.");
 
     selected_chain.to_owned()
+}
+
+pub fn get_block_reward(
+    chain_id: u64,
+    block: &Block<Transaction>,
+) -> U256 {
+    match chain_id {
+        1 => calculate_ethereum_block_reward(block),
+        56 => calculate_bsc_block_reward(block),
+        137 => calculate_polygon_block_reward(block),
+        _ => panic!("invalid chain"),
+    }
 }
