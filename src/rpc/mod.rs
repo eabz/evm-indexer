@@ -3,8 +3,8 @@ use crate::{
     configs::Config,
     db::{
         models::{
-            block::DatabaseBlock, contract::DatabaseContract,
-            dex_trade::DatabaseDexTrade,
+            block::DatabaseBlock, block_reward::DatabaseBlockReward,
+            contract::DatabaseContract, dex_trade::DatabaseDexTrade,
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
@@ -146,6 +146,7 @@ impl Rpc {
         chain: &Chain,
     ) -> Option<(
         DatabaseBlock,
+        DatabaseBlockReward,
         Vec<DatabaseTransaction>,
         Vec<DatabaseReceipt>,
         Vec<DatabaseLog>,
@@ -237,6 +238,13 @@ impl Rpc {
                         }
                     }
                 }
+
+                // Calculate the block reward
+                let db_block_reward = DatabaseBlockReward::calculate(
+                    &db_block,
+                    &db_receipts,
+                    self.chain.id,
+                );
 
                 // Insert contracts created through the traces
                 let create_traces: Vec<&DatabaseTrace> = traces
@@ -469,6 +477,7 @@ impl Rpc {
 
                 Some((
                     db_block,
+                    db_block_reward,
                     db_transactions,
                     db_receipts,
                     db_logs,
@@ -552,6 +561,7 @@ impl Rpc {
 
                     if let Some((
                         block,
+                        block_reward,
                         transactions,
                         receipts,
                         logs,
@@ -566,6 +576,7 @@ impl Rpc {
                     {
                         let fetched_data = BlockFetchedData {
                             blocks: vec![block],
+                            block_rewards: vec![block_reward],
                             contracts,
                             dex_trades,
                             erc20_transfers,

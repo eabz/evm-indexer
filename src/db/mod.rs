@@ -17,8 +17,11 @@ use models::{
 use serde::Serialize;
 use std::{collections::HashSet, time::Duration};
 
+use self::models::block_reward::DatabaseBlockReward;
+
 pub struct BlockFetchedData {
     pub blocks: Vec<DatabaseBlock>,
+    pub block_rewards: Vec<DatabaseBlockReward>,
     pub contracts: Vec<DatabaseContract>,
     pub dex_trades: Vec<DatabaseDexTrade>,
     pub erc20_transfers: Vec<DatabaseERC20Transfer>,
@@ -44,6 +47,7 @@ pub struct Database {
 
 pub enum DatabaseTables {
     Blocks,
+    BlockRewards,
     Contracts,
     DexTrades,
     Erc1155Transfers,
@@ -60,6 +64,7 @@ impl DatabaseTables {
     pub fn as_str(&self) -> &'static str {
         match self {
             DatabaseTables::Blocks => "blocks",
+            DatabaseTables::BlockRewards => "block_rewards",
             DatabaseTables::Contracts => "contracts",
             DatabaseTables::DexTrades => "dex_trades",
             DatabaseTables::Erc1155Transfers => "erc1155_transfers",
@@ -117,6 +122,22 @@ impl Database {
 
     pub async fn store_data(&self, data: &BlockFetchedData) {
         let mut stores = vec![];
+
+        if !data.block_rewards.is_empty() {
+            let work = tokio::spawn({
+                let block_rewards: Vec<DatabaseBlockReward> =
+                    data.block_rewards.clone();
+                let db = self.clone();
+                async move {
+                    db.store_items(
+                        &block_rewards,
+                        DatabaseTables::BlockRewards.as_str(),
+                    )
+                    .await
+                }
+            });
+            stores.push(work);
+        }
 
         if !data.contracts.is_empty() {
             let work = tokio::spawn({
@@ -284,7 +305,8 @@ impl Database {
         }
 
         info!(
-            "Inserted: contracts ({}) trades ({}) erc1155 ({}) erc20 ({}) erc721 ({}) logs ({}) receipts ({}) traces ({}) transactions ({}) withdrawals ({}) in ({}) blocks.",
+            "Inserted: rewards ({}) contracts ({}) trades ({}) erc1155 ({}) erc20 ({}) erc721 ({}) logs ({}) receipts ({}) traces ({}) transactions ({}) withdrawals ({}) in ({}) blocks.",
+            data.block_rewards.len(),
             data.contracts.len(),
             data.dex_trades.len(),
             data.erc1155_transfers.len(),

@@ -112,6 +112,7 @@ async fn sync_chain(
 
         let mut fetched_data = BlockFetchedData {
             blocks: Vec::new(),
+            block_rewards: Vec::new(),
             contracts: Vec::new(),
             dex_trades: Vec::new(),
             erc20_transfers: Vec::new(),
@@ -128,6 +129,7 @@ async fn sync_chain(
             match result {
                 Some((
                     block,
+                    block_reward,
                     mut transactions,
                     mut receipts,
                     mut logs,
@@ -140,6 +142,7 @@ async fn sync_chain(
                     mut withdrawals,
                 )) => {
                     fetched_data.blocks.push(block);
+                    fetched_data.block_rewards.push(block_reward);
                     fetched_data.transactions.append(&mut transactions);
                     fetched_data.receipts.append(&mut receipts);
                     fetched_data.logs.append(&mut logs);

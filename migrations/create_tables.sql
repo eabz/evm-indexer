@@ -1,9 +1,7 @@
 CREATE DATABASE IF NOT EXISTS indexer;
 
 CREATE TABLE indexer.blocks (
-  base_block_reward UInt256,
   base_fee_per_gas Nullable(UInt256),
-  burned UInt256,
   chain UInt64,
   difficulty UInt256,
   excess_data_gas Nullable(UInt256),
@@ -23,11 +21,21 @@ CREATE TABLE indexer.blocks (
   state_root String,
   timestamp UInt64,
   total_difficulty Nullable(UInt256),
-  total_fee_reward UInt256,
   transactions UInt64,
   transactions_root String,
   uncles Array(String),
   withdrawals_root Nullable(String),
+)
+ENGINE = ReplacingMergeTree()
+PRIMARY KEY (hash);
+
+CREATE TABLE indexer.block_rewards (
+  base_block_reward UInt256,
+  burned UInt256,
+  chain UInt64,
+  hash String,
+  miner String,
+  total_fee_reward UInt256,
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);

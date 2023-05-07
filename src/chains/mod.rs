@@ -1,8 +1,13 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    ops::{Add, Mul},
+    str::FromStr,
+};
 
 use ethabi::ethereum_types::U256;
-use ethers::types::{Block, Transaction};
 use serde::{Deserialize, Serialize};
+
+use crate::db::models::{block::DatabaseBlock, receipt::DatabaseReceipt};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BalanceAllocation {
@@ -31,9 +36,48 @@ pub const ETHEREUM: Chain = Chain {
 };
 
 fn calculate_ethereum_block_reward(
-    block: &Block<Transaction>,
+    block: &DatabaseBlock,
+    receipts: &Vec<DatabaseReceipt>,
 ) -> (U256, U256, U256) {
-    (U256([0, 0, 0, 0]), U256([0, 0, 0, 0]), U256([0, 0, 0, 0]))
+    // The ETH base reward is 5 ETH
+    let mut base_block_reward =
+        U256::from_str("0x4563918244f40000").unwrap();
+
+    // If the block is above the Bizantium fork the reward is 3 ETH
+    if block.number > 4_370_000 {
+        base_block_reward = U256::from_str("0x29a2241af62c0000").unwrap();
+    }
+
+    // If the block is above the Constantinople fork the reward is 3 ETH
+    if block.number > 7_280_000 {
+        base_block_reward = U256::from_str("0x1bc16d674ec80000").unwrap();
+    }
+
+    // If the block is above The Merge the base block reward is 0 ETH
+    if block.number > 15_537_393 {
+        base_block_reward = U256::from_str("0x0").unwrap();
+    }
+
+    let mut fees_reward = U256::from_str("0x0").unwrap();
+
+    let burned = U256::from_str("0x0").unwrap();
+
+    let is_above_london = block.number > 12_965_000;
+
+    for receipt in receipts.iter() {
+        // If the block is above the London fork fees are calculated different
+        if is_above_london {
+        } else {
+            let reward = receipt
+                .gas_used
+                .unwrap()
+                .mul(receipt.effective_gas_price.unwrap());
+
+            fees_reward.add(reward);
+        }
+    }
+
+    (base_block_reward, fees_reward, burned)
 }
 
 pub const POLYGON: Chain = Chain {
@@ -47,9 +91,14 @@ pub const POLYGON: Chain = Chain {
 };
 
 fn calculate_polygon_block_reward(
-    block: &Block<Transaction>,
+    block: &DatabaseBlock,
+    receipts: &Vec<DatabaseReceipt>,
 ) -> (U256, U256, U256) {
-    (U256([0, 0, 0, 0]), U256([0, 0, 0, 0]), U256([0, 0, 0, 0]))
+    (
+        U256::from_dec_str("0").unwrap(),
+        U256([0, 0, 0, 0]),
+        U256([0, 0, 0, 0]),
+    )
 }
 
 pub const BSC: Chain = Chain {
@@ -63,9 +112,14 @@ pub const BSC: Chain = Chain {
 };
 
 fn calculate_bsc_block_reward(
-    block: &Block<Transaction>,
+    block: &DatabaseBlock,
+    receipts: &Vec<DatabaseReceipt>,
 ) -> (U256, U256, U256) {
-    (U256([0, 0, 0, 0]), U256([0, 0, 0, 0]), U256([0, 0, 0, 0]))
+    (
+        U256::from_dec_str("0").unwrap(),
+        U256([0, 0, 0, 0]),
+        U256([0, 0, 0, 0]),
+    )
 }
 
 pub static CHAINS: [Chain; 3] = [ETHEREUM, POLYGON, BSC];
@@ -90,12 +144,13 @@ pub fn get_chain(chain: u64) -> Chain {
 
 pub fn get_block_reward(
     chain: u64,
-    block: &Block<Transaction>,
+    block: &DatabaseBlock,
+    receipts: &Vec<DatabaseReceipt>,
 ) -> (U256, U256, U256) {
     match chain {
-        1 => calculate_ethereum_block_reward(block),
-        56 => calculate_bsc_block_reward(block),
-        137 => calculate_polygon_block_reward(block),
+        1 => calculate_ethereum_block_reward(block, receipts),
+        56 => calculate_bsc_block_reward(block, receipts),
+        137 => calculate_polygon_block_reward(block, receipts),
         _ => panic!("invalid chain"),
     }
 }
