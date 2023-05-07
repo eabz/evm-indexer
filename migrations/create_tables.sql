@@ -198,9 +198,9 @@ CREATE TABLE indexer.withdrawals (
   amount UInt256,
   block_number UInt64,
   chain UInt64,
-  index UInt64,
   timestamp UInt64,
   validator_index UInt64,
+  withdrawal_index UInt64,
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (block_number, index, chain);
+PRIMARY KEY (block_number, withdrawal_index, chain);

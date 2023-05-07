@@ -11,7 +11,9 @@ use crate::utils::format::{
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseReceipt {
+    #[serde(with = "opt_serialize_u256")]
     pub base_fee_per_gas: Option<U256>,
+    #[serde(with = "serialize_u256")]
     pub burned_fees: U256,
     pub chain: u64,
     pub contract_address: Option<String>,

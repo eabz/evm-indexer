@@ -69,7 +69,7 @@ impl DatabaseTables {
             DatabaseTables::DexTrades => "dex_trades",
             DatabaseTables::Erc1155Transfers => "erc1155_transfers",
             DatabaseTables::Erc20Transfers => "erc20_transfers",
-            DatabaseTables::Erc721Transfers => "erc721_tranfers",
+            DatabaseTables::Erc721Transfers => "erc721_transfers",
             DatabaseTables::Logs => "logs",
             DatabaseTables::Receipts => "receipts",
             DatabaseTables::Traces => "traces",

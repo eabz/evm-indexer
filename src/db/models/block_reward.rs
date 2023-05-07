@@ -4,17 +4,20 @@ use clickhouse::Row;
 use ethabi::ethereum_types::U256;
 use serde::{Deserialize, Serialize};
 
-use crate::chains::get_block_reward;
+use crate::{chains::get_block_reward, utils::format::serialize_u256};
 
 use super::{block::DatabaseBlock, receipt::DatabaseReceipt};
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseBlockReward {
+    #[serde(with = "serialize_u256")]
     pub base_block_reward: U256,
+    #[serde(with = "serialize_u256")]
     pub burned: U256,
     pub chain: u64,
     pub hash: String,
     pub miner: String,
+    #[serde(with = "serialize_u256")]
     pub total_fee_reward: U256,
 }
 
