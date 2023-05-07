@@ -1,6 +1,6 @@
 use evm_indexer::{
     configs::Config,
-    db::{BlockFetchedData, Database},
+    db::{BlockFetchedData, Database, DatabaseTables},
     genesis::get_genesis_allocations,
     rpc::Rpc,
 };
@@ -58,7 +58,11 @@ async fn main() {
     if indexed_blocks.is_empty() {
         let genesis_transactions =
             get_genesis_allocations(config.chain.clone());
-        db.store_transactions(&genesis_transactions).await;
+        db.store_items(
+            &genesis_transactions,
+            DatabaseTables::Transactions.as_str(),
+        )
+        .await;
     }
 
     if config.end_block != 0 {
