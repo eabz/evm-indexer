@@ -14,19 +14,19 @@ use super::log::DatabaseLog;
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseDexTrade {
     pub chain: u64,
-    pub maker: String,
-    pub transaction_hash: String,
     #[serde(with = "serialize_u256")]
     pub log_index: U256,
-    pub receiver: String,
+    pub maker: String,
     pub pair_address: String,
+    pub receiver: String,
+    pub timestamp: u64,
     #[serde(with = "serialize_u256")]
     pub token0_amount: U256,
     #[serde(with = "serialize_u256")]
     pub token1_amount: U256,
+    pub transaction_hash: String,
     #[serde(with = "opt_serialize_u256")]
     pub transaction_log_index: Option<U256>,
-    pub timestamp: u64,
 }
 
 impl DatabaseDexTrade {
@@ -76,19 +76,19 @@ impl DatabaseDexTrade {
 
         Self {
             chain,
+            log_index: log.log_index,
             maker: format_address(
                 maker.to_owned().into_address().unwrap(),
             ),
-            transaction_hash: log.transaction_hash.clone(),
-            log_index: log.log_index,
+            pair_address,
             receiver: format_address(
                 receiver.to_owned().into_address().unwrap(),
             ),
+            timestamp: log.timestamp,
             token0_amount: token0_out,
             token1_amount: token1_out,
+            transaction_hash: log.transaction_hash.clone(),
             transaction_log_index: log.transaction_log_index,
-            timestamp: log.timestamp,
-            pair_address,
         }
     }
 
@@ -141,19 +141,19 @@ impl DatabaseDexTrade {
 
         Self {
             chain,
+            log_index: log.log_index,
             maker: format_address(
                 maker.to_owned().into_address().unwrap(),
             ),
-            transaction_hash: log.transaction_hash.clone(),
-            log_index: log.log_index,
+            pair_address,
             receiver: format_address(
                 receiver.to_owned().into_address().unwrap(),
             ),
+            timestamp: log.timestamp,
             token0_amount,
             token1_amount,
+            transaction_hash: log.transaction_hash.clone(),
             transaction_log_index: log.transaction_log_index,
-            timestamp: log.timestamp,
-            pair_address,
         }
     }
 }

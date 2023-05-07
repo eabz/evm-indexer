@@ -20,15 +20,15 @@ use self::models::withdrawals::DatabaseWithdrawal;
 
 pub struct BlockFetchedData {
     pub blocks: Vec<DatabaseBlock>,
-    pub transactions: Vec<DatabaseTransaction>,
-    pub receipts: Vec<DatabaseReceipt>,
-    pub logs: Vec<DatabaseLog>,
     pub contracts: Vec<DatabaseContract>,
+    pub dex_trades: Vec<DatabaseDexTrade>,
     pub erc20_transfers: Vec<DatabaseERC20Transfer>,
     pub erc721_transfers: Vec<DatabaseERC721Transfer>,
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
-    pub dex_trades: Vec<DatabaseDexTrade>,
+    pub logs: Vec<DatabaseLog>,
+    pub receipts: Vec<DatabaseReceipt>,
     pub traces: Vec<DatabaseTrace>,
+    pub transactions: Vec<DatabaseTransaction>,
     pub withdrawals: Vec<DatabaseWithdrawal>,
 }
 

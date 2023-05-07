@@ -108,15 +108,15 @@ async fn sync_chain(
 
         let mut fetched_data = BlockFetchedData {
             blocks: Vec::new(),
-            transactions: Vec::new(),
-            receipts: Vec::new(),
-            logs: Vec::new(),
             contracts: Vec::new(),
+            dex_trades: Vec::new(),
             erc20_transfers: Vec::new(),
             erc721_transfers: Vec::new(),
             erc1155_transfers: Vec::new(),
-            dex_trades: Vec::new(),
+            logs: Vec::new(),
+            receipts: Vec::new(),
             traces: Vec::new(),
+            transactions: Vec::new(),
             withdrawals: Vec::new(),
         };
 

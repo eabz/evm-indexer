@@ -55,19 +55,19 @@ use serde_json::Error;
 abigen!(
     ERC20,
     r#"[
+        function decimals() external view returns (uint8)
+        function factory() external view returns (address)
         function name() external view returns (string)
         function symbol() external view returns (string)
-        function decimals() external view returns (uint8)
         function token0() external view returns (address)
         function token1() external view returns (address)
-        function factory() external view returns (address)
     ]"#,
 );
 #[derive(Debug, Clone)]
 pub struct Rpc {
+    pub chain: Chain,
     pub clients: Vec<HttpClient<HttpBackend>>,
     pub clients_urls: Vec<String>,
-    pub chain: Chain,
     pub ws_url: Option<String>,
 }
 
@@ -114,9 +114,9 @@ impl Rpc {
         }
 
         Self {
+            chain: config.chain.clone(),
             clients,
             clients_urls,
-            chain: config.chain.clone(),
             ws_url: config.ws_url.clone(),
         }
     }
@@ -566,15 +566,15 @@ impl Rpc {
                     {
                         let fetched_data = BlockFetchedData {
                             blocks: vec![block],
-                            transactions,
-                            receipts,
-                            logs,
                             contracts,
+                            dex_trades,
                             erc20_transfers,
                             erc721_transfers,
                             erc1155_transfers,
-                            dex_trades,
+                            logs,
+                            receipts,
                             traces,
+                            transactions,
                             withdrawals,
                         };
 
@@ -650,6 +650,8 @@ impl Rpc {
                                     DatabaseWithdrawal::from_rpc(
                                         withdrawal,
                                         self.chain.id,
+                                        db_block.number,
+                                        db_block.timestamp,
                                     );
 
                                 db_withdrawals.push(db_withdrawal)

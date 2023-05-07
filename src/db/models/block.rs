@@ -67,9 +67,9 @@ impl DatabaseBlock {
             size: block.size,
             state_root: format_hash(block.state_root),
             timestamp: block.timestamp.as_u64(),
-            transactions_root: format_hash(block.transactions_root),
             total_difficulty: block.total_difficulty,
             transactions: block.transactions.len() as u64,
+            transactions_root: format_hash(block.transactions_root),
             uncles: block
                 .uncles
                 .clone()

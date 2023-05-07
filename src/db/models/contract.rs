@@ -7,8 +7,8 @@ use crate::utils::format::{format_address, format_hash};
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseContract {
     pub block: u64,
-    pub contract_address: String,
     pub chain: u64,
+    pub contract_address: String,
     pub creator: String,
     pub transaction_hash: String,
 }
@@ -17,7 +17,7 @@ impl DatabaseContract {
     pub fn from_rpc(receipt: &TransactionReceipt, chain: u64) -> Self {
         Self {
             block: receipt.block_number.unwrap().as_u64(),
-            chain: chain.to_owned(),
+            chain,
             contract_address: format_address(
                 receipt.contract_address.unwrap(),
             ),

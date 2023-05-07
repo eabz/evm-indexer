@@ -78,20 +78,20 @@ impl DatabaseTransaction {
             access_list,
             block_hash: format_hash(transaction.block_hash.unwrap()),
             block_number: transaction.block_number.unwrap().as_u64(),
-            chain: chain.to_owned(),
+            chain,
             from: format_address(transaction.from),
             gas: transaction.gas,
             gas_price: transaction.gas_price,
-            max_priority_fee_per_gas: transaction.max_priority_fee_per_gas,
-            max_fee_per_gas: transaction.max_fee_per_gas,
             hash: format_hash(transaction.hash),
+            input: format_bytes(&transaction.input),
+            max_fee_per_gas: transaction.max_fee_per_gas,
+            max_priority_fee_per_gas: transaction.max_priority_fee_per_gas,
             method: format!(
                 "0x{}",
                 hex::encode(byte4_from_input(&format_bytes(
                     &transaction.input
                 )))
             ),
-            input: format_bytes(&transaction.input),
             nonce: transaction.nonce,
             timestamp,
             to,

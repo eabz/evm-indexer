@@ -13,18 +13,18 @@ pub struct DatabaseLog {
     pub address: String,
     pub chain: u64,
     pub data: String,
-    pub transaction_hash: String,
     #[serde(with = "serialize_u256")]
     pub log_index: U256,
     pub log_type: Option<String>,
     pub removed: bool,
+    pub timestamp: u64,
     pub topic0: Option<String>,
     pub topic1: Option<String>,
     pub topic2: Option<String>,
     pub topic3: Option<String>,
+    pub transaction_hash: String,
     #[serde(with = "opt_serialize_u256")]
     pub transaction_log_index: Option<U256>,
-    pub timestamp: u64,
 }
 
 impl DatabaseLog {
@@ -59,16 +59,16 @@ impl DatabaseLog {
             address: format_address(log.address),
             chain,
             data: format_bytes(&log.data),
-            transaction_hash: format_hash(log.transaction_hash.unwrap()),
-            removed: log.removed.unwrap(),
             log_index: log.log_index.unwrap(),
+            log_type: log.log_type.clone(),
+            removed: log.removed.unwrap(),
+            timestamp,
             topic0,
             topic1,
             topic2,
             topic3,
-            log_type: log.log_type.clone(),
+            transaction_hash: format_hash(log.transaction_hash.unwrap()),
             transaction_log_index: log.transaction_log_index,
-            timestamp,
         }
     }
 }
