@@ -170,3 +170,19 @@ SELECT
     count() as transactions
 FROM indexer.transactions
 GROUP BY chain;
+
+CREATE MATERIALIZED VIEW indexer.withdrawals_count_by_chain
+ENGINE = SummingMergeTree()
+ORDER BY chain
+AS SELECT
+    chain,
+    count() as withdrawals
+FROM indexer.withdrawals
+GROUP BY chain;
+
+INSERT INTO indexer.withdrawals_count_by_chain
+SELECT
+    chain,
+    count() as withdrawals
+FROM indexer.withdrawals
+GROUP BY chain;

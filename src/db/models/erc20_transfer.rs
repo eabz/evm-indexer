@@ -17,14 +17,14 @@ pub struct DatabaseERC20Transfer {
     pub amount: U256,
     pub chain: u64,
     pub from: String,
-    pub transaction_hash: String,
     #[serde(with = "serialize_u256")]
     pub log_index: U256,
-    pub to: String,
+    pub timestamp: u64,
     pub token: String,
+    pub to: String,
+    pub transaction_hash: String,
     #[serde(with = "opt_serialize_u256")]
     pub transaction_log_index: Option<U256>,
-    pub timestamp: u64,
 }
 
 impl DatabaseERC20Transfer {
@@ -68,19 +68,19 @@ impl DatabaseERC20Transfer {
         let token = log.address.clone();
 
         Self {
+            amount: value.to_owned().into_uint().unwrap(),
             chain,
             from: format_address(
                 from_address.to_owned().into_address().unwrap(),
             ),
-            transaction_hash: log.transaction_hash.clone(),
             log_index: log.log_index,
+            timestamp: log.timestamp,
+            token,
             to: format_address(
                 to_address.to_owned().into_address().unwrap(),
             ),
-            token,
+            transaction_hash: log.transaction_hash.clone(),
             transaction_log_index: log.transaction_log_index,
-            amount: value.to_owned().into_uint().unwrap(),
-            timestamp: log.timestamp,
         }
     }
 }

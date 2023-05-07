@@ -38,7 +38,7 @@ pub struct DatabaseTransaction {
 
 impl DatabaseTransaction {
     pub fn from_rpc(
-        transaction: Transaction,
+        transaction: &Transaction,
         chain: u64,
         timestamp: u64,
     ) -> Self {
@@ -52,46 +52,46 @@ impl DatabaseTransaction {
             None => 0,
         };
 
-        let access_list: Vec<(String, Vec<String>)> = match transaction
-            .access_list
-        {
-            Some(access_list_items) => {
-                let mut access_list: Vec<(String, Vec<String>)> =
-                    Vec::new();
+        let access_list: Vec<(String, Vec<String>)> =
+            match transaction.access_list.to_owned() {
+                Some(access_list_items) => {
+                    let mut access_list: Vec<(String, Vec<String>)> =
+                        Vec::new();
 
-                for item in access_list_items.0 {
-                    let keys: Vec<String> = item
-                        .storage_keys
-                        .into_iter()
-                        .map(format_hash)
-                        .collect();
+                    for item in access_list_items.0 {
+                        let keys: Vec<String> = item
+                            .storage_keys
+                            .into_iter()
+                            .map(format_hash)
+                            .collect();
 
-                    access_list.push((format_address(item.address), keys))
+                        access_list
+                            .push((format_address(item.address), keys))
+                    }
+
+                    access_list
                 }
-
-                access_list
-            }
-            None => Vec::new(),
-        };
+                None => Vec::new(),
+            };
 
         Self {
             access_list,
             block_hash: format_hash(transaction.block_hash.unwrap()),
             block_number: transaction.block_number.unwrap().as_u64(),
-            chain: chain.to_owned(),
+            chain,
             from: format_address(transaction.from),
             gas: transaction.gas,
             gas_price: transaction.gas_price,
-            max_priority_fee_per_gas: transaction.max_priority_fee_per_gas,
-            max_fee_per_gas: transaction.max_fee_per_gas,
             hash: format_hash(transaction.hash),
+            input: format_bytes(&transaction.input),
+            max_fee_per_gas: transaction.max_fee_per_gas,
+            max_priority_fee_per_gas: transaction.max_priority_fee_per_gas,
             method: format!(
                 "0x{}",
                 hex::encode(byte4_from_input(&format_bytes(
                     &transaction.input
                 )))
             ),
-            input: format_bytes(&transaction.input),
             nonce: transaction.nonce,
             timestamp,
             to,

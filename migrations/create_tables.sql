@@ -1,8 +1,10 @@
 CREATE DATABASE IF NOT EXISTS indexer;
+
 CREATE TABLE indexer.blocks (
   base_fee_per_gas Nullable(UInt256),
   chain UInt64,
   difficulty UInt256,
+  excess_data_gas Nullable(UInt256),
   extra_data String,
   gas_limit UInt256,
   gas_used UInt256,
@@ -22,14 +24,15 @@ CREATE TABLE indexer.blocks (
   transactions UInt64,
   transactions_root String,
   uncles Array(String),
+  withdrawals_root Nullable(String),
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);
 
 CREATE TABLE indexer.contracts (
   block UInt64,
-  contract_address String,
   chain UInt64,
+  contract_address String,
   creator String,
   transaction_hash String,
 )
@@ -38,31 +41,31 @@ PRIMARY KEY (contract_address, chain);
 
 CREATE TABLE indexer.dex_trades (
   chain UInt64,
-  maker String,
-  transaction_hash String,
   log_index UInt256,
-  receiver String,
+  maker String,
   pair_address String,
+  receiver String,
+  timestamp UInt64,
   token0_amount UInt256,
   token1_amount UInt256,
+  transaction_hash String,
   transaction_log_index Nullable(UInt256),
-  timestamp UInt64
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
 
 CREATE TABLE indexer.erc1155_transfers (
   chain UInt64,
-  operator String,
   from String,
-  transaction_hash String,
-  log_index UInt256,
-  to String,
-  token String ,
-  transaction_log_index Nullable(UInt256),
   id UInt256,
-  value UInt256,
+  log_index UInt256,
+  operator String,
   timestamp UInt64,
+  to String,
+  token String,
+  transaction_hash String,
+  transaction_log_index Nullable(UInt256),
+  value UInt256,
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
@@ -71,12 +74,12 @@ CREATE TABLE indexer.erc20_transfers (
   amount UInt256,
   chain UInt64,
   from String,
-  transaction_hash String,
   log_index UInt256,
+  timestamp UInt64,
   to String,
   token String,
+  transaction_hash String,
   transaction_log_index Nullable(UInt256),
-  timestamp UInt64,
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
@@ -84,13 +87,13 @@ PRIMARY KEY (transaction_hash, log_index);
 CREATE TABLE indexer.erc721_transfers (
   chain UInt64,
   from String,
-  transaction_hash String,
+  id UInt256,
   log_index UInt256,
+  timestamp UInt64,
   to String,
   token String,
+  transaction_hash String,
   transaction_log_index Nullable(UInt256),
-  id UInt256,
-  timestamp UInt64,
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
@@ -99,16 +102,16 @@ CREATE TABLE indexer.logs (
   address String,
   chain UInt64,
   data String,
-  transaction_hash String,
   log_index UInt256,
   log_type Nullable(String),
   removed boolean,
+  timestamp UInt64,
   topic0 Nullable(String),
   topic1 Nullable(String),
   topic2 Nullable(String),
   topic3 Nullable(String),
+  transaction_hash String,
   transaction_log_index Nullable(UInt256),
-  timestamp UInt64,
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (transaction_hash, log_index);
@@ -124,6 +127,35 @@ CREATE TABLE indexer.receipts (
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);
+
+CREATE TABLE indexer.traces (
+  action_type String,
+  address Nullable(String),
+  author Nullable(String),
+  balance Nullable(UInt256),
+  block_hash String,
+  block_number UInt64,
+  call_type Nullable(String),
+  chain UInt64,
+  code Nullable(String),
+  error Nullable(String),
+  from Nullable(String),
+  gas Nullable(UInt256),
+  gas_used Nullable(UInt256),
+  init Nullable(String),
+  input Nullable(String),
+  output Nullable(String),
+  refund_address Nullable(String),
+  reward_type Nullable(String),
+  subtraces UInt64,
+  to Nullable(String),
+  trace_address Array(UInt64),
+  transaction_hash Nullable(String),
+  transaction_position Nullable(UInt64),
+  value Nullable(UInt256),
+)
+ENGINE = MergeTree()
+PRIMARY KEY (block_hash);
 
 CREATE TABLE indexer.transactions (
   access_list Array(Tuple(String, Array(String))),
@@ -143,36 +175,19 @@ CREATE TABLE indexer.transactions (
   to String,
   transaction_index UInt16,
   transaction_type UInt16,
-  value UInt256
+  value UInt256,
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);
 
-CREATE TABLE indexer.traces (
-  from Nullable(String),
-  to Nullable(String),
-  value Nullable(UInt256),
-  gas Nullable(UInt256),
-  input Nullable(String),
-  call_type Nullable(String),
-  init Nullable(String),
-  address Nullable(String),
-  refund_address Nullable(String),
-  balance Nullable(UInt256),
-  author Nullable(String),
-  reward_type Nullable(String),
-  gas_used Nullable(UInt256),
-  output Nullable(String),
-  code Nullable(String),
-  trace_address Array(UInt64),
-  subtraces UInt64,
-  transaction_position Nullable(UInt64),
-  transaction_hash Nullable(String),
+CREATE TABLE indexer.withdrawals (
+  address String,
+  amount UInt256,
   block_number UInt64,
-  block_hash String,
-  action_type String,
   chain UInt64,
-  error Nullable(String),
+  index UInt64,
+  timestamp UInt64,
+  validator_index UInt64,
 )
-ENGINE = MergeTree()
-PRIMARY KEY (block_hash);
+ENGINE = ReplacingMergeTree()
+PRIMARY KEY (hash);

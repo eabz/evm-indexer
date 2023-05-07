@@ -1,6 +1,6 @@
 use evm_indexer::{
     configs::Config,
-    db::{BlockFetchedData, Database},
+    db::{BlockFetchedData, Database, DatabaseTables},
     genesis::get_genesis_allocations,
     rpc::Rpc,
 };
@@ -58,7 +58,11 @@ async fn main() {
     if indexed_blocks.is_empty() {
         let genesis_transactions =
             get_genesis_allocations(config.chain.clone());
-        db.store_transactions(&genesis_transactions).await;
+        db.store_items(
+            &genesis_transactions,
+            DatabaseTables::Transactions.as_str(),
+        )
+        .await;
     }
 
     if config.end_block != 0 {
@@ -108,15 +112,16 @@ async fn sync_chain(
 
         let mut fetched_data = BlockFetchedData {
             blocks: Vec::new(),
-            transactions: Vec::new(),
-            receipts: Vec::new(),
-            logs: Vec::new(),
             contracts: Vec::new(),
+            dex_trades: Vec::new(),
             erc20_transfers: Vec::new(),
             erc721_transfers: Vec::new(),
             erc1155_transfers: Vec::new(),
-            dex_trades: Vec::new(),
+            logs: Vec::new(),
+            receipts: Vec::new(),
             traces: Vec::new(),
+            transactions: Vec::new(),
+            withdrawals: Vec::new(),
         };
 
         for result in results {
@@ -132,6 +137,7 @@ async fn sync_chain(
                     mut erc1155_transfers,
                     mut dex_trades,
                     mut traces,
+                    mut withdrawals,
                 )) => {
                     fetched_data.blocks.push(block);
                     fetched_data.transactions.append(&mut transactions);
@@ -148,7 +154,8 @@ async fn sync_chain(
                         .erc1155_transfers
                         .append(&mut erc1155_transfers);
                     fetched_data.dex_trades.append(&mut dex_trades);
-                    fetched_data.traces.append(&mut traces)
+                    fetched_data.traces.append(&mut traces);
+                    fetched_data.withdrawals.append(&mut withdrawals)
                 }
                 None => continue,
             }

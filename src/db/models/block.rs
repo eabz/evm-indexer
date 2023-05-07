@@ -38,10 +38,14 @@ pub struct DatabaseBlock {
     pub transactions: u64,
     pub transactions_root: String,
     pub uncles: Vec<String>,
+    pub withdrawals_root: Option<String>,
 }
 
 impl DatabaseBlock {
     pub fn from_rpc(block: &Block<Transaction>, chain: u64) -> Self {
+        let withdrawals_root: Option<String> =
+            block.withdrawals_root.map(format_hash);
+
         Self {
             base_fee_per_gas: block.base_fee_per_gas,
             chain,
@@ -63,15 +67,16 @@ impl DatabaseBlock {
             size: block.size,
             state_root: format_hash(block.state_root),
             timestamp: block.timestamp.as_u64(),
-            transactions_root: format_hash(block.transactions_root),
             total_difficulty: block.total_difficulty,
             transactions: block.transactions.len() as u64,
+            transactions_root: format_hash(block.transactions_root),
             uncles: block
                 .uncles
                 .clone()
                 .into_iter()
                 .map(format_hash)
                 .collect(),
+            withdrawals_root,
         }
     }
 }

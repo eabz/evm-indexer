@@ -14,20 +14,20 @@ use super::log::DatabaseLog;
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC1155Transfer {
     pub chain: u64,
-    pub operator: String,
     pub from: String,
-    pub transaction_hash: String,
-    #[serde(with = "serialize_u256")]
-    pub log_index: U256,
-    pub to: String,
-    pub token: String,
-    #[serde(with = "opt_serialize_u256")]
-    pub transaction_log_index: Option<U256>,
     #[serde(with = "serialize_u256")]
     pub id: U256,
     #[serde(with = "serialize_u256")]
-    pub value: U256,
+    pub log_index: U256,
+    pub operator: String,
     pub timestamp: u64,
+    pub token: String,
+    pub to: String,
+    pub transaction_hash: String,
+    #[serde(with = "opt_serialize_u256")]
+    pub transaction_log_index: Option<U256>,
+    #[serde(with = "serialize_u256")]
+    pub value: U256,
 }
 
 impl DatabaseERC1155Transfer {
@@ -80,22 +80,23 @@ impl DatabaseERC1155Transfer {
 
         Self {
             chain,
-            operator: format_address(
-                operator.to_owned().into_address().unwrap(),
-            ),
             from: format_address(
                 from_address.to_owned().into_address().unwrap(),
             ),
-            transaction_hash: log.transaction_hash.clone(),
+            id,
             log_index: log.log_index,
+
+            operator: format_address(
+                operator.to_owned().into_address().unwrap(),
+            ),
+            timestamp: log.timestamp,
+            token: log.address.clone(),
             to: format_address(
                 to_address.to_owned().into_address().unwrap(),
             ),
-            token: log.address.clone(),
+            transaction_hash: log.transaction_hash.clone(),
             transaction_log_index: log.transaction_log_index,
-            id,
             value,
-            timestamp: log.timestamp,
         }
     }
 }

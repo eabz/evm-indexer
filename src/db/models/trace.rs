@@ -9,40 +9,34 @@ use crate::utils::format::{
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTrace {
-    // Call
-    pub from: Option<String>,
-    pub to: Option<String>,
-    #[serde(with = "opt_serialize_u256")]
-    pub value: Option<U256>,
-    #[serde(with = "opt_serialize_u256")]
-    pub gas: Option<U256>,
-    pub input: Option<String>,
-    pub call_type: Option<String>,
-    // Create (uses from, value and gas)
-    pub init: Option<String>,
-    // Suicide
+    pub action_type: String,
     pub address: Option<String>,
-    pub refund_address: Option<String>,
+    pub author: Option<String>,
     #[serde(with = "opt_serialize_u256")]
     pub balance: Option<U256>,
-    // Reward (uses value)
-    pub author: Option<String>,
-    pub reward_type: Option<String>,
-    // Call Result
+    pub block_hash: String,
+    pub block_number: u64,
+    pub call_type: Option<String>,
+    pub chain: u64,
+    pub code: Option<String>,
+    pub error: Option<String>,
+    pub from: Option<String>,
+    #[serde(with = "opt_serialize_u256")]
+    pub gas: Option<U256>,
     #[serde(with = "opt_serialize_u256")]
     pub gas_used: Option<U256>,
+    pub init: Option<String>,
+    pub input: Option<String>,
     pub output: Option<String>,
-    // Create Result (uses gas_used, address)
-    pub code: Option<String>,
-    pub trace_address: Vec<u64>,
+    pub refund_address: Option<String>,
+    pub reward_type: Option<String>,
     pub subtraces: u64,
-    pub transaction_position: Option<u64>,
+    pub to: Option<String>,
+    pub trace_address: Vec<u64>,
     pub transaction_hash: Option<String>,
-    pub block_number: u64,
-    pub block_hash: String,
-    pub action_type: String,
-    pub chain: u64,
-    pub error: Option<String>,
+    pub transaction_position: Option<u64>,
+    #[serde(with = "opt_serialize_u256")]
+    pub value: Option<U256>,
 }
 
 impl DatabaseTrace {
@@ -162,30 +156,30 @@ impl DatabaseTrace {
         }
 
         Self {
-            from,
-            to,
-            value,
-            gas,
-            input,
-            call_type,
-            init,
-            address,
-            refund_address,
-            balance,
-            author,
-            reward_type,
-            gas_used,
-            output,
-            code,
-            trace_address,
-            subtraces: trace.subtraces as u64,
-            transaction_position,
-            transaction_hash,
-            block_number: trace.block_number,
-            block_hash: format_hash(trace.block_hash),
             action_type,
+            address,
+            author,
+            balance,
+            block_hash: format_hash(trace.block_hash),
+            block_number: trace.block_number,
+            call_type,
             chain,
+            code,
             error: trace.error.clone(),
+            from,
+            gas,
+            gas_used,
+            init,
+            input,
+            output,
+            refund_address,
+            reward_type,
+            subtraces: trace.subtraces as u64,
+            to,
+            trace_address,
+            transaction_hash,
+            transaction_position,
+            value,
         }
     }
 }

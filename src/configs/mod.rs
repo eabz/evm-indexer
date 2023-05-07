@@ -8,61 +8,54 @@ use url::Url;
     about = "Scalable SQL indexer for EVM compatible blockchains."
 )]
 pub struct IndexerArgs {
-    #[arg(long, help = "Start log with debug.", default_value_t = false)]
-    pub debug: bool,
-
-    #[arg(
-        long,
-        help = "Number identifying the chain id to sync.",
-        default_value_t = 1
-    )]
-    pub chain: usize,
-
-    #[arg(long, help = "Block to start syncing.", default_value_t = 0)]
-    pub start_block: u64,
-
-    #[arg(long, help = "Last block to sync.", default_value_t = 0)]
-    pub end_block: u64,
-
     #[arg(
         long,
         help = " Amount of blocks to fetch in parallel.",
         default_value_t = 200
     )]
     pub batch_size: usize,
-
+    #[arg(
+        long,
+        help = "Number identifying the chain id to sync.",
+        default_value_t = 1
+    )]
+    pub chain: usize,
+    #[arg(
+        long,
+        help = "Clickhouse database string with username and password."
+    )]
+    pub database: String,
+    #[arg(long, help = "Start log with debug.", default_value_t = false)]
+    pub debug: bool,
+    #[arg(long, help = "Last block to sync.", default_value_t = 0)]
+    pub end_block: u64,
     #[arg(
         long,
         help = "Comma separated list of rpcs to use to fetch blocks."
     )]
     pub rpcs: String,
-
+    #[arg(long, help = "Block to start syncing.", default_value_t = 0)]
+    pub start_block: u64,
     #[arg(
         long,
         help = "Url of the websocket endpoint to fetch new blocks.",
         default_value_t = String::from("")
     )]
     pub ws: String,
-
-    #[arg(
-        long,
-        help = "Clickhouse database string with username and password."
-    )]
-    pub database: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub start_block: u64,
-    pub end_block: u64,
-    pub db_host: String,
-    pub db_username: String,
-    pub db_password: String,
-    pub db_name: String,
-    pub debug: bool,
-    pub chain: Chain,
     pub batch_size: usize,
+    pub chain: Chain,
+    pub db_host: String,
+    pub db_name: String,
+    pub db_password: String,
+    pub db_username: String,
+    pub debug: bool,
+    pub end_block: u64,
     pub rpcs: Vec<String>,
+    pub start_block: u64,
     pub ws_url: Option<String>,
 }
 
@@ -101,16 +94,16 @@ impl Config {
             url_paths.first().expect("no database name provided on path");
 
         Self {
-            start_block: args.start_block,
-            end_block: args.end_block,
-            db_host: format!("{}://{}", url.scheme(), db_host),
-            db_username: username.to_string(),
-            db_password: password.to_string(),
-            db_name: db_name.to_string(),
-            debug: args.debug,
-            chain,
             batch_size: args.batch_size,
+            chain,
+            db_host: format!("{}://{}", url.scheme(), db_host),
+            db_name: db_name.to_string(),
+            db_password: password.to_string(),
+            db_username: username.to_string(),
+            debug: args.debug,
+            end_block: args.end_block,
             rpcs,
+            start_block: args.start_block,
             ws_url,
         }
     }

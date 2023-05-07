@@ -10,6 +10,7 @@ use crate::{
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
             receipt::DatabaseReceipt, trace::DatabaseTrace,
             transaction::DatabaseTransaction,
+            withdrawals::DatabaseWithdrawal,
         },
         BlockFetchedData, Database,
     },
@@ -29,9 +30,12 @@ use ethers::{
     types::{Block, Trace, Transaction, TransactionReceipt, TxHash, U256},
 };
 
-use jsonrpsee::core::{
-    client::{ClientT, Subscription, SubscriptionClientT},
-    rpc_params,
+use jsonrpsee::{
+    core::{
+        client::{ClientT, Subscription, SubscriptionClientT},
+        rpc_params,
+    },
+    tracing::debug,
 };
 use jsonrpsee_http_client::{
     transport::HttpBackend, HttpClient, HttpClientBuilder,
@@ -51,19 +55,19 @@ use serde_json::Error;
 abigen!(
     ERC20,
     r#"[
+        function decimals() external view returns (uint8)
+        function factory() external view returns (address)
         function name() external view returns (string)
         function symbol() external view returns (string)
-        function decimals() external view returns (uint8)
         function token0() external view returns (address)
         function token1() external view returns (address)
-        function factory() external view returns (address)
     ]"#,
 );
 #[derive(Debug, Clone)]
 pub struct Rpc {
+    pub chain: Chain,
     pub clients: Vec<HttpClient<HttpBackend>>,
     pub clients_urls: Vec<String>,
-    pub chain: Chain,
     pub ws_url: Option<String>,
 }
 
@@ -110,9 +114,9 @@ impl Rpc {
         }
 
         Self {
+            chain: config.chain.clone(),
             clients,
             clients_urls,
-            chain: config.chain.clone(),
             ws_url: config.ws_url.clone(),
         }
     }
@@ -151,15 +155,19 @@ impl Rpc {
         Vec<DatabaseERC1155Transfer>,
         Vec<DatabaseDexTrade>,
         Vec<DatabaseTrace>,
+        Vec<DatabaseWithdrawal>,
     )> {
-        let block_data: Option<(DatabaseBlock, Vec<DatabaseTransaction>)> =
-            self.get_block(block_number).await;
+        let block_data: Option<(
+            DatabaseBlock,
+            Vec<DatabaseTransaction>,
+            Vec<DatabaseWithdrawal>,
+        )> = self.get_block(block_number).await;
 
         let traces: Vec<DatabaseTrace> =
             self.get_block_traces(block_number).await;
 
         match block_data {
-            Some((db_block, db_transactions)) => {
+            Some((db_block, db_transactions, db_withdrawals)) => {
                 let total_block_transactions = db_transactions.len();
 
                 // Make sure all the transactions are correctly formatted.
@@ -444,8 +452,8 @@ impl Rpc {
                     .map(|value| value.to_owned())
                     .collect();
 
-                info!(
-                    "Found: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) traces ({}) for block {}.",
+                debug!(
+                    "Found: txs ({}) receipts ({}) logs ({}) contracts ({}) transfers erc20 ({}) erc721 ({}) erc1155 ({}) trades ({}) traces ({}) withdrawals ({}) for block {}.",
                     total_block_transactions,
                     db_receipts.len(),
                     db_logs.len(),
@@ -455,6 +463,7 @@ impl Rpc {
                     db_erc1155_transfers.len(),
                     db_dex_trades.len(),
                     traces.len(),
+                    db_withdrawals.len(),
                     block_number,
                 );
 
@@ -469,6 +478,7 @@ impl Rpc {
                     db_erc1155_transfers,
                     db_dex_trades,
                     traces,
+                    db_withdrawals,
                 ))
             }
             None => None,
@@ -551,19 +561,21 @@ impl Rpc {
                         erc1155_transfers,
                         dex_trades,
                         traces,
+                        withdrawals,
                     )) = block_data
                     {
                         let fetched_data = BlockFetchedData {
                             blocks: vec![block],
-                            transactions,
-                            receipts,
-                            logs,
                             contracts,
+                            dex_trades,
                             erc20_transfers,
                             erc721_transfers,
                             erc1155_transfers,
-                            dex_trades,
+                            logs,
+                            receipts,
                             traces,
+                            transactions,
+                            withdrawals,
                         };
 
                         db.store_data(&fetched_data).await;
@@ -591,7 +603,11 @@ impl Rpc {
     async fn get_block(
         &self,
         block_number: &u64,
-    ) -> Option<(DatabaseBlock, Vec<DatabaseTransaction>)> {
+    ) -> Option<(
+        DatabaseBlock,
+        Vec<DatabaseTransaction>,
+        Vec<DatabaseWithdrawal>,
+    )> {
         let client = self.get_client();
 
         let raw_block = client
@@ -613,7 +629,7 @@ impl Rpc {
 
                         let mut db_transactions = Vec::new();
 
-                        for transaction in block.transactions {
+                        for transaction in block.transactions.iter() {
                             let db_transaction =
                                 DatabaseTransaction::from_rpc(
                                     transaction,
@@ -624,7 +640,25 @@ impl Rpc {
                             db_transactions.push(db_transaction)
                         }
 
-                        Some((db_block, db_transactions))
+                        let mut db_withdrawals = Vec::new();
+
+                        if block.withdrawals.is_some() {
+                            for withdrawal in
+                                block.withdrawals.unwrap().iter()
+                            {
+                                let db_withdrawal =
+                                    DatabaseWithdrawal::from_rpc(
+                                        withdrawal,
+                                        self.chain.id,
+                                        db_block.number,
+                                        db_block.timestamp,
+                                    );
+
+                                db_withdrawals.push(db_withdrawal)
+                            }
+                        }
+
+                        Some((db_block, db_transactions, db_withdrawals))
                     }
                     Err(_) => None,
                 }

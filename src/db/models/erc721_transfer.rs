@@ -15,16 +15,16 @@ use super::log::DatabaseLog;
 pub struct DatabaseERC721Transfer {
     pub chain: u64,
     pub from: String,
-    pub transaction_hash: String,
-    #[serde(with = "serialize_u256")]
-    pub log_index: U256,
-    pub to: String,
-    pub token: String,
-    #[serde(with = "opt_serialize_u256")]
-    pub transaction_log_index: Option<U256>,
     #[serde(with = "serialize_u256")]
     pub id: U256,
+    #[serde(with = "serialize_u256")]
+    pub log_index: U256,
     pub timestamp: u64,
+    pub token: String,
+    pub to: String,
+    pub transaction_hash: String,
+    #[serde(with = "opt_serialize_u256")]
+    pub transaction_log_index: Option<U256>,
 }
 
 impl DatabaseERC721Transfer {
@@ -73,15 +73,15 @@ impl DatabaseERC721Transfer {
             from: format_address(
                 from_address.to_owned().into_address().unwrap(),
             ),
-            transaction_hash: log.transaction_hash.clone(),
+            id: id.to_owned().into_uint().unwrap(),
             log_index: log.log_index,
+            timestamp: log.timestamp,
+            token: log.address.clone(),
             to: format_address(
                 to_address.to_owned().into_address().unwrap(),
             ),
-            token: log.address.clone(),
+            transaction_hash: log.transaction_hash.clone(),
             transaction_log_index: log.transaction_log_index,
-            id: id.to_owned().into_uint().unwrap(),
-            timestamp: log.timestamp,
         }
     }
 }
