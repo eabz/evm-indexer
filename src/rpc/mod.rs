@@ -146,7 +146,7 @@ impl Rpc {
         chain: &Chain,
     ) -> Option<(
         DatabaseBlock,
-        DatabaseBlockReward,
+        Vec<DatabaseBlockReward>,
         Vec<DatabaseTransaction>,
         Vec<DatabaseReceipt>,
         Vec<DatabaseLog>,
@@ -158,17 +158,18 @@ impl Rpc {
         Vec<DatabaseTrace>,
         Vec<DatabaseWithdrawal>,
     )> {
-        let block_data: Option<(
-            DatabaseBlock,
-            Vec<DatabaseTransaction>,
-            Vec<DatabaseWithdrawal>,
-        )> = self.get_block(block_number).await;
+        let block_data = self.get_block(block_number).await;
 
         let traces: Vec<DatabaseTrace> =
             self.get_block_traces(block_number).await;
 
         match block_data {
-            Some((db_block, db_transactions, db_withdrawals)) => {
+            Some((
+                db_block,
+                db_transactions,
+                db_withdrawals,
+                block_uncles,
+            )) => {
                 let total_block_transactions = db_transactions.len();
 
                 // Make sure all the transactions are correctly formatted.
@@ -241,12 +242,33 @@ impl Rpc {
                     }
                 }
 
-                // Calculate the block reward
+                let mut db_block_rewards = Vec::new();
+
+                // Calculate the current block reward
                 let db_block_reward = DatabaseBlockReward::calculate(
                     &db_block,
                     &db_receipts,
+                    &block_uncles,
                     self.chain.id,
+                    false,
+                    None,
                 );
+
+                db_block_rewards.push(db_block_reward);
+
+                for uncle in block_uncles {
+                    let uncle_block_reward =
+                        DatabaseBlockReward::calculate(
+                            &uncle,
+                            &[],
+                            &[],
+                            self.chain.id,
+                            true,
+                            Some(db_block.number),
+                        );
+
+                    db_block_rewards.push(uncle_block_reward);
+                }
 
                 // Insert contracts created through the traces
                 let create_traces: Vec<&DatabaseTrace> = traces
@@ -479,7 +501,7 @@ impl Rpc {
 
                 Some((
                     db_block,
-                    db_block_reward,
+                    db_block_rewards,
                     db_transactions,
                     db_receipts,
                     db_logs,
@@ -563,7 +585,7 @@ impl Rpc {
 
                     if let Some((
                         block,
-                        block_reward,
+                        block_rewards,
                         transactions,
                         receipts,
                         logs,
@@ -578,7 +600,7 @@ impl Rpc {
                     {
                         let fetched_data = BlockFetchedData {
                             blocks: vec![block],
-                            block_rewards: vec![block_reward],
+                            block_rewards,
                             contracts,
                             dex_trades,
                             erc20_transfers,
@@ -620,6 +642,7 @@ impl Rpc {
         DatabaseBlock,
         Vec<DatabaseTransaction>,
         Vec<DatabaseWithdrawal>,
+        Vec<DatabaseBlock>,
     )> {
         let client = self.get_client();
 
@@ -671,7 +694,52 @@ impl Rpc {
                             }
                         }
 
-                        Some((db_block, db_transactions, db_withdrawals))
+                        let mut block_uncles = Vec::new();
+
+                        for (i, _) in db_block.uncles.iter().enumerate() {
+                            let raw_uncle = client
+                                .request(
+                                    "eth_getUncleByBlockNumberAndIndex",
+                                    rpc_params![
+                                        format!("0x{:x}", db_block.number),
+                                        format!("0x{:x}", i)
+                                    ],
+                                )
+                                .await;
+                            match raw_uncle {
+                                Ok(value) => {
+                                    let block: Result<
+                                        Block<TxHash>,
+                                        Error,
+                                    > = serde_json::from_value(value);
+
+                                    match block {
+                                        Ok(block) => {
+                                            let db_block =
+                                                DatabaseBlock::from_rpc(
+                                                    &block,
+                                                    self.chain.id,
+                                                );
+
+                                            block_uncles.push(db_block)
+                                        }
+                                        Err(err) => {
+                                            println!("{}", err)
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    println!("{}", err)
+                                }
+                            }
+                        }
+
+                        Some((
+                            db_block,
+                            db_transactions,
+                            db_withdrawals,
+                            block_uncles,
+                        ))
                     }
                     Err(_) => None,
                 }

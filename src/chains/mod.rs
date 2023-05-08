@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    ops::{Add, Mul},
+    ops::{AddAssign, DivAssign, Mul, MulAssign, SubAssign},
     str::FromStr,
 };
 
@@ -38,7 +38,10 @@ pub const ETHEREUM: Chain = Chain {
 fn calculate_ethereum_block_reward(
     block: &DatabaseBlock,
     receipts: &[DatabaseReceipt],
-) -> (U256, U256) {
+    uncles: &[DatabaseBlock],
+    is_uncle: bool,
+    uncle_parent_number: Option<u64>,
+) -> (U256, U256, U256) {
     // The ETH base reward is 5 ETH
     let mut base_block_reward =
         U256::from_str("0x4563918244f40000").unwrap();
@@ -55,10 +58,34 @@ fn calculate_ethereum_block_reward(
 
     // If the block is above The Merge the base block reward is 0 ETH
     if block.number > 15_537_393 {
-        base_block_reward = U256::from_str("0x0").unwrap();
+        base_block_reward = U256::zero();
     }
 
-    (base_block_reward, get_total_fees(receipts))
+    let mut uncle_rewards = U256::zero();
+
+    if !uncles.is_empty() {
+        let base_uncle_reward =
+            U256::from_str("0xde0b6b3a764000").unwrap();
+
+        uncle_rewards = base_uncle_reward.mul(uncles.len());
+    }
+
+    if is_uncle {
+        let mut uncle_block_reward = U256::zero();
+
+        uncle_block_reward.add_assign(U256::from(8));
+        uncle_block_reward.add_assign(U256::from(block.number));
+        uncle_block_reward
+            .sub_assign(U256::from(uncle_parent_number.unwrap()));
+
+        uncle_block_reward.mul_assign(base_block_reward);
+
+        uncle_block_reward.div_assign(U256::from(8));
+
+        return (uncle_block_reward, U256::zero(), U256::zero());
+    }
+
+    (base_block_reward, get_total_fees(receipts), uncle_rewards)
 }
 
 pub const POLYGON: Chain = Chain {
@@ -72,10 +99,13 @@ pub const POLYGON: Chain = Chain {
 };
 
 fn calculate_polygon_block_reward(
-    _block: &DatabaseBlock,
     receipts: &[DatabaseReceipt],
-) -> (U256, U256) {
-    (U256::from_dec_str("0").unwrap(), get_total_fees(receipts))
+) -> (U256, U256, U256) {
+    (
+        U256::from_dec_str("0").unwrap(),
+        get_total_fees(receipts),
+        U256::from_dec_str("0").unwrap(),
+    )
 }
 
 pub const BSC: Chain = Chain {
@@ -89,10 +119,13 @@ pub const BSC: Chain = Chain {
 };
 
 fn calculate_bsc_block_reward(
-    _block: &DatabaseBlock,
     receipts: &[DatabaseReceipt],
-) -> (U256, U256) {
-    (U256::from_dec_str("0").unwrap(), get_total_fees(receipts))
+) -> (U256, U256, U256) {
+    (
+        U256::from_dec_str("0").unwrap(),
+        get_total_fees(receipts),
+        U256::from_dec_str("0").unwrap(),
+    )
 }
 
 pub static CHAINS: [Chain; 3] = [ETHEREUM, POLYGON, BSC];
@@ -116,7 +149,7 @@ pub fn get_chain(chain: u64) -> Chain {
 }
 
 fn get_total_fees(receipts: &[DatabaseReceipt]) -> U256 {
-    let mut fees_reward = U256::from_str("0x0").unwrap();
+    let mut fees_reward = U256::zero();
 
     for receipt in receipts {
         let reward = receipt
@@ -124,7 +157,7 @@ fn get_total_fees(receipts: &[DatabaseReceipt]) -> U256 {
             .unwrap()
             .mul(receipt.effective_gas_price.unwrap());
 
-        fees_reward = fees_reward.add(reward);
+        fees_reward.add_assign(reward);
     }
 
     fees_reward
@@ -134,11 +167,20 @@ pub fn get_block_reward(
     chain: u64,
     block: &DatabaseBlock,
     receipts: &[DatabaseReceipt],
-) -> (U256, U256) {
+    uncles: &[DatabaseBlock],
+    is_uncle: bool,
+    uncle_parent_number: Option<u64>,
+) -> (U256, U256, U256) {
     match chain {
-        1 => calculate_ethereum_block_reward(block, receipts),
-        56 => calculate_bsc_block_reward(block, receipts),
-        137 => calculate_polygon_block_reward(block, receipts),
+        1 => calculate_ethereum_block_reward(
+            block,
+            receipts,
+            uncles,
+            is_uncle,
+            uncle_parent_number,
+        ),
+        56 => calculate_bsc_block_reward(receipts),
+        137 => calculate_polygon_block_reward(receipts),
         _ => panic!("invalid chain"),
     }
 }

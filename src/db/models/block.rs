@@ -1,6 +1,6 @@
 use clickhouse::Row;
 use ethabi::ethereum_types::U256;
-use ethers::types::{Block, Transaction};
+use ethers::types::Block;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::format::{
@@ -42,7 +42,7 @@ pub struct DatabaseBlock {
 }
 
 impl DatabaseBlock {
-    pub fn from_rpc(block: &Block<Transaction>, chain: u64) -> Self {
+    pub fn from_rpc<T>(block: &Block<T>, chain: u64) -> Self {
         let withdrawals_root: Option<String> =
             block.withdrawals_root.map(format_hash);
 

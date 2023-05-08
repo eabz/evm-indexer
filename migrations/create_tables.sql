@@ -35,7 +35,10 @@ CREATE TABLE indexer.block_rewards (
   chain UInt64,
   hash String,
   miner String,
+  number UInt64,
+  timestamp UInt64,
   total_fee_reward UInt256,
+  uncle_rewards UInt256
 )
 ENGINE = ReplacingMergeTree()
 PRIMARY KEY (hash);

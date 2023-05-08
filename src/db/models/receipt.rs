@@ -1,4 +1,4 @@
-use std::{ops::Mul, str::FromStr};
+use std::ops::Mul;
 
 use clickhouse::Row;
 use ethabi::ethereum_types::U256;
@@ -45,7 +45,7 @@ impl DatabaseReceipt {
             Some(base_fee_per_gas) => {
                 base_fee_per_gas.mul(receipt.gas_used.unwrap())
             }
-            None => U256::from_str("0x0").unwrap(),
+            None => U256::zero(),
         };
 
         Self {

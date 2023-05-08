@@ -1,4 +1,4 @@
-use std::{ops::Mul, str::FromStr};
+use std::ops::Mul;
 
 use clickhouse::Row;
 use ethabi::ethereum_types::U256;
@@ -17,22 +17,36 @@ pub struct DatabaseBlockReward {
     pub chain: u64,
     pub hash: String,
     pub miner: String,
+    pub number: u64,
+    pub timestamp: u64,
     #[serde(with = "serialize_u256")]
     pub total_fee_reward: U256,
+    #[serde(with = "serialize_u256")]
+    pub uncle_rewards: U256,
 }
 
 impl DatabaseBlockReward {
     pub fn calculate(
         block: &DatabaseBlock,
         receipts: &[DatabaseReceipt],
+        uncles: &[DatabaseBlock],
         chain: u64,
+        is_uncle: bool,
+        uncle_parent_number: Option<u64>,
     ) -> Self {
-        let (base_block_reward, total_fee_reward) =
-            get_block_reward(chain, block, receipts);
+        let (base_block_reward, total_fee_reward, uncle_rewards) =
+            get_block_reward(
+                chain,
+                block,
+                receipts,
+                uncles,
+                is_uncle,
+                uncle_parent_number,
+            );
 
         let burned = match block.base_fee_per_gas {
             Some(base_fee_per_gas) => base_fee_per_gas.mul(block.gas_used),
-            None => U256::from_str("0x0").unwrap(),
+            None => U256::zero(),
         };
 
         Self {
@@ -41,7 +55,10 @@ impl DatabaseBlockReward {
             chain,
             hash: block.hash.clone(),
             miner: block.miner.clone(),
+            number: block.number,
+            timestamp: block.timestamp,
             total_fee_reward,
+            uncle_rewards,
         }
     }
 }
