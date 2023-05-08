@@ -119,7 +119,7 @@ services:
     env_file:
       - ./.env
     restart: always
-    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 17000000 --end-block 17000000
+    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 16000000 --end-block 17000000
 
   indexer-18:
     image: ghcr.io/kindynosmx/evm-indexer:main
