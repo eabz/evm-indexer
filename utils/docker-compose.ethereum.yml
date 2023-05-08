@@ -2,6 +2,11 @@ version: "3.9"
 
 services:
   indexer-1:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -9,6 +14,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 0 --end-block 3000000 --batch-size 500
 
   indexer-2:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -16,6 +26,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 3000000 --end-block 6000000 --batch-size 500
 
   indexer-3:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -23,6 +38,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 6000000 --end-block 8000000 --batch-size 500
 
   indexer-4:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -30,6 +50,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 8000000 --end-block 10000000 --batch-size 500
 
   indexer-5:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -37,6 +62,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 10000000 --end-block 11000000 --batch-size 500
 
   indexer-6:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -44,6 +74,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 11000000 --end-block 12000000 --batch-size 500
 
   indexer-7:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -51,6 +86,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 12000000 --end-block 13000000 --batch-size 500
 
   indexer-8:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -58,6 +98,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 13000000 --end-block 14000000 --batch-size 500
   
   indexer-9:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -65,6 +110,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 14000000 --end-block 15000000 --batch-size 500
 
   indexer-10:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -72,6 +122,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 15000000 --end-block 16000000 --batch-size 500
 
   indexer-11:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -79,6 +134,11 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 16000000 --end-block 17000000 --batch-size 500
 
   indexer-12:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s 
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
@@ -86,8 +146,13 @@ services:
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 17000000 --batch-size 500
 
   indexer-13:
+    restart_policy:
+          condition: on-failure
+          delay: 5s
+          max_attempts: 3
+          window: 120s
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: always
-    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --ws ${WS_URL} --start-block 17200000 --batch-size 500
+    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --ws ${WS_URL} --batch-size 500
