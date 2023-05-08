@@ -41,51 +41,58 @@ services:
     env_file:
       - ./.env
     restart: on-failure
-    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 11000000 --end-block 12000000 --batch-size 500
+    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 11000000 --end-block 11500000 --batch-size 500
 
   indexer-7:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
-    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 12000000 --end-block 13000000 --batch-size 500
+    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 11500000 --end-block 12000000 --batch-size 500
 
   indexer-8:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
+    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 12000000 --end-block 13000000 --batch-size 500
+
+  indexer-9:
+    image: ghcr.io/kindynosmx/evm-indexer:main
+    env_file:
+      - ./.env
+    restart: on-failure
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 13000000 --end-block 14000000 --batch-size 500
   
-  indexer-9:
+  indexer-10:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 14000000 --end-block 15000000 --batch-size 500
 
-  indexer-10:
+  indexer-11:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 15000000 --end-block 16000000 --batch-size 500
 
-  indexer-11:
+  indexer-12:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 16000000 --end-block 17000000 --batch-size 500
 
-  indexer-12:
+  indexer-13:
     restart: on-failure
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
-    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 17000000 --batch-size 500
+    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 17000000 --end-block 17200000 --batch-size 500
 
-  indexer-13:
+  indexer-14:
     restart: always
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
