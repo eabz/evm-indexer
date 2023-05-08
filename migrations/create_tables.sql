@@ -184,7 +184,7 @@ CREATE TABLE indexer.traces (
   subtraces UInt64,
   to Nullable(String),
   trace_address Array(UInt64),
-  transaction_hash String,
+  transaction_hash Nullable(String),
   transaction_position Nullable(UInt64),
   value Nullable(UInt256),
 )

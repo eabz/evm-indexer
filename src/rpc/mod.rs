@@ -291,7 +291,10 @@ impl Rpc {
                         contract_address: contract_address.to_string(),
                         chain: self.chain.id,
                         creator: trace.from.clone().unwrap(),
-                        transaction_hash: trace.transaction_hash.clone(),
+                        transaction_hash: trace
+                            .transaction_hash
+                            .clone()
+                            .unwrap(),
                     };
 
                     contracts_map

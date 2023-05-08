@@ -1,10 +1,10 @@
 CREATE MATERIALIZED VIEW indexer.blocks_count_by_chain
 ENGINE = SummingMergeTree()
+ORDER BY chain
 AS SELECT
     chain,
     count() as blocks
 FROM indexer.blocks
-ORDER BY chain
 GROUP BY chain;
 
 INSERT INTO indexer.blocks_count_by_chain
