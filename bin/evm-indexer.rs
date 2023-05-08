@@ -7,7 +7,7 @@ use evm_indexer::{
 use futures::future::join_all;
 use log::*;
 use simple_logger::SimpleLogger;
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 use tokio::time::sleep;
 
 #[tokio::main()]
@@ -52,6 +52,17 @@ async fn main() {
         });
     }
 
+    if config.end_block != 0 {
+        sync_chain(&rpc, &db, &config).await;
+    } else {
+        loop {
+            sync_chain(&rpc, &db, &config).await;
+            sleep(Duration::from_secs(30)).await;
+        }
+    }
+}
+
+async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
     let mut indexed_blocks = db.get_indexed_blocks().await;
 
     // If there are no indexed blocks, insert the genesis transactions
@@ -65,22 +76,6 @@ async fn main() {
         .await;
     }
 
-    if config.end_block != 0 {
-        sync_chain(&rpc, &db, &config, &mut indexed_blocks).await;
-    } else {
-        loop {
-            sync_chain(&rpc, &db, &config, &mut indexed_blocks).await;
-            sleep(Duration::from_secs(30)).await;
-        }
-    }
-}
-
-async fn sync_chain(
-    rpc: &Rpc,
-    db: &Database,
-    config: &Config,
-    indexed_blocks: &mut HashSet<u64>,
-) {
     let last_block = if config.end_block != 0 {
         config.end_block
     } else {
@@ -112,6 +107,7 @@ async fn sync_chain(
 
         let mut fetched_data = BlockFetchedData {
             blocks: Vec::new(),
+            block_rewards: Vec::new(),
             contracts: Vec::new(),
             dex_trades: Vec::new(),
             erc20_transfers: Vec::new(),
@@ -128,6 +124,7 @@ async fn sync_chain(
             match result {
                 Some((
                     block,
+                    mut block_rewards,
                     mut transactions,
                     mut receipts,
                     mut logs,
@@ -140,6 +137,7 @@ async fn sync_chain(
                     mut withdrawals,
                 )) => {
                     fetched_data.blocks.push(block);
+                    fetched_data.block_rewards.append(&mut block_rewards);
                     fetched_data.transactions.append(&mut transactions);
                     fetched_data.receipts.append(&mut receipts);
                     fetched_data.logs.append(&mut logs);

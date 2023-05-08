@@ -1,4 +1,5 @@
 pub mod block;
+pub mod block_reward;
 pub mod contract;
 pub mod dex_trade;
 pub mod erc1155_transfer;

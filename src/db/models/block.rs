@@ -1,24 +1,17 @@
 use clickhouse::Row;
 use ethabi::ethereum_types::U256;
-use ethers::types::{Block, Transaction};
+use ethers::types::Block;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    chains::get_block_reward,
-    utils::format::{
-        format_address, format_bytes, format_bytes_slice, format_hash,
-        format_nonce, opt_serialize_u256, serialize_u256,
-    },
+use crate::utils::format::{
+    format_address, format_bytes, format_bytes_slice, format_hash,
+    format_nonce, opt_serialize_u256, serialize_u256,
 };
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseBlock {
-    #[serde(with = "serialize_u256")]
-    pub base_block_reward: U256,
     #[serde(with = "opt_serialize_u256")]
     pub base_fee_per_gas: Option<U256>,
-    #[serde(with = "serialize_u256")]
-    pub burned: U256,
     pub chain: u64,
     #[serde(with = "serialize_u256")]
     pub difficulty: U256,
@@ -42,7 +35,6 @@ pub struct DatabaseBlock {
     pub timestamp: u64,
     #[serde(with = "opt_serialize_u256")]
     pub total_difficulty: Option<U256>,
-    pub total_fee_reward: U256,
     pub transactions: u64,
     pub transactions_root: String,
     pub uncles: Vec<String>,
@@ -50,17 +42,12 @@ pub struct DatabaseBlock {
 }
 
 impl DatabaseBlock {
-    pub fn from_rpc(block: &Block<Transaction>, chain: u64) -> Self {
+    pub fn from_rpc<T>(block: &Block<T>, chain: u64) -> Self {
         let withdrawals_root: Option<String> =
             block.withdrawals_root.map(format_hash);
 
-        let (base_block_reward, total_fee_reward, burned) =
-            get_block_reward(chain, block);
-
         Self {
-            base_block_reward,
             base_fee_per_gas: block.base_fee_per_gas,
-            burned,
             chain,
             difficulty: block.difficulty,
             extra_data: format_bytes(&block.extra_data),
@@ -81,7 +68,6 @@ impl DatabaseBlock {
             state_root: format_hash(block.state_root),
             timestamp: block.timestamp.as_u64(),
             total_difficulty: block.total_difficulty,
-            total_fee_reward,
             transactions: block.transactions.len() as u64,
             transactions_root: format_hash(block.transactions_root),
             uncles: block

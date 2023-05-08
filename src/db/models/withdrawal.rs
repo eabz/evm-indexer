@@ -12,9 +12,9 @@ pub struct DatabaseWithdrawal {
     pub amount: U256,
     pub block_number: u64,
     pub chain: u64,
-    pub index: u64,
     pub timestamp: u64,
     pub validator_index: u64,
+    pub withdrawal_index: u64,
 }
 
 impl DatabaseWithdrawal {
@@ -29,9 +29,9 @@ impl DatabaseWithdrawal {
             amount: withdrawal.amount,
             block_number,
             chain,
-            index: withdrawal.index.as_u64(),
             timestamp,
             validator_index: withdrawal.validator_index.as_u64(),
+            withdrawal_index: withdrawal.index.as_u64(),
         }
     }
 }
