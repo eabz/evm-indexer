@@ -28,7 +28,13 @@ pub struct IndexerArgs {
     #[arg(long, help = "Start log with debug.", default_value_t = false)]
     pub debug: bool,
     #[arg(long, help = "Last block to sync.", default_value_t = 0)]
-    pub end_block: u64,
+    pub end_block: i64,
+    #[arg(
+        long,
+        help = "Boolean to listen to new blocks only.",
+        default_value_t = false
+    )]
+    pub new_blocks_only: bool,
     #[arg(
         long,
         help = "Comma separated list of rpcs to use to fetch blocks."
@@ -53,7 +59,8 @@ pub struct Config {
     pub db_password: String,
     pub db_username: String,
     pub debug: bool,
-    pub end_block: u64,
+    pub end_block: i64,
+    pub new_blocks_only: bool,
     pub rpcs: Vec<String>,
     pub start_block: u64,
     pub ws_url: Option<String>,
@@ -102,6 +109,7 @@ impl Config {
             db_username: username.to_string(),
             debug: args.debug,
             end_block: args.end_block,
+            new_blocks_only: args.new_blocks_only,
             rpcs,
             start_block: args.start_block,
             ws_url,

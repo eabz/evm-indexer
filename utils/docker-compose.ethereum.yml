@@ -90,11 +90,11 @@ services:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
-    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 17000000 --end-block 17200000 --batch-size 500
+    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 17000000 --batch-size 500
 
   indexer-14:
     restart: always
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
-    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --ws ${WS_URL} --batch-size 500
+    command: evm-indexer --rpcs ${RPC_URLS} --database ${DATABASE_URL} --ws ${WS_URL} --new-blocks-only

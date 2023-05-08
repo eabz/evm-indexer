@@ -24,7 +24,7 @@ async fn main() {
 
     info!("Starting EVM Indexer.");
 
-    info!("Syncing chain {}.", config.chain.name);
+    info!("Syncing {}.", config.chain.name);
 
     let rpc = Rpc::new(&config).await;
 
@@ -37,7 +37,9 @@ async fn main() {
     )
     .await;
 
-    if config.ws_url.is_some() && config.end_block == 0 {
+    if config.ws_url.is_some() && config.end_block == 0
+        || config.end_block == -1
+    {
         tokio::spawn({
             let rpc: Rpc = rpc.clone();
             let db: Database = db.clone();
@@ -52,13 +54,11 @@ async fn main() {
         });
     }
 
-    if config.end_block != 0 {
-        sync_chain(&rpc, &db, &config).await;
-    } else {
-        loop {
+    loop {
+        if !config.new_blocks_only {
             sync_chain(&rpc, &db, &config).await;
-            sleep(Duration::from_secs(30)).await;
         }
+        sleep(Duration::from_secs(30)).await;
     }
 }
 
@@ -77,7 +77,7 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
     }
 
     let last_block = if config.end_block != 0 {
-        config.end_block
+        config.end_block as u64
     } else {
         rpc.get_last_block().await
     };
@@ -91,6 +91,12 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
         .collect();
 
     let total_missing_blocks = missing_blocks.len();
+
+    // If the program uses a block range and finishes shutdown gracefully
+    if config.end_block != 0 && total_missing_blocks == 0 {
+        info!("Finished syncing blocks");
+        std::process::exit(0);
+    }
 
     info!("Syncing {} blocks.", total_missing_blocks);
 

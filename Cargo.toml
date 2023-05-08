@@ -1,6 +1,6 @@
 [package]
 name = "evm-indexer"
-version = "1.2.0"
+version = "1.2.1"
 license = "MIT"
 edition = "2021"
 repository = "https://github.com/kindynosmx/evm-indexer"
