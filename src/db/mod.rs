@@ -4,7 +4,7 @@ use crate::chains::Chain;
 use clickhouse::{Client, Row};
 use futures::future::join_all;
 use hyper_tls::HttpsConnector;
-use log::info;
+use log::{error, info};
 use models::{
     block::DatabaseBlock, contract::DatabaseContract,
     dex_trade::DatabaseDexTrade,
@@ -331,8 +331,12 @@ impl Database {
             inserter.write(item).await.unwrap();
         }
 
-        inserter.end().await.unwrap_or_else(|_| {
-            panic!("Unable to store {} into database", table)
-        });
+        match inserter.end().await {
+            Ok(_) => (),
+            Err(err) => {
+                error!("{}", err);
+                panic!("Unable to store {} into database", table)
+            }
+        }
     }
 }
