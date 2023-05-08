@@ -17,7 +17,7 @@ pub struct DatabaseLog {
     pub log_index: U256,
     pub log_type: Option<String>,
     pub removed: bool,
-    pub timestamp: u64,
+    pub timestamp: u32,
     pub topic0: Option<String>,
     pub topic1: Option<String>,
     pub topic2: Option<String>,
@@ -28,7 +28,7 @@ pub struct DatabaseLog {
 }
 
 impl DatabaseLog {
-    pub fn from_rpc(log: &Log, chain: u64, timestamp: u64) -> Self {
+    pub fn from_rpc(log: &Log, chain: u64, timestamp: u32) -> Self {
         let topic0 = if log.topics.is_empty() {
             None
         } else {

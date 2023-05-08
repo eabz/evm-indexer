@@ -17,7 +17,7 @@ struct BalanceAllocation {
 #[derive(Debug, Clone)]
 pub struct Chain {
     pub genesis_hash: &'static str,
-    pub genesis_timestamp: u64,
+    pub genesis_timestamp: u32,
     pub id: u64,
     pub name: &'static str,
     pub supports_blocks_receipts: bool,

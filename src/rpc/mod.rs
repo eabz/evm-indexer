@@ -291,10 +291,7 @@ impl Rpc {
                         contract_address: contract_address.to_string(),
                         chain: self.chain.id,
                         creator: trace.from.clone().unwrap(),
-                        transaction_hash: trace
-                            .transaction_hash
-                            .clone()
-                            .unwrap(),
+                        transaction_hash: trace.transaction_hash.clone(),
                     };
 
                     contracts_map
@@ -792,7 +789,7 @@ impl Rpc {
         &self,
         base_fee_per_gas: Option<U256>,
         transaction: String,
-        transaction_timestamp: u64,
+        transaction_timestamp: u32,
     ) -> Option<(
         DatabaseReceipt,
         Vec<DatabaseLog>,
@@ -869,7 +866,7 @@ impl Rpc {
         &self,
         base_fee_per_gas: Option<U256>,
         block_number: &u64,
-        block_timestamp: u64,
+        block_timestamp: u32,
     ) -> Option<(
         Vec<DatabaseReceipt>,
         Vec<DatabaseLog>,

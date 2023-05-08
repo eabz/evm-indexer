@@ -18,7 +18,7 @@ pub struct DatabaseBlockReward {
     pub hash: String,
     pub miner: String,
     pub number: u64,
-    pub timestamp: u64,
+    pub timestamp: u32,
     #[serde(with = "serialize_u256")]
     pub total_fee_reward: U256,
     #[serde(with = "serialize_u256")]

@@ -1,5 +1,23 @@
 CREATE DATABASE IF NOT EXISTS indexer;
 
+SET optimize_on_insert = 1;
+
+CREATE TABLE indexer.block_rewards (
+  base_block_reward UInt256,
+  burned UInt256,
+  chain UInt64,
+  hash String,
+  miner String,
+  number UInt64,
+  timestamp DateTime,
+  total_fee_reward UInt256,
+  uncle_rewards UInt256
+)
+ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (hash, miner, chain, timestamp)
+SETTINGS index_granularity = 8192;
+
 CREATE TABLE indexer.blocks (
   base_fee_per_gas Nullable(UInt256),
   chain UInt64,
@@ -19,7 +37,7 @@ CREATE TABLE indexer.blocks (
   sha3_uncles String,
   size Nullable(UInt256),
   state_root String,
-  timestamp UInt64,
+  timestamp DateTime,
   total_difficulty Nullable(UInt256),
   transactions UInt64,
   transactions_root String,
@@ -27,21 +45,9 @@ CREATE TABLE indexer.blocks (
   withdrawals_root Nullable(String),
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (hash);
-
-CREATE TABLE indexer.block_rewards (
-  base_block_reward UInt256,
-  burned UInt256,
-  chain UInt64,
-  hash String,
-  miner String,
-  number UInt64,
-  timestamp UInt64,
-  total_fee_reward UInt256,
-  uncle_rewards UInt256
-)
-ENGINE = ReplacingMergeTree()
-PRIMARY KEY (hash);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (hash, chain, timestamp, number)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.contracts (
   block UInt64,
@@ -51,7 +57,8 @@ CREATE TABLE indexer.contracts (
   transaction_hash String,
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (contract_address, chain);
+ORDER BY (contract_address, creator, chain, transaction_hash)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.dex_trades (
   chain UInt64,
@@ -59,14 +66,16 @@ CREATE TABLE indexer.dex_trades (
   maker String,
   pair_address String,
   receiver String,
-  timestamp UInt64,
+  timestamp DateTime,
   token0_amount UInt256,
   token1_amount UInt256,
   transaction_hash String,
   transaction_log_index Nullable(UInt256),
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (transaction_hash, log_index);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (transaction_hash, chain, maker, timestamp, log_index)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.erc1155_transfers (
   chain UInt64,
@@ -74,7 +83,7 @@ CREATE TABLE indexer.erc1155_transfers (
   id UInt256,
   log_index UInt256,
   operator String,
-  timestamp UInt64,
+  timestamp DateTime,
   to String,
   token String,
   transaction_hash String,
@@ -82,35 +91,41 @@ CREATE TABLE indexer.erc1155_transfers (
   value UInt256,
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (transaction_hash, log_index);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (transaction_hash, chain, from, token, to, timestamp, operator, log_index)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.erc20_transfers (
   amount UInt256,
   chain UInt64,
   from String,
   log_index UInt256,
-  timestamp UInt64,
+  timestamp DateTime,
   to String,
   token String,
   transaction_hash String,
   transaction_log_index Nullable(UInt256),
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (transaction_hash, log_index);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (transaction_hash, chain, from, token, to, timestamp, log_index)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.erc721_transfers (
   chain UInt64,
   from String,
   id UInt256,
   log_index UInt256,
-  timestamp UInt64,
+  timestamp DateTime,
   to String,
   token String,
   transaction_hash String,
   transaction_log_index Nullable(UInt256),
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (transaction_hash, log_index);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (transaction_hash, chain, from, token, to, timestamp, id, log_index)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.logs (
   address String,
@@ -119,7 +134,7 @@ CREATE TABLE indexer.logs (
   log_index UInt256,
   log_type Nullable(String),
   removed boolean,
-  timestamp UInt64,
+  timestamp DateTime,
   topic0 Nullable(String),
   topic1 Nullable(String),
   topic2 Nullable(String),
@@ -128,7 +143,9 @@ CREATE TABLE indexer.logs (
   transaction_log_index Nullable(UInt256),
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (transaction_hash, log_index);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (transaction_hash, address, chain, topic0, log_index, timestamp)
+SETTINGS allow_nullable_key = 1, index_granularity = 8192;
 
 CREATE TABLE indexer.receipts (
   base_fee_per_gas Nullable(UInt256),
@@ -142,7 +159,8 @@ CREATE TABLE indexer.receipts (
   status UInt64,
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (hash);
+ORDER BY (hash, chain)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.traces (
   action_type String,
@@ -166,12 +184,13 @@ CREATE TABLE indexer.traces (
   subtraces UInt64,
   to Nullable(String),
   trace_address Array(UInt64),
-  transaction_hash Nullable(String),
+  transaction_hash String,
   transaction_position Nullable(UInt64),
   value Nullable(UInt256),
 )
-ENGINE = MergeTree()
-PRIMARY KEY (block_hash);
+ENGINE = ReplacingMergeTree()
+ORDER BY (block_hash, transaction_hash, call_type, trace_address, author)
+SETTINGS allow_nullable_key = 1, index_granularity = 8192;
 
 CREATE TABLE indexer.transactions (
   access_list Array(Tuple(String, Array(String))),
@@ -187,23 +206,27 @@ CREATE TABLE indexer.transactions (
   max_priority_fee_per_gas Nullable(UInt256),
   method String,
   nonce UInt256,
-  timestamp UInt64,
+  timestamp DateTime,
   to String,
   transaction_index UInt16,
   transaction_type UInt16,
   value UInt256,
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (hash);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (hash, from, to, timestamp, chain, method)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.withdrawals (
   address String,
   amount UInt256,
   block_number UInt64,
   chain UInt64,
-  timestamp UInt64,
+  timestamp DateTime,
   validator_index UInt64,
   withdrawal_index UInt64,
 )
 ENGINE = ReplacingMergeTree()
-PRIMARY KEY (block_number, withdrawal_index, chain);
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (address, block_number, chain, timestamp, validator_index)
+SETTINGS index_granularity = 8192;

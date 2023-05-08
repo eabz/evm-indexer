@@ -19,7 +19,7 @@ pub struct DatabaseERC721Transfer {
     pub id: U256,
     #[serde(with = "serialize_u256")]
     pub log_index: U256,
-    pub timestamp: u64,
+    pub timestamp: u32,
     pub token: String,
     pub to: String,
     pub transaction_hash: String,

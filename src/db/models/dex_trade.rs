@@ -19,7 +19,7 @@ pub struct DatabaseDexTrade {
     pub maker: String,
     pub pair_address: String,
     pub receiver: String,
-    pub timestamp: u64,
+    pub timestamp: u32,
     #[serde(with = "serialize_u256")]
     pub token0_amount: U256,
     #[serde(with = "serialize_u256")]

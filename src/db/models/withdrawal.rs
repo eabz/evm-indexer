@@ -12,7 +12,7 @@ pub struct DatabaseWithdrawal {
     pub amount: U256,
     pub block_number: u64,
     pub chain: u64,
-    pub timestamp: u64,
+    pub timestamp: u32,
     pub validator_index: u64,
     pub withdrawal_index: u64,
 }
@@ -22,7 +22,7 @@ impl DatabaseWithdrawal {
         withdrawal: &Withdrawal,
         chain: u64,
         block_number: u64,
-        timestamp: u64,
+        timestamp: u32,
     ) -> Self {
         Self {
             address: format_address(withdrawal.address),

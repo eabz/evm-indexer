@@ -1,10 +1,10 @@
 CREATE MATERIALIZED VIEW indexer.blocks_count_by_chain
 ENGINE = SummingMergeTree()
-ORDER BY chain
 AS SELECT
     chain,
     count() as blocks
 FROM indexer.blocks
+ORDER BY chain
 GROUP BY chain;
 
 INSERT INTO indexer.blocks_count_by_chain
@@ -13,19 +13,6 @@ SELECT
     count() as blocks
 FROM indexer.blocks
 GROUP BY chain;
-
-CREATE MATERIALIZED VIEW blocks_by_chain
-ENGINE = MergeTree()
-ORDER BY chain
-AS
-    SELECT number, chain
-    FROM blocks;
-    
-INSERT INTO indexer.blocks_by_chain
-SELECT
-    number,
-    chain
-FROM indexer.blocks;
 
 CREATE MATERIALIZED VIEW indexer.contracts_count_by_chain
 ENGINE = SummingMergeTree()

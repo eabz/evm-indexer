@@ -28,7 +28,7 @@ pub struct DatabaseTransaction {
     pub method: String,
     #[serde(with = "serialize_u256")]
     pub nonce: U256,
-    pub timestamp: u64,
+    pub timestamp: u32,
     pub to: String,
     pub transaction_index: u16,
     pub transaction_type: u16,
@@ -40,7 +40,7 @@ impl DatabaseTransaction {
     pub fn from_rpc(
         transaction: &Transaction,
         chain: u64,
-        timestamp: u64,
+        timestamp: u32,
     ) -> Self {
         let to: String = match transaction.to {
             Some(address) => format_address(address),

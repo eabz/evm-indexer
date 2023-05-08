@@ -33,7 +33,7 @@ pub struct DatabaseTrace {
     pub subtraces: u64,
     pub to: Option<String>,
     pub trace_address: Vec<u64>,
-    pub transaction_hash: Option<String>,
+    pub transaction_hash: String,
     pub transaction_position: Option<u64>,
     #[serde(with = "opt_serialize_u256")]
     pub value: Option<U256>,
@@ -51,9 +51,6 @@ impl DatabaseTrace {
         let transaction_position: Option<u64> = trace
             .transaction_position
             .map(|transaction_position| transaction_position as u64);
-
-        let transaction_hash: Option<String> =
-            trace.transaction_hash.map(format_hash);
 
         let action_type = match trace.action_type {
             ethers::types::ActionType::Call => String::from("call"),
@@ -177,7 +174,7 @@ impl DatabaseTrace {
             subtraces: trace.subtraces as u64,
             to,
             trace_address,
-            transaction_hash,
+            transaction_hash: format_hash(trace.transaction_hash.unwrap()),
             transaction_position,
             value,
         }

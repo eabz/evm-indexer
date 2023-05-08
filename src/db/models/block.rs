@@ -32,7 +32,7 @@ pub struct DatabaseBlock {
     #[serde(with = "opt_serialize_u256")]
     pub size: Option<U256>,
     pub state_root: String,
-    pub timestamp: u64,
+    pub timestamp: u32,
     #[serde(with = "opt_serialize_u256")]
     pub total_difficulty: Option<U256>,
     pub transactions: u64,
@@ -66,7 +66,7 @@ impl DatabaseBlock {
             sha3_uncles: format_hash(block.uncles_hash),
             size: block.size,
             state_root: format_hash(block.state_root),
-            timestamp: block.timestamp.as_u64(),
+            timestamp: block.timestamp.as_u32(),
             total_difficulty: block.total_difficulty,
             transactions: block.transactions.len() as u64,
             transactions_root: format_hash(block.transactions_root),
