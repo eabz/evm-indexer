@@ -1,98 +1,98 @@
 version: "3.9"
 
 services:
-  indexer-1:
+  polygon-indexer-1:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 0 --end-block 5000000 --batch-size 500
 
-  indexer-2:
+  polygon-indexer-2:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 5000000 --end-block 10000000 --batch-size 500
 
-  indexer-3:
+  polygon-indexer-3:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 10000000 --end-block 13000000 --batch-size 500
 
-  indexer-4:
+  polygon-indexer-4:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 13000000 --end-block 16000000 --batch-size 500
 
-  indexer-5:
+  polygon-indexer-5:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 16000000 --end-block 19000000 --batch-size 500
 
-  indexer-6:
+  polygon-indexer-6:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 19000000 --end-block 22000000 --batch-size 500
 
-  indexer-7:
+  polygon-indexer-7:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 22000000 --end-block 24000000 --batch-size 500
 
-  indexer-8:
+  polygon-indexer-8:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 24000000 --end-block 27000000 --batch-size 500
 
-  indexer-9:
+  polygon-indexer-9:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 27000000 --end-block 31000000 --batch-size 500
   
-  indexer-10:
+  polygon-indexer-10:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 31000000 --end-block 35000000 --batch-size 500
 
-  indexer-11:
+  polygon-indexer-11:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 35000000 --end-block 39000000 --batch-size 500
 
-  indexer-12:
+  polygon-indexer-12:
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     restart: on-failure
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 39000000 --end-block 42000000 --batch-size 500
 
-  indexer-13:
+  polygon-indexer-13:
     restart: on-failure
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
       - ./.env
     command: evm-indexer --chain 137 --rpcs ${RPC_URLS} --database ${DATABASE_URL} --start-block 42000000 --batch-size 500
 
-  indexer-14:
+  polygon-indexer-14:
     restart: always
     image: ghcr.io/kindynosmx/evm-indexer:main
     env_file:
