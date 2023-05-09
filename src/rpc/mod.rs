@@ -3,8 +3,10 @@ use crate::{
     configs::Config,
     db::{
         models::{
-            block::DatabaseBlock, contract::DatabaseContract,
-            log::DatabaseLog, trace::DatabaseTrace,
+            block::DatabaseBlock,
+            contract::DatabaseContract,
+            log::DatabaseLog,
+            trace::{DatabaseTrace, TraceType},
             transaction::DatabaseTransaction,
             withdrawal::DatabaseWithdrawal,
         },
@@ -303,7 +305,7 @@ impl Rpc {
                 // Insert contracts created through the traces
                 let create_traces: Vec<&DatabaseTrace> = traces
                     .iter()
-                    .filter(|trace| trace.action_type == "create")
+                    .filter(|trace| trace.action_type == TraceType::Create)
                     .collect();
 
                 for trace in create_traces {

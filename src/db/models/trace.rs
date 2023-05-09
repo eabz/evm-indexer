@@ -6,7 +6,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::utils::format::{format_address, format_bytes, format_hash};
 
-#[derive(Debug, Clone, Serialize_repr, Deserialize_repr)]
+#[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq)]
 #[repr(u8)]
 pub enum TraceType {
     Call = 1,
