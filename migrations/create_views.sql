@@ -1,175 +1,54 @@
-CREATE MATERIALIZED VIEW indexer.blocks_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as blocks
-FROM indexer.blocks
-GROUP BY chain;
+ALTER TABLE blocks ADD PROJECTION blocks_count_by_chain (SELECT count(*) as blocks, chain GROUP BY chain);
 
-INSERT INTO indexer.blocks_count_by_chain
-SELECT
-    chain,
-    count() as blocks
-FROM indexer.blocks
-GROUP BY chain;
+ALTER TABLE blocks
+    MATERIALIZE PROJECTION blocks_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.contracts_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as contracts
-FROM indexer.contracts
-GROUP BY chain;
+ALTER TABLE contracts ADD PROJECTION contracts_count_by_chain (SELECT count(*) as contracts, chain GROUP BY chain);
 
-INSERT INTO indexer.contracts_count_by_chain
-SELECT
-    chain,
-    count() as contracts
-FROM indexer.contracts
-GROUP BY chain;
+ALTER TABLE contracts
+    MATERIALIZE PROJECTION contracts_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.dex_trades_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as dex_trades
-FROM indexer.dex_trades
-GROUP BY chain;
+ALTER TABLE dex_trades ADD PROJECTION dex_trades_count_by_chain (SELECT count(*) as dex_trades, chain GROUP BY chain);
 
-INSERT INTO indexer.dex_trades_count_by_chain
-SELECT
-    chain,
-    count() as dex_trades
-FROM indexer.dex_trades
-GROUP BY chain;
+ALTER TABLE dex_trades
+    MATERIALIZE PROJECTION dex_trades_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.erc1155_transfers_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as erc1155_transfers
-FROM indexer.erc1155_transfers
-GROUP BY chain;
+ALTER TABLE erc1155_transfers ADD PROJECTION erc1155_transfers_count_by_chain (SELECT count(*) as erc1155_transfers, chain GROUP BY chain);
 
-INSERT INTO indexer.erc1155_transfers_count_by_chain
-SELECT
-    chain,
-    count() as erc1155_transfers
-FROM indexer.erc1155_transfers
-GROUP BY chain;
+ALTER TABLE erc1155_transfers
+    MATERIALIZE PROJECTION erc1155_transfers_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.erc20_transfers_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as erc20_transfers
-FROM indexer.erc20_transfers
-GROUP BY chain;
+ALTER TABLE erc20_transfers ADD PROJECTION erc20_transfers_count_by_chain (SELECT count(*) as erc20_transfers, chain GROUP BY chain);
 
-INSERT INTO indexer.erc20_transfers_count_by_chain
-SELECT
-    chain,
-    count() as erc20_transfers
-FROM indexer.erc20_transfers
-GROUP BY chain;
+ALTER TABLE erc20_transfers
+    MATERIALIZE PROJECTION erc20_transfers_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.erc721_transfers_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as erc721_transfers
-FROM indexer.erc721_transfers
-GROUP BY chain;
+ALTER TABLE erc721_transfers ADD PROJECTION erc721_transfers_count_by_chain (SELECT count(*) as erc721_transfers, chain GROUP BY chain);
 
-INSERT INTO indexer.erc721_transfers_count_by_chain
-SELECT
-    chain,
-    count() as erc721_transfers
-FROM indexer.erc721_transfers
-GROUP BY chain;
+ALTER TABLE erc721_transfers
+    MATERIALIZE PROJECTION erc721_transfers_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.logs_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as logs
-FROM indexer.logs
-GROUP BY chain;
+ALTER TABLE logs ADD PROJECTION logs_count_by_chain (SELECT count(*) as logs, chain GROUP BY chain);
 
-INSERT INTO indexer.logs_count_by_chain
-SELECT
-    chain,
-    count() as logs
-FROM indexer.logs
-GROUP BY chain;
+ALTER TABLE logs
+    MATERIALIZE PROJECTION logs_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.receipts_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as receipts
-FROM indexer.receipts
-GROUP BY chain;
+ALTER TABLE receipts ADD PROJECTION receipts_count_by_chain (SELECT count(*) as receipts, chain GROUP BY chain);
 
-INSERT INTO indexer.receipts_count_by_chain
-SELECT
-    chain,
-    count() as receipts
-FROM indexer.receipts
-GROUP BY chain;
+ALTER TABLE receipts
+    MATERIALIZE PROJECTION receipts_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.traces_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as traces
-FROM indexer.traces
-GROUP BY chain;
+ALTER TABLE traces ADD PROJECTION traces_count_by_chain (SELECT count(*) as traces, chain GROUP BY chain);
 
-INSERT INTO indexer.traces_count_by_chain
-SELECT
-    chain,
-    count() as traces
-FROM indexer.traces
-GROUP BY chain;
+ALTER TABLE traces
+    MATERIALIZE PROJECTION traces_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.transactions_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as transactions
-FROM indexer.transactions
-GROUP BY chain;
+ALTER TABLE transactions ADD PROJECTION transactions_count_by_chain (SELECT count(*) as transactions, chain GROUP BY chain);
 
-INSERT INTO indexer.transactions_count_by_chain
-SELECT
-    chain,
-    count() as transactions
-FROM indexer.transactions
-GROUP BY chain;
+ALTER TABLE transactions
+    MATERIALIZE PROJECTION transactions_count_by_chain SETTINGS mutations_sync = 1;
 
-CREATE MATERIALIZED VIEW indexer.withdrawals_count_by_chain
-ENGINE = SummingMergeTree()
-ORDER BY chain
-AS SELECT
-    chain,
-    count() as withdrawals
-FROM indexer.withdrawals
-GROUP BY chain;
+ALTER TABLE withdrawals ADD PROJECTION withdrawals_count_by_chain (SELECT count(*) as withdrawals, chain GROUP BY chain);
 
-INSERT INTO indexer.withdrawals_count_by_chain
-SELECT
-    chain,
-    count() as withdrawals
-FROM indexer.withdrawals
-GROUP BY chain;
+ALTER TABLE withdrawals
+    MATERIALIZE PROJECTION withdrawals_count_by_chain SETTINGS mutations_sync = 1;
