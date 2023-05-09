@@ -17,7 +17,7 @@ use crate::{
             SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE,
             TRANSFER_EVENTS_SIGNATURE,
         },
-        format::decode_bytes,
+        format::{decode_bytes, format_hash},
     },
 };
 use ethabi::ParamType;
@@ -135,7 +135,7 @@ impl Rpc {
 
     pub async fn fetch_block(
         &self,
-        block_number: &u64,
+        block_number: &u32,
         chain: &Chain,
     ) -> Option<(
         Vec<DatabaseBlock>,
@@ -171,7 +171,9 @@ impl Rpc {
                     return None;
                 }
 
-                let mut db_receipts: Vec<TransactionReceipt> = Vec::new();
+                let mut db_receipts: HashMap<String, TransactionReceipt> =
+                    HashMap::new();
+
                 let mut db_logs: Vec<DatabaseLog> = Vec::new();
                 let mut contracts_map: HashMap<String, DatabaseContract> =
                     HashMap::new();
@@ -185,8 +187,13 @@ impl Rpc {
                         .await;
 
                     match receipts_data {
-                        Some((mut receipts, mut logs, contracts)) => {
-                            db_receipts.append(&mut receipts);
+                        Some((receipts, mut logs, contracts)) => {
+                            for receipt in receipts {
+                                db_receipts.insert(
+                                    format_hash(receipt.transaction_hash),
+                                    receipt,
+                                );
+                            }
                             db_logs.append(&mut logs);
                             for contract in contracts {
                                 contracts_map.insert(
@@ -203,12 +210,16 @@ impl Rpc {
                             .get_transaction_receipt(
                                 transaction.hash.clone(),
                                 transaction.timestamp,
+                                block_number,
                             )
                             .await;
 
                         match receipt_data {
                             Some((receipt, mut logs, contract)) => {
-                                db_receipts.push(receipt);
+                                db_receipts.insert(
+                                    format_hash(receipt.transaction_hash),
+                                    receipt,
+                                );
                                 db_logs.append(&mut logs);
                                 match contract {
                                     Some(contract) => {
@@ -288,8 +299,6 @@ impl Rpc {
 
                 db_blocks.push(db_block);
 
-                // TODO: calculate the block reward information and include inside the block;
-
                 // Insert contracts created through the traces
                 let create_traces: Vec<&DatabaseTrace> = traces
                     .iter()
@@ -307,7 +316,7 @@ impl Rpc {
                     }
 
                     let contract = DatabaseContract {
-                        block: trace.block_number,
+                        block_number: trace.block_number,
                         contract_address: contract_address.to_string(),
                         chain: self.chain.id,
                         creator: trace.from.clone().unwrap(),
@@ -321,28 +330,21 @@ impl Rpc {
                         .insert(contract_address.to_string(), contract);
                 }
 
-                // filter only logs with topic
-                let logs_scan: Vec<&DatabaseLog> = db_logs
-                    .iter()
-                    .filter(|log| log.topic0.is_some())
-                    .collect();
-
-                for log in logs_scan.iter() {
+                for log in db_logs.iter_mut() {
                     // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
-                    let topic0 = log.topic0.clone().unwrap();
+                    let topic0 = log.topic0.clone();
 
                     if topic0 == TRANSFER_EVENTS_SIGNATURE {
                         // Check if it is a erc20 or a erc721 based on the number of logs
 
                         // erc721 token transfer events have 3 indexed values.
                         if log.topic3.is_some() {
-                            // TODO: add erc721 data to the log.
+                            log.parse_erc721_transfer();
                         } else if log.topic1.is_some()
                             && log.topic2.is_some()
                         {
                             // erc20 token transfer events have 2 indexed values.
-
-                            // TODO: add erc20 data to the log.
+                            log.parse_erc20_transfer();
                         }
                     }
 
@@ -363,12 +365,13 @@ impl Rpc {
                             .clone()
                             .into_uint()
                             .unwrap();
-                        let value = transfer_values[1]
+
+                        let amount = transfer_values[1]
                             .clone()
                             .into_uint()
                             .unwrap();
 
-                        // TODO: add erc1155 data to the log.
+                        log.parse_single_erc1155_transfer(id, amount);
                     }
 
                     if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
@@ -420,14 +423,14 @@ impl Rpc {
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                     {
-                        // TODO: add dex_trade data to the log.
+                        log.parse_swap_v2();
                     }
 
                     if topic0 == SWAPV3_EVENT_SIGNATURE
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                     {
-                        // TODO: add dex_trade data to the log.
+                        log.parse_swap_v3();
                     }
                 }
 
@@ -500,7 +503,7 @@ impl Rpc {
                 let db = db.clone();
                 let block = block.unwrap().clone();
                 async move {
-                    let block_number = block.number.unwrap().as_u64();
+                    let block_number = block.number.unwrap().as_u32();
 
                     info!("New head found {}.", block_number.clone());
 
@@ -566,7 +569,7 @@ impl Rpc {
 
     async fn get_block(
         &self,
-        block_number: &u64,
+        block_number: &u32,
     ) -> Option<(
         DatabaseBlock,
         Vec<DatabaseTransaction>,
@@ -683,7 +686,7 @@ impl Rpc {
 
     async fn get_block_traces(
         &self,
-        block_number: &u64,
+        block_number: &u32,
     ) -> Vec<DatabaseTrace> {
         let client = self.get_client();
 
@@ -725,6 +728,7 @@ impl Rpc {
         &self,
         transaction: String,
         transaction_timestamp: u32,
+        block_number: &u32,
     ) -> Option<(
         TransactionReceipt,
         Vec<DatabaseLog>,
@@ -773,6 +777,7 @@ impl Rpc {
                                 log,
                                 self.chain.id,
                                 transaction_timestamp,
+                                block_number,
                             );
 
                             db_transaction_logs.push(db_log)
@@ -789,7 +794,7 @@ impl Rpc {
 
     async fn get_block_receipts(
         &self,
-        block_number: &u64,
+        block_number: &u32,
         block_timestamp: u32,
     ) -> Option<(
         Vec<TransactionReceipt>,
@@ -839,6 +844,7 @@ impl Rpc {
                                     log,
                                     self.chain.id,
                                     block_timestamp,
+                                    block_number,
                                 );
 
                                 db_transaction_logs.push(db_log)

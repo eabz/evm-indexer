@@ -15,7 +15,7 @@ pub struct DatabaseTrace {
     #[serde(with = "opt_serialize_u256")]
     pub balance: Option<U256>,
     pub block_hash: String,
-    pub block_number: u64,
+    pub block_number: u32,
     pub call_type: Option<String>,
     pub chain: u64,
     pub code: Option<String>,
@@ -161,7 +161,7 @@ impl DatabaseTrace {
             author,
             balance,
             block_hash: format_hash(trace.block_hash),
-            block_number: trace.block_number,
+            block_number: trace.block_number as u32,
             call_type,
             chain,
             code,

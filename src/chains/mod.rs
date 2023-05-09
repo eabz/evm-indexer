@@ -38,7 +38,7 @@ pub const ETHEREUM: Chain = Chain {
 
 fn calculate_ethereum_block_reward(
     block: &DatabaseBlock,
-    receipts: &[TransactionReceipt],
+    receipts: &HashMap<String, TransactionReceipt>,
     uncles: &[DatabaseBlock],
     is_uncle: bool,
     uncle_parent_number: Option<u32>,
@@ -100,7 +100,7 @@ pub const POLYGON: Chain = Chain {
 };
 
 fn calculate_polygon_block_reward(
-    receipts: &[TransactionReceipt],
+    receipts: &HashMap<String, TransactionReceipt>,
 ) -> (U256, U256, U256) {
     (
         U256::from_dec_str("0").unwrap(),
@@ -120,7 +120,7 @@ pub const BSC: Chain = Chain {
 };
 
 fn calculate_bsc_block_reward(
-    receipts: &[TransactionReceipt],
+    receipts: &HashMap<String, TransactionReceipt>,
 ) -> (U256, U256, U256) {
     (
         U256::from_dec_str("0").unwrap(),
@@ -149,10 +149,10 @@ pub fn get_chain(chain: u64) -> Chain {
     selected_chain.to_owned()
 }
 
-fn get_total_fees(receipts: &[TransactionReceipt]) -> U256 {
+fn get_total_fees(receipts: &HashMap<String, TransactionReceipt>) -> U256 {
     let mut fees_reward = U256::zero();
 
-    for receipt in receipts {
+    for (_, receipt) in receipts {
         let reward = receipt
             .gas_used
             .unwrap()
@@ -167,7 +167,7 @@ fn get_total_fees(receipts: &[TransactionReceipt]) -> U256 {
 pub fn get_block_reward(
     chain: u64,
     block: &DatabaseBlock,
-    receipts: &[TransactionReceipt],
+    receipts: &HashMap<String, TransactionReceipt>,
     uncles: &[DatabaseBlock],
     is_uncle: bool,
     uncle_parent_number: Option<u32>,

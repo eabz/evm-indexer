@@ -68,7 +68,7 @@ CREATE TABLE indexer.logs (
   token_transfer_operator Nullable(String),
   token_transfer_to Nullable(String),
   token_transfer_token_address Nullable(String),
-  token_transfer_type Nullable(Enum('erc20' = 1, 'erc721' = 2, 'erc1155' = 3)),
+  token_transfer_type Nullable(Enum8('erc20' = 1, 'erc721' = 2, 'erc1155' = 3)),
   topic0 LowCardinality(String),
   topic1 Nullable(String),
   topic2 Nullable(String),
