@@ -2,24 +2,10 @@ CREATE DATABASE IF NOT EXISTS indexer;
 
 SET optimize_on_insert = 1;
 
-CREATE TABLE indexer.block_rewards (
-  base_block_reward UInt256,
-  burned UInt256,
-  chain UInt64,
-  hash String,
-  miner String,
-  number UInt64,
-  timestamp DateTime,
-  total_fee_reward UInt256,
-  uncle_rewards UInt256
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (hash, miner, chain, timestamp)
-SETTINGS index_granularity = 8192;
-
 CREATE TABLE indexer.blocks (
+  base_block_reward UInt256,
   base_fee_per_gas Nullable(UInt256),
+  burned UInt256,
   chain UInt64,
   difficulty UInt256,
   excess_data_gas Nullable(UInt256),
@@ -39,14 +25,16 @@ CREATE TABLE indexer.blocks (
   state_root String,
   timestamp DateTime,
   total_difficulty Nullable(UInt256),
+  total_fee_reward UInt256,
   transactions UInt64,
   transactions_root String,
   uncles Array(String),
+  uncle_rewards UInt256,
   withdrawals_root Nullable(String),
 )
 ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (hash, chain, timestamp, number)
+ORDER BY (hash, miner, chain, timestamp, number)
 SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.contracts (
@@ -57,84 +45,29 @@ CREATE TABLE indexer.contracts (
   transaction_hash String,
 )
 ENGINE = ReplacingMergeTree()
-ORDER BY (contract_address, creator, chain, transaction_hash)
-SETTINGS index_granularity = 8192;
-
-CREATE TABLE indexer.dex_trades (
-  chain UInt64,
-  log_index UInt256,
-  maker String,
-  pair_address String,
-  receiver String,
-  timestamp DateTime,
-  token0_amount UInt256,
-  token1_amount UInt256,
-  transaction_hash String,
-  transaction_log_index Nullable(UInt256),
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (transaction_hash, chain, maker, timestamp, log_index)
-SETTINGS index_granularity = 8192;
-
-CREATE TABLE indexer.erc1155_transfers (
-  chain UInt64,
-  from String,
-  id UInt256,
-  log_index UInt256,
-  operator String,
-  timestamp DateTime,
-  to String,
-  token String,
-  transaction_hash String,
-  transaction_log_index Nullable(UInt256),
-  value UInt256,
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (transaction_hash, chain, from, token, to, timestamp, operator, log_index)
-SETTINGS index_granularity = 8192;
-
-CREATE TABLE indexer.erc20_transfers (
-  amount UInt256,
-  chain UInt64,
-  from String,
-  log_index UInt256,
-  timestamp DateTime,
-  to String,
-  token String,
-  transaction_hash String,
-  transaction_log_index Nullable(UInt256),
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (transaction_hash, chain, from, token, to, timestamp, log_index)
-SETTINGS index_granularity = 8192;
-
-CREATE TABLE indexer.erc721_transfers (
-  chain UInt64,
-  from String,
-  id UInt256,
-  log_index UInt256,
-  timestamp DateTime,
-  to String,
-  token String,
-  transaction_hash String,
-  transaction_log_index Nullable(UInt256),
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (transaction_hash, chain, from, token, to, timestamp, id, log_index)
+ORDER BY (contract_address, transaction_hash, creator, chain)
 SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.logs (
   address String,
   chain UInt64,
   data String,
+  dex_trade_maker Nullable(String),
+  dex_trade_pair Nullable(String),
+  dex_trade_receiver Nullable(String),
+  dex_trade_token0_amount Nullable(UInt256),
+  dex_trade_token1_amount Nullable(UInt256),
   log_index UInt256,
   log_type Nullable(String),
   removed boolean,
   timestamp DateTime,
+  token_transfer_amount Nullable(UInt256),
+  token_transfer_from Nullable(String),
+  token_transfer_id Nullable(UInt256),
+  token_transfer_operator Nullable(String),
+  token_transfer_to Nullable(String),
+  token_transfer_token_address Nullable(String),
+  token_transfer_type Nullable(Enum('erc20' = 1, 'erc721' = 1, 'erc1155' = 1))
   topic0 Nullable(String),
   topic1 Nullable(String),
   topic2 Nullable(String),
@@ -142,25 +75,11 @@ CREATE TABLE indexer.logs (
   transaction_hash String,
   transaction_log_index Nullable(UInt256),
 )
+
 ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (transaction_hash, address, chain, topic0, log_index, timestamp)
 SETTINGS allow_nullable_key = 1, index_granularity = 8192;
-
-CREATE TABLE indexer.receipts (
-  base_fee_per_gas Nullable(UInt256),
-  burned_fees UInt256,
-  chain UInt64,
-  contract_address Nullable(String),
-  cumulative_gas_used UInt256,
-  effective_gas_price Nullable(UInt256),
-  gas_used Nullable(UInt256),
-  hash String,
-  status UInt64,
-)
-ENGINE = ReplacingMergeTree()
-ORDER BY (hash, chain)
-SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.traces (
   action_type String,
@@ -194,18 +113,25 @@ SETTINGS allow_nullable_key = 1, index_granularity = 8192;
 
 CREATE TABLE indexer.transactions (
   access_list Array(Tuple(String, Array(String))),
+  base_fee_per_gas Nullable(UInt256),
   block_hash String,
   block_number UInt64,
+  burned UInt256,
   chain UInt64,
+  contract_created Nullable(String),
+  cumulative_gas_used UInt256,
+  effective_gas_price Nullable(UInt256),
   from String,
   gas UInt256,
   gas_price Nullable(UInt256),
+  gas_used Nullable(UInt256),
   hash String,
   input String,
   max_fee_per_gas Nullable(UInt256),
   max_priority_fee_per_gas Nullable(UInt256),
   method String,
   nonce UInt256,
+  status UInt64,
   timestamp DateTime,
   to String,
   transaction_index UInt16,
