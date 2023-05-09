@@ -6,29 +6,17 @@ use futures::future::join_all;
 use hyper_tls::HttpsConnector;
 use log::{error, info};
 use models::{
-    block::DatabaseBlock, contract::DatabaseContract,
-    dex_trade::DatabaseDexTrade,
-    erc1155_transfer::DatabaseERC1155Transfer,
-    erc20_transfer::DatabaseERC20Transfer,
-    erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-    receipt::DatabaseReceipt, trace::DatabaseTrace,
-    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
+    block::DatabaseBlock, contract::DatabaseContract, log::DatabaseLog,
+    trace::DatabaseTrace, transaction::DatabaseTransaction,
+    withdrawal::DatabaseWithdrawal,
 };
 use serde::Serialize;
 use std::{collections::HashSet, time::Duration};
 
-use self::models::block_reward::DatabaseBlockReward;
-
 pub struct BlockFetchedData {
     pub blocks: Vec<DatabaseBlock>,
-    pub block_rewards: Vec<DatabaseBlockReward>,
     pub contracts: Vec<DatabaseContract>,
-    pub dex_trades: Vec<DatabaseDexTrade>,
-    pub erc20_transfers: Vec<DatabaseERC20Transfer>,
-    pub erc721_transfers: Vec<DatabaseERC721Transfer>,
-    pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
     pub logs: Vec<DatabaseLog>,
-    pub receipts: Vec<DatabaseReceipt>,
     pub traces: Vec<DatabaseTrace>,
     pub transactions: Vec<DatabaseTransaction>,
     pub withdrawals: Vec<DatabaseWithdrawal>,
@@ -123,22 +111,6 @@ impl Database {
     pub async fn store_data(&self, data: &BlockFetchedData) {
         let mut stores = vec![];
 
-        if !data.block_rewards.is_empty() {
-            let work = tokio::spawn({
-                let block_rewards: Vec<DatabaseBlockReward> =
-                    data.block_rewards.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &block_rewards,
-                        DatabaseTables::BlockRewards.as_str(),
-                    )
-                    .await
-                }
-            });
-            stores.push(work);
-        }
-
         if !data.contracts.is_empty() {
             let work = tokio::spawn({
                 let contracts = data.contracts.clone();
@@ -154,66 +126,6 @@ impl Database {
             stores.push(work);
         }
 
-        if !data.dex_trades.is_empty() {
-            let work = tokio::spawn({
-                let dex_trades = data.dex_trades.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &dex_trades,
-                        DatabaseTables::DexTrades.as_str(),
-                    )
-                    .await
-                }
-            });
-            stores.push(work);
-        }
-
-        if !data.erc1155_transfers.is_empty() {
-            let work = tokio::spawn({
-                let erc1155_transfers = data.erc1155_transfers.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &erc1155_transfers,
-                        DatabaseTables::Erc1155Transfers.as_str(),
-                    )
-                    .await
-                }
-            });
-            stores.push(work);
-        }
-
-        if !data.erc20_transfers.is_empty() {
-            let work = tokio::spawn({
-                let erc20_transfers = data.erc20_transfers.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &erc20_transfers,
-                        DatabaseTables::Erc20Transfers.as_str(),
-                    )
-                    .await
-                }
-            });
-            stores.push(work);
-        }
-
-        if !data.erc721_transfers.is_empty() {
-            let work = tokio::spawn({
-                let erc721_transfers = data.erc721_transfers.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &erc721_transfers,
-                        DatabaseTables::Erc721Transfers.as_str(),
-                    )
-                    .await
-                }
-            });
-            stores.push(work);
-        }
-
         if !data.logs.is_empty() {
             let work = tokio::spawn({
                 let logs = data.logs.clone();
@@ -221,21 +133,6 @@ impl Database {
                 async move {
                     db.store_items(&logs, DatabaseTables::Logs.as_str())
                         .await
-                }
-            });
-            stores.push(work);
-        }
-
-        if !data.receipts.is_empty() {
-            let work = tokio::spawn({
-                let receipts = data.receipts.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &receipts,
-                        DatabaseTables::Receipts.as_str(),
-                    )
-                    .await
                 }
             });
             stores.push(work);
@@ -305,15 +202,9 @@ impl Database {
         }
 
         info!(
-            "Inserted: rewards ({}) contracts ({}) trades ({}) erc1155 ({}) erc20 ({}) erc721 ({}) logs ({}) receipts ({}) traces ({}) transactions ({}) withdrawals ({}) in ({}) blocks.",
-            data.block_rewards.len(),
+            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) in ({}) blocks.",
             data.contracts.len(),
-            data.dex_trades.len(),
-            data.erc1155_transfers.len(),
-            data.erc20_transfers.len(),
-            data.erc721_transfers.len(),
             data.logs.len(),
-            data.receipts.len(),
             data.traces.len(),
             data.transactions.len(),
             data.withdrawals.len(),

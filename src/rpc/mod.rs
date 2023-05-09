@@ -1,14 +1,10 @@
 use crate::{
-    chains::Chain,
+    chains::{get_block_reward, Chain},
     configs::Config,
     db::{
         models::{
-            block::DatabaseBlock, block_reward::DatabaseBlockReward,
-            contract::DatabaseContract, dex_trade::DatabaseDexTrade,
-            erc1155_transfer::DatabaseERC1155Transfer,
-            erc20_transfer::DatabaseERC20Transfer,
-            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            receipt::DatabaseReceipt, trace::DatabaseTrace,
+            block::DatabaseBlock, contract::DatabaseContract,
+            log::DatabaseLog, trace::DatabaseTrace,
             transaction::DatabaseTransaction,
             withdrawal::DatabaseWithdrawal,
         },
@@ -44,10 +40,7 @@ use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 
 use log::{info, warn};
 use rand::seq::SliceRandom;
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::{collections::HashMap, ops::Mul, time::Duration};
 use tokio::time::sleep;
 
 use serde_json::Error;
@@ -145,16 +138,10 @@ impl Rpc {
         block_number: &u64,
         chain: &Chain,
     ) -> Option<(
-        DatabaseBlock,
-        Vec<DatabaseBlockReward>,
+        Vec<DatabaseBlock>,
         Vec<DatabaseTransaction>,
-        Vec<DatabaseReceipt>,
         Vec<DatabaseLog>,
         Vec<DatabaseContract>,
-        Vec<DatabaseERC20Transfer>,
-        Vec<DatabaseERC721Transfer>,
-        Vec<DatabaseERC1155Transfer>,
-        Vec<DatabaseDexTrade>,
         Vec<DatabaseTrace>,
         Vec<DatabaseWithdrawal>,
     )> {
@@ -165,7 +152,7 @@ impl Rpc {
 
         match block_data {
             Some((
-                db_block,
+                mut db_block,
                 db_transactions,
                 db_withdrawals,
                 block_uncles,
@@ -173,18 +160,18 @@ impl Rpc {
                 let total_block_transactions = db_transactions.len();
 
                 // Make sure all the transactions are correctly formatted.
-                if db_block.transactions != total_block_transactions as u64
+                if db_block.transactions != total_block_transactions as u16
                 {
                     warn!(
                         "Missing {} transactions for block {}.",
                         db_block.transactions
-                            - total_block_transactions as u64,
+                            - total_block_transactions as u16,
                         db_block.number
                     );
                     return None;
                 }
 
-                let mut db_receipts: Vec<DatabaseReceipt> = Vec::new();
+                let mut db_receipts: Vec<TransactionReceipt> = Vec::new();
                 let mut db_logs: Vec<DatabaseLog> = Vec::new();
                 let mut contracts_map: HashMap<String, DatabaseContract> =
                     HashMap::new();
@@ -192,7 +179,6 @@ impl Rpc {
                 if chain.supports_blocks_receipts {
                     let receipts_data = self
                         .get_block_receipts(
-                            db_block.base_fee_per_gas,
                             block_number,
                             db_block.timestamp,
                         )
@@ -215,7 +201,6 @@ impl Rpc {
                     for transaction in db_transactions.iter() {
                         let receipt_data = self
                             .get_transaction_receipt(
-                                db_block.base_fee_per_gas,
                                 transaction.hash.clone(),
                                 transaction.timestamp,
                             )
@@ -242,33 +227,68 @@ impl Rpc {
                     }
                 }
 
-                let mut db_block_rewards = Vec::new();
+                if total_block_transactions != db_receipts.len() {
+                    warn!(
+                        "Missing receipts for block {}. Transactions {} receipts {}",
+                        db_block.number,
+                        total_block_transactions,
+                        db_receipts.len()
+                    );
+                    return None;
+                }
 
-                // Calculate the current block reward
-                let db_block_reward = DatabaseBlockReward::calculate(
-                    &db_block,
-                    &db_receipts,
-                    &block_uncles,
-                    self.chain.id,
-                    false,
-                    None,
+                let (base_block_reward, total_fee_reward, uncle_rewards) =
+                    get_block_reward(
+                        self.chain.id,
+                        &db_block,
+                        &db_receipts,
+                        &block_uncles,
+                        false,
+                        None,
+                    );
+
+                let burned = match db_block.base_fee_per_gas {
+                    Some(base_fee_per_gas) => U256::from(base_fee_per_gas)
+                        .mul(U256::from(db_block.gas_used)),
+                    None => U256::zero(),
+                };
+
+                let mut db_blocks: Vec<DatabaseBlock> = Vec::new();
+
+                db_block.add_rewards(
+                    base_block_reward,
+                    burned,
+                    total_fee_reward,
+                    uncle_rewards,
                 );
 
-                db_block_rewards.push(db_block_reward);
+                for mut uncle in block_uncles {
+                    let (
+                        base_block_reward,
+                        total_fee_reward,
+                        uncle_rewards,
+                    ) = get_block_reward(
+                        self.chain.id,
+                        &db_block,
+                        &db_receipts,
+                        &[],
+                        true,
+                        Some(db_block.number),
+                    );
 
-                for uncle in block_uncles {
-                    let uncle_block_reward =
-                        DatabaseBlockReward::calculate(
-                            &uncle,
-                            &[],
-                            &[],
-                            self.chain.id,
-                            true,
-                            Some(db_block.number),
-                        );
+                    uncle.add_rewards(
+                        base_block_reward,
+                        U256::zero(),
+                        total_fee_reward,
+                        uncle_rewards,
+                    );
 
-                    db_block_rewards.push(uncle_block_reward);
+                    db_blocks.push(uncle);
                 }
+
+                db_blocks.push(db_block);
+
+                // TODO: calculate the block reward information and include inside the block;
 
                 // Insert contracts created through the traces
                 let create_traces: Vec<&DatabaseTrace> = traces
@@ -301,50 +321,11 @@ impl Rpc {
                         .insert(contract_address.to_string(), contract);
                 }
 
-                if total_block_transactions != db_receipts.len() {
-                    warn!(
-                        "Missing receipts for block {}. Transactions {} receipts {}",
-                        db_block.number,
-                        total_block_transactions,
-                        db_receipts.len()
-                    );
-                    return None;
-                }
-
-                let mut tokens_metadata_required: HashSet<String> =
-                    HashSet::new();
-
                 // filter only logs with topic
                 let logs_scan: Vec<&DatabaseLog> = db_logs
                     .iter()
                     .filter(|log| log.topic0.is_some())
                     .collect();
-
-                // insert all the tokens from the logs to metadata check
-                for log in logs_scan.iter() {
-                    let topic_0 = log.topic0.clone().unwrap();
-
-                    if topic_0 == TRANSFER_EVENTS_SIGNATURE
-                        || topic_0
-                            == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
-                        || topic_0
-                            == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
-                        || topic_0 == SWAPV3_EVENT_SIGNATURE
-                        || topic_0 == SWAP_EVENT_SIGNATURE
-                    {
-                        tokens_metadata_required
-                            .insert(log.address.clone());
-                    }
-                }
-
-                let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
-                    Vec::new();
-                let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> =
-                    Vec::new();
-                let mut db_erc1155_transfers: Vec<
-                    DatabaseERC1155Transfer,
-                > = Vec::new();
-                let mut db_dex_trades: Vec<DatabaseDexTrade> = Vec::new();
 
                 for log in logs_scan.iter() {
                     // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
@@ -355,23 +336,13 @@ impl Rpc {
 
                         // erc721 token transfer events have 3 indexed values.
                         if log.topic3.is_some() {
-                            let db_erc721_transfer =
-                                DatabaseERC721Transfer::from_log(
-                                    log, chain.id,
-                                );
-
-                            db_erc721_transfers.push(db_erc721_transfer);
+                            // TODO: add erc721 data to the log.
                         } else if log.topic1.is_some()
                             && log.topic2.is_some()
                         {
                             // erc20 token transfer events have 2 indexed values.
 
-                            let db_erc20_transfer =
-                                DatabaseERC20Transfer::from_log(
-                                    log, chain.id,
-                                );
-
-                            db_erc20_transfers.push(db_erc20_transfer);
+                            // TODO: add erc20 data to the log.
                         }
                     }
 
@@ -397,12 +368,7 @@ impl Rpc {
                             .into_uint()
                             .unwrap();
 
-                        let db_erc1155_transfer =
-                            DatabaseERC1155Transfer::from_log(
-                                log, chain.id, id, value,
-                            );
-
-                        db_erc1155_transfers.push(db_erc1155_transfer)
+                        // TODO: add erc1155 data to the log.
                     }
 
                     if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
@@ -446,15 +412,7 @@ impl Rpc {
 
                         for (i, id) in transfer_ids.into_iter().enumerate()
                         {
-                            let db_erc1155_transfer =
-                                DatabaseERC1155Transfer::from_log(
-                                    log,
-                                    chain.id,
-                                    id,
-                                    transfer_values[i],
-                                );
-
-                            db_erc1155_transfers.push(db_erc1155_transfer)
+                            // TODO: add erc1155 data to the log.
                         }
                     }
 
@@ -462,20 +420,14 @@ impl Rpc {
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                     {
-                        let db_dex_trade =
-                            DatabaseDexTrade::from_v2_log(log, chain.id);
-
-                        db_dex_trades.push(db_dex_trade);
+                        // TODO: add dex_trade data to the log.
                     }
 
                     if topic0 == SWAPV3_EVENT_SIGNATURE
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                     {
-                        let db_dex_trade =
-                            DatabaseDexTrade::from_v3_log(log, chain.id);
-
-                        db_dex_trades.push(db_dex_trade);
+                        // TODO: add dex_trade data to the log.
                     }
                 }
 
@@ -485,14 +437,9 @@ impl Rpc {
                     .collect();
 
                 debug!(
-                    "Found: contracts ({}) trades ({}) erc1155 ({}) erc20 ({}) erc721 ({}) logs ({}) receipts ({}) traces ({}) transactions ({}) withdrawals ({}) for ({}) block.",
+                    "Found: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) for ({}) block.",
                     db_contracts.len(),
-                    db_dex_trades.len(),
-                    db_erc1155_transfers.len(),
-                    db_erc20_transfers.len(),
-                    db_erc721_transfers.len(),
                     db_logs.len(),
-                    db_receipts.len(),
                     traces.len(),
                     total_block_transactions,
                     db_withdrawals.len(),
@@ -500,16 +447,10 @@ impl Rpc {
                 );
 
                 Some((
-                    db_block,
-                    db_block_rewards,
+                    db_blocks,
                     db_transactions,
-                    db_receipts,
                     db_logs,
                     db_contracts,
-                    db_erc20_transfers,
-                    db_erc721_transfers,
-                    db_erc1155_transfers,
-                    db_dex_trades,
                     traces,
                     db_withdrawals,
                 ))
@@ -584,30 +525,18 @@ impl Rpc {
                         rpc.fetch_block(&block_number, &rpc.chain).await;
 
                     if let Some((
-                        block,
-                        block_rewards,
+                        blocks,
                         transactions,
-                        receipts,
                         logs,
                         contracts,
-                        erc20_transfers,
-                        erc721_transfers,
-                        erc1155_transfers,
-                        dex_trades,
                         traces,
                         withdrawals,
                     )) = block_data
                     {
                         let fetched_data = BlockFetchedData {
-                            blocks: vec![block],
-                            block_rewards,
+                            blocks,
                             contracts,
-                            dex_trades,
-                            erc20_transfers,
-                            erc721_transfers,
-                            erc1155_transfers,
                             logs,
-                            receipts,
                             traces,
                             transactions,
                             withdrawals,
@@ -660,8 +589,11 @@ impl Rpc {
 
                 match block {
                     Ok(block) => {
-                        let db_block =
-                            DatabaseBlock::from_rpc(&block, self.chain.id);
+                        let db_block = DatabaseBlock::from_rpc(
+                            &block,
+                            self.chain.id,
+                            false,
+                        );
 
                         let mut db_transactions = Vec::new();
 
@@ -719,6 +651,7 @@ impl Rpc {
                                                 DatabaseBlock::from_rpc(
                                                     &block,
                                                     self.chain.id,
+                                                    true,
                                                 );
 
                                             block_uncles.push(db_block)
@@ -790,11 +723,10 @@ impl Rpc {
 
     async fn get_transaction_receipt(
         &self,
-        base_fee_per_gas: Option<U256>,
         transaction: String,
         transaction_timestamp: u32,
     ) -> Option<(
-        DatabaseReceipt,
+        TransactionReceipt,
         Vec<DatabaseLog>,
         Option<DatabaseContract>,
     )> {
@@ -811,12 +743,6 @@ impl Rpc {
 
                 match receipt {
                     Ok(receipt) => {
-                        let db_receipt = DatabaseReceipt::from_rpc(
-                            base_fee_per_gas,
-                            &receipt,
-                            self.chain.id,
-                        );
-
                         let mut db_transaction_logs: Vec<DatabaseLog> =
                             Vec::new();
 
@@ -852,11 +778,7 @@ impl Rpc {
                             db_transaction_logs.push(db_log)
                         }
 
-                        Some((
-                            db_receipt,
-                            db_transaction_logs,
-                            db_contract,
-                        ))
+                        Some((receipt, db_transaction_logs, db_contract))
                     }
                     Err(_) => None,
                 }
@@ -867,11 +789,10 @@ impl Rpc {
 
     async fn get_block_receipts(
         &self,
-        base_fee_per_gas: Option<U256>,
         block_number: &u64,
         block_timestamp: u32,
     ) -> Option<(
-        Vec<DatabaseReceipt>,
+        Vec<TransactionReceipt>,
         Vec<DatabaseLog>,
         Vec<DatabaseContract>,
     )> {
@@ -891,7 +812,7 @@ impl Rpc {
 
                 match receipts {
                     Ok(receipts) => {
-                        let mut db_receipts: Vec<DatabaseReceipt> =
+                        let mut db_receipts: Vec<TransactionReceipt> =
                             Vec::new();
 
                         let mut db_transaction_logs: Vec<DatabaseLog> =
@@ -901,14 +822,6 @@ impl Rpc {
                             Vec::new();
 
                         for receipt in receipts {
-                            let db_receipt = DatabaseReceipt::from_rpc(
-                                base_fee_per_gas,
-                                &receipt,
-                                self.chain.id,
-                            );
-
-                            db_receipts.push(db_receipt);
-
                             let db_contract =
                                 receipt.contract_address.map(|_| {
                                     DatabaseContract::from_rpc(
@@ -930,6 +843,8 @@ impl Rpc {
 
                                 db_transaction_logs.push(db_log)
                             }
+
+                            db_receipts.push(receipt);
                         }
 
                         Some((

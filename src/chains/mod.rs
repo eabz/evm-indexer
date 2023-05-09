@@ -5,9 +5,10 @@ use std::{
 };
 
 use ethabi::ethereum_types::U256;
+use ethers::types::TransactionReceipt;
 use serde::{Deserialize, Serialize};
 
-use crate::db::models::{block::DatabaseBlock, receipt::DatabaseReceipt};
+use crate::db::models::block::DatabaseBlock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BalanceAllocation {
@@ -37,10 +38,10 @@ pub const ETHEREUM: Chain = Chain {
 
 fn calculate_ethereum_block_reward(
     block: &DatabaseBlock,
-    receipts: &[DatabaseReceipt],
+    receipts: &[TransactionReceipt],
     uncles: &[DatabaseBlock],
     is_uncle: bool,
-    uncle_parent_number: Option<u64>,
+    uncle_parent_number: Option<u32>,
 ) -> (U256, U256, U256) {
     // The ETH base reward is 5 ETH
     let mut base_block_reward =
@@ -99,7 +100,7 @@ pub const POLYGON: Chain = Chain {
 };
 
 fn calculate_polygon_block_reward(
-    receipts: &[DatabaseReceipt],
+    receipts: &[TransactionReceipt],
 ) -> (U256, U256, U256) {
     (
         U256::from_dec_str("0").unwrap(),
@@ -119,7 +120,7 @@ pub const BSC: Chain = Chain {
 };
 
 fn calculate_bsc_block_reward(
-    receipts: &[DatabaseReceipt],
+    receipts: &[TransactionReceipt],
 ) -> (U256, U256, U256) {
     (
         U256::from_dec_str("0").unwrap(),
@@ -148,7 +149,7 @@ pub fn get_chain(chain: u64) -> Chain {
     selected_chain.to_owned()
 }
 
-fn get_total_fees(receipts: &[DatabaseReceipt]) -> U256 {
+fn get_total_fees(receipts: &[TransactionReceipt]) -> U256 {
     let mut fees_reward = U256::zero();
 
     for receipt in receipts {
@@ -166,10 +167,10 @@ fn get_total_fees(receipts: &[DatabaseReceipt]) -> U256 {
 pub fn get_block_reward(
     chain: u64,
     block: &DatabaseBlock,
-    receipts: &[DatabaseReceipt],
+    receipts: &[TransactionReceipt],
     uncles: &[DatabaseBlock],
     is_uncle: bool,
-    uncle_parent_number: Option<u64>,
+    uncle_parent_number: Option<u32>,
 ) -> (U256, U256, U256) {
     match chain {
         1 => calculate_ethereum_block_reward(

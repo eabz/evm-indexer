@@ -3,16 +3,16 @@ CREATE DATABASE IF NOT EXISTS indexer;
 SET optimize_on_insert = 1;
 
 CREATE TABLE indexer.blocks (
-  base_block_reward Decimal64(18) CODEC(T64, ZSTD(1)),
-  base_fee_per_gas UInt64 CODEC(Delta(8), ZSTD(1)),
-  burned Decimal64(18) CODEC(T64, ZSTD(1)),
+  base_block_reward UInt256,
+  base_fee_per_gas Nullable(UInt64) CODEC(Delta(8), ZSTD(1)),
+  burned UInt256,
   chain UInt64 CODEC(Delta(8), ZSTD(1)),
-  difficulty Decimal64(18) CODEC(T64, ZSTD(1)),
-  excess_data_gas Nullable(UInt64),
+  difficulty UInt256,
   extra_data String CODEC(ZSTD(9)),
   gas_limit UInt32 CODEC(Delta(4), ZSTD(1)),
   gas_used UInt32 CODEC(Delta(4), ZSTD(1)),
   hash LowCardinality(String),
+  is_uncle: Boolean,
   logs_bloom String CODEC(ZSTD(9)),
   miner LowCardinality(String),
   mix_hash String,
@@ -24,12 +24,12 @@ CREATE TABLE indexer.blocks (
   size UInt32 CODEC(Delta(4), ZSTD(1)),
   state_root String,
   timestamp DateTime CODEC(Delta(4), ZSTD(1)),
-  total_difficulty Decimal64(18) CODEC(T64, ZSTD(1)),
-  total_fee_reward Decimal64(18) CODEC(T64, ZSTD(1)),
+  total_difficulty UInt256,
+  total_fee_reward UInt256,
   transactions UInt16 CODEC(Delta(2), ZSTD(1)),
   transactions_root String,
   uncles Array(String),
-  uncle_rewards Decimal64(18) CODEC(T64, ZSTD(1)),
+  uncle_rewards UInt256,
   withdrawals_root Nullable(String),
 )
 ENGINE = ReplacingMergeTree()
@@ -106,7 +106,7 @@ CREATE TABLE indexer.traces (
   trace_address Array(UInt16),
   transaction_hash Nullable(String),
   transaction_position Nullable(UInt16),
-  value Nullable(Decimal64(18) CODEC(T64, ZSTD(1))),
+  value Nullable(UInt256),
 )
 ENGINE = ReplacingMergeTree()
 ORDER BY (block_hash, transaction_hash, call_type, trace_address, author)
@@ -114,23 +114,23 @@ SETTINGS allow_nullable_key = 1, index_granularity = 8192;
 
 CREATE TABLE indexer.transactions (
   access_list Array(Tuple(String, Array(String))),
-  base_fee_per_gas Decimal64(18) CODEC(T64, ZSTD(1)),
+  base_fee_per_gas UInt256,
   block_hash LowCardinality(String),
   block_number UInt32 CODEC(Delta(4), ZSTD(1)),
-  burned Decimal64(18) CODEC(T64, ZSTD(1)),
+  burned UInt256,
   chain UInt64 CODEC(Delta(8), ZSTD(1)),
   contract_created Nullable(String),
   cumulative_gas_used Nullable(UInt32) CODEC(Delta(4), ZSTD(1),
-  effective_gas_price Nullable(Decimal64(18)) CODEC(T64, ZSTD(1)),
-  effective_transaction_fee Decimal64(18) CODEC(T64, ZSTD(1)),
+  effective_gas_price Nullable(UInt256),
+  effective_transaction_fee UInt256,
   from LowCardinality(String),
   gas UInt32 CODEC(Delta(4), ZSTD(1)),
-  gas_price Nullable(Decimal64(18)) CODEC(T64, ZSTD(1)),
+  gas_price Nullable(UInt256),
   gas_used Nullable(UInt32) CODEC(Delta(4), ZSTD(1),
   hash LowCardinality(String),
   input String CODEC(ZSTD(9)),
-  max_fee_per_gas Nullable(Decimal64(18) CODEC(T64, ZSTD(1))),
-  max_priority_fee_per_gas Nullable(Decimal64(18) CODEC(T64, ZSTD(1))),
+  max_fee_per_gas Nullable(UInt256),
+  max_priority_fee_per_gas Nullable(UInt256),
   method LowCardinality(String),
   nonce UInt32 CODEC(Delta(4), ZSTD(1)),
   status Enum('unknown' = -1, 'failure' = 0, 'success' = 1),
@@ -138,7 +138,7 @@ CREATE TABLE indexer.transactions (
   to LowCardinality(String),
   transaction_index UInt16 CODEC(Delta(2), ZSTD(1)),
   transaction_type UInt16 CODEC(Delta(2), ZSTD(1)),
-  value Decimal64(18) CODEC(T64, ZSTD(1)),
+  value UInt256,
 )
 ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
@@ -147,7 +147,7 @@ SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.withdrawals (
   address LowCardinality(String),
-  amount Decimal64(18) CODEC(T64, ZSTD(1)),
+  amount UInt256,
   block_number UInt32 CODEC(Delta(4), ZSTD(1)),
   chain UInt64 CODEC(Delta(8), ZSTD(1)),
   timestamp DateTime CODEC(Delta(4), ZSTD(1)),

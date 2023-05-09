@@ -10,7 +10,7 @@ pub struct DatabaseWithdrawal {
     pub address: String,
     #[serde(with = "serialize_u256")]
     pub amount: U256,
-    pub block_number: u64,
+    pub block_number: u32,
     pub chain: u64,
     pub timestamp: u32,
     pub validator_index: u64,
@@ -21,7 +21,7 @@ impl DatabaseWithdrawal {
     pub fn from_rpc(
         withdrawal: &Withdrawal,
         chain: u64,
-        block_number: u64,
+        block_number: u32,
         timestamp: u32,
     ) -> Self {
         Self {
