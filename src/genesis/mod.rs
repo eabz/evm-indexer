@@ -4,7 +4,7 @@ mod polygon;
 
 use std::collections::HashMap;
 
-use ethabi::ethereum_types::{H160, U256};
+use primitive_types::{H160, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::{

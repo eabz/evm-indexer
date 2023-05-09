@@ -41,7 +41,7 @@ pub struct IndexerArgs {
     )]
     pub rpcs: String,
     #[arg(long, help = "Block to start syncing.", default_value_t = 0)]
-    pub start_block: u64,
+    pub start_block: u32,
     #[arg(
         long,
         help = "Url of the websocket endpoint to fetch new blocks.",
@@ -62,7 +62,7 @@ pub struct Config {
     pub end_block: i64,
     pub new_blocks_only: bool,
     pub rpcs: Vec<String>,
-    pub start_block: u64,
+    pub start_block: u32,
     pub ws_url: Option<String>,
 }
 

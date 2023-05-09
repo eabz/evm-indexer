@@ -1,11 +1,10 @@
 use clickhouse::Row;
-use ethabi::ethereum_types::{H160, U256};
 use ethers::types::Transaction;
+use primitive_types::{H160, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::format::{
     byte4_from_input, format_address, format_bytes, format_hash,
-    opt_serialize_u256, serialize_u256,
 };
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
@@ -15,24 +14,18 @@ pub struct DatabaseTransaction {
     pub block_number: u64,
     pub chain: u64,
     pub from: String,
-    #[serde(with = "serialize_u256")]
     pub gas: U256,
-    #[serde(with = "opt_serialize_u256")]
     pub gas_price: Option<U256>,
     pub hash: String,
     pub input: String,
-    #[serde(with = "opt_serialize_u256")]
     pub max_fee_per_gas: Option<U256>,
-    #[serde(with = "opt_serialize_u256")]
     pub max_priority_fee_per_gas: Option<U256>,
     pub method: String,
-    #[serde(with = "serialize_u256")]
     pub nonce: U256,
     pub timestamp: u32,
     pub to: String,
     pub transaction_index: u16,
     pub transaction_type: u16,
-    #[serde(with = "serialize_u256")]
     pub value: U256,
 }
 

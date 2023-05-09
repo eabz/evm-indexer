@@ -1,22 +1,19 @@
 use clickhouse::Row;
-use ethabi::ethereum_types::U256;
 use ethers::types::Block;
+use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::format::{
     format_address, format_bytes, format_bytes_slice, format_hash,
-    format_nonce, serialize_u256,
+    format_nonce,
 };
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseBlock {
-    #[serde(with = "serialize_u256")]
     pub base_block_reward: U256,
     pub base_fee_per_gas: Option<u64>,
-    #[serde(with = "serialize_u256")]
     pub burned: U256,
     pub chain: u64,
-    #[serde(with = "serialize_u256")]
     pub difficulty: U256,
     pub extra_data: String,
     pub gas_limit: u32,
@@ -39,7 +36,6 @@ pub struct DatabaseBlock {
     pub transactions: u16,
     pub transactions_root: String,
     pub uncles: Vec<String>,
-    #[serde(with = "serialize_u256")]
     pub uncle_rewards: U256,
     pub withdrawals_root: Option<String>,
 }

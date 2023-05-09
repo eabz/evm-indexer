@@ -23,8 +23,9 @@ use crate::{
 use ethabi::ParamType;
 use ethers::{
     prelude::abigen,
-    types::{Block, Trace, Transaction, TransactionReceipt, TxHash, U256},
+    types::{Block, Trace, Transaction, TransactionReceipt, TxHash},
 };
+use primitive_types::U256;
 
 use jsonrpsee::{
     core::{
@@ -114,7 +115,7 @@ impl Rpc {
         }
     }
 
-    pub async fn get_last_block(&self) -> u64 {
+    pub async fn get_last_block(&self) -> u32 {
         let client = self.get_client();
 
         let last_block =
@@ -127,7 +128,7 @@ impl Rpc {
                         "Unable to deserialize eth_blockNumber response",
                     );
 
-                block_number.as_u64()
+                block_number.as_u32()
             }
             Err(_) => 0,
         }
@@ -394,7 +395,7 @@ impl Rpc {
                         )
                         .unwrap();
 
-                        let transfer_ids: Vec<U256> = transfer_values[0]
+                        let ids: Vec<U256> = transfer_values[0]
                             .clone()
                             .into_array()
                             .unwrap()
@@ -404,19 +405,17 @@ impl Rpc {
                             })
                             .collect();
 
-                        let transfer_values: Vec<U256> = transfer_values
-                            [1]
-                        .clone()
-                        .into_array()
-                        .unwrap()
-                        .iter()
-                        .map(|token| token.clone().into_uint().unwrap())
-                        .collect();
+                        let amounts: Vec<U256> = transfer_values[1]
+                            .clone()
+                            .into_array()
+                            .unwrap()
+                            .iter()
+                            .map(|token| {
+                                token.clone().into_uint().unwrap()
+                            })
+                            .collect();
 
-                        for (i, id) in transfer_ids.into_iter().enumerate()
-                        {
-                            // TODO: add erc1155 data to the log.
-                        }
+                        log.parse_batch_erc1155_transfer(ids, amounts);
                     }
 
                     if topic0 == SWAP_EVENT_SIGNATURE

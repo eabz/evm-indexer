@@ -4,8 +4,8 @@ use std::{
     str::FromStr,
 };
 
-use ethabi::ethereum_types::U256;
 use ethers::types::TransactionReceipt;
+use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
 use crate::db::models::block::DatabaseBlock;

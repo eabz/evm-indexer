@@ -1,20 +1,19 @@
 use clickhouse::Row;
-use ethabi::ethereum_types::U256;
 use ethers::types::Withdrawal;
+use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::format::{format_address, serialize_u256};
+use crate::utils::format::format_address;
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseWithdrawal {
     pub address: String,
-    #[serde(with = "serialize_u256")]
     pub amount: U256,
     pub block_number: u32,
     pub chain: u64,
     pub timestamp: u32,
-    pub validator_index: u64,
-    pub withdrawal_index: u64,
+    pub validator_index: u32,
+    pub withdrawal_index: u32,
 }
 
 impl DatabaseWithdrawal {
@@ -30,8 +29,8 @@ impl DatabaseWithdrawal {
             block_number,
             chain,
             timestamp,
-            validator_index: withdrawal.validator_index.as_u64(),
-            withdrawal_index: withdrawal.index.as_u64(),
+            validator_index: withdrawal.validator_index.as_u32(),
+            withdrawal_index: withdrawal.index.as_u32(),
         }
     }
 }

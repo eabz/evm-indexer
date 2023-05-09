@@ -77,15 +77,15 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
     }
 
     let last_block = if config.end_block != 0 {
-        config.end_block as u64
+        config.end_block as u32
     } else {
         rpc.get_last_block().await
     };
 
-    let full_block_range: Vec<u64> =
+    let full_block_range: Vec<u32> =
         (config.start_block..last_block).collect();
 
-    let missing_blocks: Vec<&u64> = full_block_range
+    let missing_blocks: Vec<&u32> = full_block_range
         .iter()
         .filter(|block| !indexed_blocks.contains(block))
         .collect();
@@ -113,14 +113,8 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
 
         let mut fetched_data = BlockFetchedData {
             blocks: Vec::new(),
-            block_rewards: Vec::new(),
             contracts: Vec::new(),
-            dex_trades: Vec::new(),
-            erc20_transfers: Vec::new(),
-            erc721_transfers: Vec::new(),
-            erc1155_transfers: Vec::new(),
             logs: Vec::new(),
-            receipts: Vec::new(),
             traces: Vec::new(),
             transactions: Vec::new(),
             withdrawals: Vec::new(),
@@ -129,35 +123,17 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
         for result in results {
             match result {
                 Some((
-                    block,
-                    mut block_rewards,
+                    mut blocks,
                     mut transactions,
-                    mut receipts,
                     mut logs,
                     mut contracts,
-                    mut erc20_transfers,
-                    mut erc721_transfers,
-                    mut erc1155_transfers,
-                    mut dex_trades,
                     mut traces,
                     mut withdrawals,
                 )) => {
-                    fetched_data.blocks.push(block);
-                    fetched_data.block_rewards.append(&mut block_rewards);
+                    fetched_data.blocks.append(&mut blocks);
                     fetched_data.transactions.append(&mut transactions);
-                    fetched_data.receipts.append(&mut receipts);
                     fetched_data.logs.append(&mut logs);
                     fetched_data.contracts.append(&mut contracts);
-                    fetched_data
-                        .erc20_transfers
-                        .append(&mut erc20_transfers);
-                    fetched_data
-                        .erc721_transfers
-                        .append(&mut erc721_transfers);
-                    fetched_data
-                        .erc1155_transfers
-                        .append(&mut erc1155_transfers);
-                    fetched_data.dex_trades.append(&mut dex_trades);
                     fetched_data.traces.append(&mut traces);
                     fetched_data.withdrawals.append(&mut withdrawals)
                 }

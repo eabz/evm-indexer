@@ -92,18 +92,18 @@ impl Database {
         Self { chain, db }
     }
 
-    pub async fn get_indexed_blocks(&self) -> HashSet<u64> {
+    pub async fn get_indexed_blocks(&self) -> HashSet<u32> {
         let query = format!(
             "SELECT number FROM blocks WHERE chain = {}",
             self.chain.id
         );
 
-        let tokens = match self.db.query(&query).fetch_all::<u64>().await {
+        let tokens = match self.db.query(&query).fetch_all::<u32>().await {
             Ok(tokens) => tokens,
             Err(_) => Vec::new(),
         };
 
-        let blocks: HashSet<u64> = HashSet::from_iter(tokens.into_iter());
+        let blocks: HashSet<u32> = HashSet::from_iter(tokens.into_iter());
 
         blocks
     }
