@@ -156,7 +156,7 @@ impl Rpc {
         match block_data {
             Some((
                 mut db_block,
-                db_transactions,
+                mut db_transactions,
                 db_withdrawals,
                 block_uncles,
             )) => {
@@ -249,6 +249,18 @@ impl Rpc {
                         db_receipts.len()
                     );
                     return None;
+                }
+
+                // TODO: add receipt data to transactions
+                for transaction in db_transactions.iter_mut() {
+                    let receipt = db_receipts
+                        .get(&transaction.hash.clone())
+                        .expect("unable to get receipt for transaction");
+
+                    transaction.add_receipt_data(
+                        db_block.base_fee_per_gas,
+                        receipt,
+                    );
                 }
 
                 let (base_block_reward, total_fee_reward, uncle_rewards) =

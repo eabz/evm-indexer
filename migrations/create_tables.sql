@@ -116,15 +116,15 @@ SETTINGS allow_nullable_key = 1, index_granularity = 8192;
 
 CREATE TABLE indexer.transactions (
   access_list Array(Tuple(String, Array(String))),
-  base_fee_per_gas UInt256,
+  base_fee_per_gas Nullable(UInt64),
   block_hash LowCardinality(String),
   block_number UInt32 CODEC(Delta(4), ZSTD(1)),
-  burned UInt256,
+  burned Nullable(UInt256),
   chain UInt64 CODEC(Delta(8), ZSTD(1)),
   contract_created Nullable(String),
   cumulative_gas_used Nullable(UInt32) CODEC(Delta(4), ZSTD(1),
   effective_gas_price Nullable(UInt256),
-  effective_transaction_fee UInt256,
+  effective_transaction_fee Nullable(UInt256),
   from LowCardinality(String),
   gas UInt32 CODEC(Delta(4), ZSTD(1)),
   gas_price Nullable(UInt256),
@@ -135,11 +135,11 @@ CREATE TABLE indexer.transactions (
   max_priority_fee_per_gas Nullable(UInt256),
   method LowCardinality(String),
   nonce UInt32 CODEC(Delta(4), ZSTD(1)),
-  status Enum('unknown' = -1, 'failure' = 0, 'success' = 1),
+  status Nullable(Enum8('unknown' = -1, 'failure' = 0, 'success' = 1)),
   timestamp DateTime CODEC(Delta(4), ZSTD(1)),
   to LowCardinality(String),
   transaction_index UInt16 CODEC(Delta(2), ZSTD(1)),
-  transaction_type UInt16 CODEC(Delta(2), ZSTD(1)),
+  transaction_type Enum8('legacy' = 0, 'access_list' = 1, 'eip_1559' = 2),
   value UInt256,
 )
 ENGINE = ReplacingMergeTree()

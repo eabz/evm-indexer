@@ -152,7 +152,7 @@ pub fn get_chain(chain: u64) -> Chain {
 fn get_total_fees(receipts: &HashMap<String, TransactionReceipt>) -> U256 {
     let mut fees_reward = U256::zero();
 
-    for (_, receipt) in receipts {
+    for receipt in receipts.values() {
         let reward = receipt
             .gas_used
             .unwrap()
