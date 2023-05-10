@@ -44,7 +44,11 @@ use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 
 use log::{info, warn};
 use rand::seq::SliceRandom;
-use std::{collections::HashMap, ops::Mul, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Mul,
+    time::Duration,
+};
 use tokio::time::sleep;
 
 use serde_json::Error;
@@ -268,7 +272,7 @@ impl Rpc {
                     get_block_reward(
                         self.chain.id,
                         &db_block,
-                        &db_receipts,
+                        Some(&db_receipts),
                         &block_uncles,
                         false,
                         None,
@@ -296,8 +300,8 @@ impl Rpc {
                         uncle_rewards,
                     ) = get_block_reward(
                         self.chain.id,
-                        &db_block,
-                        &db_receipts,
+                        &uncle,
+                        None,
                         &[],
                         true,
                         Some(db_block.number),
