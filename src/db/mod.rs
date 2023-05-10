@@ -35,14 +35,8 @@ pub struct Database {
 
 pub enum DatabaseTables {
     Blocks,
-    BlockRewards,
     Contracts,
-    DexTrades,
-    Erc1155Transfers,
-    Erc20Transfers,
-    Erc721Transfers,
     Logs,
-    Receipts,
     Traces,
     Transactions,
     Withdrawals,
@@ -52,14 +46,8 @@ impl DatabaseTables {
     pub fn as_str(&self) -> &'static str {
         match self {
             DatabaseTables::Blocks => "blocks",
-            DatabaseTables::BlockRewards => "block_rewards",
             DatabaseTables::Contracts => "contracts",
-            DatabaseTables::DexTrades => "dex_trades",
-            DatabaseTables::Erc1155Transfers => "erc1155_transfers",
-            DatabaseTables::Erc20Transfers => "erc20_transfers",
-            DatabaseTables::Erc721Transfers => "erc721_transfers",
             DatabaseTables::Logs => "logs",
-            DatabaseTables::Receipts => "receipts",
             DatabaseTables::Traces => "traces",
             DatabaseTables::Transactions => "transactions",
             DatabaseTables::Withdrawals => "withdrawals",

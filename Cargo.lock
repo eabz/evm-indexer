@@ -390,6 +390,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "capnp"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13e2d432d1601d61d1e11140d04e9d239b5cf7316fa1106523c3d86eea19c29d"
+
+[[package]]
+name = "capnpc"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d96f2815c224ac779eeef76a292264d5361600f0f3ab97ab189342c7042308cc"
+dependencies = [
+ "capnp",
+]
+
+[[package]]
 name = "cargo-platform"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1420,6 +1435,7 @@ name = "evm-indexer"
 version = "1.3.0"
 dependencies = [
  "array-bytes",
+ "capnpc",
  "clap 4.2.7",
  "clickhouse",
  "ethers",

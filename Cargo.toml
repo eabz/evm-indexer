@@ -5,9 +5,14 @@ license = "MIT"
 edition = "2021"
 repository = "https://github.com/kindynosmx/evm-indexer"
 description = "Scalable SQL indexer for EVM compatible blockchains"
+build = "build.rs"
+
+[build-dependencies]
+capnpc = "0.17.0"
 
 [dependencies]
 array-bytes = "6"
+capnpc = "0.17.0"
 clap = { version = "4", features = ["derive"] }
 clickhouse = "0.11"
 ethers = { version = "2.0.4", features = ["rustls"] }
