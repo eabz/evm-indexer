@@ -117,7 +117,8 @@ impl DatabaseTransaction {
             access_list,
             base_fee_per_gas: None,
             block_hash: format_hash(transaction.block_hash.unwrap()),
-            block_number: transaction.block_number.unwrap().as_u32(),
+            block_number: transaction.block_number.unwrap().as_usize()
+                as u32,
             burned: None,
             chain,
             contract_created: None,
@@ -125,7 +126,7 @@ impl DatabaseTransaction {
             effective_gas_price: None,
             effective_transaction_fee: None,
             from: format_address(transaction.from),
-            gas: transaction.gas.as_u32(),
+            gas: transaction.gas.as_usize() as u32,
             gas_price: transaction.gas_price,
             gas_used: None,
             hash: format_hash(transaction.hash),
@@ -138,7 +139,7 @@ impl DatabaseTransaction {
                     &transaction.input
                 )))
             ),
-            nonce: transaction.nonce.as_u32(),
+            nonce: transaction.nonce.as_usize() as u32,
             status: None,
             timestamp,
             to,
@@ -188,10 +189,10 @@ impl DatabaseTransaction {
         self.contract_created =
             receipt.contract_address.map(format_address);
         self.cumulative_gas_used =
-            Some(receipt.cumulative_gas_used.as_u32());
+            Some(receipt.cumulative_gas_used.as_usize() as u32);
         self.effective_gas_price = receipt.effective_gas_price;
         self.effective_transaction_fee = Some(effective_transaction_fee);
-        self.gas_used = Some(gas_used.as_u32());
+        self.gas_used = Some(gas_used.as_usize() as u32);
         self.status = Some(status)
     }
 }

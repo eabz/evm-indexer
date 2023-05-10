@@ -131,7 +131,7 @@ impl Rpc {
                         "Unable to deserialize eth_blockNumber response",
                     );
 
-                block_number.as_u32()
+                block_number.as_usize() as u32
             }
             Err(_) => 0,
         }
@@ -517,7 +517,8 @@ impl Rpc {
                 let db = db.clone();
                 let block = block.unwrap().clone();
                 async move {
-                    let block_number = block.number.unwrap().as_u32();
+                    let block_number =
+                        block.number.unwrap().as_usize() as u32;
 
                     info!("New head found {}.", block_number.clone());
 

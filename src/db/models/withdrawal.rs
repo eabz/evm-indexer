@@ -32,8 +32,8 @@ impl DatabaseWithdrawal {
             block_number,
             chain,
             timestamp,
-            validator_index: withdrawal.validator_index.as_u32(),
-            withdrawal_index: withdrawal.index.as_u32(),
+            validator_index: withdrawal.validator_index..as_usize() as u32,
+            withdrawal_index: withdrawal.index.as_usize() as u32,
         }
     }
 }

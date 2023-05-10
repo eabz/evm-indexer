@@ -110,7 +110,7 @@ impl DatabaseTrace {
                 from = Some(format_address(call.from));
                 to = Some(format_address(call.to));
                 value = Some(call.value);
-                gas = Some(call.gas.as_u32());
+                gas = Some(call.gas.as_usize() as u32);
                 input = Some(format_bytes(&call.input));
                 call_type = match call.call_type {
                     ethers::types::CallType::None => Some(CallType::None),
@@ -129,7 +129,7 @@ impl DatabaseTrace {
             ethers::types::Action::Create(create) => {
                 from = Some(format_address(create.from));
                 value = Some(create.value);
-                gas = Some(create.gas.as_u32());
+                gas = Some(create.gas.as_usize() as u32);
                 init = Some(format_bytes(&create.init));
             }
             ethers::types::Action::Suicide(suicide) => {
@@ -168,12 +168,12 @@ impl DatabaseTrace {
             let result = trace.result.clone().unwrap();
             match result {
                 ethers::types::Res::Call(call) => {
-                    gas_used = Some(call.gas_used.as_u32());
+                    gas_used = Some(call.gas_used.as_usize() as u32);
                     output = Some(format_bytes(&call.output))
                 }
                 ethers::types::Res::Create(create) => {
                     address = Some(format_address(create.address));
-                    gas_used = Some(create.gas_used.as_u32());
+                    gas_used = Some(create.gas_used.as_usize() as u32);
                     code = Some(format_bytes(&create.code))
                 }
                 ethers::types::Res::None => (),

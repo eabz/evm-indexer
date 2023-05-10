@@ -16,7 +16,7 @@ pub struct DatabaseContract {
 impl DatabaseContract {
     pub fn from_rpc(receipt: &TransactionReceipt, chain: u64) -> Self {
         Self {
-            block_number: receipt.block_number.unwrap().as_u32(),
+            block_number: receipt.block_number.unwrap().as_usize() as u32,
             chain,
             contract_address: format_address(
                 receipt.contract_address.unwrap(),

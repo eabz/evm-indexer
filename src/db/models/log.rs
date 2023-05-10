@@ -91,7 +91,7 @@ impl DatabaseLog {
 
         let transaction_log_index: Option<u16> =
             log.transaction_log_index.map(|transaction_log_index| {
-                transaction_log_index.as_u32() as u16
+                transaction_log_index.as_usize() as u16
             });
 
         Self {
@@ -104,7 +104,7 @@ impl DatabaseLog {
             dex_trade_receiver: None,
             dex_trade_token0_amount: None,
             dex_trade_token1_amount: None,
-            log_index: log.log_index.unwrap().as_u32() as u16,
+            log_index: log.log_index.unwrap().as_usize() as u16,
             log_type: log.log_type.clone(),
             removed: log.removed.unwrap(),
             timestamp,
