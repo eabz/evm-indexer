@@ -154,8 +154,8 @@ fn get_total_fees(
 ) -> U256 {
     let mut fees_reward = U256::zero();
 
-    if receipts.is_some() {
-        for receipt in receipts.unwrap().values() {
+    if let Some(receipts) = receipts {
+        for receipt in receipts.values() {
             let reward = receipt
                 .gas_used
                 .unwrap()
