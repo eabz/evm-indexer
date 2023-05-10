@@ -1,4 +1,5 @@
 use ethabi::ParamType;
+use ethers::abi::ethabi;
 
 pub fn transfer_event() -> ethabi::Event {
     ethabi::Event {

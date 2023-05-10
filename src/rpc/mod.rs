@@ -24,6 +24,7 @@ use crate::{
 };
 use ethabi::ParamType;
 use ethers::{
+    abi::ethabi,
     prelude::abigen,
     types::{Block, Trace, Transaction, TransactionReceipt, TxHash},
 };
@@ -158,7 +159,7 @@ impl Rpc {
                 mut db_block,
                 mut db_transactions,
                 db_withdrawals,
-                block_uncles,
+                mut block_uncles,
             )) => {
                 let total_block_transactions = db_transactions.len();
 
@@ -288,7 +289,7 @@ impl Rpc {
                     uncle_rewards,
                 );
 
-                for mut uncle in block_uncles {
+                for uncle in block_uncles.iter_mut() {
                     let (
                         base_block_reward,
                         total_fee_reward,
@@ -309,7 +310,7 @@ impl Rpc {
                         uncle_rewards,
                     );
 
-                    db_blocks.push(uncle);
+                    db_blocks.push(uncle.to_owned());
                 }
 
                 db_blocks.push(db_block);

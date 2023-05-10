@@ -10,7 +10,6 @@ description = "Scalable SQL indexer for EVM compatible blockchains"
 array-bytes = "6"
 clap = { version = "4", features = ["derive"] }
 clickhouse = "0.11"
-ethabi = "18"
 ethers = { version = "2.0.4", features = ["rustls"] }
 futures = "0.3"
 hex = "0.4"
@@ -20,14 +19,14 @@ jsonrpsee = { version = "0.18", features = ["macros", "server"] }
 jsonrpsee-http-client = "0.18"
 jsonrpsee-ws-client = "0.18"
 log = "0.4"
-primitive-types = { version = "0.12.1", features = ["serde"] }
+primitive-types = "0.12"
 rand = "0.8"
 serde = "1"
 serde_bytes = "0.11"
 serde_json = "1"
-serde_repr = "0.1.12"
+serde_repr = "0.1"
 tokio = { version = "1", features = ["full"] }
-url = "2.3.1"
+url = "2"
 
 [dependencies.simple_logger]
 version = "4.0.0"

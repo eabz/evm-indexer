@@ -3,11 +3,12 @@ use ethers::types::Withdrawal;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::format::format_address;
+use crate::utils::{format::format_address, serde::u256};
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseWithdrawal {
     pub address: String,
+    #[serde(with = "u256")]
     pub amount: U256,
     pub block_number: u32,
     pub chain: u64,

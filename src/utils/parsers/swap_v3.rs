@@ -1,4 +1,5 @@
 use ethabi::{ethereum_types::H256, ParamType};
+use ethers::abi::ethabi;
 
 use crate::{
     db::models::log::DatabaseLog,

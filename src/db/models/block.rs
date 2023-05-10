@@ -3,17 +3,23 @@ use ethers::types::Block;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
-use crate::utils::format::{
-    format_address, format_bytes, format_bytes_slice, format_hash,
-    format_nonce,
+use crate::utils::{
+    format::{
+        format_address, format_bytes, format_bytes_slice, format_hash,
+        format_nonce,
+    },
+    serde::{opt_u256, u256},
 };
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseBlock {
+    #[serde(with = "u256")]
     pub base_block_reward: U256,
     pub base_fee_per_gas: Option<u64>,
+    #[serde(with = "u256")]
     pub burned: U256,
     pub chain: u64,
+    #[serde(with = "u256")]
     pub difficulty: U256,
     pub extra_data: String,
     pub gas_limit: u32,
@@ -22,7 +28,7 @@ pub struct DatabaseBlock {
     pub is_uncle: bool,
     pub logs_bloom: String,
     pub miner: String,
-    pub mix_hash: String,
+    pub mix_hash: Option<String>,
     pub nonce: String,
     pub number: u32,
     pub parent_hash: String,
@@ -31,11 +37,14 @@ pub struct DatabaseBlock {
     pub size: u32,
     pub state_root: String,
     pub timestamp: u32,
-    pub total_difficulty: U256,
+    #[serde(with = "opt_u256")]
+    pub total_difficulty: Option<U256>,
+    #[serde(with = "u256")]
     pub total_fee_reward: U256,
     pub transactions: u16,
     pub transactions_root: String,
     pub uncles: Vec<String>,
+    #[serde(with = "u256")]
     pub uncle_rewards: U256,
     pub withdrawals_root: Option<String>,
 }
@@ -68,7 +77,7 @@ impl DatabaseBlock {
                 block.logs_bloom.unwrap().as_bytes(),
             ),
             miner: format_address(block.author.unwrap()),
-            mix_hash: format_hash(block.mix_hash.unwrap()),
+            mix_hash: block.mix_hash.map(format_hash),
             nonce: format_nonce(block.nonce.unwrap()),
             number: block.number.unwrap().as_u32(),
             parent_hash: format_hash(block.parent_hash),
@@ -77,7 +86,7 @@ impl DatabaseBlock {
             size: block.size.unwrap().as_u32(),
             state_root: format_hash(block.state_root),
             timestamp: block.timestamp.as_u32(),
-            total_difficulty: block.total_difficulty.unwrap(),
+            total_difficulty: block.total_difficulty,
             total_fee_reward: U256::zero(),
             transactions: block.transactions.len() as u16,
             transactions_root: format_hash(block.transactions_root),

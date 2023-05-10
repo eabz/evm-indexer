@@ -1321,7 +1321,6 @@ dependencies = [
  "array-bytes",
  "clap 4.2.7",
  "clickhouse",
- "ethabi",
  "ethers",
  "futures",
  "hex",
