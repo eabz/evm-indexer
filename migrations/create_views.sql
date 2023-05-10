@@ -1,8 +1,3 @@
-ALTER TABLE blocks ADD PROJECTION blocks_count_by_chain (SELECT count(*) as blocks, chain GROUP BY chain);
-
-ALTER TABLE blocks
-    MATERIALIZE PROJECTION blocks_count_by_chain SETTINGS mutations_sync = 1;
-
 ALTER TABLE contracts ADD PROJECTION contracts_count_by_chain (SELECT count(*) as contracts, chain GROUP BY chain);
 
 ALTER TABLE contracts
