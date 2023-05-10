@@ -3,6 +3,7 @@ use ethers::types::Log;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use serde_with::serde_as;
 
 #[derive(Debug, Clone, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
@@ -14,9 +15,10 @@ pub enum TokenTransferType {
 
 use crate::utils::{
     format::{format_address, format_bytes, format_hash},
-    serde::{opt_u256, vec_u256},
+    serde::SerU256,
 };
 
+#[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseLog {
     pub address: String,
@@ -26,21 +28,23 @@ pub struct DatabaseLog {
     pub dex_trade_maker: Option<String>,
     pub dex_trade_pair: Option<String>,
     pub dex_trade_receiver: Option<String>,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub dex_trade_token0_amount: Option<U256>,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub dex_trade_token1_amount: Option<U256>,
     pub log_index: u16,
     pub log_type: Option<String>,
     pub removed: bool,
     pub timestamp: u32,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub token_transfer_amount: Option<U256>,
-
+    #[serde_as(as = "Vec<SerU256>")]
+    pub token_transfer_amounts: Vec<U256>,
     pub token_transfer_from: Option<String>,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub token_transfer_id: Option<U256>,
-
+    #[serde_as(as = "Vec<SerU256>")]
+    pub token_transfer_ids: Vec<U256>,
     pub token_transfer_operator: Option<String>,
     pub token_transfer_to: Option<String>,
     pub token_transfer_token_address: Option<String>,
@@ -106,8 +110,10 @@ impl DatabaseLog {
             removed: log.removed.unwrap(),
             timestamp,
             token_transfer_amount: None,
+            token_transfer_amounts: Vec::new(),
             token_transfer_from: None,
             token_transfer_id: None,
+            token_transfer_ids: Vec::new(),
             token_transfer_operator: None,
             token_transfer_to: None,
             token_transfer_token_address: None,

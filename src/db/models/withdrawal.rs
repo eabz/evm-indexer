@@ -2,13 +2,15 @@ use clickhouse::Row;
 use ethers::types::Withdrawal;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 
-use crate::utils::{format::format_address, serde::u256};
+use crate::utils::{format::format_address, serde::SerU256};
 
+#[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseWithdrawal {
     pub address: String,
-    #[serde(with = "u256")]
+    #[serde_as(as = "SerU256")]
     pub amount: U256,
     pub block_number: u32,
     pub chain: u64,

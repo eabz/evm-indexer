@@ -5,12 +5,13 @@ use ethers::types::{Transaction, TransactionReceipt};
 use primitive_types::{H160, U256};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use serde_with::serde_as;
 
 use crate::utils::{
     format::{
         byte4_from_input, format_address, format_bytes, format_hash,
     },
-    serde::{opt_u256, u256},
+    serde::SerU256,
 };
 
 #[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq)]
@@ -21,6 +22,7 @@ pub enum TransactionType {
     Eip1559 = 2,
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq)]
 #[repr(u8)]
 pub enum TransactionStatus {
@@ -29,31 +31,32 @@ pub enum TransactionStatus {
     Success = 2,
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTransaction {
     pub access_list: Vec<(String, Vec<String>)>,
     pub base_fee_per_gas: Option<u64>,
     pub block_hash: String,
     pub block_number: u32,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub burned: Option<U256>,
     pub chain: u64,
     pub contract_created: Option<String>,
     pub cumulative_gas_used: Option<u32>,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub effective_gas_price: Option<U256>,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub effective_transaction_fee: Option<U256>,
     pub from: String,
     pub gas: u32,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub gas_price: Option<U256>,
     pub gas_used: Option<u32>,
     pub hash: String,
     pub input: String,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub max_fee_per_gas: Option<U256>,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub max_priority_fee_per_gas: Option<U256>,
     pub method: String,
     pub nonce: u32,
@@ -62,7 +65,7 @@ pub struct DatabaseTransaction {
     pub to: String,
     pub transaction_index: u16,
     pub transaction_type: TransactionType,
-    #[serde(with = "u256")]
+    #[serde_as(as = "SerU256")]
     pub value: U256,
 }
 

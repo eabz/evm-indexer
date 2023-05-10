@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use ethabi::{
     ethereum_types::{H256, U256},
     ParamType,
@@ -125,9 +123,11 @@ impl DatabaseLog {
         self.token_transfer_to = Some(format_address(
             to_address.to_owned().into_address().unwrap(),
         ));
+        self.token_transfer_ids = ids;
         self.token_transfer_operator = Some(format_address(
             operator.to_owned().into_address().unwrap(),
         ));
+        self.token_transfer_amounts = amounts;
         self.token_transfer_token_address = Some(self.address.clone());
         self.token_transfer_type = Some(TokenTransferType::Erc1155);
     }

@@ -3,10 +3,11 @@ use ethers::types::Trace;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use serde_with::serde_as;
 
 use crate::utils::{
     format::{format_address, format_bytes, format_hash},
-    serde::opt_u256,
+    serde::SerU256,
 };
 
 #[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq)]
@@ -37,12 +38,13 @@ pub enum RewardType {
     External = 4,
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTrace {
     pub action_type: TraceType,
     pub address: Option<String>,
     pub author: Option<String>,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub balance: Option<U256>,
     pub block_hash: String,
     pub block_number: u32,
@@ -63,7 +65,7 @@ pub struct DatabaseTrace {
     pub trace_address: Vec<u16>,
     pub transaction_hash: Option<String>,
     pub transaction_position: Option<u16>,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub value: Option<U256>,
 }
 

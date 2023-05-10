@@ -2,24 +2,26 @@ use clickhouse::Row;
 use ethers::types::Block;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 
 use crate::utils::{
     format::{
         format_address, format_bytes, format_bytes_slice, format_hash,
         format_nonce,
     },
-    serde::{opt_u256, u256},
+    serde::SerU256,
 };
 
+#[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseBlock {
-    #[serde(with = "u256")]
+    #[serde_as(as = "SerU256")]
     pub base_block_reward: U256,
     pub base_fee_per_gas: Option<u64>,
-    #[serde(with = "u256")]
+    #[serde_as(as = "SerU256")]
     pub burned: U256,
     pub chain: u64,
-    #[serde(with = "u256")]
+    #[serde_as(as = "SerU256")]
     pub difficulty: U256,
     pub extra_data: String,
     pub gas_limit: u32,
@@ -37,14 +39,14 @@ pub struct DatabaseBlock {
     pub size: u32,
     pub state_root: String,
     pub timestamp: u32,
-    #[serde(with = "opt_u256")]
+    #[serde_as(as = "Option<SerU256>")]
     pub total_difficulty: Option<U256>,
-    #[serde(with = "u256")]
+    #[serde_as(as = "SerU256")]
     pub total_fee_reward: U256,
     pub transactions: u16,
     pub transactions_root: String,
     pub uncles: Vec<String>,
-    #[serde(with = "u256")]
+    #[serde_as(as = "SerU256")]
     pub uncle_rewards: U256,
     pub withdrawals_root: Option<String>,
 }
