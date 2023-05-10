@@ -4,12 +4,9 @@ use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::utils::{
-    format::{
-        format_address, format_bytes, format_bytes_slice, format_hash,
-        format_nonce,
-    },
-    serde::SerU256,
+use crate::utils::format::{
+    format_address, format_bytes, format_bytes_slice, format_hash,
+    format_nonce, SerU256,
 };
 
 #[serde_as]

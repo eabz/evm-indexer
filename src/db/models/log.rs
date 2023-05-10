@@ -13,9 +13,8 @@ pub enum TokenTransferType {
     Erc1155 = 3,
 }
 
-use crate::utils::{
-    format::{format_address, format_bytes, format_hash},
-    serde::SerU256,
+use crate::utils::format::{
+    format_address, format_bytes, format_hash, SerU256,
 };
 
 #[serde_as]

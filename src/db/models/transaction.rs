@@ -7,11 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
 
-use crate::utils::{
-    format::{
-        byte4_from_input, format_address, format_bytes, format_hash,
-    },
-    serde::SerU256,
+use crate::utils::format::{
+    byte4_from_input, format_address, format_bytes, format_hash, SerU256,
 };
 
 #[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq)]
