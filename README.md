@@ -5,7 +5,7 @@
 <strong>Scalable SQL indexer for EVM compatible blockchains</strong>
 </p>
 
-![build](https://github.com/kindynosmx/evm-indexer/actions/workflows/build.yml/badge.svg)
+![build](https://github.com/eabz/evm-indexer/actions/workflows/build.yml/badge.svg)
 
 An indexer is a program that fetches and stores blockchain data for later analysis.
 
@@ -41,7 +41,7 @@ You can try the indexer locally or through Docker.
 1. Clone the repository
 
 ```
-git clone https://github.com/kindynosmx/evm-indexer && cd evm-indexer
+git clone https://github.com/eabz/evm-indexer && cd evm-indexer
 ```
 
 2. Build the program
@@ -57,7 +57,7 @@ cargo build --release
 1. Clone the repository
 
 ```
-git clone https://github.com/kindynosmx/evm-indexer && cd evm-indexer
+git clone https://github.com/eabz/evm-indexer && cd evm-indexer
 ```
 
 2. Build the image and tag it as `indexer`
