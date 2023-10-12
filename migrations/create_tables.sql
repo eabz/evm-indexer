@@ -135,7 +135,7 @@ CREATE TABLE indexer.transactions (
   max_priority_fee_per_gas Nullable(UInt256),
   method LowCardinality(String),
   nonce UInt32 CODEC(Delta(4), ZSTD(1)),
-  status Nullable(Enum8('unknown' = -1, 'failure' = 0, 'success' = 1)),
+  status Nullable(Enum8('unknown' = 0, 'failure' = 1, 'success' = 2)),
   timestamp DateTime CODEC(Delta(4), ZSTD(1)),
   to LowCardinality(String),
   transaction_index UInt16 CODEC(Delta(2), ZSTD(1)),
