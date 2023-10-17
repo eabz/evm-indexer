@@ -118,6 +118,10 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
             traces: Vec::new(),
             transactions: Vec::new(),
             withdrawals: Vec::new(),
+            erc20_transfers: Vec::new(),
+            erc721_transfers: Vec::new(),
+            erc1155_transfers: Vec::new(),
+            dex_trades: Vec::new(),
         };
 
         for result in results {
@@ -129,13 +133,27 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
                     mut contracts,
                     mut traces,
                     mut withdrawals,
+                    mut erc20_transfers,
+                    mut erc721_transfers,
+                    mut erc1155_transfers,
+                    mut dex_trades,
                 )) => {
                     fetched_data.blocks.append(&mut blocks);
                     fetched_data.transactions.append(&mut transactions);
                     fetched_data.logs.append(&mut logs);
                     fetched_data.contracts.append(&mut contracts);
                     fetched_data.traces.append(&mut traces);
-                    fetched_data.withdrawals.append(&mut withdrawals)
+                    fetched_data.withdrawals.append(&mut withdrawals);
+                    fetched_data
+                        .erc20_transfers
+                        .append(&mut erc20_transfers);
+                    fetched_data
+                        .erc721_transfers
+                        .append(&mut erc721_transfers);
+                    fetched_data
+                        .erc1155_transfers
+                        .append(&mut erc1155_transfers);
+                    fetched_data.dex_trades.append(&mut dex_trades);
                 }
                 None => continue,
             }

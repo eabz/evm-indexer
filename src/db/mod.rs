@@ -13,6 +13,13 @@ use models::{
 use serde::Serialize;
 use std::{collections::HashSet, time::Duration};
 
+use self::models::{
+    dex_trade::DatabaseDexTrade,
+    erc1155_transfer::DatabaseERC1155Transfer,
+    erc20_transfer::DatabaseERC20Transfer,
+    erc721_transfer::DatabaseERC721Transfer,
+};
+
 pub struct BlockFetchedData {
     pub blocks: Vec<DatabaseBlock>,
     pub contracts: Vec<DatabaseContract>,
@@ -20,6 +27,10 @@ pub struct BlockFetchedData {
     pub traces: Vec<DatabaseTrace>,
     pub transactions: Vec<DatabaseTransaction>,
     pub withdrawals: Vec<DatabaseWithdrawal>,
+    pub erc20_transfers: Vec<DatabaseERC20Transfer>,
+    pub erc721_transfers: Vec<DatabaseERC721Transfer>,
+    pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
+    pub dex_trades: Vec<DatabaseDexTrade>,
 }
 
 // Ref: https://github.com/loyd/clickhouse.rs/blob/master/src/lib.rs#L51
@@ -40,6 +51,10 @@ pub enum DatabaseTables {
     Traces,
     Transactions,
     Withdrawals,
+    Erc20Transfers,
+    Erc721Transfers,
+    Erc1155Transfers,
+    DexTrades,
 }
 
 impl DatabaseTables {
@@ -51,6 +66,10 @@ impl DatabaseTables {
             DatabaseTables::Traces => "traces",
             DatabaseTables::Transactions => "transactions",
             DatabaseTables::Withdrawals => "withdrawals",
+            DatabaseTables::Erc20Transfers => "erc20_transfers",
+            DatabaseTables::Erc721Transfers => "erc721_transfers",
+            DatabaseTables::Erc1155Transfers => "erc1155_transfers",
+            DatabaseTables::DexTrades => "dex_trades",
         }
     }
 }
@@ -111,6 +130,7 @@ impl Database {
                     .await
                 }
             });
+
             stores.push(work);
         }
 
@@ -123,6 +143,7 @@ impl Database {
                         .await
                 }
             });
+
             stores.push(work);
         }
 
@@ -138,6 +159,7 @@ impl Database {
                     .await
                 }
             });
+
             stores.push(work);
         }
 
@@ -153,6 +175,7 @@ impl Database {
                     .await
                 }
             });
+
             stores.push(work);
         }
 
@@ -169,6 +192,75 @@ impl Database {
                     .await
                 }
             });
+
+            stores.push(work);
+        }
+
+        if !data.erc20_transfers.is_empty() {
+            let work = tokio::spawn({
+                let transfers: Vec<DatabaseERC20Transfer> =
+                    data.erc20_transfers.clone();
+                let db = self.clone();
+                async move {
+                    db.store_items(
+                        &transfers,
+                        DatabaseTables::Erc20Transfers.as_str(),
+                    )
+                    .await
+                }
+            });
+
+            stores.push(work);
+        }
+
+        if !data.erc721_transfers.is_empty() {
+            let work = tokio::spawn({
+                let transfers: Vec<DatabaseERC721Transfer> =
+                    data.erc721_transfers.clone();
+                let db = self.clone();
+                async move {
+                    db.store_items(
+                        &transfers,
+                        DatabaseTables::Erc721Transfers.as_str(),
+                    )
+                    .await
+                }
+            });
+
+            stores.push(work);
+        }
+
+        if !data.erc1155_transfers.is_empty() {
+            let work = tokio::spawn({
+                let transfers: Vec<DatabaseERC1155Transfer> =
+                    data.erc1155_transfers.clone();
+                let db = self.clone();
+                async move {
+                    db.store_items(
+                        &transfers,
+                        DatabaseTables::Erc1155Transfers.as_str(),
+                    )
+                    .await
+                }
+            });
+
+            stores.push(work);
+        }
+
+        if !data.dex_trades.is_empty() {
+            let work = tokio::spawn({
+                let trades: Vec<DatabaseDexTrade> =
+                    data.dex_trades.clone();
+                let db = self.clone();
+                async move {
+                    db.store_items(
+                        &trades,
+                        DatabaseTables::DexTrades.as_str(),
+                    )
+                    .await
+                }
+            });
+
             stores.push(work);
         }
 
@@ -190,13 +282,17 @@ impl Database {
         }
 
         info!(
-            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) in ({}) blocks.",
+            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) dex_trades ({}) in ({}) blocks.",
             data.contracts.len(),
             data.logs.len(),
             data.traces.len(),
             data.transactions.len(),
             data.withdrawals.len(),
-            data.blocks.len(),
+            data.erc20_transfers.len(),
+            data.erc721_transfers.len(),
+            data.erc1155_transfers.len(),
+            data.dex_trades.len(),
+            data.blocks.len()
         );
     }
 

@@ -5,6 +5,10 @@ use crate::{
         models::{
             block::DatabaseBlock,
             contract::DatabaseContract,
+            dex_trade::DatabaseDexTrade,
+            erc1155_transfer::DatabaseERC1155Transfer,
+            erc20_transfer::DatabaseERC20Transfer,
+            erc721_transfer::DatabaseERC721Transfer,
             log::DatabaseLog,
             trace::{DatabaseTrace, TraceType},
             transaction::DatabaseTransaction,
@@ -148,6 +152,10 @@ impl Rpc {
         Vec<DatabaseContract>,
         Vec<DatabaseTrace>,
         Vec<DatabaseWithdrawal>,
+        Vec<DatabaseERC20Transfer>,
+        Vec<DatabaseERC721Transfer>,
+        Vec<DatabaseERC1155Transfer>,
+        Vec<DatabaseDexTrade>,
     )> {
         let block_data = self.get_block(block_number).await;
 
@@ -346,6 +354,18 @@ impl Rpc {
                         .insert(contract_address.to_string(), contract);
                 }
 
+                let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
+                    Vec::new();
+
+                let mut db_erc721_transfers: Vec<DatabaseERC721Transfer> =
+                    Vec::new();
+
+                let mut db_erc1155_transfers: Vec<
+                    DatabaseERC1155Transfer,
+                > = Vec::new();
+
+                let mut db_dex_trades: Vec<DatabaseDexTrade> = Vec::new();
+
                 for log in db_logs.iter_mut() {
                     // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
                     let topic0 = log.topic0.clone();
@@ -355,12 +375,18 @@ impl Rpc {
 
                         // erc721 token transfer events have 3 indexed values.
                         if log.topic3.is_some() {
-                            log.parse_erc721_transfer();
+                            let erc721 =
+                                DatabaseERC721Transfer::from_rpc(log);
+
+                            db_erc721_transfers.push(erc721)
                         } else if log.topic1.is_some()
                             && log.topic2.is_some()
                         {
                             // erc20 token transfer events have 2 indexed values.
-                            log.parse_erc20_transfer();
+                            let erc20 =
+                                DatabaseERC20Transfer::from_rpc(log);
+
+                            db_erc20_transfers.push(erc20)
                         }
                     }
 
@@ -387,7 +413,12 @@ impl Rpc {
                             .into_uint()
                             .unwrap();
 
-                        log.parse_single_erc1155_transfer(id, amount);
+                        let erc1155_transfer =
+                            DatabaseERC1155Transfer::from_single_rpc(
+                                log, id, amount,
+                            );
+
+                        db_erc1155_transfers.push(erc1155_transfer);
                     }
 
                     if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
@@ -430,21 +461,30 @@ impl Rpc {
                             })
                             .collect();
 
-                        log.parse_batch_erc1155_transfer(ids, amounts);
+                        let erc1155_transfer =
+                            DatabaseERC1155Transfer::from_batch_rpc(
+                                log, ids, amounts,
+                            );
+
+                        db_erc1155_transfers.push(erc1155_transfer);
                     }
 
                     if topic0 == SWAP_EVENT_SIGNATURE
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                     {
-                        log.parse_swap_v2();
+                        let swap = DatabaseDexTrade::from_v2_rpc(log);
+
+                        db_dex_trades.push(swap);
                     }
 
                     if topic0 == SWAPV3_EVENT_SIGNATURE
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                     {
-                        log.parse_swap_v3();
+                        let swap = DatabaseDexTrade::from_v3_rpc(log);
+
+                        db_dex_trades.push(swap);
                     }
                 }
 
@@ -470,6 +510,10 @@ impl Rpc {
                     db_contracts,
                     traces,
                     db_withdrawals,
+                    db_erc20_transfers,
+                    db_erc721_transfers,
+                    db_erc1155_transfers,
+                    db_dex_trades,
                 ))
             }
             None => None,
@@ -549,6 +593,10 @@ impl Rpc {
                         contracts,
                         traces,
                         withdrawals,
+                        erc20_transfers,
+                        erc721_transfers,
+                        erc1155_transfers,
+                        dex_trades,
                     )) = block_data
                     {
                         let fetched_data = BlockFetchedData {
@@ -558,6 +606,10 @@ impl Rpc {
                             traces,
                             transactions,
                             withdrawals,
+                            erc20_transfers,
+                            erc721_transfers,
+                            erc1155_transfers,
+                            dex_trades,
                         };
 
                         db.store_data(&fetched_data).await;
@@ -850,8 +902,11 @@ impl Rpc {
                                     )
                                 });
 
-                            if db_contract.is_some() {
-                                db_contracts.push(db_contract.unwrap())
+                            match db_contract.is_some() {
+                                true => {
+                                    db_contracts.push(db_contract.unwrap())
+                                }
+                                false => (),
                             }
 
                             for log in receipt.logs.iter() {

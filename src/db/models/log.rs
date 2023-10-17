@@ -1,21 +1,9 @@
 use clickhouse::Row;
 use ethers::types::Log;
-use primitive_types::U256;
 use serde::{Deserialize, Serialize};
-use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
 
-#[derive(Debug, Clone, Serialize_repr, Deserialize_repr)]
-#[repr(u8)]
-pub enum TokenTransferType {
-    Erc20 = 1,
-    Erc721 = 2,
-    Erc1155 = 3,
-}
-
-use crate::utils::format::{
-    format_address, format_bytes, format_hash, SerU256,
-};
+use crate::utils::format::{format_address, format_bytes, format_hash};
 
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
@@ -24,30 +12,10 @@ pub struct DatabaseLog {
     pub block_number: u32,
     pub chain: u64,
     pub data: String,
-    pub dex_trade_maker: Option<String>,
-    pub dex_trade_pair: Option<String>,
-    pub dex_trade_receiver: Option<String>,
-    #[serde_as(as = "Option<SerU256>")]
-    pub dex_trade_token0_amount: Option<U256>,
-    #[serde_as(as = "Option<SerU256>")]
-    pub dex_trade_token1_amount: Option<U256>,
     pub log_index: u16,
     pub log_type: Option<String>,
     pub removed: bool,
     pub timestamp: u32,
-    #[serde_as(as = "Option<SerU256>")]
-    pub token_transfer_amount: Option<U256>,
-    #[serde_as(as = "Vec<SerU256>")]
-    pub token_transfer_amounts: Vec<U256>,
-    pub token_transfer_from: Option<String>,
-    #[serde_as(as = "Option<SerU256>")]
-    pub token_transfer_id: Option<U256>,
-    #[serde_as(as = "Vec<SerU256>")]
-    pub token_transfer_ids: Vec<U256>,
-    pub token_transfer_operator: Option<String>,
-    pub token_transfer_to: Option<String>,
-    pub token_transfer_token_address: Option<String>,
-    pub token_transfer_type: Option<TokenTransferType>,
     pub topic0: String,
     pub topic1: Option<String>,
     pub topic2: Option<String>,
@@ -99,24 +67,10 @@ impl DatabaseLog {
             block_number: block_number.to_owned(),
             chain,
             data: format_bytes(&log.data),
-            dex_trade_maker: None,
-            dex_trade_pair: None,
-            dex_trade_receiver: None,
-            dex_trade_token0_amount: None,
-            dex_trade_token1_amount: None,
             log_index: log.log_index.unwrap().as_usize() as u16,
             log_type: log.log_type.clone(),
             removed: log.removed.unwrap(),
             timestamp,
-            token_transfer_amount: None,
-            token_transfer_amounts: Vec::new(),
-            token_transfer_from: None,
-            token_transfer_id: None,
-            token_transfer_ids: Vec::new(),
-            token_transfer_operator: None,
-            token_transfer_to: None,
-            token_transfer_token_address: None,
-            token_transfer_type: None,
             topic0,
             topic1,
             topic2,
