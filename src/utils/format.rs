@@ -47,7 +47,7 @@ pub fn byte4_from_input(input: &str) -> [u8; 4] {
     byte4
 }
 
-pub struct SerU256(U256);
+pub struct SerU256(());
 
 impl SerializeAs<U256> for SerU256 {
     fn serialize_as<S>(x: &U256, serializer: S) -> Result<S::Ok, S::Error>
