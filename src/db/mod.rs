@@ -3,7 +3,6 @@ pub mod models;
 use crate::chains::Chain;
 use clickhouse::{Client, Row};
 use futures::future::join_all;
-use hyper_tls::HttpsConnector;
 use log::{error, info};
 use models::{
     block::DatabaseBlock, contract::DatabaseContract, log::DatabaseLog,
@@ -11,7 +10,7 @@ use models::{
     withdrawal::DatabaseWithdrawal,
 };
 use serde::Serialize;
-use std::{collections::HashSet, time::Duration};
+use std::collections::HashSet;
 
 use self::models::{
     dex_trade::DatabaseDexTrade,
@@ -32,11 +31,6 @@ pub struct BlockFetchedData {
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
     pub dex_trades: Vec<DatabaseDexTrade>,
 }
-
-// Ref: https://github.com/loyd/clickhouse.rs/blob/master/src/lib.rs#L51
-// ClickHouse uses 3s by default.
-// See https://github.com/ClickHouse/ClickHouse/blob/368cb74b4d222dc5472a7f2177f6bb154ebae07a/programs/server/config.xml#L201
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct Database {
@@ -84,13 +78,7 @@ impl Database {
     ) -> Self {
         info!("Starting EVM database service");
 
-        let https = HttpsConnector::new();
-
-        let client = hyper::Client::builder()
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            .build::<_, hyper::Body>(https);
-
-        let db = Client::with_http_client(client)
+        let db = Client::default()
             .with_url(db_host)
             .with_user(db_username)
             .with_password(db_password)
