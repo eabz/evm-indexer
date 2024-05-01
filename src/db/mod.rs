@@ -13,7 +13,6 @@ use serde::Serialize;
 use std::collections::HashSet;
 
 use self::models::{
-    dex_trade::DatabaseDexTrade,
     erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer,
@@ -29,7 +28,6 @@ pub struct BlockFetchedData {
     pub erc20_transfers: Vec<DatabaseERC20Transfer>,
     pub erc721_transfers: Vec<DatabaseERC721Transfer>,
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
-    pub dex_trades: Vec<DatabaseDexTrade>,
 }
 
 #[derive(Clone)]
@@ -235,23 +233,6 @@ impl Database {
             stores.push(work);
         }
 
-        if !data.dex_trades.is_empty() {
-            let work = tokio::spawn({
-                let trades: Vec<DatabaseDexTrade> =
-                    data.dex_trades.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &trades,
-                        DatabaseTables::DexTrades.as_str(),
-                    )
-                    .await
-                }
-            });
-
-            stores.push(work);
-        }
-
         let res = join_all(stores).await;
 
         let errored: Vec<_> =
@@ -270,7 +251,7 @@ impl Database {
         }
 
         info!(
-            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) dex_trades ({}) in ({}) blocks.",
+            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) in ({}) blocks.",
             data.contracts.len(),
             data.logs.len(),
             data.traces.len(),
@@ -279,7 +260,6 @@ impl Database {
             data.erc20_transfers.len(),
             data.erc721_transfers.len(),
             data.erc1155_transfers.len(),
-            data.dex_trades.len(),
             data.blocks.len()
         );
     }

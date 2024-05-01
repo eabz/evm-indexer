@@ -1,5 +1,3 @@
-use std::ops::Mul;
-
 use clickhouse::Row;
 use ethers::types::{Transaction, TransactionReceipt};
 use primitive_types::{H160, U256};
@@ -35,15 +33,11 @@ pub struct DatabaseTransaction {
     pub base_fee_per_gas: Option<u64>,
     pub block_hash: String,
     pub block_number: u32,
-    #[serde_as(as = "Option<SerU256>")]
-    pub burned: Option<U256>,
     pub chain: u64,
     pub contract_created: Option<String>,
     pub cumulative_gas_used: Option<u32>,
     #[serde_as(as = "Option<SerU256>")]
     pub effective_gas_price: Option<U256>,
-    #[serde_as(as = "Option<SerU256>")]
-    pub effective_transaction_fee: Option<U256>,
     pub from: String,
     pub gas: u32,
     #[serde_as(as = "Option<SerU256>")]
@@ -119,12 +113,10 @@ impl DatabaseTransaction {
             block_hash: format_hash(transaction.block_hash.unwrap()),
             block_number: transaction.block_number.unwrap().as_usize()
                 as u32,
-            burned: None,
             chain,
             contract_created: None,
             cumulative_gas_used: None,
             effective_gas_price: None,
-            effective_transaction_fee: None,
             from: format_address(transaction.from),
             gas: transaction.gas.as_usize() as u32,
             gas_price: transaction.gas_price,
@@ -159,11 +151,6 @@ impl DatabaseTransaction {
     ) {
         let gas_used = receipt.gas_used.unwrap();
 
-        let effective_transaction_fee = receipt
-            .gas_used
-            .unwrap()
-            .mul(receipt.effective_gas_price.unwrap());
-
         let status = match receipt.status {
             Some(status) => {
                 if status.as_usize() == 0 {
@@ -177,21 +164,12 @@ impl DatabaseTransaction {
             None => TransactionStatus::Unknown,
         };
 
-        let burned = match base_fee_per_gas {
-            Some(base_fee_per_gas) => {
-                U256::from(base_fee_per_gas).mul(gas_used)
-            }
-            None => U256::zero(),
-        };
-
         self.base_fee_per_gas = base_fee_per_gas;
-        self.burned = Some(burned);
         self.contract_created =
             receipt.contract_address.map(format_address);
         self.cumulative_gas_used =
             Some(receipt.cumulative_gas_used.as_usize() as u32);
         self.effective_gas_price = receipt.effective_gas_price;
-        self.effective_transaction_fee = Some(effective_transaction_fee);
         self.gas_used = Some(gas_used.as_usize() as u32);
         self.status = Some(status)
     }

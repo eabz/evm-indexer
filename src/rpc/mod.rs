@@ -5,7 +5,6 @@ use crate::{
         models::{
             block::DatabaseBlock,
             contract::DatabaseContract,
-            dex_trade::DatabaseDexTrade,
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
             erc721_transfer::DatabaseERC721Transfer,
@@ -20,7 +19,6 @@ use crate::{
         events::{
             ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
             ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
-            SWAPV3_EVENT_SIGNATURE, SWAP_EVENT_SIGNATURE,
             TRANSFER_EVENTS_SIGNATURE,
         },
         format::{decode_bytes, format_hash},
@@ -29,7 +27,6 @@ use crate::{
 use ethabi::ParamType;
 use ethers::{
     abi::ethabi,
-    prelude::abigen,
     types::{Block, Trace, Transaction, TransactionReceipt, TxHash},
 };
 use primitive_types::U256;
@@ -53,23 +50,13 @@ use tokio::time::sleep;
 
 use serde_json::Error;
 
-abigen!(
-    ERC20,
-    r#"[
-        function decimals() external view returns (uint8)
-        function factory() external view returns (address)
-        function name() external view returns (string)
-        function symbol() external view returns (string)
-        function token0() external view returns (address)
-        function token1() external view returns (address)
-    ]"#,
-);
 #[derive(Debug, Clone)]
 pub struct Rpc {
     pub chain: Chain,
     pub clients: Vec<HttpClient<HttpBackend>>,
     pub clients_urls: Vec<String>,
     pub ws_url: Option<String>,
+    pub traces: bool,
 }
 
 impl Rpc {
@@ -119,6 +106,7 @@ impl Rpc {
             clients,
             clients_urls,
             ws_url: config.ws_url.clone(),
+            traces: config.traces,
         }
     }
 
@@ -155,12 +143,17 @@ impl Rpc {
         Vec<DatabaseERC20Transfer>,
         Vec<DatabaseERC721Transfer>,
         Vec<DatabaseERC1155Transfer>,
-        Vec<DatabaseDexTrade>,
     )> {
         let block_data = self.get_block(block_number).await;
 
-        let traces: Vec<DatabaseTrace> =
-            self.get_block_traces(block_number).await;
+        let mut traces: Vec<DatabaseTrace> = Vec::new();
+
+        if self.traces {
+            let fetched_traces: Vec<DatabaseTrace> =
+                self.get_block_traces(block_number).await;
+
+            traces = fetched_traces
+        }
 
         match block_data {
             Some((
@@ -321,8 +314,6 @@ impl Rpc {
                     DatabaseERC1155Transfer,
                 > = Vec::new();
 
-                let mut db_dex_trades: Vec<DatabaseDexTrade> = Vec::new();
-
                 for log in db_logs.iter_mut() {
                     // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
                     let topic0 = log.topic0.clone();
@@ -425,24 +416,6 @@ impl Rpc {
 
                         db_erc1155_transfers.push(erc1155_transfer);
                     }
-
-                    if topic0 == SWAP_EVENT_SIGNATURE
-                        && log.topic1.is_some()
-                        && log.topic2.is_some()
-                    {
-                        let swap = DatabaseDexTrade::from_v2_rpc(log);
-
-                        db_dex_trades.push(swap);
-                    }
-
-                    if topic0 == SWAPV3_EVENT_SIGNATURE
-                        && log.topic1.is_some()
-                        && log.topic2.is_some()
-                    {
-                        let swap = DatabaseDexTrade::from_v3_rpc(log);
-
-                        db_dex_trades.push(swap);
-                    }
                 }
 
                 let db_contracts: Vec<DatabaseContract> = contracts_map
@@ -470,7 +443,6 @@ impl Rpc {
                     db_erc20_transfers,
                     db_erc721_transfers,
                     db_erc1155_transfers,
-                    db_dex_trades,
                 ))
             }
             None => None,
@@ -553,7 +525,6 @@ impl Rpc {
                         erc20_transfers,
                         erc721_transfers,
                         erc1155_transfers,
-                        dex_trades,
                     )) = block_data
                     {
                         let fetched_data = BlockFetchedData {
@@ -566,7 +537,6 @@ impl Rpc {
                             erc20_transfers,
                             erc721_transfers,
                             erc1155_transfers,
-                            dex_trades,
                         };
 
                         db.store_data(&fetched_data).await;

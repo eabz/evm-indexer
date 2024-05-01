@@ -60,3 +60,4 @@ docker build . -t indexer
 | `--rpcs`        | `empty` | Comma separated list of rpcs to use to fetch blocks.   |
 | `--database`    | `empty` | Clickhouse database string with username and password. |
 | `--ws`          | `empty` | Url of the websocket endpoint to fetch new blocks.     |
+| `--traces`      | true    | Fetch blockchain traces.                               |

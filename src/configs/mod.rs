@@ -48,6 +48,12 @@ pub struct IndexerArgs {
         default_value_t = String::from("")
     )]
     pub ws: String,
+    #[arg(
+        long,
+        help = "Fetch blockchain traces.",
+        default_value_t = true
+    )]
+    pub traces: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +70,7 @@ pub struct Config {
     pub rpcs: Vec<String>,
     pub start_block: u32,
     pub ws_url: Option<String>,
+    pub traces: bool,
 }
 
 impl Default for Config {
@@ -113,6 +120,7 @@ impl Config {
             rpcs,
             start_block: args.start_block,
             ws_url,
+            traces: args.traces,
         }
     }
 }
