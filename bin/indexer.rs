@@ -1,7 +1,6 @@
 use evm_indexer::{
     configs::Config,
-    db::{BlockFetchedData, Database, DatabaseTables},
-    genesis::get_genesis_allocations,
+    db::{BlockFetchedData, Database},
     rpc::Rpc,
 };
 use futures::future::join_all;
@@ -64,17 +63,6 @@ async fn main() {
 
 async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
     let mut indexed_blocks = db.get_indexed_blocks().await;
-
-    // If there are no indexed blocks, insert the genesis transactions
-    if indexed_blocks.is_empty() {
-        let genesis_transactions =
-            get_genesis_allocations(config.chain.clone());
-        db.store_items(
-            &genesis_transactions,
-            DatabaseTables::Transactions.as_str(),
-        )
-        .await;
-    }
 
     let last_block = if config.end_block != 0 {
         config.end_block as u32

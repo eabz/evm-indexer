@@ -1,9 +1,9 @@
 [package]
 name = "evm-indexer"
-version = "1.4.0"
+version = "1.5.0"
 license = "MIT"
 edition = "2021"
-repository = "https://github.com/kindynosmx/evm-indexer"
+repository = "https://github.com/eabz/evm-indexer"
 description = "Scalable SQL indexer for EVM compatible blockchains"
 
 [dependencies]
@@ -33,5 +33,5 @@ default-features = false
 features = ["colors"]
 
 [[bin]]
-path = "bin/evm-indexer.rs"
-name = "evm-indexer"
+path = "bin/indexer.rs"
+name = "indexer"

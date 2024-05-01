@@ -1,5 +1,5 @@
 use crate::{
-    chains::{get_block_reward, Chain},
+    chains::Chain,
     configs::Config,
     db::{
         models::{
@@ -48,7 +48,7 @@ use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 
 use log::{info, warn};
 use rand::seq::SliceRandom;
-use std::{collections::HashMap, ops::Mul, time::Duration};
+use std::{collections::HashMap, time::Duration};
 use tokio::time::sleep;
 
 use serde_json::Error;
@@ -164,7 +164,7 @@ impl Rpc {
 
         match block_data {
             Some((
-                mut db_block,
+                db_block,
                 mut db_transactions,
                 db_withdrawals,
                 mut block_uncles,
@@ -272,52 +272,9 @@ impl Rpc {
                     );
                 }
 
-                let (base_block_reward, total_fee_reward, uncle_rewards) =
-                    get_block_reward(
-                        self.chain.id,
-                        &db_block,
-                        Some(&db_receipts),
-                        &block_uncles,
-                        false,
-                        None,
-                    );
-
-                let burned = match db_block.base_fee_per_gas {
-                    Some(base_fee_per_gas) => U256::from(base_fee_per_gas)
-                        .mul(U256::from(db_block.gas_used)),
-                    None => U256::zero(),
-                };
-
                 let mut db_blocks: Vec<DatabaseBlock> = Vec::new();
 
-                db_block.add_rewards(
-                    base_block_reward,
-                    burned,
-                    total_fee_reward,
-                    uncle_rewards,
-                );
-
                 for uncle in block_uncles.iter_mut() {
-                    let (
-                        base_block_reward,
-                        total_fee_reward,
-                        uncle_rewards,
-                    ) = get_block_reward(
-                        self.chain.id,
-                        uncle,
-                        None,
-                        &[],
-                        true,
-                        Some(db_block.number),
-                    );
-
-                    uncle.add_rewards(
-                        base_block_reward,
-                        U256::zero(),
-                        total_fee_reward,
-                        uncle_rewards,
-                    );
-
                     db_blocks.push(uncle.to_owned());
                 }
 

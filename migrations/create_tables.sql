@@ -1,9 +1,7 @@
 CREATE DATABASE IF NOT EXISTS indexer;
 
 CREATE TABLE indexer.blocks (
-  base_block_reward UInt256,
   base_fee_per_gas Nullable(UInt64),
-  burned UInt256,
   chain UInt64,
   difficulty UInt256,
   extra_data String CODEC(ZSTD(9)),
@@ -23,10 +21,8 @@ CREATE TABLE indexer.blocks (
   state_root String,
   timestamp DateTime,
   total_difficulty Nullable(UInt256),
-  total_fee_reward UInt256,
   transactions UInt16,
   transactions_root String,
-  uncle_rewards UInt256,
   uncles Array(String),
   withdrawals_root Nullable(String)
 )
@@ -129,26 +125,6 @@ PARTITION BY toYYYYMM(timestamp)
 ORDER BY (transaction_hash, address, chain, log_index, timestamp)
 SETTINGS index_granularity = 8192;
 
-CREATE TABLE indexer.dex_trades (
-  address String,
-  block_number UInt32,
-  chain UInt64,
-  log_index UInt16,
-  log_type Nullable(String),
-  maker String,
-  pair String,
-  receiver String,
-  removed Boolean,
-  timestamp DateTime,
-  token0_amount UInt256,
-  token1_amount UInt256,
-  transaction_hash String,
-  transaction_log_index Nullable(UInt16)
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (transaction_hash, address, chain, log_index, timestamp)
-SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.traces (
   action_type Enum8('call' = 1, 'create' = 2, 'suicide' = 3, 'reward' = 4),

@@ -12,11 +12,7 @@ use crate::utils::format::{
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseBlock {
-    #[serde_as(as = "SerU256")]
-    pub base_block_reward: U256,
     pub base_fee_per_gas: Option<u64>,
-    #[serde_as(as = "SerU256")]
-    pub burned: U256,
     pub chain: u64,
     #[serde_as(as = "SerU256")]
     pub difficulty: U256,
@@ -38,13 +34,9 @@ pub struct DatabaseBlock {
     pub timestamp: u32,
     #[serde_as(as = "Option<SerU256>")]
     pub total_difficulty: Option<U256>,
-    #[serde_as(as = "SerU256")]
-    pub total_fee_reward: U256,
     pub transactions: u16,
     pub transactions_root: String,
     pub uncles: Vec<String>,
-    #[serde_as(as = "SerU256")]
-    pub uncle_rewards: U256,
     pub withdrawals_root: Option<String>,
 }
 
@@ -62,9 +54,7 @@ impl DatabaseBlock {
             .map(|base_fee_per_gas| base_fee_per_gas.as_u64());
 
         Self {
-            base_block_reward: U256::zero(),
             base_fee_per_gas,
-            burned: U256::zero(),
             chain,
             difficulty: block.difficulty,
             extra_data: format_bytes(&block.extra_data),
@@ -86,7 +76,6 @@ impl DatabaseBlock {
             state_root: format_hash(block.state_root),
             timestamp: block.timestamp.as_usize() as u32,
             total_difficulty: block.total_difficulty,
-            total_fee_reward: U256::zero(),
             transactions: block.transactions.len() as u16,
             transactions_root: format_hash(block.transactions_root),
             uncles: block
@@ -95,21 +84,7 @@ impl DatabaseBlock {
                 .into_iter()
                 .map(format_hash)
                 .collect(),
-            uncle_rewards: U256::zero(),
             withdrawals_root,
         }
-    }
-
-    pub fn add_rewards(
-        &mut self,
-        base_block_reward: U256,
-        burned: U256,
-        total_fee_reward: U256,
-        uncle_rewards: U256,
-    ) {
-        self.base_block_reward = base_block_reward;
-        self.burned = burned;
-        self.total_fee_reward = total_fee_reward;
-        self.uncle_rewards = uncle_rewards;
     }
 }
