@@ -5,7 +5,7 @@
 <strong>Scalable SQL indexer for EVM-compatible blockchains</strong>
 </p>
 
-[![Docker Image Size](https://badgen.net/docker/size/0xeabz/evm-indexer?icon=docker&label=image%20size)](https://hub.docker.com/r/0xeabz/evm-indexer)
+[![Docker Image Size](https://badgen.net/docker/size/0xeabz/evm-indexer/main?icon=docker&label=image%20size)](https://hub.docker.com/r/0xeabz/evm-indexer)
 ![build](https://github.com/eabz/evm-indexer/actions/workflows/build.yml/badge.svg)
 
 An indexer is a program that fetches and stores blockchain data for later analysis.
