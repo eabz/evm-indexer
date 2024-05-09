@@ -23,7 +23,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: 0xeabz/videoteca
+          images: 0xeabz/evm-indexer
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
