@@ -266,7 +266,7 @@ impl Database {
     where
         T: Row + Serialize,
     {
-        let mut inserter = self.db.insert(table).unwrap();
+        let mut inserter = self.db.inserter(table).unwrap();
 
         for item in items {
             inserter.write(item).await.unwrap();
