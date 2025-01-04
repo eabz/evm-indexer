@@ -37,7 +37,14 @@ pub const BSC: Chain = Chain {
     supports_trace_block: true,
 };
 
-pub static CHAINS: [Chain; 3] = [ETHEREUM, POLYGON, BSC];
+pub const MONAD_DEVNET: Chain = Chain {
+    id: 41454,
+    name: "DMON",
+    supports_blocks_receipts: false,
+    supports_trace_block: false,
+};
+
+pub static CHAINS: [Chain; 4] = [ETHEREUM, POLYGON, BSC, MONAD_DEVNET];
 
 pub fn get_chains() -> HashMap<u64, Chain> {
     let mut chains: HashMap<u64, Chain> = HashMap::new();
