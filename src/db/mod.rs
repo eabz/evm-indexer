@@ -91,10 +91,8 @@ impl Database {
             self.chain.id
         );
 
-        let tokens = match self.db.query(&query).fetch_all::<u32>().await {
-            Ok(tokens) => tokens,
-            Err(_) => Vec::new(),
-        };
+        let tokens = (self.db.query(&query).fetch_all::<u32>().await)
+            .unwrap_or_default();
 
         let blocks: HashSet<u32> = HashSet::from_iter(tokens.into_iter());
 
@@ -268,7 +266,7 @@ impl Database {
     where
         T: Row + Serialize,
     {
-        let mut inserter = self.db.inserter(table).unwrap();
+        let mut inserter = self.db.insert(table).unwrap();
 
         for item in items {
             inserter.write(item).await.unwrap();
