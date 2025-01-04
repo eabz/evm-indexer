@@ -35,19 +35,20 @@ impl DatabaseERC1155Transfer {
         id: U256,
         amount: U256,
     ) -> Self {
-        let operator_bytes = array_bytes::hex_n_into::<String, H256, 32>(
-            log.topic1.clone().unwrap(),
-        )
-        .unwrap();
+        let operator_bytes =
+            array_bytes::dehexify_array_then_into::<String, H256, 32>(
+                log.topic1.clone().unwrap(),
+            )
+            .unwrap();
 
         let from_address_bytes =
-            array_bytes::hex_n_into::<String, H256, 32>(
+            array_bytes::dehexify_array_then_into::<String, H256, 32>(
                 log.topic2.clone().unwrap(),
             )
             .unwrap();
 
         let to_address_bytes =
-            array_bytes::hex_n_into::<String, H256, 32>(
+            array_bytes::dehexify_array_then_into::<String, H256, 32>(
                 log.topic3.clone().unwrap(),
             )
             .unwrap();
@@ -106,19 +107,20 @@ impl DatabaseERC1155Transfer {
         ids: Vec<U256>,
         amounts: Vec<U256>,
     ) -> Self {
-        let operator_bytes = array_bytes::hex_n_into::<String, H256, 32>(
-            log.topic1.clone().unwrap(),
-        )
-        .unwrap();
+        let operator_bytes =
+            array_bytes::dehexify_array_then_into::<String, H256, 32>(
+                log.topic1.clone().unwrap(),
+            )
+            .unwrap();
 
         let from_address_bytes =
-            array_bytes::hex_n_into::<String, H256, 32>(
+            array_bytes::dehexify_array_then_into::<String, H256, 32>(
                 log.topic2.clone().unwrap(),
             )
             .unwrap();
 
         let to_address_bytes =
-            array_bytes::hex_n_into::<String, H256, 32>(
+            array_bytes::dehexify_array_then_into::<String, H256, 32>(
                 log.topic3.clone().unwrap(),
             )
             .unwrap();

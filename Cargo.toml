@@ -1,13 +1,13 @@
 [package]
 name = "evm-indexer"
-version = "1.5.0"
+version = "1.5.1"
 license = "MIT"
 edition = "2021"
 repository = "https://github.com/eabz/evm-indexer"
 description = "Scalable SQL indexer for EVM compatible blockchains"
 
 [dependencies]
-array-bytes = "6"
+array-bytes = "9"
 clap = { version = "4", features = ["derive"] }
 clickhouse = "0.13"
 ethers = { version = "2", features = ["rustls"] }

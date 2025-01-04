@@ -113,9 +113,12 @@ dependencies = [
 
 [[package]]
 name = "array-bytes"
-version = "6.2.3"
+version = "9.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d5dde061bd34119e902bbb2d9b90c5692635cf59fb91d582c2b68043f1b8293"
+checksum = "4449507daf4f07a8c8309e122d32a53d15c9f33e77eaf01c839fea42ccd4d673"
+dependencies = [
+ "smallvec",
+]
 
 [[package]]
 name = "arrayvec"
@@ -1266,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "evm-indexer"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "array-bytes",
  "clap",

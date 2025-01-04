@@ -29,13 +29,13 @@ pub struct DatabaseERC20Transfer {
 impl DatabaseERC20Transfer {
     pub fn from_rpc(log: &DatabaseLog) -> Self {
         let from_address_bytes =
-            array_bytes::hex_n_into::<String, H256, 32>(
+            array_bytes::dehexify_array_then_into::<String, H256, 32>(
                 log.topic0.clone(),
             )
             .unwrap();
 
         let to_address_bytes =
-            array_bytes::hex_n_into::<String, H256, 32>(
+            array_bytes::dehexify_array_then_into::<String, H256, 32>(
                 log.topic2.clone().unwrap(),
             )
             .unwrap();
