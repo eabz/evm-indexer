@@ -9,7 +9,7 @@ description = "Scalable SQL indexer for EVM compatible blockchains"
 [dependencies]
 array-bytes = "9"
 clap = { version = "4", features = ["derive"] }
-clickhouse = "0.11"
+clickhouse = "0.13"
 ethers = { version = "2", features = ["rustls"] }
 futures = "0.3"
 hex = "0.4"
