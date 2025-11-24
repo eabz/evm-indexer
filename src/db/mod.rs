@@ -5,8 +5,9 @@ use futures::future::join_all;
 use log::{error, info};
 use models::{
     block::DatabaseBlock, contract::DatabaseContract,
-    dex_trade::DatabaseDexTrade, log::DatabaseLog, trace::DatabaseTrace,
-    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
+    dex_trade::DatabaseDexTrade, log::DatabaseLog, token::DatabaseToken,
+    trace::DatabaseTrace, transaction::DatabaseTransaction,
+    withdrawal::DatabaseWithdrawal,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -28,6 +29,7 @@ pub struct BlockFetchedData {
     pub erc721_transfers: Vec<DatabaseERC721Transfer>,
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
     pub dex_trades: Vec<DatabaseDexTrade>,
+    pub tokens: Vec<DatabaseToken>,
 }
 
 #[derive(Clone)]
@@ -47,6 +49,7 @@ pub enum DatabaseTables {
     Erc721Transfers,
     Erc1155Transfers,
     DexTrades,
+    Tokens,
 }
 
 impl DatabaseTables {
@@ -62,6 +65,7 @@ impl DatabaseTables {
             DatabaseTables::Erc721Transfers => "erc721_transfers",
             DatabaseTables::Erc1155Transfers => "erc1155_transfers",
             DatabaseTables::DexTrades => "dex_trades",
+            DatabaseTables::Tokens => "tokens",
         }
     }
 }
@@ -245,6 +249,16 @@ impl Database {
             stores.push(work);
         }
 
+        if !data.tokens.is_empty() {
+            let tokens = Arc::new(data.tokens.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(&tokens, DatabaseTables::Tokens.as_str())
+                    .await
+            });
+            stores.push(work);
+        }
+
         let res = join_all(stores).await;
 
         let errored: Vec<_> =
@@ -263,7 +277,7 @@ impl Database {
         }
 
         info!(
-            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) dex_trades ({}) in ({}) blocks.",
+            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) dex_trades ({}) tokens ({}) in ({}) blocks.",
             data.contracts.len(),
             data.logs.len(),
             data.traces.len(),
@@ -273,6 +287,7 @@ impl Database {
             data.erc721_transfers.len(),
             data.erc1155_transfers.len(),
             data.dex_trades.len(),
+            data.tokens.len(),
             data.blocks.len()
         );
     }

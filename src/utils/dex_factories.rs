@@ -545,6 +545,17 @@ impl DexRouters {
 
         routers.insert(43114, avalanche_routers);
 
+        // ========== Monad (chain_id: 143) ==========
+        let mut monad_routers = HashMap::new();
+
+        // Monad DEX
+        monad_routers.insert(
+            "0x33566fE5976AAa420F3d5C64996641Fc3858CaDB".parse().unwrap(),
+            DexInfo { name: "Monad", version: "V1" },
+        );
+
+        routers.insert(143, monad_routers);
+
         Self { routers }
     }
 
@@ -564,29 +575,31 @@ impl DexRouters {
     /// which emit the same Swap event signature as Uniswap V2
     pub fn get_default_v2_dex(&self, chain_id: u64) -> &'static str {
         match chain_id {
-            1 => "Uniswap V2",           // Ethereum - Uniswap V2 dominant
-            56 => "PancakeSwap V2",      // BSC - PancakeSwap dominant
-            42161 => "Camelot",          // Arbitrum - Camelot/Ramses both popular, Camelot more common
-            10 => "Velodrome",           // Optimism - Velodrome dominant
-            8453 => "Aerodrome",         // Base - Aerodrome dominant
-            43114 => "TraderJoe",        // Avalanche - TraderJoe dominant
-            137 => "QuickSwap",          // Polygon - QuickSwap dominant
-            250 => "SpookySwap",         // Fantom - SpookySwap dominant
-            _ => "DEX V2",               // Generic fallback
+            1 => "Uniswap V2",      // Ethereum - Uniswap V2 dominant
+            56 => "PancakeSwap V2", // BSC - PancakeSwap dominant
+            42161 => "Camelot", // Arbitrum - Camelot/Ramses both popular, Camelot more common
+            10 => "Velodrome",  // Optimism - Velodrome dominant
+            8453 => "Aerodrome", // Base - Aerodrome dominant
+            43114 => "TraderJoe", // Avalanche - TraderJoe dominant
+            137 => "QuickSwap", // Polygon - QuickSwap dominant
+            250 => "SpookySwap", // Fantom - SpookySwap dominant
+            143 => "MonadSwap", // Monad - Default
+            _ => "DEX V2",      // Generic fallback
         }
     }
 
     /// Get the dominant V3-style DEX for a chain when router detection fails
     pub fn get_default_v3_dex(&self, chain_id: u64) -> &'static str {
         match chain_id {
-            1 => "Uniswap V3",           // Ethereum
-            56 => "PancakeSwap V3",      // BSC
-            42161 => "Uniswap V3",       // Arbitrum
-            10 => "Uniswap V3",          // Optimism
-            8453 => "Uniswap V3",        // Base
-            43114 => "Uniswap V3",       // Avalanche
-            137 => "Uniswap V3",         // Polygon
-            _ => "DEX V3",               // Generic fallback
+            1 => "Uniswap V3",      // Ethereum
+            56 => "PancakeSwap V3", // BSC
+            42161 => "Uniswap V3",  // Arbitrum
+            10 => "Uniswap V3",     // Optimism
+            8453 => "Uniswap V3",   // Base
+            43114 => "Uniswap V3",  // Avalanche
+            137 => "Uniswap V3",    // Polygon
+            143 => "Uniswap V3",    // Monad
+            _ => "DEX V3",          // Generic fallback
         }
     }
 }

@@ -7,7 +7,8 @@ use crate::{
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            trace::DatabaseTrace, transaction::DatabaseTransaction,
+            token::DatabaseToken, trace::DatabaseTrace,
+            transaction::DatabaseTransaction,
             withdrawal::DatabaseWithdrawal,
         },
         BlockFetchedData, Database,
@@ -42,8 +43,17 @@ use futures::StreamExt;
 use log::{debug, error, info, warn};
 use rand::seq::SliceRandom;
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use url::Url;
+
+alloy::sol! {
+    #[sol(rpc)]
+    contract IERC20 {
+        function name() external view returns (string);
+        function symbol() external view returns (string);
+        function decimals() external view returns (uint8);
+    }
+}
 
 #[derive(Clone)]
 pub struct Rpc {
@@ -141,6 +151,64 @@ impl Rpc {
         block_number
     }
 
+    pub async fn fetch_tokens_metadata(
+        &self,
+        tokens: &HashSet<Address>,
+    ) -> Vec<DatabaseToken> {
+        let mut db_tokens = Vec::new();
+        let client = self.get_client();
+
+        for &token_address in tokens {
+            let contract = IERC20::new(token_address, client.clone());
+
+            // Try to fetch name, symbol, decimals. Some might fail (e.g. ERC1155 or non-compliant tokens)
+            // We use a best-effort approach.
+
+            let name = match contract.name().call().await {
+                Ok(res) => res._0,
+                Err(_) => "".to_string(),
+            };
+
+            let symbol = match contract.symbol().call().await {
+                Ok(res) => res._0,
+                Err(_) => "".to_string(),
+            };
+
+            let decimals = match contract.decimals().call().await {
+                Ok(res) => res._0,
+                Err(_) => 0,
+            };
+
+            // Determine type based on success? Or just default to "Unknown" or "ERC20" if successful?
+            // For now, we'll label as "ERC20" if we got at least name or symbol, otherwise "Unknown"
+            // But we are fetching for all types.
+            // Ideally we would check interface support (ERC165) but that's slower.
+            // Let's just store what we found.
+
+            let token_type = if !name.is_empty() || !symbol.is_empty() {
+                "ERC20".to_string() // Assumption, could be ERC721 too
+            } else {
+                "Unknown".to_string()
+            };
+
+            // Only store if we found something useful, or if we want to index existence?
+            // User asked to index metadata. If empty, maybe skip?
+            // But we might want to store it to avoid re-fetching?
+            // For now, let's store it.
+
+            db_tokens.push(DatabaseToken {
+                address: token_address,
+                name,
+                symbol,
+                decimals,
+                r#type: token_type,
+                chain: self.chain_id,
+            });
+        }
+
+        db_tokens
+    }
+
     pub async fn fetch_block(
         &self,
         block_number: &u32,
@@ -155,6 +223,7 @@ impl Rpc {
         Vec<DatabaseERC721Transfer>,
         Vec<DatabaseERC1155Transfer>,
         Vec<DatabaseDexTrade>,
+        Vec<DatabaseToken>,
     )> {
         let block_data = self.get_block(block_number).await;
 
@@ -407,7 +476,8 @@ impl Rpc {
                     let router = tx_routers.get(&log.transaction_hash);
 
                     // Detect DEX name from router address
-                    let router_dex_name = if let Some(router_addr) = router {
+                    let router_dex_name = if let Some(router_addr) = router
+                    {
                         self.dex_routers
                             .get_dex_from_router(
                                 self.chain_id,
@@ -452,9 +522,12 @@ impl Rpc {
                     {
                         // For V2 swaps, use chain-specific default DEX when router not detected
                         // This properly labels Solidly forks (Velodrome, Aerodrome, Thena, etc.)
-                        let v2_dex_name = router_dex_name.clone().unwrap_or_else(|| {
-                            self.dex_routers.get_default_v2_dex(self.chain_id).to_string()
-                        });
+                        let v2_dex_name =
+                            router_dex_name.clone().unwrap_or_else(|| {
+                                self.dex_routers
+                                    .get_default_v2_dex(self.chain_id)
+                                    .to_string()
+                            });
                         if let Some(trade) =
                             DatabaseDexTrade::from_uniswap_v2_swap(
                                 &alloy_log,
@@ -479,9 +552,12 @@ impl Rpc {
                         )
                     {
                         // For V3 swaps, use chain-specific default DEX when router not detected
-                        let v3_dex_name = router_dex_name.clone().unwrap_or_else(|| {
-                            self.dex_routers.get_default_v3_dex(self.chain_id).to_string()
-                        });
+                        let v3_dex_name =
+                            router_dex_name.clone().unwrap_or_else(|| {
+                                self.dex_routers
+                                    .get_default_v3_dex(self.chain_id)
+                                    .to_string()
+                            });
                         if let Some(trade) =
                             DatabaseDexTrade::from_uniswap_v3_swap(
                                 &alloy_log,
@@ -526,7 +602,8 @@ impl Rpc {
                         )
                     {
                         // Balancer has its own unique event, so fallback is always Balancer
-                        let balancer_dex_name = router_dex_name.clone()
+                        let balancer_dex_name = router_dex_name
+                            .clone()
                             .unwrap_or_else(|| "Balancer V2".to_string());
                         if let Some(trade) =
                             DatabaseDexTrade::from_balancer_swap(
@@ -547,7 +624,8 @@ impl Rpc {
                     if topic0
                         == Some(DODO_SWAP_EVENT_SIGNATURE.parse().unwrap())
                     {
-                        let dodo_dex_name = router_dex_name.clone()
+                        let dodo_dex_name = router_dex_name
+                            .clone()
                             .unwrap_or_else(|| "DODO".to_string());
                         if let Some(trade) =
                             DatabaseDexTrade::from_dodo_swap(
@@ -570,7 +648,8 @@ impl Rpc {
                             KYBER_SWAPPED_EVENT_SIGNATURE.parse().unwrap(),
                         )
                     {
-                        let kyber_dex_name = router_dex_name.clone()
+                        let kyber_dex_name = router_dex_name
+                            .clone()
                             .unwrap_or_else(|| "Kyber".to_string());
                         if let Some(trade) =
                             DatabaseDexTrade::from_kyber_swapped(
@@ -595,7 +674,8 @@ impl Rpc {
                                 .unwrap(),
                         )
                     {
-                        let maverick_dex_name = router_dex_name.clone()
+                        let maverick_dex_name = router_dex_name
+                            .clone()
                             .unwrap_or_else(|| "Maverick".to_string());
                         if let Some(trade) =
                             DatabaseDexTrade::from_maverick_swap_filled(
@@ -642,7 +722,8 @@ impl Rpc {
                                 .unwrap(),
                         )
                     {
-                        let traderjoe_dex_name = router_dex_name.clone()
+                        let traderjoe_dex_name = router_dex_name
+                            .clone()
                             .unwrap_or_else(|| "TraderJoe".to_string());
                         if let Some(trade) =
                             DatabaseDexTrade::from_traderjoe_lb_swap(
@@ -695,6 +776,21 @@ impl Rpc {
                     block_number,
                 );
 
+                // Collect unique token addresses for metadata fetching
+                let mut token_addresses = HashSet::new();
+                for transfer in &db_erc20_transfers {
+                    token_addresses.insert(transfer.token_address);
+                }
+                for transfer in &db_erc721_transfers {
+                    token_addresses.insert(transfer.token_address);
+                }
+                for transfer in &db_erc1155_transfers {
+                    token_addresses.insert(transfer.token_address);
+                }
+
+                let db_tokens =
+                    self.fetch_tokens_metadata(&token_addresses).await;
+
                 Some((
                     db_blocks,
                     db_transactions,
@@ -706,6 +802,7 @@ impl Rpc {
                     db_erc721_transfers,
                     db_erc1155_transfers,
                     db_dex_trades,
+                    db_tokens,
                 ))
             }
             None => None,
@@ -804,6 +901,7 @@ impl Rpc {
                                 erc721_transfers,
                                 erc1155_transfers,
                                 dex_trades,
+                                tokens,
                             )) => {
                                 let fetched_data = BlockFetchedData {
                                     blocks,
@@ -816,6 +914,7 @@ impl Rpc {
                                     erc721_transfers,
                                     erc1155_transfers,
                                     dex_trades,
+                                    tokens,
                                 };
 
                                 db.store_data(&fetched_data).await;
