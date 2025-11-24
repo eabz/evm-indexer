@@ -15,11 +15,17 @@ use crate::{
     utils::{
         dex_factories::DexRouters,
         events::{
+            BALANCER_SWAP_EVENT_SIGNATURE,
             CURVE_TOKEN_EXCHANGE_EVENT_SIGNATURE,
+            CURVE_TOKEN_EXCHANGE_UNDERLYING_EVENT_SIGNATURE,
+            DODO_SWAP_EVENT_SIGNATURE,
             ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
             ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
-            TRANSFER_EVENTS_SIGNATURE, UNISWAP_V2_SWAP_EVENT_SIGNATURE,
-            UNISWAP_V3_SWAP_EVENT_SIGNATURE,
+            KYBER_SWAPPED_EVENT_SIGNATURE,
+            MAVERICK_SWAP_FILLED_EVENT_SIGNATURE,
+            TRADERJOE_LB_SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
+            UNISWAP_V2_SWAP_EVENT_SIGNATURE,
+            UNISWAP_V3_SWAP_EVENT_SIGNATURE, WOOFI_SWAP_EVENT_SIGNATURE,
         },
     },
 };
@@ -401,16 +407,15 @@ impl Rpc {
                     let router = tx_routers.get(&log.transaction_hash);
 
                     // Detect DEX name from router address
-                    let dex_name = if let Some(router_addr) = router {
+                    let router_dex_name = if let Some(router_addr) = router {
                         self.dex_routers
                             .get_dex_from_router(
                                 self.chain_id,
                                 router_addr,
                             )
                             .map(|info| info.display_name())
-                            .unwrap_or_else(|| "Unknown DEX".to_string())
                     } else {
-                        "Unknown DEX".to_string()
+                        None
                     };
 
                     // Reconstruct alloy Log from DatabaseLog
@@ -437,7 +442,7 @@ impl Rpc {
                         removed: false,
                     };
 
-                    // Uniswap V2-style Swap (PancakeSwap, SushiSwap, QuickSwap, etc.)
+                    // Uniswap V2-style Swap (PancakeSwap, SushiSwap, QuickSwap, Solidly forks, etc.)
                     if topic0
                         == Some(
                             UNISWAP_V2_SWAP_EVENT_SIGNATURE
@@ -445,6 +450,11 @@ impl Rpc {
                                 .unwrap(),
                         )
                     {
+                        // For V2 swaps, use chain-specific default DEX when router not detected
+                        // This properly labels Solidly forks (Velodrome, Aerodrome, Thena, etc.)
+                        let v2_dex_name = router_dex_name.clone().unwrap_or_else(|| {
+                            self.dex_routers.get_default_v2_dex(self.chain_id).to_string()
+                        });
                         if let Some(trade) =
                             DatabaseDexTrade::from_uniswap_v2_swap(
                                 &alloy_log,
@@ -453,14 +463,14 @@ impl Rpc {
                                 log.timestamp,
                                 log.transaction_hash,
                                 log.log_index,
-                                dex_name.clone(),
+                                v2_dex_name,
                             )
                         {
                             db_dex_trades.push(trade);
                         }
                     }
 
-                    // Uniswap V3-style Swap (PancakeSwap V3, etc.)
+                    // Uniswap V3-style Swap (PancakeSwap V3, Algebra forks, etc.)
                     if topic0
                         == Some(
                             UNISWAP_V3_SWAP_EVENT_SIGNATURE
@@ -468,6 +478,10 @@ impl Rpc {
                                 .unwrap(),
                         )
                     {
+                        // For V3 swaps, use chain-specific default DEX when router not detected
+                        let v3_dex_name = router_dex_name.clone().unwrap_or_else(|| {
+                            self.dex_routers.get_default_v3_dex(self.chain_id).to_string()
+                        });
                         if let Some(trade) =
                             DatabaseDexTrade::from_uniswap_v3_swap(
                                 &alloy_log,
@@ -476,7 +490,7 @@ impl Rpc {
                                 log.timestamp,
                                 log.transaction_hash,
                                 log.log_index,
-                                dex_name.clone(),
+                                v3_dex_name,
                             )
                         {
                             db_dex_trades.push(trade);
@@ -493,6 +507,166 @@ impl Rpc {
                     {
                         if let Some(trade) =
                             DatabaseDexTrade::from_curve_token_exchange(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Balancer Swap
+                    if topic0
+                        == Some(
+                            BALANCER_SWAP_EVENT_SIGNATURE.parse().unwrap(),
+                        )
+                    {
+                        // Balancer has its own unique event, so fallback is always Balancer
+                        let balancer_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "Balancer V2".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_balancer_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                balancer_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // DODO Swap
+                    if topic0
+                        == Some(DODO_SWAP_EVENT_SIGNATURE.parse().unwrap())
+                    {
+                        let dodo_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "DODO".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_dodo_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                dodo_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Kyber Swapped
+                    if topic0
+                        == Some(
+                            KYBER_SWAPPED_EVENT_SIGNATURE.parse().unwrap(),
+                        )
+                    {
+                        let kyber_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "Kyber".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_kyber_swapped(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                kyber_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Maverick SwapFilled
+                    if topic0
+                        == Some(
+                            MAVERICK_SWAP_FILLED_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        let maverick_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "Maverick".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_maverick_swap_filled(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                maverick_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Curve TokenExchangeUnderlying (meta pools)
+                    if topic0
+                        == Some(
+                            CURVE_TOKEN_EXCHANGE_UNDERLYING_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_curve_token_exchange_underlying(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // TraderJoe V2.1 LB Swap
+                    if topic0
+                        == Some(
+                            TRADERJOE_LB_SWAP_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        let traderjoe_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "TraderJoe".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_traderjoe_lb_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                traderjoe_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // WooFi WooSwap
+                    if topic0
+                        == Some(
+                            WOOFI_SWAP_EVENT_SIGNATURE.parse().unwrap(),
+                        )
+                    {
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_woofi_swap(
                                 &alloy_log,
                                 self.chain_id,
                                 log.block_number,
@@ -589,40 +763,80 @@ impl Rpc {
                 let rpc = self.clone();
                 let db = db.clone();
                 let block = block.clone();
+                let supports_receipts = ws_supports_block_receipts;
                 async move {
                     let block_number = block.header.number.unwrap() as u32;
 
-                    info!("New head found {}.", block_number.clone());
+                    info!("New head found {}.", block_number);
 
-                    let block_data = rpc.fetch_block(&block_number).await;
+                    // Use websocket capability detection to optimize trace fetching
+                    let mut rpc_with_ws_capability = rpc.clone();
+                    rpc_with_ws_capability.supports_blocks_receipts =
+                        supports_receipts;
 
-                    if let Some((
-                        blocks,
-                        transactions,
-                        logs,
-                        contracts,
-                        traces,
-                        withdrawals,
-                        erc20_transfers,
-                        erc721_transfers,
-                        erc1155_transfers,
-                        dex_trades,
-                    )) = block_data
-                    {
-                        let fetched_data = BlockFetchedData {
-                            blocks,
-                            contracts,
-                            logs,
-                            traces,
-                            transactions,
-                            withdrawals,
-                            erc20_transfers,
-                            erc721_transfers,
-                            erc1155_transfers,
-                            dex_trades,
-                        };
+                    // Retry logic for new heads - RPC may not have synced yet
+                    let max_retries = 10;
+                    let mut retry_delay =
+                        std::time::Duration::from_millis(100);
 
-                        db.store_data(&fetched_data).await;
+                    for attempt in 1..=max_retries {
+                        // Small delay before first attempt to let RPC sync
+                        if attempt == 1 {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(50),
+                            )
+                            .await;
+                        }
+
+                        let block_data = rpc_with_ws_capability
+                            .fetch_block(&block_number)
+                            .await;
+
+                        match block_data {
+                            Some((
+                                blocks,
+                                transactions,
+                                logs,
+                                contracts,
+                                traces,
+                                withdrawals,
+                                erc20_transfers,
+                                erc721_transfers,
+                                erc1155_transfers,
+                                dex_trades,
+                            )) => {
+                                let fetched_data = BlockFetchedData {
+                                    blocks,
+                                    contracts,
+                                    logs,
+                                    traces,
+                                    transactions,
+                                    withdrawals,
+                                    erc20_transfers,
+                                    erc721_transfers,
+                                    erc1155_transfers,
+                                    dex_trades,
+                                };
+
+                                db.store_data(&fetched_data).await;
+                                break;
+                            }
+                            None => {
+                                if attempt < max_retries {
+                                    debug!(
+                                        "Failed to fetch new head {} (attempt {}/{}), retrying in {:?}",
+                                        block_number, attempt, max_retries, retry_delay
+                                    );
+                                    tokio::time::sleep(retry_delay).await;
+                                    retry_delay *= 2; // Exponential backoff
+                                } else {
+                                    error!(
+                                        "Failed to fetch new head {} after {} attempts, block will be picked up by indexer later",
+                                        block_number, max_retries
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             });

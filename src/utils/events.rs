@@ -20,3 +20,32 @@ pub const UNISWAP_V3_SWAP_EVENT_SIGNATURE: &str =
 // Curve TokenExchange: TokenExchange(address indexed buyer, uint256 sold_id, uint256 tokens_sold, uint256 bought_id, uint256 tokens_bought)
 pub const CURVE_TOKEN_EXCHANGE_EVENT_SIGNATURE: &str =
     "0x8b3e96f2b38596c00065310677151151122ba8153782eeec1e3567cc2a8f3b8b";
+
+// Curve TokenExchangeUnderlying: TokenExchangeUnderlying(address indexed buyer, int128 sold_id, uint256 tokens_sold, int128 bought_id, uint256 tokens_bought)
+// Used for meta pools to swap underlying tokens directly
+pub const CURVE_TOKEN_EXCHANGE_UNDERLYING_EVENT_SIGNATURE: &str =
+    "0xd013ca23e77a65003c2c659c5442c00c805371b7fc1ebd4c206c41d1536bd90b";
+
+// Balancer V2 Swap: Swap(bytes32 indexed poolId, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut)
+pub const BALANCER_SWAP_EVENT_SIGNATURE: &str =
+    "0x908fb5ee0f4747fbf483d1ff1405d916f86720130038586180403d7e46b6b5f8";
+
+// DODO Swap: Swap(address indexed sender, address indexed receiver, address tokenB, address tokenQuote, uint256 payQuote, uint256 receiveBase)
+pub const DODO_SWAP_EVENT_SIGNATURE: &str =
+    "0xc2c0b5e1ab1ec6b34b26ff79c0e1be2fdc89c4ed0cf2cc9e906f986de7ded41f";
+
+// Kyber Swapped: Swapped(bytes32 indexed pool, address indexed router, address indexed token0, address indexed token1, int256 delta0, int256 delta1)
+pub const KYBER_SWAPPED_EVENT_SIGNATURE: &str =
+    "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496";
+
+// Maverick SwapFilled: SwapFilled(address indexed recipient, uint256 amountAIn, uint256 amountBIn, uint256 amountAOut, uint256 amountBOut)
+pub const MAVERICK_SWAP_FILLED_EVENT_SIGNATURE: &str =
+    "0xdb5f3876bb8b6c00fb1a4c32c5947c5ad45a70c07d30a1a3fd90f3ad8dd86c3f";
+
+// TraderJoe V2.1 LB Swap: Swap(address indexed sender, address indexed to, uint24 id, bytes32 amountsIn, bytes32 amountsOut)
+pub const TRADERJOE_LB_SWAP_EVENT_SIGNATURE: &str =
+    "0xad7d6f97abf51ce18e17a38f4d70e975be9c0708474987bb3e26ad21bd93ca70";
+
+// WooFi WooSwap: WooSwap(address indexed from, address indexed to, address fromToken, address toToken, uint256 fromAmount, uint256 toAmount, address rebateTo)
+pub const WOOFI_SWAP_EVENT_SIGNATURE: &str =
+    "0x74ef34e2ea7c5d9f7b7ed44e97ad44b4303416c3a660c3fb5b3bdb95a1d6abd3";

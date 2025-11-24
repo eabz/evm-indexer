@@ -35,10 +35,10 @@ services:
       indexer
       --chain 1
       --database clickhouse://indexer:indexer@clickhouse:8123/indexer
-      --rpcs https://long-late-firefly.quiknode.pro/4bb1e6b2dec8294938b6fdfdb7cf0cf70c4e97a2/
+      --rpcs https://eth.llamarpc.com,https://rpc.ankr.com/eth,https://cloudflare-eth.com
       --ws wss://long-late-firefly.quiknode.pro/4bb1e6b2dec8294938b6fdfdb7cf0cf70c4e97a2/
       --start-block 15000000
-      --batch-size 200
+      --batch-size 10
     networks:
       - indexer-network
     restart: unless-stopped

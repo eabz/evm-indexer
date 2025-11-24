@@ -282,8 +282,13 @@ impl Database {
         T: Serialize,
         for<'a> T: Row<Value<'a> = T>,
     {
+        if items.is_empty() {
+            return;
+        }
+
         let mut inserter = self.db.insert::<T>(table).await.unwrap();
 
+        // Write all items - ClickHouse client handles batching internally
         for item in items {
             inserter.write(item).await.unwrap();
         }

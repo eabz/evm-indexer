@@ -94,58 +94,28 @@ impl DexRouters {
             DexInfo { name: "Curve", version: "3Crv" },
         );
 
-        // Aave Flashloan Router
-        eth_routers.insert(
-            "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9".parse().unwrap(),
-            DexInfo { name: "Aave", version: "V2" },
-        );
-
-        // Compound
-        eth_routers.insert(
-            "0x3d9819210A31b4961b30EF54bE2aeB56B84ee3a0".parse().unwrap(),
-            DexInfo { name: "Compound", version: "V2" },
-        );
-
-        // Yearn
-        eth_routers.insert(
-            "0x19D3364A9d1d463b7d7C6f95bcF2F7F482E2eBB1".parse().unwrap(),
-            DexInfo { name: "Yearn", version: "V2" },
-        );
-
-        // Lido
-        eth_routers.insert(
-            "0xae7ab96520DE3a18E5e111B5EaAc1417064f0C31".parse().unwrap(),
-            DexInfo { name: "Lido", version: "stETH" },
-        );
-
-        // Paraswap
-        eth_routers.insert(
-            "0x216B4B4ba9F3E719726886d346f1D6C3644QA8".parse().unwrap(),
-            DexInfo { name: "ParaSwap", version: "V5" },
-        );
-
-        // OpenOcean
-        eth_routers.insert(
-            "0x6352a56caadc4f1e25cd6c75970fa768a3aaf514".parse().unwrap(),
-            DexInfo { name: "OpenOcean", version: "" },
-        );
-
         // Kyber
         eth_routers.insert(
             "0x1c87257F5e8609940Bc751a07BB085Bb7Fed0c64".parse().unwrap(),
             DexInfo { name: "Kyber", version: "V3" },
         );
 
-        // CoW Protocol
+        // WooFi on Ethereum
         eth_routers.insert(
-            "0x9008D19f58AAbD9eD0D60971565AA15BAa120Ff2".parse().unwrap(),
-            DexInfo { name: "CoW Protocol", version: "V2" },
+            "0xC90bFE9951a4Efbf20aCa5ECd9966b2bF8A01294".parse().unwrap(),
+            DexInfo { name: "WooFi", version: "" },
         );
 
-        // Matcha / 0x
+        // Fraxswap
         eth_routers.insert(
-            "0x6000da47483062A0D734Ba3dc87f17aA63c1e16F".parse().unwrap(),
-            DexInfo { name: "Matcha", version: "V1" },
+            "0xC14d550632db8592D1243Edc8B95b0Ad06703867".parse().unwrap(),
+            DexInfo { name: "Fraxswap", version: "" },
+        );
+
+        // Shibaswap
+        eth_routers.insert(
+            "0x03f7724180AA6b939894B5Ca4314783B0b36b329".parse().unwrap(),
+            DexInfo { name: "ShibaSwap", version: "" },
         );
 
         routers.insert(1, eth_routers);
@@ -233,80 +203,29 @@ impl DexRouters {
             DexInfo { name: "Ellipsis", version: "" },
         );
 
+        // Thena (Solidly fork on BSC)
+        bsc_routers.insert(
+            "0xd4ae6eCA985340Dd434D38F470aCCce4DC78D109".parse().unwrap(),
+            DexInfo { name: "Thena", version: "V1" },
+        );
+        bsc_routers.insert(
+            "0x327Dd3208f0bCF590A66110aCB6e5e6941A4EfA0".parse().unwrap(),
+            DexInfo { name: "Thena", version: "Fusion" },
+        );
+
+        // WooFi on BSC
+        bsc_routers.insert(
+            "0x4f4Fd4290c9bB49764701803AF6445c5b03E8f06".parse().unwrap(),
+            DexInfo { name: "WooFi", version: "" },
+        );
+
+        // iZiSwap on BSC
+        bsc_routers.insert(
+            "0xBd3bd95529e0784aD973FD14928eEDF3678cfad8".parse().unwrap(),
+            DexInfo { name: "iZiSwap", version: "" },
+        );
+
         routers.insert(56, bsc_routers);
-
-        // ========== Polygon (chain_id: 137) ==========
-        let mut polygon_routers = HashMap::new();
-
-        // Uniswap on Polygon
-        polygon_routers.insert(
-            "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
-            DexInfo { name: "Uniswap", version: "V3" },
-        );
-        polygon_routers.insert(
-            "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45".parse().unwrap(),
-            DexInfo { name: "Uniswap", version: "V3" },
-        );
-
-        // SushiSwap on Polygon
-        polygon_routers.insert(
-            "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506".parse().unwrap(),
-            DexInfo { name: "SushiSwap", version: "V2" },
-        );
-
-        // QuickSwap
-        polygon_routers.insert(
-            "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff".parse().unwrap(),
-            DexInfo { name: "QuickSwap", version: "V2" },
-        );
-        polygon_routers.insert(
-            "0xf5b509bB0909a69B1c207E495f687a596C168E12".parse().unwrap(),
-            DexInfo { name: "QuickSwap", version: "V3" },
-        );
-
-        // Balancer on Polygon
-        polygon_routers.insert(
-            "0xBA12222222228d8Ba445958a75a0704d566BF2C8".parse().unwrap(),
-            DexInfo { name: "Balancer", version: "V2" },
-        );
-
-        // Curve on Polygon
-        polygon_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Curve", version: "V1" },
-        );
-
-        // Aave on Polygon
-        polygon_routers.insert(
-            "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9".parse().unwrap(),
-            DexInfo { name: "Aave", version: "V3" },
-        );
-
-        // Wmatic Staking
-        polygon_routers.insert(
-            "0x5f3Dc4Cc9f4FfB386d925B51b10b33B64000FC91".parse().unwrap(),
-            DexInfo { name: "PoS Portal", version: "Wmatic" },
-        );
-
-        // Polycat Finance
-        polygon_routers.insert(
-            "0x1E4F97b9f9F913EA8ee06f7D93a2D3A0Cc8EB2FC".parse().unwrap(),
-            DexInfo { name: "Polycat", version: "" },
-        );
-
-        // Dfyn
-        polygon_routers.insert(
-            "0xA102072A7FD54eD864e64e75ec46F7C62c03a72b".parse().unwrap(),
-            DexInfo { name: "Dfyn", version: "" },
-        );
-
-        // Matic Network
-        polygon_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Matic", version: "Network" },
-        );
-
-        routers.insert(137, polygon_routers);
 
         // ========== Arbitrum (chain_id: 42161) ==========
         let mut arbitrum_routers = HashMap::new();
@@ -349,34 +268,16 @@ impl DexRouters {
             DexInfo { name: "TraderJoe", version: "V2" },
         );
 
-        // Curve on Arbitrum
-        arbitrum_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Curve", version: "V1" },
-        );
-
         // DODO V2 on Arbitrum
         arbitrum_routers.insert(
             "0x88d7D573Ae20f34384D50fa5f1d2ff1E441667e2".parse().unwrap(),
             DexInfo { name: "DODO", version: "V2" },
         );
 
-        // Aave on Arbitrum
+        // Aave on Arbitrum (lending protocol, not DEX swap)
         arbitrum_routers.insert(
             "0x794a61358D6845594F94dc1DB02A252b5b4814aD".parse().unwrap(),
             DexInfo { name: "Aave", version: "V3" },
-        );
-
-        // Compound on Arbitrum
-        arbitrum_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Compound", version: "V3" },
-        );
-
-        // Yearn on Arbitrum
-        arbitrum_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Yearn", version: "V2" },
         );
 
         // GMX
@@ -397,6 +298,28 @@ impl DexRouters {
             DexInfo { name: "Gains Network", version: "" },
         );
 
+        // Ramses (Solidly fork on Arbitrum)
+        arbitrum_routers.insert(
+            "0xAAA87963EFeB6f7E0a2711F397663105Acb1805e".parse().unwrap(),
+            DexInfo { name: "Ramses", version: "V1" },
+        );
+        arbitrum_routers.insert(
+            "0xAA23611badAFB62D37E7295A682D21960ac85A90".parse().unwrap(),
+            DexInfo { name: "Ramses", version: "V2" },
+        );
+
+        // WooFi on Arbitrum
+        arbitrum_routers.insert(
+            "0x9aEd3A8896A85FE9a8CAc52C9B402D092B629a30".parse().unwrap(),
+            DexInfo { name: "WooFi", version: "" },
+        );
+
+        // Zyberswap (Algebra fork)
+        arbitrum_routers.insert(
+            "0x16e71B13fE6079B4312063F7E81F76d165Ad32Ad".parse().unwrap(),
+            DexInfo { name: "Zyberswap", version: "" },
+        );
+
         routers.insert(42161, arbitrum_routers);
 
         // ========== Optimism (chain_id: 10) ==========
@@ -412,10 +335,21 @@ impl DexRouters {
             DexInfo { name: "Uniswap", version: "V3" },
         );
 
-        // Velodrome
+        // Velodrome V1
         optimism_routers.insert(
             "0x9c12939334C3742416f400C3793D6d271Fd3666f".parse().unwrap(),
+            DexInfo { name: "Velodrome", version: "V1" },
+        );
+        // Velodrome V2
+        optimism_routers.insert(
+            "0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858".parse().unwrap(),
             DexInfo { name: "Velodrome", version: "V2" },
+        );
+
+        // WooFi on Optimism
+        optimism_routers.insert(
+            "0x4c4AF8DBc524681930a27b2F1Af5bcC8062E6fB7".parse().unwrap(),
+            DexInfo { name: "WooFi", version: "" },
         );
 
         // SushiSwap on Optimism
@@ -430,22 +364,10 @@ impl DexRouters {
             DexInfo { name: "Balancer", version: "V2" },
         );
 
-        // Curve on Optimism
-        optimism_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Curve", version: "V1" },
-        );
-
-        // Aave on Optimism
+        // Aave on Optimism (lending protocol, not DEX swap)
         optimism_routers.insert(
             "0x794a61358D6845594F94dc1DB02A252b5b4814aD".parse().unwrap(),
             DexInfo { name: "Aave", version: "V3" },
-        );
-
-        // Compound on Optimism
-        optimism_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Compound", version: "V3" },
         );
 
         // 1inch on Optimism
@@ -456,7 +378,7 @@ impl DexRouters {
 
         // Synthetix
         optimism_routers.insert(
-            "0x2e5dB100552b932b299c3zc3b0253481fFEbA513".parse().unwrap(),
+            "0x2e5dB100552b932b299c3cc3b0253481fFEbA513".parse().unwrap(),
             DexInfo { name: "Synthetix", version: "" },
         );
 
@@ -481,10 +403,27 @@ impl DexRouters {
             DexInfo { name: "Uniswap", version: "V3" },
         );
 
-        // Aerodrome
+        // Aerodrome V1
         base_routers.insert(
             "0xcF77a3ba9A5CA399B7c97c74d54e5b1Beb874e43".parse().unwrap(),
+            DexInfo { name: "Aerodrome", version: "V1" },
+        );
+        // Aerodrome V2
+        base_routers.insert(
+            "0x6Cb442acF35158D5eDa88fe602221b67B400Be3E".parse().unwrap(),
             DexInfo { name: "Aerodrome", version: "V2" },
+        );
+
+        // WooFi on Base
+        base_routers.insert(
+            "0x27425e9FB6A9A625E8484CFD9620b259571F6E57".parse().unwrap(),
+            DexInfo { name: "WooFi", version: "" },
+        );
+
+        // Alien Base
+        base_routers.insert(
+            "0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7".parse().unwrap(),
+            DexInfo { name: "AlienBase", version: "" },
         );
 
         // SushiSwap on Base
@@ -499,28 +438,16 @@ impl DexRouters {
             DexInfo { name: "BaseSwap", version: "" },
         );
 
-        // Curve on Base
-        base_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Curve", version: "V1" },
-        );
-
         // DODO V2 on Base
         base_routers.insert(
             "0x6B0431840294e53f1991bF8051413d90b8692CCb".parse().unwrap(),
             DexInfo { name: "DODO", version: "V2" },
         );
 
-        // Aave on Base
+        // Aave on Base (lending protocol, not DEX swap)
         base_routers.insert(
             "0x794a61358D6845594F94dc1DB02A252b5b4814aD".parse().unwrap(),
             DexInfo { name: "Aave", version: "V3" },
-        );
-
-        // Compound on Base
-        base_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Compound", version: "V3" },
         );
 
         // Balancer on Base
@@ -568,28 +495,16 @@ impl DexRouters {
             DexInfo { name: "SushiSwap", version: "V2" },
         );
 
-        // Curve on Avalanche
-        avalanche_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Curve", version: "V1" },
-        );
-
         // DODO V2 on Avalanche
         avalanche_routers.insert(
             "0xb27682b145913e06bdb3d379762cf87e80e3c6e3".parse().unwrap(),
             DexInfo { name: "DODO", version: "V2" },
         );
 
-        // Aave on Avalanche
+        // Aave on Avalanche (lending protocol, not DEX swap)
         avalanche_routers.insert(
             "0x794a61358D6845594F94dc1DB02A252b5b4814aD".parse().unwrap(),
             DexInfo { name: "Aave", version: "V3" },
-        );
-
-        // Compound on Avalanche
-        avalanche_routers.insert(
-            "0x0000000000000000000000000000000000000000".parse().unwrap(),
-            DexInfo { name: "Compound", version: "V3" },
         );
 
         // 1inch on Avalanche
@@ -616,6 +531,18 @@ impl DexRouters {
             DexInfo { name: "Teddy", version: "" },
         );
 
+        // WooFi on Avalanche
+        avalanche_routers.insert(
+            "0xC22FBb3133dF781E6C25ea6acebe2D2Bb8CeA2f9".parse().unwrap(),
+            DexInfo { name: "WooFi", version: "" },
+        );
+
+        // Pharaoh (Solidly fork on Avalanche)
+        avalanche_routers.insert(
+            "0xAAAE99091Fbb28D400029052821653c1C752483B".parse().unwrap(),
+            DexInfo { name: "Pharaoh", version: "" },
+        );
+
         routers.insert(43114, avalanche_routers);
 
         Self { routers }
@@ -630,6 +557,37 @@ impl DexRouters {
         self.routers
             .get(&chain_id)
             .and_then(|chain_routers| chain_routers.get(router))
+    }
+
+    /// Get the dominant V2-style DEX for a chain when router detection fails
+    /// This helps properly label Solidly forks (Velodrome, Aerodrome, Thena, etc.)
+    /// which emit the same Swap event signature as Uniswap V2
+    pub fn get_default_v2_dex(&self, chain_id: u64) -> &'static str {
+        match chain_id {
+            1 => "Uniswap V2",           // Ethereum - Uniswap V2 dominant
+            56 => "PancakeSwap V2",      // BSC - PancakeSwap dominant
+            42161 => "Camelot",          // Arbitrum - Camelot/Ramses both popular, Camelot more common
+            10 => "Velodrome",           // Optimism - Velodrome dominant
+            8453 => "Aerodrome",         // Base - Aerodrome dominant
+            43114 => "TraderJoe",        // Avalanche - TraderJoe dominant
+            137 => "QuickSwap",          // Polygon - QuickSwap dominant
+            250 => "SpookySwap",         // Fantom - SpookySwap dominant
+            _ => "DEX V2",               // Generic fallback
+        }
+    }
+
+    /// Get the dominant V3-style DEX for a chain when router detection fails
+    pub fn get_default_v3_dex(&self, chain_id: u64) -> &'static str {
+        match chain_id {
+            1 => "Uniswap V3",           // Ethereum
+            56 => "PancakeSwap V3",      // BSC
+            42161 => "Uniswap V3",       // Arbitrum
+            10 => "Uniswap V3",          // Optimism
+            8453 => "Uniswap V3",        // Base
+            43114 => "Uniswap V3",       // Avalanche
+            137 => "Uniswap V3",         // Polygon
+            _ => "DEX V3",               // Generic fallback
+        }
     }
 }
 
