@@ -23,18 +23,11 @@ async fn main() {
 
     info!("Starting EVM Indexer.");
 
-    info!("Syncing {}.", config.chain.name);
+    info!("Syncing chain id {}.", config.chain_id);
 
     let rpc = Rpc::new(&config).await;
 
-    let db = Database::new(
-        config.db_host.clone(),
-        config.db_username.clone(),
-        config.db_password.clone(),
-        config.db_name.clone(),
-        config.chain.clone(),
-    )
-    .await;
+    let db = Database::new(&config.database_url, config.chain_id).await;
 
     if config.ws_url.is_some() && config.end_block == 0
         || config.end_block == -1
@@ -94,7 +87,7 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
         let mut work = vec![];
 
         for block_number in missing_blocks_chunk {
-            work.push(rpc.fetch_block(block_number, &config.chain))
+            work.push(rpc.fetch_block(block_number))
         }
 
         let results = join_all(work).await;
@@ -109,6 +102,7 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
             erc20_transfers: Vec::new(),
             erc721_transfers: Vec::new(),
             erc1155_transfers: Vec::new(),
+            dex_trades: Vec::new(),
         };
 
         for result in results {
@@ -123,6 +117,7 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
                     mut erc20_transfers,
                     mut erc721_transfers,
                     mut erc1155_transfers,
+                    mut dex_trades,
                 )) => {
                     fetched_data.blocks.append(&mut blocks);
                     fetched_data.transactions.append(&mut transactions);
@@ -139,6 +134,7 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
                     fetched_data
                         .erc1155_transfers
                         .append(&mut erc1155_transfers);
+                    fetched_data.dex_trades.append(&mut dex_trades);
                 }
                 None => continue,
             }

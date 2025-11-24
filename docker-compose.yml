@@ -1,0 +1,52 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: evm-indexer-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    environment:
+      CLICKHOUSE_DB: indexer
+      CLICKHOUSE_USER: indexer
+      CLICKHOUSE_PASSWORD: indexer
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - indexer-network
+
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: evm-indexer
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info
+    command: >
+      indexer
+      --chain 1
+      --database clickhouse://indexer:indexer@clickhouse:8123/indexer
+      --rpcs https://0xrpc.io/eth
+      --ws wss://0xrpc.io/eth
+      --start-block 15000000
+      --batch-size 10
+    networks:
+      - indexer-network
+    restart: unless-stopped
+
+volumes:
+  clickhouse_data:
+    driver: local
+
+networks:
+  indexer-network:
+    driver: bridge

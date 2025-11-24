@@ -1,92 +1,78 @@
 use crate::{
-    chains::Chain,
     configs::Config,
     db::{
         models::{
-            block::DatabaseBlock,
-            contract::DatabaseContract,
+            block::DatabaseBlock, contract::DatabaseContract,
+            dex_trade::DatabaseDexTrade,
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
-            erc721_transfer::DatabaseERC721Transfer,
-            log::DatabaseLog,
-            trace::{DatabaseTrace, TraceType},
-            transaction::DatabaseTransaction,
+            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
+            trace::DatabaseTrace, transaction::DatabaseTransaction,
             withdrawal::DatabaseWithdrawal,
         },
         BlockFetchedData, Database,
     },
     utils::{
+        dex_factories::DexRouters,
         events::{
+            BALANCER_SWAP_EVENT_SIGNATURE,
+            CURVE_TOKEN_EXCHANGE_EVENT_SIGNATURE,
+            CURVE_TOKEN_EXCHANGE_UNDERLYING_EVENT_SIGNATURE,
+            DODO_SWAP_EVENT_SIGNATURE,
             ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
             ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
-            TRANSFER_EVENTS_SIGNATURE,
+            KYBER_SWAPPED_EVENT_SIGNATURE,
+            MAVERICK_SWAP_FILLED_EVENT_SIGNATURE,
+            TRADERJOE_LB_SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
+            UNISWAP_V2_SWAP_EVENT_SIGNATURE,
+            UNISWAP_V3_SWAP_EVENT_SIGNATURE, WOOFI_SWAP_EVENT_SIGNATURE,
         },
-        format::{decode_bytes, format_hash},
     },
 };
-use ethabi::ParamType;
-use ethers::{
-    abi::ethabi,
-    types::{Block, Trace, Transaction, TransactionReceipt, TxHash},
+use alloy::primitives::{Address, B256};
+use alloy::providers::{
+    Provider, ProviderBuilder, RootProvider, WsConnect,
 };
-use primitive_types::U256;
-
-use jsonrpsee::{
-    core::{
-        client::{ClientT, Subscription, SubscriptionClientT},
-        rpc_params,
-    },
-    tracing::debug,
+use alloy::rpc::types::{
+    BlockNumberOrTag, BlockTransactions, Transaction, TransactionReceipt,
 };
-use jsonrpsee_http_client::{
-    transport::HttpBackend, HttpClient, HttpClientBuilder,
-};
-use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
-
-use log::{info, warn};
+use alloy::transports::http::Http;
+use alloy_rpc_types_trace::parity::LocalizedTransactionTrace as Trace;
+use futures::StreamExt;
+use log::{debug, error, info, warn};
 use rand::seq::SliceRandom;
-use std::{collections::HashMap, time::Duration};
-use tokio::time::sleep;
+use reqwest::Client;
+use std::collections::HashMap;
+use url::Url;
 
-use serde_json::Error;
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Rpc {
-    pub chain: Chain,
-    pub clients: Vec<HttpClient<HttpBackend>>,
+    pub chain_id: u64,
+    pub clients: Vec<RootProvider<Http<Client>>>,
     pub clients_urls: Vec<String>,
     pub ws_url: Option<String>,
     pub traces: bool,
+    pub supports_blocks_receipts: bool,
+    pub fetch_uncles: bool,
+    pub dex_routers: DexRouters,
 }
 
 impl Rpc {
     pub async fn new(config: &Config) -> Self {
         info!("Starting rpc service");
 
-        let timeout = Duration::from_secs(60);
-
         let mut clients = Vec::new();
         let mut clients_urls = Vec::new();
 
         for rpc in config.rpcs.iter() {
-            let client = HttpClientBuilder::default()
-                .max_concurrent_requests(100000)
-                .request_timeout(timeout)
-                .build(rpc)
-                .unwrap();
+            let url = Url::parse(rpc).expect("Invalid RPC URL");
+            let client = ProviderBuilder::new().on_http(url);
 
-            let client_id =
-                client.request("eth_chainId", rpc_params![]).await;
+            let chain_id = client.get_chain_id().await;
 
-            match client_id {
-                Ok(value) => {
-                    let chain_id: U256 =
-                        match serde_json::from_value(value) {
-                            Ok(value) => value,
-                            Err(_) => continue,
-                        };
-
-                    if chain_id.as_u64() != config.chain.id {
+            match chain_id {
+                Ok(id) => {
+                    if id != config.chain_id {
                         continue;
                     }
 
@@ -101,38 +87,63 @@ impl Rpc {
             panic!("No valid rpc client found");
         }
 
-        Self {
-            chain: config.chain.clone(),
+        let mut rpc = Self {
+            chain_id: config.chain_id,
             clients,
             clients_urls,
             ws_url: config.ws_url.clone(),
             traces: config.traces,
+            supports_blocks_receipts: false,
+            fetch_uncles: config.fetch_uncles,
+            dex_routers: DexRouters::new(),
+        };
+
+        rpc.detect_capabilities().await;
+
+        rpc
+    }
+
+    async fn detect_capabilities(&mut self) {
+        info!("Detecting RPC capabilities for chain {}", self.chain_id);
+        let start = std::time::Instant::now();
+
+        let client = self.get_client();
+        let latest_block = client.get_block_number().await;
+
+        if let Ok(block_number) = latest_block {
+            let receipts = client
+                .raw_request::<_, Vec<serde_json::Value>>(
+                    "eth_getBlockReceipts".into(),
+                    [format!("0x{:x}", block_number)],
+                )
+                .await;
+
+            self.supports_blocks_receipts = receipts.is_ok();
+
+            let elapsed = start.elapsed();
+            info!(
+                "RPC capability detection completed in {:.2}s: eth_getBlockReceipts={}",
+                elapsed.as_secs_f64(),
+                self.supports_blocks_receipts
+            );
+        } else {
+            warn!("Failed to detect RPC capabilities: unable to get latest block");
         }
     }
 
     pub async fn get_last_block(&self) -> u32 {
+        debug!("Fetching latest block number for chain {}", self.chain_id);
         let client = self.get_client();
 
-        let last_block =
-            client.request("eth_blockNumber", rpc_params![]).await;
-
-        match last_block {
-            Ok(value) => {
-                let block_number: U256 = serde_json::from_value(value)
-                    .expect(
-                        "Unable to deserialize eth_blockNumber response",
-                    );
-
-                block_number.as_usize() as u32
-            }
-            Err(_) => 0,
-        }
+        let block = client.get_block_number().await.unwrap();
+        let block_number = block.try_into().unwrap();
+        debug!("Latest block: {}", block_number);
+        block_number
     }
 
     pub async fn fetch_block(
         &self,
         block_number: &u32,
-        chain: &Chain,
     ) -> Option<(
         Vec<DatabaseBlock>,
         Vec<DatabaseTransaction>,
@@ -143,6 +154,7 @@ impl Rpc {
         Vec<DatabaseERC20Transfer>,
         Vec<DatabaseERC721Transfer>,
         Vec<DatabaseERC1155Transfer>,
+        Vec<DatabaseDexTrade>,
     )> {
         let block_data = self.get_block(block_number).await;
 
@@ -158,32 +170,33 @@ impl Rpc {
         match block_data {
             Some((
                 db_block,
-                mut db_transactions,
+                raw_transactions,
                 db_withdrawals,
                 mut block_uncles,
             )) => {
-                let total_block_transactions = db_transactions.len();
+                let total_block_transactions = raw_transactions.len();
 
                 // Make sure all the transactions are correctly formatted.
                 if db_block.transactions != total_block_transactions as u16
                 {
                     warn!(
-                        "Missing {} transactions for block {}.",
+                        "Missing {} transactions for block {}. Actual: {}",
                         db_block.transactions
                             - total_block_transactions as u16,
-                        db_block.number
+                        db_block.number,
+                        total_block_transactions
                     );
                     return None;
                 }
 
-                let mut db_receipts: HashMap<String, TransactionReceipt> =
-                    HashMap::new();
+                let mut db_receipts: HashMap<B256, TransactionReceipt> =
+                    HashMap::with_capacity(total_block_transactions);
 
                 let mut db_logs: Vec<DatabaseLog> = Vec::new();
-                let mut contracts_map: HashMap<String, DatabaseContract> =
+                let mut contracts_map: HashMap<Address, DatabaseContract> =
                     HashMap::new();
 
-                if chain.supports_blocks_receipts {
+                if self.supports_blocks_receipts {
                     let receipts_data = self
                         .get_block_receipts(
                             block_number,
@@ -195,26 +208,26 @@ impl Rpc {
                         Some((receipts, mut logs, contracts)) => {
                             for receipt in receipts {
                                 db_receipts.insert(
-                                    format_hash(receipt.transaction_hash),
+                                    receipt.transaction_hash,
                                     receipt,
                                 );
                             }
                             db_logs.append(&mut logs);
                             for contract in contracts {
                                 contracts_map.insert(
-                                    contract.contract_address.clone(),
-                                    contract.clone(),
+                                    contract.contract_address,
+                                    contract,
                                 );
                             }
                         }
                         None => return None,
                     }
                 } else {
-                    for transaction in db_transactions.iter() {
+                    for transaction in raw_transactions.iter() {
                         let receipt_data = self
                             .get_transaction_receipt(
-                                transaction.hash.clone(),
-                                transaction.timestamp,
+                                transaction.hash,
+                                db_block.timestamp,
                                 block_number,
                             )
                             .await;
@@ -222,20 +235,15 @@ impl Rpc {
                         match receipt_data {
                             Some((receipt, mut logs, contract)) => {
                                 db_receipts.insert(
-                                    format_hash(receipt.transaction_hash),
+                                    receipt.transaction_hash,
                                     receipt,
                                 );
                                 db_logs.append(&mut logs);
-                                match contract {
-                                    Some(contract) => {
-                                        contracts_map.insert(
-                                            contract
-                                                .contract_address
-                                                .clone(),
-                                            contract.clone(),
-                                        );
-                                    }
-                                    None => continue,
+                                if let Some(contract) = contract {
+                                    contracts_map.insert(
+                                        contract.contract_address,
+                                        contract,
+                                    );
                                 }
                             }
                             None => continue,
@@ -253,16 +261,23 @@ impl Rpc {
                     return None;
                 }
 
-                // TODO: add receipt data to transactions
-                for transaction in db_transactions.iter_mut() {
+                // Re-create db_transactions with receipt data
+                let mut db_transactions = Vec::new();
+
+                for transaction in raw_transactions {
                     let receipt = db_receipts
-                        .get(&transaction.hash.clone())
+                        .get(&transaction.hash)
                         .expect("unable to get receipt for transaction");
 
-                    transaction.add_receipt_data(
-                        db_block.base_fee_per_gas,
+                    let db_transaction = DatabaseTransaction::from_rpc(
+                        &transaction,
                         receipt,
+                        self.chain_id,
+                        db_block.timestamp,
+                        db_block.base_fee_per_gas,
                     );
+
+                    db_transactions.push(db_transaction)
                 }
 
                 let mut db_blocks: Vec<DatabaseBlock> = Vec::new();
@@ -276,32 +291,28 @@ impl Rpc {
                 // Insert contracts created through the traces
                 let create_traces: Vec<&DatabaseTrace> = traces
                     .iter()
-                    .filter(|trace| trace.action_type == TraceType::Create)
+                    .filter(|trace| trace.action_type == "create")
                     .collect();
 
                 for trace in create_traces {
-                    let contract_address = match &trace.address {
+                    let contract_address = match trace.address {
                         Some(contract_address) => contract_address,
                         None => continue,
                     };
 
-                    if contracts_map.contains_key(contract_address) {
+                    if contracts_map.contains_key(&contract_address) {
                         continue;
                     }
 
                     let contract = DatabaseContract {
                         block_number: trace.block_number,
-                        contract_address: contract_address.to_string(),
-                        chain: self.chain.id,
-                        creator: trace.from.clone().unwrap(),
-                        transaction_hash: trace
-                            .transaction_hash
-                            .clone()
-                            .unwrap(),
+                        contract_address,
+                        chain: self.chain_id,
+                        creator: trace.from.unwrap(),
+                        transaction_hash: trace.transaction_hash.unwrap(),
                     };
 
-                    contracts_map
-                        .insert(contract_address.to_string(), contract);
+                    contracts_map.insert(contract_address, contract);
                 }
 
                 let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
@@ -316,105 +327,356 @@ impl Rpc {
 
                 for log in db_logs.iter_mut() {
                     // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
-                    let topic0 = log.topic0.clone();
+                    let topic0 = log.topic0;
 
-                    if topic0 == TRANSFER_EVENTS_SIGNATURE {
+                    if topic0
+                        == Some(TRANSFER_EVENTS_SIGNATURE.parse().unwrap())
+                    {
                         // Check if it is a erc20 or a erc721 based on the number of logs
 
                         // erc721 token transfer events have 3 indexed values.
                         if log.topic3.is_some() {
                             let erc721 =
-                                DatabaseERC721Transfer::from_rpc(log);
+                                DatabaseERC721Transfer::from_log(log);
 
-                            db_erc721_transfers.push(erc721)
+                            if let Some(erc721) = erc721 {
+                                db_erc721_transfers.push(erc721)
+                            }
                         } else if log.topic1.is_some()
                             && log.topic2.is_some()
                         {
                             // erc20 token transfer events have 2 indexed values.
                             let erc20 =
-                                DatabaseERC20Transfer::from_rpc(log);
+                                DatabaseERC20Transfer::from_log(log);
 
-                            db_erc20_transfers.push(erc20)
+                            if let Some(erc20) = erc20 {
+                                db_erc20_transfers.push(erc20)
+                            }
                         }
                     }
 
-                    if topic0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
+                    if topic0
+                        == Some(
+                            ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                         && log.topic3.is_some()
                     {
-                        let log_data = decode_bytes(log.data.clone());
-
-                        let transfer_values = ethabi::decode(
-                            &[ParamType::Uint(256), ParamType::Uint(256)],
-                            &log_data[..],
-                        )
-                        .unwrap();
-
-                        let id = transfer_values[0]
-                            .clone()
-                            .into_uint()
-                            .unwrap();
-
-                        let amount = transfer_values[1]
-                            .clone()
-                            .into_uint()
-                            .unwrap();
-
                         let erc1155_transfer =
-                            DatabaseERC1155Transfer::from_single_rpc(
-                                log, id, amount,
-                            );
+                            DatabaseERC1155Transfer::from_log(log);
 
-                        db_erc1155_transfers.push(erc1155_transfer);
+                        if let Some(erc1155_transfer) = erc1155_transfer {
+                            db_erc1155_transfers.push(erc1155_transfer);
+                        }
                     }
 
-                    if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
-                        && log.topic1.is_some()
-                        && log.topic2.is_some()
-                        && log.topic3.is_some()
-                    {
-                        let log_data = decode_bytes(log.data.clone());
-
-                        let transfer_values = ethabi::decode(
-                            &[
-                                ParamType::Array(Box::new(
-                                    ParamType::Uint(256),
-                                )),
-                                ParamType::Array(Box::new(
-                                    ParamType::Uint(256),
-                                )),
-                            ],
-                            &log_data[..],
+                    if topic0
+                        == Some(
+                            ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
                         )
-                        .unwrap();
-
-                        let ids: Vec<U256> = transfer_values[0]
-                            .clone()
-                            .into_array()
-                            .unwrap()
-                            .iter()
-                            .map(|token| {
-                                token.clone().into_uint().unwrap()
-                            })
-                            .collect();
-
-                        let amounts: Vec<U256> = transfer_values[1]
-                            .clone()
-                            .into_array()
-                            .unwrap()
-                            .iter()
-                            .map(|token| {
-                                token.clone().into_uint().unwrap()
-                            })
-                            .collect();
-
+                    {
                         let erc1155_transfer =
-                            DatabaseERC1155Transfer::from_batch_rpc(
-                                log, ids, amounts,
-                            );
+                            DatabaseERC1155Transfer::from_log(log);
 
-                        db_erc1155_transfers.push(erc1155_transfer);
+                        if let Some(erc1155_transfer) = erc1155_transfer {
+                            db_erc1155_transfers.push(erc1155_transfer);
+                        }
+                    }
+                }
+
+                // Decode DEX trades with automatic DEX detection
+                let mut db_dex_trades: Vec<DatabaseDexTrade> = Vec::new();
+
+                // Create mapping of transaction_hash -> to_address (router) for DEX detection
+                let mut tx_routers: HashMap<B256, Address> =
+                    HashMap::new();
+                for tx in db_transactions.iter() {
+                    tx_routers.insert(tx.hash, tx.to);
+                }
+
+                // Convert DatabaseLog to alloy Log for processing
+                for log in db_logs.iter() {
+                    let topic0 = log.topic0;
+
+                    // Get router address for this transaction to detect DEX
+                    let router = tx_routers.get(&log.transaction_hash);
+
+                    // Detect DEX name from router address
+                    let router_dex_name = if let Some(router_addr) = router {
+                        self.dex_routers
+                            .get_dex_from_router(
+                                self.chain_id,
+                                router_addr,
+                            )
+                            .map(|info| info.display_name())
+                    } else {
+                        None
+                    };
+
+                    // Reconstruct alloy Log from DatabaseLog
+                    let alloy_log = alloy::rpc::types::Log {
+                        inner: alloy::primitives::Log {
+                            address: log.address,
+                            data: alloy::primitives::LogData::new(
+                                vec![
+                                    log.topic0.unwrap_or_default(),
+                                    log.topic1.unwrap_or_default(),
+                                    log.topic2.unwrap_or_default(),
+                                    log.topic3.unwrap_or_default(),
+                                ],
+                                log.data.clone(),
+                            )
+                            .unwrap(),
+                        },
+                        block_hash: None,
+                        block_number: Some(log.block_number as u64),
+                        block_timestamp: None,
+                        transaction_hash: Some(log.transaction_hash),
+                        transaction_index: None,
+                        log_index: Some(log.log_index as u64),
+                        removed: false,
+                    };
+
+                    // Uniswap V2-style Swap (PancakeSwap, SushiSwap, QuickSwap, Solidly forks, etc.)
+                    if topic0
+                        == Some(
+                            UNISWAP_V2_SWAP_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        // For V2 swaps, use chain-specific default DEX when router not detected
+                        // This properly labels Solidly forks (Velodrome, Aerodrome, Thena, etc.)
+                        let v2_dex_name = router_dex_name.clone().unwrap_or_else(|| {
+                            self.dex_routers.get_default_v2_dex(self.chain_id).to_string()
+                        });
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_uniswap_v2_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                v2_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Uniswap V3-style Swap (PancakeSwap V3, Algebra forks, etc.)
+                    if topic0
+                        == Some(
+                            UNISWAP_V3_SWAP_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        // For V3 swaps, use chain-specific default DEX when router not detected
+                        let v3_dex_name = router_dex_name.clone().unwrap_or_else(|| {
+                            self.dex_routers.get_default_v3_dex(self.chain_id).to_string()
+                        });
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_uniswap_v3_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                v3_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Curve TokenExchange
+                    if topic0
+                        == Some(
+                            CURVE_TOKEN_EXCHANGE_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_curve_token_exchange(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Balancer Swap
+                    if topic0
+                        == Some(
+                            BALANCER_SWAP_EVENT_SIGNATURE.parse().unwrap(),
+                        )
+                    {
+                        // Balancer has its own unique event, so fallback is always Balancer
+                        let balancer_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "Balancer V2".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_balancer_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                balancer_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // DODO Swap
+                    if topic0
+                        == Some(DODO_SWAP_EVENT_SIGNATURE.parse().unwrap())
+                    {
+                        let dodo_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "DODO".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_dodo_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                dodo_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Kyber Swapped
+                    if topic0
+                        == Some(
+                            KYBER_SWAPPED_EVENT_SIGNATURE.parse().unwrap(),
+                        )
+                    {
+                        let kyber_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "Kyber".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_kyber_swapped(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                kyber_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Maverick SwapFilled
+                    if topic0
+                        == Some(
+                            MAVERICK_SWAP_FILLED_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        let maverick_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "Maverick".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_maverick_swap_filled(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                maverick_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // Curve TokenExchangeUnderlying (meta pools)
+                    if topic0
+                        == Some(
+                            CURVE_TOKEN_EXCHANGE_UNDERLYING_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_curve_token_exchange_underlying(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // TraderJoe V2.1 LB Swap
+                    if topic0
+                        == Some(
+                            TRADERJOE_LB_SWAP_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        let traderjoe_dex_name = router_dex_name.clone()
+                            .unwrap_or_else(|| "TraderJoe".to_string());
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_traderjoe_lb_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                                traderjoe_dex_name,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
+                    }
+
+                    // WooFi WooSwap
+                    if topic0
+                        == Some(
+                            WOOFI_SWAP_EVENT_SIGNATURE.parse().unwrap(),
+                        )
+                    {
+                        if let Some(trade) =
+                            DatabaseDexTrade::from_woofi_swap(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp,
+                                log.transaction_hash,
+                                log.log_index,
+                            )
+                        {
+                            db_dex_trades.push(trade);
+                        }
                     }
                 }
 
@@ -443,6 +705,7 @@ impl Rpc {
                     db_erc20_transfers,
                     db_erc721_transfers,
                     db_erc1155_transfers,
+                    db_dex_trades,
                 ))
             }
             None => None,
@@ -452,229 +715,236 @@ impl Rpc {
     pub async fn listen_blocks(&self, db: &Database) {
         info!("Starting new blocks listener.");
 
-        let client = self.get_ws_client().await;
+        let ws_url = self.ws_url.clone().unwrap();
+        let ws_connect = WsConnect::new(ws_url);
+        let client = ProviderBuilder::new()
+            .on_ws(ws_connect)
+            .await
+            .expect("unable to connect to websocket");
 
-        let client_id = client.request("eth_chainId", rpc_params![]).await;
+        let chain_id = client
+            .get_chain_id()
+            .await
+            .expect("unable to get chain id from websocket");
 
-        match client_id {
-            Ok(value) => {
-                let chain_id: U256 = match serde_json::from_value(value) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        panic!("unable to get chain id from websocket")
-                    }
-                };
-
-                if chain_id.as_u64() != self.chain.id {
-                    panic!("websocket chain id doesn't match with configured chain id")
-                }
-            }
-            Err(_) => panic!("unable to access websocket"),
+        if chain_id != self.chain_id {
+            panic!("websocket chain id doesn't match with configured chain id")
         }
 
-        let mut subscription: Subscription<Block<TxHash>> = client
-            .subscribe(
-                "eth_subscribe",
-                rpc_params!["newHeads"],
-                "eth_unsubscribe",
-            )
+        // Detect capabilities on websocket connection
+        let latest_block = client.get_block_number().await;
+        let mut ws_supports_block_receipts = false;
+
+        if let Ok(block_number) = latest_block {
+            let receipts = client
+                .raw_request::<_, Vec<serde_json::Value>>(
+                    "eth_getBlockReceipts".into(),
+                    [format!("0x{:x}", block_number)],
+                )
+                .await;
+
+            ws_supports_block_receipts = receipts.is_ok();
+            info!(
+                "Websocket capability detection: eth_getBlockReceipts={}",
+                ws_supports_block_receipts
+            );
+        } else {
+            warn!("Failed to detect websocket capabilities: unable to get latest block");
+        }
+
+        let subscription = client
+            .subscribe_blocks()
             .await
             .expect("unable to start block listener");
+        let mut stream = subscription.into_stream();
 
-        while let Some(block) = subscription.next().await {
-            if block.is_err() {
-                continue;
-            }
+        while let Some(block) = stream.next().await {
             tokio::spawn({
                 let rpc = self.clone();
                 let db = db.clone();
-                let block = block.unwrap().clone();
+                let block = block.clone();
+                let supports_receipts = ws_supports_block_receipts;
                 async move {
-                    let block_number =
-                        block.number.unwrap().as_usize() as u32;
+                    let block_number = block.header.number.unwrap() as u32;
 
-                    info!("New head found {}.", block_number.clone());
+                    info!("New head found {}.", block_number);
 
-                    // Some chains require a small delay between receiving the head and fetching the block
-                    // to allow the chain and nodes propagate and execute the block data.
+                    // Use websocket capability detection to optimize trace fetching
+                    let mut rpc_with_ws_capability = rpc.clone();
+                    rpc_with_ws_capability.supports_blocks_receipts =
+                        supports_receipts;
 
-                    // The list of chains to add delay should be added manually and tested
-                    // Right now this is tested for ETH (1) and BSC (56)
-                    // These values can change depending on network load
+                    // Retry logic for new heads - RPC may not have synced yet
+                    let max_retries = 10;
+                    let mut retry_delay =
+                        std::time::Duration::from_millis(100);
 
-                    // ETH requires 300ms
-                    if rpc.chain.id == 1 {
-                        sleep(Duration::from_millis(300)).await;
-                    }
+                    for attempt in 1..=max_retries {
+                        // Small delay before first attempt to let RPC sync
+                        if attempt == 1 {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(50),
+                            )
+                            .await;
+                        }
 
-                    // BSC requires 4s
-                    if rpc.chain.id == 56 {
-                        sleep(Duration::from_secs(4)).await;
-                    }
+                        let block_data = rpc_with_ws_capability
+                            .fetch_block(&block_number)
+                            .await;
 
-                    let block_data =
-                        rpc.fetch_block(&block_number, &rpc.chain).await;
+                        match block_data {
+                            Some((
+                                blocks,
+                                transactions,
+                                logs,
+                                contracts,
+                                traces,
+                                withdrawals,
+                                erc20_transfers,
+                                erc721_transfers,
+                                erc1155_transfers,
+                                dex_trades,
+                            )) => {
+                                let fetched_data = BlockFetchedData {
+                                    blocks,
+                                    contracts,
+                                    logs,
+                                    traces,
+                                    transactions,
+                                    withdrawals,
+                                    erc20_transfers,
+                                    erc721_transfers,
+                                    erc1155_transfers,
+                                    dex_trades,
+                                };
 
-                    if let Some((
-                        blocks,
-                        transactions,
-                        logs,
-                        contracts,
-                        traces,
-                        withdrawals,
-                        erc20_transfers,
-                        erc721_transfers,
-                        erc1155_transfers,
-                    )) = block_data
-                    {
-                        let fetched_data = BlockFetchedData {
-                            blocks,
-                            contracts,
-                            logs,
-                            traces,
-                            transactions,
-                            withdrawals,
-                            erc20_transfers,
-                            erc721_transfers,
-                            erc1155_transfers,
-                        };
-
-                        db.store_data(&fetched_data).await;
+                                db.store_data(&fetched_data).await;
+                                break;
+                            }
+                            None => {
+                                if attempt < max_retries {
+                                    debug!(
+                                        "Failed to fetch new head {} (attempt {}/{}), retrying in {:?}",
+                                        block_number, attempt, max_retries, retry_delay
+                                    );
+                                    tokio::time::sleep(retry_delay).await;
+                                    retry_delay *= 2; // Exponential backoff
+                                } else {
+                                    error!(
+                                        "Failed to fetch new head {} after {} attempts, block will be picked up by indexer later",
+                                        block_number, max_retries
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             });
         }
     }
 
-    fn get_client(&self) -> &HttpClient<HttpBackend> {
+    fn get_client(&self) -> &RootProvider<Http<Client>> {
         let client = self.clients.choose(&mut rand::thread_rng()).unwrap();
 
         client
     }
 
-    async fn get_ws_client(&self) -> WsClient {
-        let url = self.ws_url.clone().unwrap();
-
-        let client_wss: WsClient =
-            WsClientBuilder::default().build(url).await.unwrap();
-
-        client_wss
-    }
-
-    async fn get_block(
+    pub async fn get_block(
         &self,
         block_number: &u32,
     ) -> Option<(
         DatabaseBlock,
-        Vec<DatabaseTransaction>,
+        Vec<Transaction>,
         Vec<DatabaseWithdrawal>,
         Vec<DatabaseBlock>,
     )> {
         let client = self.get_client();
-
-        let raw_block = client
-            .request(
-                "eth_getBlockByNumber",
-                rpc_params![format!("0x{:x}", block_number), true],
+        let block = client
+            .get_block_by_number(
+                BlockNumberOrTag::Number(*block_number as u64),
+                true,
             )
             .await;
 
-        match raw_block {
-            Ok(value) => {
-                let block: Result<Block<Transaction>, Error> =
-                    serde_json::from_value(value);
+        match block {
+            Ok(block) => match block {
+                Some(block) => {
+                    let is_uncle = false;
+                    let db_block = DatabaseBlock::from_rpc(
+                        &block,
+                        self.chain_id,
+                        is_uncle,
+                    );
 
-                match block {
-                    Ok(block) => {
-                        let db_block = DatabaseBlock::from_rpc(
-                            &block,
-                            self.chain.id,
-                            false,
-                        );
+                    let mut db_transactions: Vec<Transaction> = Vec::new();
 
-                        let mut db_transactions = Vec::new();
+                    if let BlockTransactions::Full(txs) =
+                        &block.transactions
+                    {
+                        db_transactions.extend(txs.iter().cloned());
+                    }
 
-                        for transaction in block.transactions.iter() {
-                            let db_transaction =
-                                DatabaseTransaction::from_rpc(
-                                    transaction,
-                                    self.chain.id,
+                    let mut db_withdrawals: Vec<DatabaseWithdrawal> =
+                        Vec::new();
+
+                    if let Some(withdrawals) = &block.withdrawals {
+                        for withdrawal in withdrawals {
+                            let db_withdrawal =
+                                DatabaseWithdrawal::from_rpc(
+                                    withdrawal,
+                                    self.chain_id,
+                                    db_block.number,
                                     db_block.timestamp,
                                 );
 
-                            db_transactions.push(db_transaction)
+                            db_withdrawals.push(db_withdrawal)
                         }
+                    }
+                    let mut block_uncles = Vec::new();
 
-                        let mut db_withdrawals = Vec::new();
-
-                        if block.withdrawals.is_some() {
-                            for withdrawal in
-                                block.withdrawals.unwrap().iter()
-                            {
-                                let db_withdrawal =
-                                    DatabaseWithdrawal::from_rpc(
-                                        withdrawal,
-                                        self.chain.id,
-                                        db_block.number,
-                                        db_block.timestamp,
-                                    );
-
-                                db_withdrawals.push(db_withdrawal)
-                            }
-                        }
-
-                        let mut block_uncles = Vec::new();
-
-                        for (i, _) in db_block.uncles.iter().enumerate() {
-                            let raw_uncle = client
-                                .request(
-                                    "eth_getUncleByBlockNumberAndIndex",
-                                    rpc_params![
-                                        format!("0x{:x}", db_block.number),
-                                        format!("0x{:x}", i)
-                                    ],
+                    if self.fetch_uncles {
+                        for (i, _) in block.uncles.iter().enumerate() {
+                            let uncle = client
+                                .get_uncle(
+                                    alloy::rpc::types::BlockId::Number(
+                                        BlockNumberOrTag::Number(
+                                            *block_number as u64,
+                                        ),
+                                    ),
+                                    i as u64,
                                 )
                                 .await;
-                            match raw_uncle {
-                                Ok(value) => {
-                                    let block: Result<
-                                        Block<TxHash>,
-                                        Error,
-                                    > = serde_json::from_value(value);
 
-                                    match block {
-                                        Ok(block) => {
-                                            let db_block =
-                                                DatabaseBlock::from_rpc(
-                                                    &block,
-                                                    self.chain.id,
-                                                    true,
-                                                );
-
-                                            block_uncles.push(db_block)
-                                        }
-                                        Err(err) => {
-                                            println!("{}", err)
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    println!("{}", err)
-                                }
+                            if let Ok(Some(block)) = uncle {
+                                let db_block = DatabaseBlock::from_rpc(
+                                    &block,
+                                    self.chain_id,
+                                    true,
+                                );
+                                block_uncles.push(db_block)
                             }
                         }
-
-                        Some((
-                            db_block,
-                            db_transactions,
-                            db_withdrawals,
-                            block_uncles,
-                        ))
+                    } else if !block.uncles.is_empty() {
+                        debug!(
+                            "Skipping {} uncle blocks for block {} (fetch_uncles=false)",
+                            block.uncles.len(),
+                            block_number
+                        );
                     }
-                    Err(_) => None,
+
+                    Some((
+                        db_block,
+                        db_transactions,
+                        db_withdrawals,
+                        block_uncles,
+                    ))
                 }
+                None => None,
+            },
+            Err(e) => {
+                error!("Error fetching block: {:?}", e);
+                None
             }
-            Err(_) => None,
         }
     }
 
@@ -684,35 +954,27 @@ impl Rpc {
     ) -> Vec<DatabaseTrace> {
         let client = self.get_client();
 
-        let raw_block = client
-            .request(
-                "trace_block",
-                rpc_params![format!("0x{:x}", block_number)],
+        // trace_block is not yet in standard Alloy provider trait in 0.1?
+        // We use raw request
+        let traces: Result<Vec<Trace>, _> = client
+            .raw_request(
+                "trace_block".into(),
+                vec![format!("0x{:x}", block_number)],
             )
             .await;
 
-        match raw_block {
-            Ok(value) => {
-                let traces: Result<Vec<Trace>, Error> =
-                    serde_json::from_value(value);
+        match traces {
+            Ok(traces) => {
+                let mut db_traces = Vec::new();
 
-                match traces {
-                    Ok(traces) => {
-                        let mut db_traces = Vec::new();
+                for trace in traces.iter() {
+                    let db_trace =
+                        DatabaseTrace::from_rpc(trace, self.chain_id);
 
-                        for trace in traces.iter() {
-                            let db_trace = DatabaseTrace::from_rpc(
-                                trace,
-                                self.chain.id,
-                            );
-
-                            db_traces.push(db_trace)
-                        }
-
-                        db_traces
-                    }
-                    Err(_) => Vec::new(),
+                    db_traces.push(db_trace)
                 }
+
+                db_traces
             }
             Err(_) => Vec::new(),
         }
@@ -720,7 +982,7 @@ impl Rpc {
 
     async fn get_transaction_receipt(
         &self,
-        transaction: String,
+        transaction: B256,
         transaction_timestamp: u32,
         block_number: &u32,
     ) -> Option<(
@@ -730,59 +992,36 @@ impl Rpc {
     )> {
         let client = self.get_client();
 
-        let raw_receipt = client
-            .request("eth_getTransactionReceipt", rpc_params![transaction])
-            .await;
+        let receipt = client.get_transaction_receipt(transaction).await;
 
-        match raw_receipt {
-            Ok(value) => {
-                let receipt: Result<TransactionReceipt, Error> =
-                    serde_json::from_value(value);
+        match receipt {
+            Ok(Some(receipt)) => {
+                let mut db_transaction_logs: Vec<DatabaseLog> = Vec::new();
 
-                match receipt {
-                    Ok(receipt) => {
-                        let mut db_transaction_logs: Vec<DatabaseLog> =
-                            Vec::new();
+                let status = receipt.status();
 
-                        let status: bool = match receipt.status {
-                            None => true,
-                            Some(status) => {
-                                let status_number = status.as_u64() as i64;
+                let mut db_contract: Option<DatabaseContract> = None;
 
-                                status_number != 0
-                            }
-                        };
-
-                        let mut db_contract: Option<DatabaseContract> =
-                            None;
-
-                        if status {
-                            db_contract =
-                                receipt.contract_address.map(|_| {
-                                    DatabaseContract::from_rpc(
-                                        &receipt,
-                                        self.chain.id,
-                                    )
-                                });
-                        }
-
-                        for log in receipt.logs.iter() {
-                            let db_log = DatabaseLog::from_rpc(
-                                log,
-                                self.chain.id,
-                                transaction_timestamp,
-                                block_number,
-                            );
-
-                            db_transaction_logs.push(db_log)
-                        }
-
-                        Some((receipt, db_transaction_logs, db_contract))
-                    }
-                    Err(_) => None,
+                if status {
+                    db_contract = receipt.contract_address.map(|_| {
+                        DatabaseContract::from_rpc(&receipt, self.chain_id)
+                    });
                 }
+
+                for log in receipt.inner.logs() {
+                    let db_log = DatabaseLog::from_rpc(
+                        log,
+                        self.chain_id,
+                        transaction_timestamp,
+                        block_number,
+                    );
+
+                    db_transaction_logs.push(db_log)
+                }
+
+                Some((receipt, db_transaction_logs, db_contract))
             }
-            Err(_) => None,
+            _ => None,
         }
     }
 
@@ -797,67 +1036,42 @@ impl Rpc {
     )> {
         let client = self.get_client();
 
-        let raw_receipts = client
-            .request(
-                "eth_getBlockReceipts",
-                rpc_params![format!("0x{:x}", block_number)],
+        // eth_getBlockReceipts might not be standard, use raw request
+        let receipts: Result<Vec<TransactionReceipt>, _> = client
+            .raw_request(
+                "eth_getBlockReceipts".into(),
+                vec![format!("0x{:x}", block_number)],
             )
             .await;
 
-        match raw_receipts {
-            Ok(value) => {
-                let receipts: Result<Vec<TransactionReceipt>, Error> =
-                    serde_json::from_value(value);
+        match receipts {
+            Ok(receipts) => {
+                let mut db_logs: Vec<DatabaseLog> = Vec::new();
+                let mut db_contracts: Vec<DatabaseContract> = Vec::new();
 
-                match receipts {
-                    Ok(receipts) => {
-                        let mut db_receipts: Vec<TransactionReceipt> =
-                            Vec::new();
+                for receipt in receipts.iter() {
+                    let status = receipt.status();
 
-                        let mut db_transaction_logs: Vec<DatabaseLog> =
-                            Vec::new();
-
-                        let mut db_contracts: Vec<DatabaseContract> =
-                            Vec::new();
-
-                        for receipt in receipts {
-                            let db_contract =
-                                receipt.contract_address.map(|_| {
-                                    DatabaseContract::from_rpc(
-                                        &receipt,
-                                        self.chain.id,
-                                    )
-                                });
-
-                            match db_contract.is_some() {
-                                true => {
-                                    db_contracts.push(db_contract.unwrap())
-                                }
-                                false => (),
-                            }
-
-                            for log in receipt.logs.iter() {
-                                let db_log = DatabaseLog::from_rpc(
-                                    log,
-                                    self.chain.id,
-                                    block_timestamp,
-                                    block_number,
-                                );
-
-                                db_transaction_logs.push(db_log)
-                            }
-
-                            db_receipts.push(receipt);
-                        }
-
-                        Some((
-                            db_receipts,
-                            db_transaction_logs,
-                            db_contracts,
-                        ))
+                    if status && receipt.contract_address.is_some() {
+                        db_contracts.push(DatabaseContract::from_rpc(
+                            receipt,
+                            self.chain_id,
+                        ));
                     }
-                    Err(_) => None,
+
+                    for log in receipt.inner.logs() {
+                        let db_log = DatabaseLog::from_rpc(
+                            log,
+                            self.chain_id,
+                            block_timestamp,
+                            block_number,
+                        );
+
+                        db_logs.push(db_log)
+                    }
                 }
+
+                Some((receipts, db_logs, db_contracts))
             }
             Err(_) => None,
         }
