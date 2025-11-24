@@ -18,8 +18,6 @@ A production-ready indexer that fetches and stores blockchain data for later ana
 - ✅ **Contract tracking**: Automatically indexes deployed contracts
 - ✅ **Parallel processing**: Configurable batch size for optimal throughput
 - ✅ **Smart RPC usage**: Auto-detects `eth_getBlockReceipts` support
-- ✅ **Memory efficient**: Arc-based storage, pre-allocated HashMaps
-- ✅ **Production ready**: Comprehensive logging, error handling, Docker support
 
 ## Requirements
 
