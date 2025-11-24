@@ -10,7 +10,7 @@ description = "Scalable SQL indexer for EVM compatible blockchains"
 alloy = { version = "0.1", features = ["full", "node-bindings", "rpc-types", "json-rpc", "rpc-client"] }
 alloy-rpc-types-trace = "0.1"
 clap = { version = "4", features = ["derive"] }
-clickhouse = "0.14"
+clickhouse = { version = "0.14", features = ["native-tls"] }
 futures = "0.3"
 hex = "0.4"
 log = "0.4"

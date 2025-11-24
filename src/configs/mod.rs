@@ -1,5 +1,4 @@
 use clap::Parser;
-use url::Url;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -61,10 +60,7 @@ pub struct IndexerArgs {
 pub struct Config {
     pub batch_size: usize,
     pub chain_id: u64,
-    pub db_host: String,
-    pub db_name: String,
-    pub db_password: String,
-    pub db_username: String,
+    pub database_url: String,
     pub debug: bool,
     pub end_block: i64,
     pub new_blocks_only: bool,
@@ -91,29 +87,10 @@ impl Config {
         let ws_url: Option<String> =
             if args.ws.is_empty() { None } else { Some(args.ws) };
 
-        let url = Url::parse(&args.database).expect("unable to parse database url expected: scheme://username:password@host/database");
-
-        let username = url.username();
-
-        let password =
-            url.password().expect("no password provided for database");
-
-        let db_host =
-            url.host().expect("no host provided for database").to_string();
-
-        let url_paths =
-            url.path_segments().map(|c| c.collect::<Vec<_>>()).unwrap();
-
-        let db_name =
-            url_paths.first().expect("no database name provided on path");
-
         Self {
             batch_size: args.batch_size,
             chain_id: args.chain as u64,
-            db_host: format!("{}://{}", url.scheme(), db_host),
-            db_name: db_name.to_string(),
-            db_password: password.to_string(),
-            db_username: username.to_string(),
+            database_url: args.database,
             debug: args.debug,
             end_block: args.end_block,
             new_blocks_only: args.new_blocks_only,

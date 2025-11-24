@@ -34,7 +34,7 @@ services:
     command: >
       indexer
       --chain 1
-      --database clickhouse://indexer:indexer@clickhouse:9000/indexer
+      --database clickhouse://indexer:indexer@clickhouse:8123/indexer
       --rpcs https://0xrpc.io/eth
       --start-block 0
       --batch-size 10

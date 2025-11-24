@@ -67,20 +67,51 @@ impl DatabaseTables {
 }
 
 impl Database {
-    pub async fn new(
-        db_host: String,
-        db_username: String,
-        db_password: String,
-        db_name: String,
-        chain_id: u64,
-    ) -> Self {
-        info!("Starting EVM database service");
+    pub async fn new(database_url: &str, chain_id: u64) -> Self {
+        info!("Connecting to database: {}", database_url);
 
-        let db = Client::default()
-            .with_url(db_host)
-            .with_user(db_username)
-            .with_password(db_password)
-            .with_database(db_name);
+        // Parse the database URL to extract components
+        let url = url::Url::parse(database_url)
+            .expect("Failed to parse database URL. Expected format: clickhouse://user:password@host:port/database");
+
+        let host = url.host_str().expect("No host in database URL");
+        let port = url.port().unwrap_or(9000);
+        let username = url.username();
+        let password = url.password().unwrap_or("");
+        let database = url.path().trim_start_matches('/');
+
+        let db = clickhouse::Client::default()
+            .with_url(format!("{}://{}:{}", url.scheme(), host, port))
+            .with_user(username)
+            .with_password(password)
+            .with_database(database);
+
+        // Retry connection test up to 10 times with exponential backoff
+        let mut retries = 0;
+        let max_retries = 10;
+
+        loop {
+            match db.query("SELECT 1").fetch_one::<u8>().await {
+                Ok(_) => {
+                    info!("Successfully connected to ClickHouse database '{}'", database);
+                    break;
+                }
+                Err(e) => {
+                    retries += 1;
+                    if retries >= max_retries {
+                        error!("Failed to connect to database after {} attempts: {}", max_retries, e);
+                        panic!("Could not connect to ClickHouse. Please check your database configuration and ensure ClickHouse is running.");
+                    }
+
+                    let wait_time = std::time::Duration::from_secs(
+                        2_u64.pow(retries.min(5)),
+                    );
+                    log::warn!("Database connection attempt {}/{} failed: {}. Retrying in {:?}...", 
+                        retries, max_retries, e, wait_time);
+                    tokio::time::sleep(wait_time).await;
+                }
+            }
+        }
 
         Self { chain_id, db }
     }

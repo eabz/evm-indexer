@@ -27,14 +27,7 @@ async fn main() {
 
     let rpc = Rpc::new(&config).await;
 
-    let db = Database::new(
-        config.db_host.clone(),
-        config.db_username.clone(),
-        config.db_password.clone(),
-        config.db_name.clone(),
-        config.chain_id,
-    )
-    .await;
+    let db = Database::new(&config.database_url, config.chain_id).await;
 
     if config.ws_url.is_some() && config.end_block == 0
         || config.end_block == -1
