@@ -220,3 +220,15 @@ ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, pool_address, block_number, log_index)
 SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS indexer.tokens (
+  address String,
+  name String,
+  symbol String,
+  decimals UInt8,
+  type String,
+  chain UInt64
+)
+ENGINE = ReplacingMergeTree()
+ORDER BY (chain, address)
+SETTINGS index_granularity = 8192;

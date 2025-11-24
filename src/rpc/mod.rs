@@ -37,6 +37,7 @@ use alloy::providers::{
 use alloy::rpc::types::{
     BlockNumberOrTag, BlockTransactions, Transaction, TransactionReceipt,
 };
+use alloy::sol_types::SolCall;
 use alloy::transports::http::Http;
 use alloy_rpc_types_trace::parity::LocalizedTransactionTrace as Trace;
 use futures::StreamExt;
@@ -44,6 +45,7 @@ use log::{debug, error, info, warn};
 use rand::seq::SliceRandom;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use url::Url;
 
 alloy::sol! {
@@ -52,6 +54,22 @@ alloy::sol! {
         function name() external view returns (string);
         function symbol() external view returns (string);
         function decimals() external view returns (uint8);
+    }
+
+    #[sol(rpc)]
+    contract IMulticall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+
+        struct Result {
+            bool success;
+            bytes returnData;
+        }
+
+        function aggregate3(Call3[] calldata calls) public payable returns (Result[] memory returnData);
     }
 }
 
@@ -65,6 +83,7 @@ pub struct Rpc {
     pub supports_blocks_receipts: bool,
     pub fetch_uncles: bool,
     pub dex_routers: DexRouters,
+    pub known_tokens: Arc<RwLock<HashSet<Address>>>,
 }
 
 impl Rpc {
@@ -106,6 +125,7 @@ impl Rpc {
             supports_blocks_receipts: false,
             fetch_uncles: config.fetch_uncles,
             dex_routers: DexRouters::new(),
+            known_tokens: Arc::new(RwLock::new(HashSet::new())),
         };
 
         rpc.detect_capabilities().await;
@@ -155,55 +175,130 @@ impl Rpc {
         &self,
         tokens: &HashSet<Address>,
     ) -> Vec<DatabaseToken> {
+        let mut new_tokens = Vec::new();
+
+        // Filter out known tokens
+        {
+            let cache = self.known_tokens.read().unwrap();
+            for token in tokens {
+                if !cache.contains(token) {
+                    new_tokens.push(*token);
+                }
+            }
+        }
+
+        if new_tokens.is_empty() {
+            return Vec::new();
+        }
+
         let mut db_tokens = Vec::new();
         let client = self.get_client();
+        let multicall_address = Address::parse_checksummed(
+            "0xcA11bde05977b3631167028862bE2a173976CA11",
+            None,
+        )
+        .unwrap();
+        let multicall =
+            IMulticall3::new(multicall_address, client.clone());
 
-        for &token_address in tokens {
-            let contract = IERC20::new(token_address, client.clone());
+        // Process in chunks to avoid gas limits
+        for chunk in new_tokens.chunks(50) {
+            let mut calls = Vec::new();
+            for &token in chunk {
+                // name()
+                calls.push(IMulticall3::Call3 {
+                    target: token,
+                    allowFailure: true,
+                    callData: IERC20::nameCall {}.abi_encode().into(),
+                });
+                // symbol()
+                calls.push(IMulticall3::Call3 {
+                    target: token,
+                    allowFailure: true,
+                    callData: IERC20::symbolCall {}.abi_encode().into(),
+                });
+                // decimals()
+                calls.push(IMulticall3::Call3 {
+                    target: token,
+                    allowFailure: true,
+                    callData: IERC20::decimalsCall {}.abi_encode().into(),
+                });
+            }
 
-            // Try to fetch name, symbol, decimals. Some might fail (e.g. ERC1155 or non-compliant tokens)
-            // We use a best-effort approach.
+            let result = multicall.aggregate3(calls).call().await;
 
-            let name = match contract.name().call().await {
-                Ok(res) => res._0,
-                Err(_) => "".to_string(),
-            };
+            match result {
+                Ok(res) => {
+                    let return_data = res.returnData;
+                    for (i, token) in chunk.iter().enumerate() {
+                        let name_res = &return_data[i * 3];
+                        let symbol_res = &return_data[i * 3 + 1];
+                        let decimals_res = &return_data[i * 3 + 2];
 
-            let symbol = match contract.symbol().call().await {
-                Ok(res) => res._0,
-                Err(_) => "".to_string(),
-            };
+                        let name = if name_res.success {
+                            IERC20::nameCall::abi_decode_returns(
+                                &name_res.returnData,
+                                true,
+                            )
+                            .map(|r| r._0)
+                            .unwrap_or_default()
+                        } else {
+                            "".to_string()
+                        };
 
-            let decimals = match contract.decimals().call().await {
-                Ok(res) => res._0,
-                Err(_) => 0,
-            };
+                        let symbol = if symbol_res.success {
+                            IERC20::symbolCall::abi_decode_returns(
+                                &symbol_res.returnData,
+                                true,
+                            )
+                            .map(|r| r._0)
+                            .unwrap_or_default()
+                        } else {
+                            "".to_string()
+                        };
 
-            // Determine type based on success? Or just default to "Unknown" or "ERC20" if successful?
-            // For now, we'll label as "ERC20" if we got at least name or symbol, otherwise "Unknown"
-            // But we are fetching for all types.
-            // Ideally we would check interface support (ERC165) but that's slower.
-            // Let's just store what we found.
+                        let decimals = if decimals_res.success {
+                            IERC20::decimalsCall::abi_decode_returns(
+                                &decimals_res.returnData,
+                                true,
+                            )
+                            .map(|r| r._0)
+                            .unwrap_or(0)
+                        } else {
+                            0
+                        };
 
-            let token_type = if !name.is_empty() || !symbol.is_empty() {
-                "ERC20".to_string() // Assumption, could be ERC721 too
-            } else {
-                "Unknown".to_string()
-            };
+                        let token_type =
+                            if !name.is_empty() || !symbol.is_empty() {
+                                "ERC20".to_string()
+                            } else {
+                                "Unknown".to_string()
+                            };
 
-            // Only store if we found something useful, or if we want to index existence?
-            // User asked to index metadata. If empty, maybe skip?
-            // But we might want to store it to avoid re-fetching?
-            // For now, let's store it.
+                        db_tokens.push(DatabaseToken {
+                            address: *token,
+                            name,
+                            symbol,
+                            decimals,
+                            r#type: token_type,
+                            chain: self.chain_id,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!("Multicall failed for chunk: {}", e);
+                    // Fallback to individual fetching or just skip?
+                    // For now, we skip but we don't add to cache so it might be retried.
+                }
+            }
+        }
 
-            db_tokens.push(DatabaseToken {
-                address: token_address,
-                name,
-                symbol,
-                decimals,
-                r#type: token_type,
-                chain: self.chain_id,
-            });
+        // Update cache
+        {
+            let mut cache = self.known_tokens.write().unwrap();
+            for token in &db_tokens {
+                cache.insert(token.address);
+            }
         }
 
         db_tokens
