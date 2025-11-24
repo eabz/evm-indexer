@@ -50,11 +50,11 @@ pub struct DatabaseTransaction {
     pub max_priority_fee_per_gas: Option<U256>,
     pub method: String,
     pub nonce: u32,
-    pub status: Option<TransactionStatus>,
+    pub status: Option<String>,
     pub timestamp: u32,
     pub to: Address,
     pub transaction_index: u16,
-    pub transaction_type: TransactionType,
+    pub transaction_type: String,
     #[serde_as(as = "SerU256")]
     pub value: U256,
 }
@@ -69,16 +69,16 @@ impl DatabaseTransaction {
     ) -> Self {
         let to = transaction.to.unwrap_or(Address::ZERO);
 
-        let transaction_type: TransactionType =
+        let transaction_type_str: String =
             match transaction.transaction_type {
                 Some(transaction_type) => match transaction_type.into() {
-                    0 => TransactionType::Legacy,
-                    1 => TransactionType::AccessList,
-                    2 => TransactionType::Eip1559,
-                    3 => TransactionType::Blob,
-                    _ => TransactionType::Legacy,
+                    0 => "legacy".to_string(),
+                    1 => "access_list".to_string(),
+                    2 => "eip_1559".to_string(),
+                    3 => "blob".to_string(),
+                    _ => "legacy".to_string(),
                 },
-                None => TransactionType::Legacy,
+                None => "legacy".to_string(),
             };
 
         let access_list: Vec<(Address, Vec<B256>)> =
@@ -97,9 +97,9 @@ impl DatabaseTransaction {
             };
 
         let status = if receipt.status() {
-            Some(TransactionStatus::Success)
+            Some("success".to_string())
         } else {
-            Some(TransactionStatus::Failure)
+            Some("failure".to_string())
         };
 
         let effective_gas_price = match receipt.effective_gas_price {
@@ -170,7 +170,7 @@ impl DatabaseTransaction {
             to,
             transaction_index: transaction.transaction_index.unwrap()
                 as u16,
-            transaction_type,
+            transaction_type: transaction_type_str,
             value: transaction.value,
         }
     }

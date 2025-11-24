@@ -9,8 +9,9 @@ impl SerializeAs<U256> for SerU256 {
     where
         S: Serializer,
     {
-        let buf: [u8; 32] = x.to_le_bytes();
-        buf.serialize(serializer)
+        // Serialize as hex string for ClickHouse compatibility
+        let hex_string = format!("{:x}", x);
+        hex_string.serialize(serializer)
     }
 }
 
@@ -19,7 +20,7 @@ impl<'de> DeserializeAs<'de, U256> for SerU256 {
     where
         D: Deserializer<'de>,
     {
-        let u: [u8; 32] = Deserialize::deserialize(deserializer)?;
-        Ok(U256::from_le_bytes(u))
+        let s: String = Deserialize::deserialize(deserializer)?;
+        U256::from_str_radix(&s, 16).map_err(serde::de::Error::custom)
     }
 }

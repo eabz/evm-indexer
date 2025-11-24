@@ -68,6 +68,86 @@ impl DexRouters {
             DexInfo { name: "1inch", version: "V4" },
         );
 
+        // Curve
+        eth_routers.insert(
+            "0x99a58482BD7f6B857d7E1f08Cd40A4c2a0b3053f".parse().unwrap(),
+            DexInfo { name: "Curve", version: "V1" },
+        );
+        eth_routers.insert(
+            "0x4c6e1eF2D04b53d1b16014ceEd20e13f1e00e27F".parse().unwrap(),
+            DexInfo { name: "Curve", version: "V2" },
+        );
+
+        // DODO
+        eth_routers.insert(
+            "0x6B0431840294e53f1991bF8051413d90b8692CCb".parse().unwrap(),
+            DexInfo { name: "DODO", version: "V1" },
+        );
+        eth_routers.insert(
+            "0x3E712033605604bC3da248719D46B6b61a341142".parse().unwrap(),
+            DexInfo { name: "DODO", version: "V2" },
+        );
+
+        // Curve 3Crv (deprecated but tracking)
+        eth_routers.insert(
+            "0x445FE580eF8d70FF569aB36e80c647af338db351".parse().unwrap(),
+            DexInfo { name: "Curve", version: "3Crv" },
+        );
+
+        // Aave Flashloan Router
+        eth_routers.insert(
+            "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9".parse().unwrap(),
+            DexInfo { name: "Aave", version: "V2" },
+        );
+
+        // Compound
+        eth_routers.insert(
+            "0x3d9819210A31b4961b30EF54bE2aeB56B84ee3a0".parse().unwrap(),
+            DexInfo { name: "Compound", version: "V2" },
+        );
+
+        // Yearn
+        eth_routers.insert(
+            "0x19D3364A9d1d463b7d7C6f95bcF2F7F482E2eBB1".parse().unwrap(),
+            DexInfo { name: "Yearn", version: "V2" },
+        );
+
+        // Lido
+        eth_routers.insert(
+            "0xae7ab96520DE3a18E5e111B5EaAc1417064f0C31".parse().unwrap(),
+            DexInfo { name: "Lido", version: "stETH" },
+        );
+
+        // Paraswap
+        eth_routers.insert(
+            "0x216B4B4ba9F3E719726886d346f1D6C3644QA8".parse().unwrap(),
+            DexInfo { name: "ParaSwap", version: "V5" },
+        );
+
+        // OpenOcean
+        eth_routers.insert(
+            "0x6352a56caadc4f1e25cd6c75970fa768a3aaf514".parse().unwrap(),
+            DexInfo { name: "OpenOcean", version: "" },
+        );
+
+        // Kyber
+        eth_routers.insert(
+            "0x1c87257F5e8609940Bc751a07BB085Bb7Fed0c64".parse().unwrap(),
+            DexInfo { name: "Kyber", version: "V3" },
+        );
+
+        // CoW Protocol
+        eth_routers.insert(
+            "0x9008D19f58AAbD9eD0D60971565AA15BAa120Ff2".parse().unwrap(),
+            DexInfo { name: "CoW Protocol", version: "V2" },
+        );
+
+        // Matcha / 0x
+        eth_routers.insert(
+            "0x6000da47483062A0D734Ba3dc87f17aA63c1e16F".parse().unwrap(),
+            DexInfo { name: "Matcha", version: "V1" },
+        );
+
         routers.insert(1, eth_routers);
 
         // ========== BSC (chain_id: 56) ==========
@@ -117,6 +197,42 @@ impl DexRouters {
             DexInfo { name: "BabySwap", version: "" },
         );
 
+        // Balancer on BSC
+        bsc_routers.insert(
+            "0xBA12222222228d8Ba445958a75a0704d566BF2C8".parse().unwrap(),
+            DexInfo { name: "Balancer", version: "V2" },
+        );
+
+        // DODO on BSC
+        bsc_routers.insert(
+            "0x8F8Bb984e652Cb8D0aa7E399189dD6C7e2F90f5E".parse().unwrap(),
+            DexInfo { name: "DODO", version: "V2" },
+        );
+
+        // Wault Finance
+        bsc_routers.insert(
+            "0xD48745E1F8dB63Ba37e7300F2C4Ee3629D2a58a6".parse().unwrap(),
+            DexInfo { name: "Wault", version: "" },
+        );
+
+        // Bakery Swap
+        bsc_routers.insert(
+            "0xCDe540411ECFb16eC3DC027ed4Cc912FFbE31405".parse().unwrap(),
+            DexInfo { name: "BakerySwap", version: "" },
+        );
+
+        // SafeMoon
+        bsc_routers.insert(
+            "0x05fF2B0DB69458A0750Bada338Cb0455B5148e8E".parse().unwrap(),
+            DexInfo { name: "SafeMoon", version: "" },
+        );
+
+        // Ellipsis Finance (curve fork)
+        bsc_routers.insert(
+            "0x7552c756E293f6b5c754eF32881Ec9b43215de26".parse().unwrap(),
+            DexInfo { name: "Ellipsis", version: "" },
+        );
+
         routers.insert(56, bsc_routers);
 
         // ========== Polygon (chain_id: 137) ==========
@@ -152,6 +268,42 @@ impl DexRouters {
         polygon_routers.insert(
             "0xBA12222222228d8Ba445958a75a0704d566BF2C8".parse().unwrap(),
             DexInfo { name: "Balancer", version: "V2" },
+        );
+
+        // Curve on Polygon
+        polygon_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Curve", version: "V1" },
+        );
+
+        // Aave on Polygon
+        polygon_routers.insert(
+            "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9".parse().unwrap(),
+            DexInfo { name: "Aave", version: "V3" },
+        );
+
+        // Wmatic Staking
+        polygon_routers.insert(
+            "0x5f3Dc4Cc9f4FfB386d925B51b10b33B64000FC91".parse().unwrap(),
+            DexInfo { name: "PoS Portal", version: "Wmatic" },
+        );
+
+        // Polycat Finance
+        polygon_routers.insert(
+            "0x1E4F97b9f9F913EA8ee06f7D93a2D3A0Cc8EB2FC".parse().unwrap(),
+            DexInfo { name: "Polycat", version: "" },
+        );
+
+        // Dfyn
+        polygon_routers.insert(
+            "0xA102072A7FD54eD864e64e75ec46F7C62c03a72b".parse().unwrap(),
+            DexInfo { name: "Dfyn", version: "" },
+        );
+
+        // Matic Network
+        polygon_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Matic", version: "Network" },
         );
 
         routers.insert(137, polygon_routers);
@@ -197,6 +349,54 @@ impl DexRouters {
             DexInfo { name: "TraderJoe", version: "V2" },
         );
 
+        // Curve on Arbitrum
+        arbitrum_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Curve", version: "V1" },
+        );
+
+        // DODO V2 on Arbitrum
+        arbitrum_routers.insert(
+            "0x88d7D573Ae20f34384D50fa5f1d2ff1E441667e2".parse().unwrap(),
+            DexInfo { name: "DODO", version: "V2" },
+        );
+
+        // Aave on Arbitrum
+        arbitrum_routers.insert(
+            "0x794a61358D6845594F94dc1DB02A252b5b4814aD".parse().unwrap(),
+            DexInfo { name: "Aave", version: "V3" },
+        );
+
+        // Compound on Arbitrum
+        arbitrum_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Compound", version: "V3" },
+        );
+
+        // Yearn on Arbitrum
+        arbitrum_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Yearn", version: "V2" },
+        );
+
+        // GMX
+        arbitrum_routers.insert(
+            "0xaBBc3E6db6a476353B5301aEA43f25AB0cFFb3B1".parse().unwrap(),
+            DexInfo { name: "GMX", version: "" },
+        );
+
+        // 1inch on Arbitrum
+        arbitrum_routers.insert(
+            "0x1111111254fb6c44bAC0beD2854e76F90643097d".parse().unwrap(),
+            DexInfo { name: "1inch", version: "V5" },
+        );
+
+        // Gains Network
+        arbitrum_routers.insert(
+            "0x18d96f45F95b73975033547eae59b02dCFF24635".parse().unwrap(),
+            DexInfo { name: "Gains Network", version: "" },
+        );
+
         routers.insert(42161, arbitrum_routers);
 
         // ========== Optimism (chain_id: 10) ==========
@@ -228,6 +428,42 @@ impl DexRouters {
         optimism_routers.insert(
             "0xBA12222222228d8Ba445958a75a0704d566BF2C8".parse().unwrap(),
             DexInfo { name: "Balancer", version: "V2" },
+        );
+
+        // Curve on Optimism
+        optimism_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Curve", version: "V1" },
+        );
+
+        // Aave on Optimism
+        optimism_routers.insert(
+            "0x794a61358D6845594F94dc1DB02A252b5b4814aD".parse().unwrap(),
+            DexInfo { name: "Aave", version: "V3" },
+        );
+
+        // Compound on Optimism
+        optimism_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Compound", version: "V3" },
+        );
+
+        // 1inch on Optimism
+        optimism_routers.insert(
+            "0x1111111254fb6c44bAC0beD2854e76F90643097d".parse().unwrap(),
+            DexInfo { name: "1inch", version: "V5" },
+        );
+
+        // Synthetix
+        optimism_routers.insert(
+            "0x2e5dB100552b932b299c3zc3b0253481fFEbA513".parse().unwrap(),
+            DexInfo { name: "Synthetix", version: "" },
+        );
+
+        // Kwenta (perps)
+        optimism_routers.insert(
+            "0x8dAEBADE922dF735c38C80C7eBD708Af50815fAa".parse().unwrap(),
+            DexInfo { name: "Kwenta", version: "" },
         );
 
         routers.insert(10, optimism_routers);
@@ -263,6 +499,48 @@ impl DexRouters {
             DexInfo { name: "BaseSwap", version: "" },
         );
 
+        // Curve on Base
+        base_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Curve", version: "V1" },
+        );
+
+        // DODO V2 on Base
+        base_routers.insert(
+            "0x6B0431840294e53f1991bF8051413d90b8692CCb".parse().unwrap(),
+            DexInfo { name: "DODO", version: "V2" },
+        );
+
+        // Aave on Base
+        base_routers.insert(
+            "0x794a61358D6845594F94dc1DB02A252b5b4814aD".parse().unwrap(),
+            DexInfo { name: "Aave", version: "V3" },
+        );
+
+        // Compound on Base
+        base_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Compound", version: "V3" },
+        );
+
+        // Balancer on Base
+        base_routers.insert(
+            "0xBA12222222228d8Ba445958a75a0704d566BF2C8".parse().unwrap(),
+            DexInfo { name: "Balancer", version: "V2" },
+        );
+
+        // 1inch on Base
+        base_routers.insert(
+            "0x1111111254fb6c44bAC0beD2854e76F90643097d".parse().unwrap(),
+            DexInfo { name: "1inch", version: "V5" },
+        );
+
+        // Maverick
+        base_routers.insert(
+            "0x32aFc0b3f1dFd463B4bFDc4C92f9DF95ed66D08f".parse().unwrap(),
+            DexInfo { name: "Maverick", version: "V1" },
+        );
+
         routers.insert(8453, base_routers);
 
         // ========== Avalanche (chain_id: 43114) ==========
@@ -288,6 +566,54 @@ impl DexRouters {
         avalanche_routers.insert(
             "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506".parse().unwrap(),
             DexInfo { name: "SushiSwap", version: "V2" },
+        );
+
+        // Curve on Avalanche
+        avalanche_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Curve", version: "V1" },
+        );
+
+        // DODO V2 on Avalanche
+        avalanche_routers.insert(
+            "0xb27682b145913e06bdb3d379762cf87e80e3c6e3".parse().unwrap(),
+            DexInfo { name: "DODO", version: "V2" },
+        );
+
+        // Aave on Avalanche
+        avalanche_routers.insert(
+            "0x794a61358D6845594F94dc1DB02A252b5b4814aD".parse().unwrap(),
+            DexInfo { name: "Aave", version: "V3" },
+        );
+
+        // Compound on Avalanche
+        avalanche_routers.insert(
+            "0x0000000000000000000000000000000000000000".parse().unwrap(),
+            DexInfo { name: "Compound", version: "V3" },
+        );
+
+        // 1inch on Avalanche
+        avalanche_routers.insert(
+            "0x1111111254fb6c44bAC0beD2854e76F90643097d".parse().unwrap(),
+            DexInfo { name: "1inch", version: "V5" },
+        );
+
+        // Balancer on Avalanche
+        avalanche_routers.insert(
+            "0xBA12222222228d8Ba445958a75a0704d566BF2C8".parse().unwrap(),
+            DexInfo { name: "Balancer", version: "V2" },
+        );
+
+        // Platypus
+        avalanche_routers.insert(
+            "0x66357dCaCe80353121602d9C76Db1cA6a7b16D8d".parse().unwrap(),
+            DexInfo { name: "Platypus", version: "" },
+        );
+
+        // Teddy
+        avalanche_routers.insert(
+            "0x54eAacE40807D8b3927F59985d2Ef8d2bECC5e76".parse().unwrap(),
+            DexInfo { name: "Teddy", version: "" },
         );
 
         routers.insert(43114, avalanche_routers);

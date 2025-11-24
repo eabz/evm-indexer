@@ -40,14 +40,14 @@ pub enum RewardType {
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTrace {
-    pub action_type: ActionType,
+    pub action_type: String,
     pub address: Option<Address>,
     pub author: Option<Address>,
     #[serde_as(as = "Option<SerU256>")]
     pub balance: Option<U256>,
     pub block_hash: B256,
     pub block_number: u32,
-    pub call_type: Option<CallType>,
+    pub call_type: Option<String>,
     pub chain: u64,
     pub code: Option<Bytes>,
     pub error: Option<String>,
@@ -58,7 +58,7 @@ pub struct DatabaseTrace {
     pub input: Option<Bytes>,
     pub output: Option<Bytes>,
     pub refund_address: Option<Address>,
-    pub reward_type: Option<RewardType>,
+    pub reward_type: Option<String>,
     pub subtraces: u16,
     pub to: Option<Address>,
     pub trace_address: Vec<u16>,
@@ -70,8 +70,8 @@ pub struct DatabaseTrace {
 
 impl DatabaseTrace {
     pub fn from_rpc(trace: &Trace, chain: u64) -> Self {
-        let mut call_type: Option<CallType> = None;
-        let mut reward_type: Option<RewardType> = None;
+        let mut call_type: Option<String> = None;
+        let mut reward_type: Option<String> = None;
         let mut from: Option<Address> = None;
         let mut to: Option<Address> = None;
         let mut gas: Option<u32> = None;
@@ -91,40 +91,42 @@ impl DatabaseTrace {
                 input = Some(call.input.clone());
                 value = Some(call.value);
                 call_type = match call.call_type {
-                    AlloyCallType::None => Some(CallType::None),
-                    AlloyCallType::Call => Some(CallType::Call),
-                    AlloyCallType::CallCode => Some(CallType::CallCode),
+                    AlloyCallType::None => Some("none".to_string()),
+                    AlloyCallType::Call => Some("call".to_string()),
+                    AlloyCallType::CallCode => {
+                        Some("callcode".to_string())
+                    }
                     AlloyCallType::DelegateCall => {
-                        Some(CallType::DelegateCall)
+                        Some("delegatecall".to_string())
                     }
                     AlloyCallType::StaticCall => {
-                        Some(CallType::StaticCall)
+                        Some("staticcall".to_string())
                     }
-                    AlloyCallType::AuthCall => Some(CallType::None),
+                    AlloyCallType::AuthCall => Some("none".to_string()),
                 };
-                ActionType::Call
+                "call".to_string()
             }
             Action::Create(create) => {
                 from = Some(create.from);
                 value = Some(create.value);
                 gas = Some(create.gas.to::<u32>());
                 init = Some(create.init.clone());
-                ActionType::Create
+                "create".to_string()
             }
             Action::Selfdestruct(suicide) => {
                 from = Some(suicide.address);
                 refund_address = Some(suicide.refund_address);
                 balance = Some(suicide.balance);
-                ActionType::Suicide
+                "suicide".to_string()
             }
             Action::Reward(reward) => {
                 author = Some(reward.author);
                 value = Some(reward.value);
                 reward_type = match reward.reward_type {
-                    AlloyRewardType::Block => Some(RewardType::Block),
-                    AlloyRewardType::Uncle => Some(RewardType::Uncle),
+                    AlloyRewardType::Block => Some("block".to_string()),
+                    AlloyRewardType::Uncle => Some("uncle".to_string()),
                 };
-                ActionType::Reward
+                "reward".to_string()
             }
         };
 

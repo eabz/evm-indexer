@@ -2,15 +2,12 @@ use crate::{
     configs::Config,
     db::{
         models::{
-            block::DatabaseBlock,
-            contract::DatabaseContract,
+            block::DatabaseBlock, contract::DatabaseContract,
             dex_trade::DatabaseDexTrade,
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
-            erc721_transfer::DatabaseERC721Transfer,
-            log::DatabaseLog,
-            trace::{ActionType, DatabaseTrace},
-            transaction::DatabaseTransaction,
+            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
+            trace::DatabaseTrace, transaction::DatabaseTransaction,
             withdrawal::DatabaseWithdrawal,
         },
         BlockFetchedData, Database,
@@ -40,8 +37,6 @@ use log::{debug, error, info, warn};
 use rand::seq::SliceRandom;
 use reqwest::Client;
 use std::collections::HashMap;
-use std::time::Duration;
-use tokio::time::sleep;
 use url::Url;
 
 #[derive(Clone)]
@@ -290,9 +285,7 @@ impl Rpc {
                 // Insert contracts created through the traces
                 let create_traces: Vec<&DatabaseTrace> = traces
                     .iter()
-                    .filter(|trace| {
-                        trace.action_type == ActionType::Create
-                    })
+                    .filter(|trace| trace.action_type == "create")
                     .collect();
 
                 for trace in create_traces {
@@ -564,6 +557,27 @@ impl Rpc {
             panic!("websocket chain id doesn't match with configured chain id")
         }
 
+        // Detect capabilities on websocket connection
+        let latest_block = client.get_block_number().await;
+        let mut ws_supports_block_receipts = false;
+
+        if let Ok(block_number) = latest_block {
+            let receipts = client
+                .raw_request::<_, Vec<serde_json::Value>>(
+                    "eth_getBlockReceipts".into(),
+                    [format!("0x{:x}", block_number)],
+                )
+                .await;
+
+            ws_supports_block_receipts = receipts.is_ok();
+            info!(
+                "Websocket capability detection: eth_getBlockReceipts={}",
+                ws_supports_block_receipts
+            );
+        } else {
+            warn!("Failed to detect websocket capabilities: unable to get latest block");
+        }
+
         let subscription = client
             .subscribe_blocks()
             .await
@@ -579,23 +593,6 @@ impl Rpc {
                     let block_number = block.header.number.unwrap() as u32;
 
                     info!("New head found {}.", block_number.clone());
-
-                    // Some chains require a small delay between receiving the head and fetching the block
-                    // to allow the chain and nodes propagate and execute the block data.
-
-                    // The list of chains to add delay should be added manually and tested
-                    // Right now this is tested for ETH (1) and BSC (56)
-                    // These values can change depending on network load
-
-                    // ETH requires 300ms
-                    if rpc.chain_id == 1 {
-                        sleep(Duration::from_millis(300)).await;
-                    }
-
-                    // BSC requires 4s
-                    if rpc.chain_id == 56 {
-                        sleep(Duration::from_secs(4)).await;
-                    }
 
                     let block_data = rpc.fetch_block(&block_number).await;
 
