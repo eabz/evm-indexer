@@ -1,13 +1,5 @@
 use std::collections::HashMap;
 
-use primitive_types::U256;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BalanceAllocation {
-    balance: U256,
-}
-
 #[derive(Debug, Clone)]
 pub struct Chain {
     pub id: u64,

@@ -1,91 +1,63 @@
+use alloy::primitives::{Address, B256, U256};
 use clickhouse::Row;
-use ethers::abi::{ethabi, ParamType};
-use primitive_types::{H256, U256};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::log::DatabaseLog;
-use crate::utils::format::{format_address, SerU256};
+use crate::utils::format::SerU256;
 
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC721Transfer {
-    pub address: String,
+    pub address: Address,
     pub block_number: u32,
     pub chain: u64,
-    pub from: String,
+    pub from: Address,
     #[serde_as(as = "SerU256")]
     pub id: U256,
     pub log_index: u16,
     pub log_type: Option<String>,
     pub removed: bool,
     pub timestamp: u32,
-    pub to: String,
-    pub token_address: String,
-    pub transaction_hash: String,
+    pub to: Address,
+    pub token_address: Address,
+    pub transaction_hash: B256,
     pub transaction_log_index: Option<u16>,
 }
 
 impl DatabaseERC721Transfer {
-    pub fn from_rpc(log: &DatabaseLog) -> Self {
-        let from_address_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic1.clone().unwrap(),
-            )
-            .unwrap();
+    pub fn from_log(log: &DatabaseLog) -> Option<Self> {
+        let topic0 = log.topic0?;
+        let topic1 = log.topic1?;
+        let topic2 = log.topic2?;
+        let topic3 = log.topic3?;
 
-        let to_address_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic2.clone().unwrap(),
-            )
-            .unwrap();
+        if topic0
+            != "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                .parse::<B256>()
+                .unwrap()
+        {
+            return None;
+        }
 
-        let id_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic3.clone().unwrap(),
-            )
-            .unwrap();
+        let from = Address::from_word(topic1);
+        let to = Address::from_word(topic2);
+        let id = U256::from_be_bytes(topic3.0);
 
-        let from_address_tokens = ethabi::decode(
-            &[ParamType::Address],
-            from_address_bytes.as_bytes(),
-        )
-        .unwrap();
-
-        let from_address = from_address_tokens.first().unwrap();
-
-        let to_address_tokens = ethabi::decode(
-            &[ParamType::Address],
-            to_address_bytes.as_bytes(),
-        )
-        .unwrap();
-
-        let to_address = to_address_tokens.first().unwrap();
-
-        let id_tokens =
-            ethabi::decode(&[ParamType::Uint(256)], id_bytes.as_bytes())
-                .unwrap();
-
-        let id = id_tokens.first().unwrap();
-
-        Self {
-            address: log.address.clone(),
+        Some(Self {
+            address: log.address,
             block_number: log.block_number,
             chain: log.chain,
-            from: format_address(
-                from_address.to_owned().into_address().unwrap(),
-            ),
-            id: id.to_owned().into_uint().unwrap(),
+            from,
+            id,
             log_index: log.log_index,
             log_type: log.log_type.clone(),
             removed: log.removed,
             timestamp: log.timestamp,
-            to: format_address(
-                to_address.to_owned().into_address().unwrap(),
-            ),
-            token_address: log.address.clone(),
-            transaction_hash: log.transaction_hash.clone(),
+            to,
+            token_address: log.address,
+            transaction_hash: log.transaction_hash,
             transaction_log_index: log.transaction_log_index,
-        }
+        })
     }
 }

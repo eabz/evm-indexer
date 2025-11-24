@@ -1,24 +1,22 @@
-use ethers::types::{Bytes, H160, H256, H64};
-use primitive_types::U256;
+use alloy::primitives::{Address, Bytes, B256, B64, U256};
 use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{DeserializeAs, SerializeAs};
 
-pub fn format_nonce(h: H64) -> String {
+pub fn format_nonce(h: B64) -> String {
     format!("{:?}", h)
 }
 
-pub fn format_hash(h: H256) -> String {
+pub fn format_hash(h: B256) -> String {
     format!("{:?}", h)
 }
 
-pub fn format_address(h: H160) -> String {
+pub fn format_address(h: Address) -> String {
     format!("{:?}", h)
 }
 
 pub fn format_bytes(b: &Bytes) -> String {
     serde_json::to_string(b).unwrap().replace('\"', "")
 }
-
 pub fn decode_bytes(s: String) -> Vec<u8> {
     let without_prefix = &s[2..];
     hex::decode(without_prefix).unwrap()
@@ -29,13 +27,13 @@ pub fn format_bytes_slice(b: &[u8]) -> String {
 }
 
 pub fn byte4_from_input(input: &str) -> [u8; 4] {
-    let input_sanitized = input.strip_prefix("0x").unwrap();
+    let input_sanitized = input.strip_prefix("0x").unwrap_or(input);
 
     if input_sanitized.is_empty() {
         return [0x00, 0x00, 0x00, 0x00];
     }
 
-    let input_bytes = hex::decode(input_sanitized).unwrap();
+    let input_bytes = hex::decode(input_sanitized).unwrap_or_default();
 
     if input_bytes.len() < 4 {
         return [0x00, 0x00, 0x00, 0x00];
@@ -54,8 +52,7 @@ impl SerializeAs<U256> for SerU256 {
     where
         S: Serializer,
     {
-        let mut buf: [u8; 32] = [0; 32];
-        x.to_little_endian(&mut buf);
+        let buf: [u8; 32] = x.to_le_bytes();
         buf.serialize(serializer)
     }
 }
@@ -66,6 +63,6 @@ impl<'de> DeserializeAs<'de, U256> for SerU256 {
         D: Deserializer<'de>,
     {
         let u: [u8; 32] = Deserialize::deserialize(deserializer)?;
-        Ok(U256::from_little_endian(&u))
+        Ok(U256::from_le_bytes(u))
     }
 }

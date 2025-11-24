@@ -1,176 +1,85 @@
+use alloy::primitives::{Address, B256, U256};
 use clickhouse::Row;
-use ethers::abi::{ethabi, ParamType};
-use primitive_types::{H256, U256};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::log::DatabaseLog;
-use crate::utils::format::{format_address, SerU256};
+use crate::utils::format::SerU256;
 
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC1155Transfer {
-    pub address: String,
+    pub address: Address,
     #[serde_as(as = "Vec<SerU256>")]
     pub amounts: Vec<U256>,
     pub block_number: u32,
     pub chain: u64,
-    pub from: String,
+    pub from: Address,
     #[serde_as(as = "Vec<SerU256>")]
     pub ids: Vec<U256>,
     pub log_index: u16,
     pub log_type: Option<String>,
-    pub operator: String,
+    pub operator: Address,
     pub removed: bool,
     pub timestamp: u32,
-    pub to: String,
-    pub token_address: String,
-    pub transaction_hash: String,
+    pub to: Address,
+    pub token_address: Address,
+    pub transaction_hash: B256,
     pub transaction_log_index: Option<u16>,
 }
 
 impl DatabaseERC1155Transfer {
-    pub fn from_single_rpc(
-        log: &DatabaseLog,
-        id: U256,
-        amount: U256,
-    ) -> Self {
-        let operator_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic1.clone().unwrap(),
-            )
+    pub fn from_log(log: &DatabaseLog) -> Option<Self> {
+        let topic0 = log.topic0?;
+        let topic1 = log.topic1?;
+        let topic2 = log.topic2?;
+        let topic3 = log.topic3?;
+
+        let single = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+            .parse::<B256>()
+            .unwrap();
+        let batch = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
+            .parse::<B256>()
             .unwrap();
 
-        let from_address_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic2.clone().unwrap(),
-            )
-            .unwrap();
-
-        let to_address_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic3.clone().unwrap(),
-            )
-            .unwrap();
-
-        let operator_tokens = ethabi::decode(
-            &[ParamType::Address],
-            operator_bytes.as_bytes(),
-        )
-        .unwrap();
-
-        let operator = operator_tokens.first().unwrap();
-
-        let from_address_tokens = ethabi::decode(
-            &[ParamType::Address],
-            from_address_bytes.as_bytes(),
-        )
-        .unwrap();
-
-        let from_address = from_address_tokens.first().unwrap();
-
-        let to_address_tokens = ethabi::decode(
-            &[ParamType::Address],
-            to_address_bytes.as_bytes(),
-        )
-        .unwrap();
-
-        let to_address = to_address_tokens.first().unwrap();
-
-        Self {
-            address: log.address.clone(),
-            amounts: vec![amount],
-            block_number: log.block_number,
-            chain: log.chain,
-            from: format_address(
-                from_address.to_owned().into_address().unwrap(),
-            ),
-            ids: vec![id],
-            log_index: log.log_index,
-            log_type: log.log_type.clone(),
-            operator: format_address(
-                operator.to_owned().into_address().unwrap(),
-            ),
-            removed: log.removed,
-            timestamp: log.timestamp,
-            to: format_address(
-                to_address.to_owned().into_address().unwrap(),
-            ),
-            token_address: log.address.clone(),
-            transaction_hash: log.transaction_hash.clone(),
-            transaction_log_index: log.transaction_log_index,
+        if topic0 != single && topic0 != batch {
+            return None;
         }
-    }
 
-    pub fn from_batch_rpc(
-        log: &DatabaseLog,
-        ids: Vec<U256>,
-        amounts: Vec<U256>,
-    ) -> Self {
-        let operator_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic1.clone().unwrap(),
-            )
-            .unwrap();
+        let operator = Address::from_word(topic1);
+        let from = Address::from_word(topic2);
+        let to = Address::from_word(topic3);
 
-        let from_address_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic2.clone().unwrap(),
-            )
-            .unwrap();
+        let mut ids = Vec::new();
+        let mut amounts = Vec::new();
 
-        let to_address_bytes =
-            array_bytes::dehexify_array_then_into::<String, H256, 32>(
-                log.topic3.clone().unwrap(),
-            )
-            .unwrap();
+        if topic0 == single {
+            if log.data.len() >= 64 {
+                let id = U256::from_be_slice(&log.data[0..32]);
+                let amount = U256::from_be_slice(&log.data[32..64]);
+                ids.push(id);
+                amounts.push(amount);
+            }
+        } else {
+            return None; // Batch decoding skipped for now
+        }
 
-        let operator_tokens = ethabi::decode(
-            &[ParamType::Address],
-            operator_bytes.as_bytes(),
-        )
-        .unwrap();
-
-        let operator = operator_tokens.first().unwrap();
-
-        let from_address_tokens = ethabi::decode(
-            &[ParamType::Address],
-            from_address_bytes.as_bytes(),
-        )
-        .unwrap();
-
-        let from_address = from_address_tokens.first().unwrap();
-
-        let to_address_tokens = ethabi::decode(
-            &[ParamType::Address],
-            to_address_bytes.as_bytes(),
-        )
-        .unwrap();
-
-        let to_address = to_address_tokens.first().unwrap();
-
-        Self {
-            address: log.address.clone(),
+        Some(Self {
+            address: log.address,
             amounts,
             block_number: log.block_number,
             chain: log.chain,
-            from: format_address(
-                from_address.to_owned().into_address().unwrap(),
-            ),
+            from,
             ids,
             log_index: log.log_index,
             log_type: log.log_type.clone(),
-            operator: format_address(
-                operator.to_owned().into_address().unwrap(),
-            ),
+            operator,
             removed: log.removed,
             timestamp: log.timestamp,
-            to: format_address(
-                to_address.to_owned().into_address().unwrap(),
-            ),
-            token_address: log.address.clone(),
-            transaction_hash: log.transaction_hash.clone(),
+            to,
+            token_address: log.address,
+            transaction_hash: log.transaction_hash,
             transaction_log_index: log.transaction_log_index,
-        }
+        })
     }
 }

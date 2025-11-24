@@ -24,36 +24,28 @@ use crate::{
         format::{decode_bytes, format_hash},
     },
 };
-use ethabi::ParamType;
-use ethers::{
-    abi::ethabi,
-    types::{Block, Trace, Transaction, TransactionReceipt, TxHash},
+use alloy::dyn_abi::DynSolType;
+use alloy::primitives::U256;
+use alloy::providers::{
+    Provider, ProviderBuilder, RootProvider, WsConnect,
 };
-use primitive_types::U256;
-
-use jsonrpsee::{
-    core::{
-        client::{ClientT, Subscription, SubscriptionClientT},
-        rpc_params,
-    },
-    tracing::debug,
+use alloy::rpc::types::{
+    BlockNumberOrTag, BlockTransactions, Transaction, TransactionReceipt,
 };
-use jsonrpsee_http_client::{
-    transport::HttpBackend, HttpClient, HttpClientBuilder,
-};
-use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
-
-use log::{info, warn};
+use alloy::transports::http::Http;
+use alloy_rpc_types_trace::parity::LocalizedTransactionTrace as Trace;
+use futures::StreamExt;
+use log::{debug, error, info, warn};
 use rand::seq::SliceRandom;
-use std::{collections::HashMap, time::Duration};
+use reqwest::Client;
+use std::collections::HashMap;
+use std::time::Duration;
 use tokio::time::sleep;
-
-use serde_json::Error;
-
-#[derive(Debug, Clone)]
+use url::Url;
+#[derive(Clone)]
 pub struct Rpc {
     pub chain: Chain,
-    pub clients: Vec<HttpClient<HttpBackend>>,
+    pub clients: Vec<RootProvider<Http<Client>>>,
     pub clients_urls: Vec<String>,
     pub ws_url: Option<String>,
     pub traces: bool,
@@ -63,30 +55,18 @@ impl Rpc {
     pub async fn new(config: &Config) -> Self {
         info!("Starting rpc service");
 
-        let timeout = Duration::from_secs(60);
-
         let mut clients = Vec::new();
         let mut clients_urls = Vec::new();
 
         for rpc in config.rpcs.iter() {
-            let client = HttpClientBuilder::default()
-                .max_concurrent_requests(100000)
-                .request_timeout(timeout)
-                .build(rpc)
-                .unwrap();
+            let url = Url::parse(rpc).expect("Invalid RPC URL");
+            let client = ProviderBuilder::new().on_http(url);
 
-            let client_id =
-                client.request("eth_chainId", rpc_params![]).await;
+            let chain_id = client.get_chain_id().await;
 
-            match client_id {
-                Ok(value) => {
-                    let chain_id: U256 =
-                        match serde_json::from_value(value) {
-                            Ok(value) => value,
-                            Err(_) => continue,
-                        };
-
-                    if chain_id.as_u64() != config.chain.id {
+            match chain_id {
+                Ok(id) => {
+                    if id != config.chain.id {
                         continue;
                     }
 
@@ -113,18 +93,8 @@ impl Rpc {
     pub async fn get_last_block(&self) -> u32 {
         let client = self.get_client();
 
-        let last_block =
-            client.request("eth_blockNumber", rpc_params![]).await;
-
-        match last_block {
-            Ok(value) => {
-                let block_number: U256 = serde_json::from_value(value)
-                    .expect(
-                        "Unable to deserialize eth_blockNumber response",
-                    );
-
-                block_number.as_usize() as u32
-            }
+        match client.get_block_number().await {
+            Ok(number) => number as u32,
             Err(_) => 0,
         }
     }
@@ -158,20 +128,21 @@ impl Rpc {
         match block_data {
             Some((
                 db_block,
-                mut db_transactions,
+                raw_transactions,
                 db_withdrawals,
                 mut block_uncles,
             )) => {
-                let total_block_transactions = db_transactions.len();
+                let total_block_transactions = raw_transactions.len();
 
                 // Make sure all the transactions are correctly formatted.
                 if db_block.transactions != total_block_transactions as u16
                 {
                     warn!(
-                        "Missing {} transactions for block {}.",
+                        "Missing {} transactions for block {}. Actual: {}",
                         db_block.transactions
                             - total_block_transactions as u16,
-                        db_block.number
+                        db_block.number,
+                        total_block_transactions
                     );
                     return None;
                 }
@@ -210,11 +181,11 @@ impl Rpc {
                         None => return None,
                     }
                 } else {
-                    for transaction in db_transactions.iter() {
+                    for transaction in raw_transactions.iter() {
                         let receipt_data = self
                             .get_transaction_receipt(
-                                transaction.hash.clone(),
-                                transaction.timestamp,
+                                format_hash(transaction.hash),
+                                db_block.timestamp,
                                 block_number,
                             )
                             .await;
@@ -253,16 +224,23 @@ impl Rpc {
                     return None;
                 }
 
-                // TODO: add receipt data to transactions
-                for transaction in db_transactions.iter_mut() {
+                // Re-create db_transactions with receipt data
+                let mut db_transactions = Vec::new();
+
+                for transaction in raw_transactions {
                     let receipt = db_receipts
-                        .get(&transaction.hash.clone())
+                        .get(&format_hash(transaction.hash))
                         .expect("unable to get receipt for transaction");
 
-                    transaction.add_receipt_data(
-                        db_block.base_fee_per_gas,
+                    let db_transaction = DatabaseTransaction::from_rpc(
+                        &transaction,
                         receipt,
+                        self.chain.id,
+                        db_block.timestamp,
+                        db_block.base_fee_per_gas,
                     );
+
+                    db_transactions.push(db_transaction)
                 }
 
                 let mut db_blocks: Vec<DatabaseBlock> = Vec::new();
@@ -318,7 +296,8 @@ impl Rpc {
                     // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
                     let topic0 = log.topic0.clone();
 
-                    if topic0 == TRANSFER_EVENTS_SIGNATURE {
+                    if topic0.as_deref() == Some(TRANSFER_EVENTS_SIGNATURE)
+                    {
                         // Check if it is a erc20 or a erc721 based on the number of logs
 
                         // erc721 token transfer events have 3 indexed values.
@@ -338,28 +317,26 @@ impl Rpc {
                         }
                     }
 
-                    if topic0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
+                    if topic0.as_deref()
+                        == Some(ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE)
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                         && log.topic3.is_some()
                     {
                         let log_data = decode_bytes(log.data.clone());
 
-                        let transfer_values = ethabi::decode(
-                            &[ParamType::Uint(256), ParamType::Uint(256)],
-                            &log_data[..],
-                        )
+                        let transfer_values = DynSolType::Tuple(vec![
+                            DynSolType::Uint(256),
+                            DynSolType::Uint(256),
+                        ])
+                        .abi_decode(&log_data)
                         .unwrap();
+                        let transfer_values =
+                            transfer_values.as_tuple().unwrap();
 
-                        let id = transfer_values[0]
-                            .clone()
-                            .into_uint()
-                            .unwrap();
-
-                        let amount = transfer_values[1]
-                            .clone()
-                            .into_uint()
-                            .unwrap();
+                        let id = transfer_values[0].as_uint().unwrap().0;
+                        let amount =
+                            transfer_values[1].as_uint().unwrap().0;
 
                         let erc1155_transfer =
                             DatabaseERC1155Transfer::from_single_rpc(
@@ -369,44 +346,38 @@ impl Rpc {
                         db_erc1155_transfers.push(erc1155_transfer);
                     }
 
-                    if topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
+                    if topic0.as_deref()
+                        == Some(ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE)
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                         && log.topic3.is_some()
                     {
                         let log_data = decode_bytes(log.data.clone());
 
-                        let transfer_values = ethabi::decode(
-                            &[
-                                ParamType::Array(Box::new(
-                                    ParamType::Uint(256),
-                                )),
-                                ParamType::Array(Box::new(
-                                    ParamType::Uint(256),
-                                )),
-                            ],
-                            &log_data[..],
-                        )
+                        let transfer_values = DynSolType::Tuple(vec![
+                            DynSolType::Array(Box::new(DynSolType::Uint(
+                                256,
+                            ))),
+                            DynSolType::Array(Box::new(DynSolType::Uint(
+                                256,
+                            ))),
+                        ])
+                        .abi_decode(&log_data)
                         .unwrap();
+                        let transfer_values =
+                            transfer_values.as_tuple().unwrap();
 
                         let ids: Vec<U256> = transfer_values[0]
-                            .clone()
-                            .into_array()
+                            .as_array()
                             .unwrap()
                             .iter()
-                            .map(|token| {
-                                token.clone().into_uint().unwrap()
-                            })
+                            .map(|v| v.as_uint().unwrap().0)
                             .collect();
-
                         let amounts: Vec<U256> = transfer_values[1]
-                            .clone()
-                            .into_array()
+                            .as_array()
                             .unwrap()
                             .iter()
-                            .map(|token| {
-                                token.clone().into_uint().unwrap()
-                            })
+                            .map(|v| v.as_uint().unwrap().0)
                             .collect();
 
                         let erc1155_transfer =
@@ -452,46 +423,35 @@ impl Rpc {
     pub async fn listen_blocks(&self, db: &Database) {
         info!("Starting new blocks listener.");
 
-        let client = self.get_ws_client().await;
+        let ws_url = self.ws_url.clone().unwrap();
+        let ws_connect = WsConnect::new(ws_url);
+        let client = ProviderBuilder::new()
+            .on_ws(ws_connect)
+            .await
+            .expect("unable to connect to websocket");
 
-        let client_id = client.request("eth_chainId", rpc_params![]).await;
+        let chain_id = client
+            .get_chain_id()
+            .await
+            .expect("unable to get chain id from websocket");
 
-        match client_id {
-            Ok(value) => {
-                let chain_id: U256 = match serde_json::from_value(value) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        panic!("unable to get chain id from websocket")
-                    }
-                };
-
-                if chain_id.as_u64() != self.chain.id {
-                    panic!("websocket chain id doesn't match with configured chain id")
-                }
-            }
-            Err(_) => panic!("unable to access websocket"),
+        if chain_id != self.chain.id {
+            panic!("websocket chain id doesn't match with configured chain id")
         }
 
-        let mut subscription: Subscription<Block<TxHash>> = client
-            .subscribe(
-                "eth_subscribe",
-                rpc_params!["newHeads"],
-                "eth_unsubscribe",
-            )
+        let subscription = client
+            .subscribe_blocks()
             .await
             .expect("unable to start block listener");
+        let mut stream = subscription.into_stream();
 
-        while let Some(block) = subscription.next().await {
-            if block.is_err() {
-                continue;
-            }
+        while let Some(block) = stream.next().await {
             tokio::spawn({
                 let rpc = self.clone();
                 let db = db.clone();
-                let block = block.unwrap().clone();
+                let block = block.clone();
                 async move {
-                    let block_number =
-                        block.number.unwrap().as_usize() as u32;
+                    let block_number = block.header.number.unwrap() as u32;
 
                     info!("New head found {}.", block_number.clone());
 
@@ -546,135 +506,102 @@ impl Rpc {
         }
     }
 
-    fn get_client(&self) -> &HttpClient<HttpBackend> {
+    fn get_client(&self) -> &RootProvider<Http<Client>> {
         let client = self.clients.choose(&mut rand::thread_rng()).unwrap();
 
         client
     }
 
-    async fn get_ws_client(&self) -> WsClient {
-        let url = self.ws_url.clone().unwrap();
-
-        let client_wss: WsClient =
-            WsClientBuilder::default().build(url).await.unwrap();
-
-        client_wss
-    }
-
-    async fn get_block(
+    pub async fn get_block(
         &self,
         block_number: &u32,
     ) -> Option<(
         DatabaseBlock,
-        Vec<DatabaseTransaction>,
+        Vec<Transaction>,
         Vec<DatabaseWithdrawal>,
         Vec<DatabaseBlock>,
     )> {
         let client = self.get_client();
-
-        let raw_block = client
-            .request(
-                "eth_getBlockByNumber",
-                rpc_params![format!("0x{:x}", block_number), true],
+        let block = client
+            .get_block_by_number(
+                BlockNumberOrTag::Number(*block_number as u64),
+                true,
             )
             .await;
 
-        match raw_block {
-            Ok(value) => {
-                let block: Result<Block<Transaction>, Error> =
-                    serde_json::from_value(value);
+        match block {
+            Ok(block) => match block {
+                Some(block) => {
+                    let is_uncle = false;
+                    let db_block = DatabaseBlock::from_rpc(
+                        &block,
+                        self.chain.id,
+                        is_uncle,
+                    );
 
-                match block {
-                    Ok(block) => {
-                        let db_block = DatabaseBlock::from_rpc(
-                            &block,
-                            self.chain.id,
-                            false,
-                        );
+                    let mut db_transactions: Vec<Transaction> = Vec::new();
 
-                        let mut db_transactions = Vec::new();
+                    if let BlockTransactions::Full(txs) =
+                        &block.transactions
+                    {
+                        for transaction in txs {
+                            db_transactions.push(transaction.clone())
+                        }
+                    }
 
-                        for transaction in block.transactions.iter() {
-                            let db_transaction =
-                                DatabaseTransaction::from_rpc(
-                                    transaction,
+                    let mut db_withdrawals: Vec<DatabaseWithdrawal> =
+                        Vec::new();
+
+                    if let Some(withdrawals) = &block.withdrawals {
+                        for withdrawal in withdrawals {
+                            let db_withdrawal =
+                                DatabaseWithdrawal::from_rpc(
+                                    withdrawal,
                                     self.chain.id,
+                                    db_block.number,
                                     db_block.timestamp,
                                 );
 
-                            db_transactions.push(db_transaction)
+                            db_withdrawals.push(db_withdrawal)
                         }
-
-                        let mut db_withdrawals = Vec::new();
-
-                        if block.withdrawals.is_some() {
-                            for withdrawal in
-                                block.withdrawals.unwrap().iter()
-                            {
-                                let db_withdrawal =
-                                    DatabaseWithdrawal::from_rpc(
-                                        withdrawal,
-                                        self.chain.id,
-                                        db_block.number,
-                                        db_block.timestamp,
-                                    );
-
-                                db_withdrawals.push(db_withdrawal)
-                            }
-                        }
-
-                        let mut block_uncles = Vec::new();
-
-                        for (i, _) in db_block.uncles.iter().enumerate() {
-                            let raw_uncle = client
-                                .request(
-                                    "eth_getUncleByBlockNumberAndIndex",
-                                    rpc_params![
-                                        format!("0x{:x}", db_block.number),
-                                        format!("0x{:x}", i)
-                                    ],
-                                )
-                                .await;
-                            match raw_uncle {
-                                Ok(value) => {
-                                    let block: Result<
-                                        Block<TxHash>,
-                                        Error,
-                                    > = serde_json::from_value(value);
-
-                                    match block {
-                                        Ok(block) => {
-                                            let db_block =
-                                                DatabaseBlock::from_rpc(
-                                                    &block,
-                                                    self.chain.id,
-                                                    true,
-                                                );
-
-                                            block_uncles.push(db_block)
-                                        }
-                                        Err(err) => {
-                                            println!("{}", err)
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    println!("{}", err)
-                                }
-                            }
-                        }
-
-                        Some((
-                            db_block,
-                            db_transactions,
-                            db_withdrawals,
-                            block_uncles,
-                        ))
                     }
-                    Err(_) => None,
+                    let mut block_uncles = Vec::new();
+
+                    for (i, _) in block.uncles.iter().enumerate() {
+                        let uncle = client
+                            .get_uncle(
+                                alloy::rpc::types::BlockId::Number(
+                                    BlockNumberOrTag::Number(
+                                        *block_number as u64,
+                                    ),
+                                ),
+                                i as u64,
+                            )
+                            .await;
+
+                        if let Ok(Some(block)) = uncle {
+                            let db_block = DatabaseBlock::from_rpc(
+                                &block,
+                                self.chain.id,
+                                true,
+                            );
+                            block_uncles.push(db_block)
+                        }
+                    }
+
+                    Some((
+                        db_block,
+                        db_transactions,
+                        db_withdrawals,
+                        block_uncles,
+                    ))
                 }
+                None => None,
+            },
+            Err(e) => {
+                error!("Error fetching block: {:?}", e);
+                None
             }
-            Err(_) => None,
         }
     }
 
@@ -684,35 +611,27 @@ impl Rpc {
     ) -> Vec<DatabaseTrace> {
         let client = self.get_client();
 
-        let raw_block = client
-            .request(
-                "trace_block",
-                rpc_params![format!("0x{:x}", block_number)],
+        // trace_block is not yet in standard Alloy provider trait in 0.1?
+        // We use raw request
+        let traces: Result<Vec<Trace>, _> = client
+            .raw_request(
+                "trace_block".into(),
+                vec![format!("0x{:x}", block_number)],
             )
             .await;
 
-        match raw_block {
-            Ok(value) => {
-                let traces: Result<Vec<Trace>, Error> =
-                    serde_json::from_value(value);
+        match traces {
+            Ok(traces) => {
+                let mut db_traces = Vec::new();
 
-                match traces {
-                    Ok(traces) => {
-                        let mut db_traces = Vec::new();
+                for trace in traces.iter() {
+                    let db_trace =
+                        DatabaseTrace::from_rpc(trace, self.chain.id);
 
-                        for trace in traces.iter() {
-                            let db_trace = DatabaseTrace::from_rpc(
-                                trace,
-                                self.chain.id,
-                            );
-
-                            db_traces.push(db_trace)
-                        }
-
-                        db_traces
-                    }
-                    Err(_) => Vec::new(),
+                    db_traces.push(db_trace)
                 }
+
+                db_traces
             }
             Err(_) => Vec::new(),
         }
@@ -730,59 +649,38 @@ impl Rpc {
     )> {
         let client = self.get_client();
 
-        let raw_receipt = client
-            .request("eth_getTransactionReceipt", rpc_params![transaction])
+        let receipt = client
+            .get_transaction_receipt(transaction.parse().unwrap())
             .await;
 
-        match raw_receipt {
-            Ok(value) => {
-                let receipt: Result<TransactionReceipt, Error> =
-                    serde_json::from_value(value);
+        match receipt {
+            Ok(Some(receipt)) => {
+                let mut db_transaction_logs: Vec<DatabaseLog> = Vec::new();
 
-                match receipt {
-                    Ok(receipt) => {
-                        let mut db_transaction_logs: Vec<DatabaseLog> =
-                            Vec::new();
+                let status = receipt.status();
 
-                        let status: bool = match receipt.status {
-                            None => true,
-                            Some(status) => {
-                                let status_number = status.as_u64() as i64;
+                let mut db_contract: Option<DatabaseContract> = None;
 
-                                status_number != 0
-                            }
-                        };
-
-                        let mut db_contract: Option<DatabaseContract> =
-                            None;
-
-                        if status {
-                            db_contract =
-                                receipt.contract_address.map(|_| {
-                                    DatabaseContract::from_rpc(
-                                        &receipt,
-                                        self.chain.id,
-                                    )
-                                });
-                        }
-
-                        for log in receipt.logs.iter() {
-                            let db_log = DatabaseLog::from_rpc(
-                                log,
-                                self.chain.id,
-                                transaction_timestamp,
-                                block_number,
-                            );
-
-                            db_transaction_logs.push(db_log)
-                        }
-
-                        Some((receipt, db_transaction_logs, db_contract))
-                    }
-                    Err(_) => None,
+                if status {
+                    db_contract = receipt.contract_address.map(|_| {
+                        DatabaseContract::from_rpc(&receipt, self.chain.id)
+                    });
                 }
+
+                for log in receipt.inner.logs() {
+                    let db_log = DatabaseLog::from_rpc(
+                        log,
+                        self.chain.id,
+                        transaction_timestamp,
+                        block_number,
+                    );
+
+                    db_transaction_logs.push(db_log)
+                }
+
+                Some((receipt, db_transaction_logs, db_contract))
             }
-            Err(_) => None,
+            _ => None,
         }
     }
 
@@ -797,67 +695,42 @@ impl Rpc {
     )> {
         let client = self.get_client();
 
-        let raw_receipts = client
-            .request(
-                "eth_getBlockReceipts",
-                rpc_params![format!("0x{:x}", block_number)],
+        // eth_getBlockReceipts might not be standard, use raw request
+        let receipts: Result<Vec<TransactionReceipt>, _> = client
+            .raw_request(
+                "eth_getBlockReceipts".into(),
+                vec![format!("0x{:x}", block_number)],
             )
             .await;
 
-        match raw_receipts {
-            Ok(value) => {
-                let receipts: Result<Vec<TransactionReceipt>, Error> =
-                    serde_json::from_value(value);
+        match receipts {
+            Ok(receipts) => {
+                let mut db_logs: Vec<DatabaseLog> = Vec::new();
+                let mut db_contracts: Vec<DatabaseContract> = Vec::new();
 
-                match receipts {
-                    Ok(receipts) => {
-                        let mut db_receipts: Vec<TransactionReceipt> =
-                            Vec::new();
+                for receipt in receipts.iter() {
+                    let status = receipt.status();
 
-                        let mut db_transaction_logs: Vec<DatabaseLog> =
-                            Vec::new();
-
-                        let mut db_contracts: Vec<DatabaseContract> =
-                            Vec::new();
-
-                        for receipt in receipts {
-                            let db_contract =
-                                receipt.contract_address.map(|_| {
-                                    DatabaseContract::from_rpc(
-                                        &receipt,
-                                        self.chain.id,
-                                    )
-                                });
-
-                            match db_contract.is_some() {
-                                true => {
-                                    db_contracts.push(db_contract.unwrap())
-                                }
-                                false => (),
-                            }
-
-                            for log in receipt.logs.iter() {
-                                let db_log = DatabaseLog::from_rpc(
-                                    log,
-                                    self.chain.id,
-                                    block_timestamp,
-                                    block_number,
-                                );
-
-                                db_transaction_logs.push(db_log)
-                            }
-
-                            db_receipts.push(receipt);
-                        }
-
-                        Some((
-                            db_receipts,
-                            db_transaction_logs,
-                            db_contracts,
-                        ))
+                    if status && receipt.contract_address.is_some() {
+                        db_contracts.push(DatabaseContract::from_rpc(
+                            receipt,
+                            self.chain.id,
+                        ));
                     }
-                    Err(_) => None,
+
+                    for log in receipt.inner.logs() {
+                        let db_log = DatabaseLog::from_rpc(
+                            log,
+                            self.chain.id,
+                            block_timestamp,
+                            block_number,
+                        );
+
+                        db_logs.push(db_log)
+                    }
                 }
+
+                Some((receipts, db_logs, db_contracts))
             }
             Err(_) => None,
         }
