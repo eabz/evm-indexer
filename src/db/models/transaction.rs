@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
 
-use crate::utils::format::{byte4_from_input, format_bytes, SerU256};
+use crate::utils::format::SerU256;
 
 #[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq)]
 #[repr(u8)]
@@ -156,12 +156,14 @@ impl DatabaseTransaction {
             max_priority_fee_per_gas: transaction
                 .max_priority_fee_per_gas
                 .map(|p| U256::from(p)),
-            method: format!(
-                "0x{}",
-                hex::encode(byte4_from_input(&format_bytes(
-                    &transaction.input
-                )))
-            ),
+            method: {
+                let input_bytes = transaction.input.as_ref();
+                if input_bytes.len() >= 4 {
+                    format!("0x{}", hex::encode(&input_bytes[..4]))
+                } else {
+                    String::from("0x00000000")
+                }
+            },
             nonce: transaction.nonce as u32,
             status,
             timestamp,

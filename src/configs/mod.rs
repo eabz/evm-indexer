@@ -53,6 +53,8 @@ pub struct IndexerArgs {
         default_value_t = true
     )]
     pub traces: bool,
+    #[arg(long, help = "Fetch uncle blocks.", default_value_t = false)]
+    pub fetch_uncles: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +72,7 @@ pub struct Config {
     pub start_block: u32,
     pub ws_url: Option<String>,
     pub traces: bool,
+    pub fetch_uncles: bool,
 }
 
 impl Default for Config {
@@ -118,6 +121,7 @@ impl Config {
             start_block: args.start_block,
             ws_url,
             traces: args.traces,
+            fetch_uncles: args.fetch_uncles,
         }
     }
 }

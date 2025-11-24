@@ -4,9 +4,9 @@ use clickhouse::{Client, Row};
 use futures::future::join_all;
 use log::{error, info};
 use models::{
-    block::DatabaseBlock, contract::DatabaseContract, log::DatabaseLog,
-    trace::DatabaseTrace, transaction::DatabaseTransaction,
-    withdrawal::DatabaseWithdrawal,
+    block::DatabaseBlock, contract::DatabaseContract,
+    dex_trade::DatabaseDexTrade, log::DatabaseLog, trace::DatabaseTrace,
+    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -27,6 +27,7 @@ pub struct BlockFetchedData {
     pub erc20_transfers: Vec<DatabaseERC20Transfer>,
     pub erc721_transfers: Vec<DatabaseERC721Transfer>,
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
+    pub dex_trades: Vec<DatabaseDexTrade>,
 }
 
 #[derive(Clone)]
@@ -99,134 +100,117 @@ impl Database {
     }
 
     pub async fn store_data(&self, data: &BlockFetchedData) {
+        use std::sync::Arc;
+
         let mut stores = vec![];
 
         if !data.contracts.is_empty() {
-            let work = tokio::spawn({
-                let contracts = data.contracts.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &contracts,
-                        DatabaseTables::Contracts.as_str(),
-                    )
-                    .await
-                }
+            let contracts = Arc::new(data.contracts.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &contracts,
+                    DatabaseTables::Contracts.as_str(),
+                )
+                .await
             });
-
             stores.push(work);
         }
 
         if !data.logs.is_empty() {
-            let work = tokio::spawn({
-                let logs = data.logs.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(&logs, DatabaseTables::Logs.as_str())
-                        .await
-                }
+            let logs = Arc::new(data.logs.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(&logs, DatabaseTables::Logs.as_str()).await
             });
-
             stores.push(work);
         }
 
         if !data.traces.is_empty() {
-            let work = tokio::spawn({
-                let traces = data.traces.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &traces,
-                        DatabaseTables::Traces.as_str(),
-                    )
+            let traces = Arc::new(data.traces.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(&traces, DatabaseTables::Traces.as_str())
                     .await
-                }
             });
-
             stores.push(work);
         }
 
         if !data.transactions.is_empty() {
-            let work = tokio::spawn({
-                let transactions = data.transactions.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &transactions,
-                        DatabaseTables::Transactions.as_str(),
-                    )
-                    .await
-                }
+            let transactions = Arc::new(data.transactions.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &transactions,
+                    DatabaseTables::Transactions.as_str(),
+                )
+                .await
             });
-
             stores.push(work);
         }
 
         if !data.withdrawals.is_empty() {
-            let work = tokio::spawn({
-                let withdrawals: Vec<DatabaseWithdrawal> =
-                    data.withdrawals.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &withdrawals,
-                        DatabaseTables::Withdrawals.as_str(),
-                    )
-                    .await
-                }
+            let withdrawals = Arc::new(data.withdrawals.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &withdrawals,
+                    DatabaseTables::Withdrawals.as_str(),
+                )
+                .await
             });
-
             stores.push(work);
         }
 
         if !data.erc20_transfers.is_empty() {
-            let work = tokio::spawn({
-                let transfers: Vec<DatabaseERC20Transfer> =
-                    data.erc20_transfers.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &transfers,
-                        DatabaseTables::Erc20Transfers.as_str(),
-                    )
-                    .await
-                }
+            let transfers = Arc::new(data.erc20_transfers.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &transfers,
+                    DatabaseTables::Erc20Transfers.as_str(),
+                )
+                .await
             });
-
             stores.push(work);
         }
 
         if !data.erc721_transfers.is_empty() {
-            let work = tokio::spawn({
-                let transfers: Vec<DatabaseERC721Transfer> =
-                    data.erc721_transfers.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &transfers,
-                        DatabaseTables::Erc721Transfers.as_str(),
-                    )
-                    .await
-                }
+            let transfers = Arc::new(data.erc721_transfers.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &transfers,
+                    DatabaseTables::Erc721Transfers.as_str(),
+                )
+                .await
             });
-
             stores.push(work);
         }
 
         if !data.erc1155_transfers.is_empty() {
-            let work = tokio::spawn({
-                let transfers: Vec<DatabaseERC1155Transfer> =
-                    data.erc1155_transfers.clone();
-                let db = self.clone();
-                async move {
-                    db.store_items(
-                        &transfers,
-                        DatabaseTables::Erc1155Transfers.as_str(),
-                    )
-                    .await
-                }
+            let transfers = Arc::new(data.erc1155_transfers.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &transfers,
+                    DatabaseTables::Erc1155Transfers.as_str(),
+                )
+                .await
             });
+            stores.push(work);
+        }
 
+        if !data.dex_trades.is_empty() {
+            let dex_trades = Arc::new(data.dex_trades.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &dex_trades,
+                    DatabaseTables::DexTrades.as_str(),
+                )
+                .await
+            });
             stores.push(work);
         }
 
@@ -248,7 +232,7 @@ impl Database {
         }
 
         info!(
-            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) in ({}) blocks.",
+            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) dex_trades ({}) in ({}) blocks.",
             data.contracts.len(),
             data.logs.len(),
             data.traces.len(),
@@ -257,6 +241,7 @@ impl Database {
             data.erc20_transfers.len(),
             data.erc721_transfers.len(),
             data.erc1155_transfers.len(),
+            data.dex_trades.len(),
             data.blocks.len()
         );
     }

@@ -1,29 +1,6 @@
-use alloy::primitives::{Bytes, U256};
+use alloy::primitives::U256;
 use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{DeserializeAs, SerializeAs};
-
-pub fn format_bytes(b: &Bytes) -> String {
-    serde_json::to_string(b).unwrap().replace('\"', "")
-}
-
-pub fn byte4_from_input(input: &str) -> [u8; 4] {
-    let input_sanitized = input.strip_prefix("0x").unwrap_or(input);
-
-    if input_sanitized.is_empty() {
-        return [0x00, 0x00, 0x00, 0x00];
-    }
-
-    let input_bytes = hex::decode(input_sanitized).unwrap_or_default();
-
-    if input_bytes.len() < 4 {
-        return [0x00, 0x00, 0x00, 0x00];
-    }
-
-    let byte4: [u8; 4] =
-        [input_bytes[0], input_bytes[1], input_bytes[2], input_bytes[3]];
-
-    byte4
-}
 
 pub struct SerU256(());
 

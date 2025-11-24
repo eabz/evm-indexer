@@ -865,15 +865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "array-bytes"
-version = "9.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4449507daf4f07a8c8309e122d32a53d15c9f33e77eaf01c839fea42ccd4d673"
-dependencies = [
- "smallvec",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1179,6 +1170,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "hyper",
+ "hyper-tls",
  "hyper-util",
  "lz4_flex",
  "replace_with",
@@ -1571,7 +1563,6 @@ version = "2.0.0"
 dependencies = [
  "alloy",
  "alloy-rpc-types-trace",
- "array-bytes",
  "clap",
  "clickhouse",
  "futures",
@@ -1580,7 +1571,6 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "serde",
- "serde_bytes",
  "serde_json",
  "serde_repr",
  "serde_with",
@@ -3231,15 +3221,6 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde_bytes"
-version = "0.11.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "387cc504cb06bb40a96c8e04e951fe01854cf6bc921053c954e4a606d9675c6a"
-dependencies = [
- "serde",
 ]
 
 [[package]]

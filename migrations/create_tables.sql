@@ -2,7 +2,7 @@ CREATE DATABASE IF NOT EXISTS indexer;
 
 CREATE TABLE indexer.blocks (
   base_fee_per_gas Nullable(UInt64),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   difficulty UInt256,
   extra_data String CODEC(ZSTD(9)),
   gas_limit UInt32,
@@ -33,19 +33,19 @@ SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.contracts (
   block_number UInt32 CODEC(Delta, ZSTD),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   contract_address String,
   creator String,
-  transaction_hash String
+  transaction_index UInt16 CODEC(Delta, ZSTD)
 )
 ENGINE = ReplacingMergeTree()
-ORDER BY (chain, contract_address, transaction_hash)
+ORDER BY (chain, block_number, transaction_hash, log_index)
 SETTINGS index_granularity = 8192;
 
 CREATE TABLE indexer.logs (
   address String,
   block_number UInt32 CODEC(Delta, ZSTD),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   data String CODEC(ZSTD(9)),
   log_index UInt16 CODEC(Delta, ZSTD),
   log_type Nullable(String),
@@ -67,7 +67,7 @@ CREATE TABLE indexer.erc20_transfers (
   address String,
   amount UInt256,
   block_number UInt32 CODEC(Delta, ZSTD),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   from String,
   log_index UInt16 CODEC(Delta, ZSTD),
   log_type Nullable(String),
@@ -86,7 +86,7 @@ SETTINGS index_granularity = 8192;
 CREATE TABLE indexer.erc721_transfers (
   address String,
   block_number UInt32 CODEC(Delta, ZSTD),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   from String,
   id UInt256,
   log_index UInt16 CODEC(Delta, ZSTD),
@@ -107,7 +107,7 @@ CREATE TABLE indexer.erc1155_transfers (
   address String,
   amounts Array(UInt256),
   block_number UInt32 CODEC(Delta, ZSTD),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   from String,
   ids Array(UInt256),
   log_index UInt16 CODEC(Delta, ZSTD),
@@ -134,7 +134,7 @@ CREATE TABLE indexer.traces (
   block_hash String,
   block_number UInt32 CODEC(Delta, ZSTD),
   call_type LowCardinality(Nullable(Enum8('none' = 0, 'call' = 1, 'callcode' = 2, 'delegatecall' = 3, 'staticcall' = 4))),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   code Nullable(String),
   error Nullable(String),
   from Nullable(String),
@@ -161,7 +161,7 @@ CREATE TABLE indexer.transactions (
   base_fee_per_gas Nullable(UInt64),
   block_hash String,
   block_number UInt32 CODEC(Delta, ZSTD),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   contract_created Nullable(String),
   cumulative_gas_used Nullable(UInt32),
   effective_gas_price Nullable(UInt256),
@@ -191,7 +191,7 @@ CREATE TABLE indexer.withdrawals (
   address String,
   amount UInt256,
   block_number UInt32 CODEC(Delta, ZSTD),
-  chain LowCardinality(UInt64),
+  chain UInt64,
   timestamp DateTime CODEC(Delta, ZSTD),
   validator_index UInt32,
   withdrawal_index UInt32
@@ -199,4 +199,24 @@ CREATE TABLE indexer.withdrawals (
 ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, withdrawal_index)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE indexer.dex_trades (
+  block_number UInt32 CODEC(Delta, ZSTD),
+  chain UInt64,
+  transaction_hash String,
+  log_index UInt16 CODEC(Delta, ZSTD),
+  pool_address String,
+  sender String,
+  recipient String,
+  amount0_in String,
+  amount1_in String,
+  amount0_out String,
+  amount1_out String,
+  dex_name String,
+  timestamp DateTime CODEC(Delta, ZSTD)
+)
+ENGINE = ReplacingMergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (chain, pool_address, block_number, log_index)
 SETTINGS index_granularity = 8192;
