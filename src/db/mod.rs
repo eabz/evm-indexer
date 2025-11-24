@@ -1,6 +1,5 @@
 pub mod models;
 
-use crate::chains::Chain;
 use clickhouse::{Client, Row};
 use futures::future::join_all;
 use log::{error, info};
@@ -32,7 +31,7 @@ pub struct BlockFetchedData {
 
 #[derive(Clone)]
 pub struct Database {
-    pub chain: Chain,
+    pub chain_id: u64,
     pub db: Client,
 }
 
@@ -72,7 +71,7 @@ impl Database {
         db_username: String,
         db_password: String,
         db_name: String,
-        chain: Chain,
+        chain_id: u64,
     ) -> Self {
         info!("Starting EVM database service");
 
@@ -82,13 +81,13 @@ impl Database {
             .with_password(db_password)
             .with_database(db_name);
 
-        Self { chain, db }
+        Self { chain_id, db }
     }
 
     pub async fn get_indexed_blocks(&self) -> HashSet<u32> {
         let query = format!(
             "SELECT number FROM blocks WHERE chain = {} AND is_uncle = false",
-            self.chain.id
+            self.chain_id
         );
 
         let tokens = (self.db.query(&query).fetch_all::<u32>().await)
@@ -264,9 +263,10 @@ impl Database {
 
     pub async fn store_items<T>(&self, items: &Vec<T>, table: &str)
     where
-        T: Row + Serialize,
+        T: Serialize,
+        for<'a> T: Row<Value<'a> = T>,
     {
-        let mut inserter = self.db.insert(table).unwrap();
+        let mut inserter = self.db.insert::<T>(table).await.unwrap();
 
         for item in items {
             inserter.write(item).await.unwrap();

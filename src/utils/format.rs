@@ -1,29 +1,9 @@
-use alloy::primitives::{Address, Bytes, B256, B64, U256};
+use alloy::primitives::{Bytes, U256};
 use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{DeserializeAs, SerializeAs};
 
-pub fn format_nonce(h: B64) -> String {
-    format!("{:?}", h)
-}
-
-pub fn format_hash(h: B256) -> String {
-    format!("{:?}", h)
-}
-
-pub fn format_address(h: Address) -> String {
-    format!("{:?}", h)
-}
-
 pub fn format_bytes(b: &Bytes) -> String {
     serde_json::to_string(b).unwrap().replace('\"', "")
-}
-pub fn decode_bytes(s: String) -> Vec<u8> {
-    let without_prefix = &s[2..];
-    hex::decode(without_prefix).unwrap()
-}
-
-pub fn format_bytes_slice(b: &[u8]) -> String {
-    format!("0x{}", hex::encode(b))
 }
 
 pub fn byte4_from_input(input: &str) -> [u8; 4] {

@@ -1,4 +1,3 @@
-use crate::chains::{get_chain, Chain};
 use clap::Parser;
 use url::Url;
 
@@ -59,7 +58,7 @@ pub struct IndexerArgs {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub batch_size: usize,
-    pub chain: Chain,
+    pub chain_id: u64,
     pub db_host: String,
     pub db_name: String,
     pub db_password: String,
@@ -82,8 +81,6 @@ impl Default for Config {
 impl Config {
     pub fn new() -> Self {
         let args = IndexerArgs::parse();
-
-        let chain = get_chain(args.chain as u64);
 
         let rpcs: Vec<String> =
             args.rpcs.split(',').map(|rpc| rpc.to_string()).collect();
@@ -109,7 +106,7 @@ impl Config {
 
         Self {
             batch_size: args.batch_size,
-            chain,
+            chain_id: args.chain as u64,
             db_host: format!("{}://{}", url.scheme(), db_host),
             db_name: db_name.to_string(),
             db_password: password.to_string(),

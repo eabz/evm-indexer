@@ -11,7 +11,7 @@ alloy = { version = "0.1", features = ["full", "node-bindings", "rpc-types", "js
 alloy-rpc-types-trace = "0.1"
 array-bytes = "9"
 clap = { version = "4", features = ["derive"] }
-clickhouse = "0.13"
+clickhouse = "0.14"
 futures = "0.3"
 hex = "0.4"
 log = "0.4"

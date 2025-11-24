@@ -1,5 +1,4 @@
 use crate::{
-    chains::Chain,
     configs::Config,
     db::{
         models::{
@@ -41,11 +40,12 @@ use url::Url;
 
 #[derive(Clone)]
 pub struct Rpc {
-    pub chain: Chain,
+    pub chain_id: u64,
     pub clients: Vec<RootProvider<Http<Client>>>,
     pub clients_urls: Vec<String>,
     pub ws_url: Option<String>,
     pub traces: bool,
+    pub supports_blocks_receipts: bool,
 }
 
 impl Rpc {
@@ -63,7 +63,7 @@ impl Rpc {
 
             match chain_id {
                 Ok(id) => {
-                    if id != config.chain.id {
+                    if id != config.chain_id {
                         continue;
                     }
 
@@ -78,12 +78,38 @@ impl Rpc {
             panic!("No valid rpc client found");
         }
 
-        Self {
-            chain: config.chain.clone(),
+        let mut rpc = Self {
+            chain_id: config.chain_id,
             clients,
             clients_urls,
             ws_url: config.ws_url.clone(),
             traces: config.traces,
+            supports_blocks_receipts: false,
+        };
+
+        rpc.detect_capabilities().await;
+
+        rpc
+    }
+
+    async fn detect_capabilities(&mut self) {
+        let client = self.get_client();
+        let block_number = self.get_last_block().await;
+
+        // Try to fetch receipts for the latest block to check if the method is supported
+        let receipts: Result<Vec<TransactionReceipt>, _> = client
+            .raw_request(
+                "eth_getBlockReceipts".into(),
+                vec![format!("0x{:x}", block_number)],
+            )
+            .await;
+
+        if receipts.is_ok() {
+            info!("Chain supports eth_getBlockReceipts");
+            self.supports_blocks_receipts = true;
+        } else {
+            warn!("Chain does not support eth_getBlockReceipts, falling back to individual receipt fetching");
+            self.supports_blocks_receipts = false;
         }
     }
 
@@ -99,7 +125,6 @@ impl Rpc {
     pub async fn fetch_block(
         &self,
         block_number: &u32,
-        chain: &Chain,
     ) -> Option<(
         Vec<DatabaseBlock>,
         Vec<DatabaseTransaction>,
@@ -151,7 +176,7 @@ impl Rpc {
                 let mut contracts_map: HashMap<Address, DatabaseContract> =
                     HashMap::new();
 
-                if chain.supports_blocks_receipts {
+                if self.supports_blocks_receipts {
                     let receipts_data = self
                         .get_block_receipts(
                             block_number,
@@ -230,7 +255,7 @@ impl Rpc {
                     let db_transaction = DatabaseTransaction::from_rpc(
                         &transaction,
                         receipt,
-                        self.chain.id,
+                        self.chain_id,
                         db_block.timestamp,
                         db_block.base_fee_per_gas,
                     );
@@ -267,7 +292,7 @@ impl Rpc {
                     let contract = DatabaseContract {
                         block_number: trace.block_number,
                         contract_address,
-                        chain: self.chain.id,
+                        chain: self.chain_id,
                         creator: trace.from.unwrap(),
                         transaction_hash: trace.transaction_hash.unwrap(),
                     };
@@ -395,7 +420,7 @@ impl Rpc {
             .await
             .expect("unable to get chain id from websocket");
 
-        if chain_id != self.chain.id {
+        if chain_id != self.chain_id {
             panic!("websocket chain id doesn't match with configured chain id")
         }
 
@@ -423,17 +448,16 @@ impl Rpc {
                     // These values can change depending on network load
 
                     // ETH requires 300ms
-                    if rpc.chain.id == 1 {
+                    if rpc.chain_id == 1 {
                         sleep(Duration::from_millis(300)).await;
                     }
 
                     // BSC requires 4s
-                    if rpc.chain.id == 56 {
+                    if rpc.chain_id == 56 {
                         sleep(Duration::from_secs(4)).await;
                     }
 
-                    let block_data =
-                        rpc.fetch_block(&block_number, &rpc.chain).await;
+                    let block_data = rpc.fetch_block(&block_number).await;
 
                     if let Some((
                         blocks,
@@ -495,7 +519,7 @@ impl Rpc {
                     let is_uncle = false;
                     let db_block = DatabaseBlock::from_rpc(
                         &block,
-                        self.chain.id,
+                        self.chain_id,
                         is_uncle,
                     );
 
@@ -517,7 +541,7 @@ impl Rpc {
                             let db_withdrawal =
                                 DatabaseWithdrawal::from_rpc(
                                     withdrawal,
-                                    self.chain.id,
+                                    self.chain_id,
                                     db_block.number,
                                     db_block.timestamp,
                                 );
@@ -542,7 +566,7 @@ impl Rpc {
                         if let Ok(Some(block)) = uncle {
                             let db_block = DatabaseBlock::from_rpc(
                                 &block,
-                                self.chain.id,
+                                self.chain_id,
                                 true,
                             );
                             block_uncles.push(db_block)
@@ -586,7 +610,7 @@ impl Rpc {
 
                 for trace in traces.iter() {
                     let db_trace =
-                        DatabaseTrace::from_rpc(trace, self.chain.id);
+                        DatabaseTrace::from_rpc(trace, self.chain_id);
 
                     db_traces.push(db_trace)
                 }
@@ -621,14 +645,14 @@ impl Rpc {
 
                 if status {
                     db_contract = receipt.contract_address.map(|_| {
-                        DatabaseContract::from_rpc(&receipt, self.chain.id)
+                        DatabaseContract::from_rpc(&receipt, self.chain_id)
                     });
                 }
 
                 for log in receipt.inner.logs() {
                     let db_log = DatabaseLog::from_rpc(
                         log,
-                        self.chain.id,
+                        self.chain_id,
                         transaction_timestamp,
                         block_number,
                     );
@@ -672,14 +696,14 @@ impl Rpc {
                     if status && receipt.contract_address.is_some() {
                         db_contracts.push(DatabaseContract::from_rpc(
                             receipt,
-                            self.chain.id,
+                            self.chain_id,
                         ));
                     }
 
                     for log in receipt.inner.logs() {
                         let db_log = DatabaseLog::from_rpc(
                             log,
-                            self.chain.id,
+                            self.chain_id,
                             block_timestamp,
                             block_number,
                         );

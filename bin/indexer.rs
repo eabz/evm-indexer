@@ -23,7 +23,7 @@ async fn main() {
 
     info!("Starting EVM Indexer.");
 
-    info!("Syncing {}.", config.chain.name);
+    info!("Syncing chain id {}.", config.chain_id);
 
     let rpc = Rpc::new(&config).await;
 
@@ -32,7 +32,7 @@ async fn main() {
         config.db_username.clone(),
         config.db_password.clone(),
         config.db_name.clone(),
-        config.chain.clone(),
+        config.chain_id,
     )
     .await;
 
@@ -94,7 +94,7 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
         let mut work = vec![];
 
         for block_number in missing_blocks_chunk {
-            work.push(rpc.fetch_block(block_number, &config.chain))
+            work.push(rpc.fetch_block(block_number))
         }
 
         let results = join_all(work).await;
