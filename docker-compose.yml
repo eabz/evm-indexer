@@ -35,7 +35,7 @@ services:
       indexer
       --chain 1
       --database clickhouse://indexer:indexer@clickhouse:9000/indexer
-      --rpcs https://long-late-firefly.quiknode.pro/4bb1e6b2dec8294938b6fdfdb7cf0cf70c4e97a2/
+      --rpcs https://0xrpc.io/eth
       --start-block 0
       --batch-size 10
     networks:
