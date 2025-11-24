@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "evm-indexer"
-version = "1.5.1"
+version = "2.0.0"
 dependencies = [
  "alloy",
  "alloy-rpc-types-trace",

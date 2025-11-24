@@ -9,23 +9,19 @@ use crate::{
             erc20_transfer::DatabaseERC20Transfer,
             erc721_transfer::DatabaseERC721Transfer,
             log::DatabaseLog,
-            trace::{DatabaseTrace, TraceType},
+            trace::{ActionType, DatabaseTrace},
             transaction::DatabaseTransaction,
             withdrawal::DatabaseWithdrawal,
         },
         BlockFetchedData, Database,
     },
-    utils::{
-        events::{
-            ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
-            ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
-            TRANSFER_EVENTS_SIGNATURE,
-        },
-        format::{decode_bytes, format_hash},
+    utils::events::{
+        ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
+        ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
+        TRANSFER_EVENTS_SIGNATURE,
     },
 };
-use alloy::dyn_abi::DynSolType;
-use alloy::primitives::U256;
+use alloy::primitives::{Address, B256};
 use alloy::providers::{
     Provider, ProviderBuilder, RootProvider, WsConnect,
 };
@@ -42,6 +38,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
 use url::Url;
+
 #[derive(Clone)]
 pub struct Rpc {
     pub chain: Chain,
@@ -147,11 +144,11 @@ impl Rpc {
                     return None;
                 }
 
-                let mut db_receipts: HashMap<String, TransactionReceipt> =
+                let mut db_receipts: HashMap<B256, TransactionReceipt> =
                     HashMap::new();
 
                 let mut db_logs: Vec<DatabaseLog> = Vec::new();
-                let mut contracts_map: HashMap<String, DatabaseContract> =
+                let mut contracts_map: HashMap<Address, DatabaseContract> =
                     HashMap::new();
 
                 if chain.supports_blocks_receipts {
@@ -166,14 +163,14 @@ impl Rpc {
                         Some((receipts, mut logs, contracts)) => {
                             for receipt in receipts {
                                 db_receipts.insert(
-                                    format_hash(receipt.transaction_hash),
+                                    receipt.transaction_hash,
                                     receipt,
                                 );
                             }
                             db_logs.append(&mut logs);
                             for contract in contracts {
                                 contracts_map.insert(
-                                    contract.contract_address.clone(),
+                                    contract.contract_address,
                                     contract.clone(),
                                 );
                             }
@@ -184,7 +181,7 @@ impl Rpc {
                     for transaction in raw_transactions.iter() {
                         let receipt_data = self
                             .get_transaction_receipt(
-                                format_hash(transaction.hash),
+                                transaction.hash,
                                 db_block.timestamp,
                                 block_number,
                             )
@@ -193,16 +190,14 @@ impl Rpc {
                         match receipt_data {
                             Some((receipt, mut logs, contract)) => {
                                 db_receipts.insert(
-                                    format_hash(receipt.transaction_hash),
+                                    receipt.transaction_hash,
                                     receipt,
                                 );
                                 db_logs.append(&mut logs);
                                 match contract {
                                     Some(contract) => {
                                         contracts_map.insert(
-                                            contract
-                                                .contract_address
-                                                .clone(),
+                                            contract.contract_address,
                                             contract.clone(),
                                         );
                                     }
@@ -229,7 +224,7 @@ impl Rpc {
 
                 for transaction in raw_transactions {
                     let receipt = db_receipts
-                        .get(&format_hash(transaction.hash))
+                        .get(&transaction.hash)
                         .expect("unable to get receipt for transaction");
 
                     let db_transaction = DatabaseTransaction::from_rpc(
@@ -254,32 +249,30 @@ impl Rpc {
                 // Insert contracts created through the traces
                 let create_traces: Vec<&DatabaseTrace> = traces
                     .iter()
-                    .filter(|trace| trace.action_type == TraceType::Create)
+                    .filter(|trace| {
+                        trace.action_type == ActionType::Create
+                    })
                     .collect();
 
                 for trace in create_traces {
-                    let contract_address = match &trace.address {
+                    let contract_address = match trace.address {
                         Some(contract_address) => contract_address,
                         None => continue,
                     };
 
-                    if contracts_map.contains_key(contract_address) {
+                    if contracts_map.contains_key(&contract_address) {
                         continue;
                     }
 
                     let contract = DatabaseContract {
                         block_number: trace.block_number,
-                        contract_address: contract_address.to_string(),
+                        contract_address,
                         chain: self.chain.id,
-                        creator: trace.from.clone().unwrap(),
-                        transaction_hash: trace
-                            .transaction_hash
-                            .clone()
-                            .unwrap(),
+                        creator: trace.from.unwrap(),
+                        transaction_hash: trace.transaction_hash.unwrap(),
                     };
 
-                    contracts_map
-                        .insert(contract_address.to_string(), contract);
+                    contracts_map.insert(contract_address, contract);
                 }
 
                 let mut db_erc20_transfers: Vec<DatabaseERC20Transfer> =
@@ -294,98 +287,65 @@ impl Rpc {
 
                 for log in db_logs.iter_mut() {
                     // Check the first topic matches the erc20, erc721, erc1155 or a swap signatures
-                    let topic0 = log.topic0.clone();
+                    let topic0 = log.topic0;
 
-                    if topic0.as_deref() == Some(TRANSFER_EVENTS_SIGNATURE)
+                    if topic0
+                        == Some(TRANSFER_EVENTS_SIGNATURE.parse().unwrap())
                     {
                         // Check if it is a erc20 or a erc721 based on the number of logs
 
                         // erc721 token transfer events have 3 indexed values.
                         if log.topic3.is_some() {
                             let erc721 =
-                                DatabaseERC721Transfer::from_rpc(log);
+                                DatabaseERC721Transfer::from_log(log);
 
-                            db_erc721_transfers.push(erc721)
+                            if let Some(erc721) = erc721 {
+                                db_erc721_transfers.push(erc721)
+                            }
                         } else if log.topic1.is_some()
                             && log.topic2.is_some()
                         {
                             // erc20 token transfer events have 2 indexed values.
                             let erc20 =
-                                DatabaseERC20Transfer::from_rpc(log);
+                                DatabaseERC20Transfer::from_log(log);
 
-                            db_erc20_transfers.push(erc20)
+                            if let Some(erc20) = erc20 {
+                                db_erc20_transfers.push(erc20)
+                            }
                         }
                     }
 
-                    if topic0.as_deref()
-                        == Some(ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE)
+                    if topic0
+                        == Some(
+                            ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
                         && log.topic1.is_some()
                         && log.topic2.is_some()
                         && log.topic3.is_some()
                     {
-                        let log_data = decode_bytes(log.data.clone());
-
-                        let transfer_values = DynSolType::Tuple(vec![
-                            DynSolType::Uint(256),
-                            DynSolType::Uint(256),
-                        ])
-                        .abi_decode(&log_data)
-                        .unwrap();
-                        let transfer_values =
-                            transfer_values.as_tuple().unwrap();
-
-                        let id = transfer_values[0].as_uint().unwrap().0;
-                        let amount =
-                            transfer_values[1].as_uint().unwrap().0;
-
                         let erc1155_transfer =
-                            DatabaseERC1155Transfer::from_single_rpc(
-                                log, id, amount,
-                            );
+                            DatabaseERC1155Transfer::from_log(log);
 
-                        db_erc1155_transfers.push(erc1155_transfer);
+                        if let Some(erc1155_transfer) = erc1155_transfer {
+                            db_erc1155_transfers.push(erc1155_transfer);
+                        }
                     }
 
-                    if topic0.as_deref()
-                        == Some(ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE)
-                        && log.topic1.is_some()
-                        && log.topic2.is_some()
-                        && log.topic3.is_some()
+                    if topic0
+                        == Some(
+                            ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
                     {
-                        let log_data = decode_bytes(log.data.clone());
-
-                        let transfer_values = DynSolType::Tuple(vec![
-                            DynSolType::Array(Box::new(DynSolType::Uint(
-                                256,
-                            ))),
-                            DynSolType::Array(Box::new(DynSolType::Uint(
-                                256,
-                            ))),
-                        ])
-                        .abi_decode(&log_data)
-                        .unwrap();
-                        let transfer_values =
-                            transfer_values.as_tuple().unwrap();
-
-                        let ids: Vec<U256> = transfer_values[0]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|v| v.as_uint().unwrap().0)
-                            .collect();
-                        let amounts: Vec<U256> = transfer_values[1]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|v| v.as_uint().unwrap().0)
-                            .collect();
-
                         let erc1155_transfer =
-                            DatabaseERC1155Transfer::from_batch_rpc(
-                                log, ids, amounts,
-                            );
+                            DatabaseERC1155Transfer::from_log(log);
 
-                        db_erc1155_transfers.push(erc1155_transfer);
+                        if let Some(erc1155_transfer) = erc1155_transfer {
+                            db_erc1155_transfers.push(erc1155_transfer);
+                        }
                     }
                 }
 
@@ -639,7 +599,7 @@ impl Rpc {
 
     async fn get_transaction_receipt(
         &self,
-        transaction: String,
+        transaction: B256,
         transaction_timestamp: u32,
         block_number: &u32,
     ) -> Option<(
@@ -649,9 +609,7 @@ impl Rpc {
     )> {
         let client = self.get_client();
 
-        let receipt = client
-            .get_transaction_receipt(transaction.parse().unwrap())
-            .await;
+        let receipt = client.get_transaction_receipt(transaction).await;
 
         match receipt {
             Ok(Some(receipt)) => {

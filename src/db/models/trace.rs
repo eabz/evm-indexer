@@ -70,7 +70,6 @@ pub struct DatabaseTrace {
 
 impl DatabaseTrace {
     pub fn from_rpc(trace: &Trace, chain: u64) -> Self {
-        let mut action_type: ActionType = ActionType::Call;
         let mut call_type: Option<CallType> = None;
         let mut reward_type: Option<RewardType> = None;
         let mut from: Option<Address> = None;
@@ -84,9 +83,8 @@ impl DatabaseTrace {
         let mut author: Option<Address> = None;
         let mut balance: Option<U256> = None;
 
-        match &trace.action {
+        let action_type = match &trace.trace.action {
             Action::Call(call) => {
-                action_type = ActionType::Call;
                 from = Some(call.from);
                 to = Some(call.to);
                 gas = Some(call.gas.to::<u32>());
@@ -104,39 +102,39 @@ impl DatabaseTrace {
                     }
                     AlloyCallType::AuthCall => Some(CallType::None),
                 };
+                ActionType::Call
             }
             Action::Create(create) => {
-                action_type = ActionType::Create;
                 from = Some(create.from);
                 value = Some(create.value);
                 gas = Some(create.gas.to::<u32>());
                 init = Some(create.init.clone());
+                ActionType::Create
             }
             Action::Selfdestruct(suicide) => {
-                action_type = ActionType::Suicide;
                 from = Some(suicide.address);
                 refund_address = Some(suicide.refund_address);
                 balance = Some(suicide.balance);
+                ActionType::Suicide
             }
             Action::Reward(reward) => {
-                action_type = ActionType::Reward;
                 author = Some(reward.author);
                 value = Some(reward.value);
                 reward_type = match reward.reward_type {
                     AlloyRewardType::Block => Some(RewardType::Block),
                     AlloyRewardType::Uncle => Some(RewardType::Uncle),
-                    _ => None,
                 };
+                ActionType::Reward
             }
-        }
+        };
 
         let mut gas_used: Option<u32> = None;
         let mut output: Option<Bytes> = None;
         let mut code: Option<Bytes> = None;
         let mut address_output: Option<Address> = None;
 
-        match &trace.result {
-            Some(result) => match result {
+        if let Some(result) = &trace.trace.result {
+            match result {
                 Res::Call(call) => {
                     gas_used = Some(call.gas_used.to::<u32>());
                     output = Some(call.output.clone());
@@ -146,9 +144,7 @@ impl DatabaseTrace {
                     code = Some(create.code.clone());
                     address_output = Some(create.address);
                 }
-                _ => {}
-            },
-            None => {}
+            }
         }
 
         if address.is_none() && address_output.is_some() {
@@ -165,7 +161,7 @@ impl DatabaseTrace {
             call_type,
             chain,
             code,
-            error: trace.error.clone(),
+            error: trace.trace.error.clone(),
             from,
             gas,
             gas_used,
@@ -174,9 +170,10 @@ impl DatabaseTrace {
             output,
             refund_address,
             reward_type,
-            subtraces: trace.subtraces as u16,
+            subtraces: trace.trace.subtraces as u16,
             to,
             trace_address: trace
+                .trace
                 .trace_address
                 .iter()
                 .map(|v| *v as u16)
