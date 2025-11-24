@@ -14,7 +14,7 @@ A production-ready indexer that fetches and stores blockchain data for later ana
 
 - ✅ **Complete blockchain primitives**: blocks, transactions, receipts, logs, traces, withdrawals
 - ✅ **Token transfers**: ERC20, ERC721, ERC1155
-- ✅ **DEX trades**: Uniswap V2, V3 swap events
+- ✅ **DEX trades**: Uniswap V2, V3 and multiple high-volume AMM.
 - ✅ **Contract tracking**: Automatically indexes deployed contracts
 - ✅ **Parallel processing**: Configurable batch size for optimal throughput
 - ✅ **Smart RPC usage**: Auto-detects `eth_getBlockReceipts` support
