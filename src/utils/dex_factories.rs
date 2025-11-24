@@ -548,10 +548,40 @@ impl DexRouters {
         // ========== Monad (chain_id: 143) ==========
         let mut monad_routers = HashMap::new();
 
-        // Monad DEX
+        // Clober - On-chain CLOB DEX
         monad_routers.insert(
-            "0x33566fE5976AAa420F3d5C64996641Fc3858CaDB".parse().unwrap(),
-            DexInfo { name: "Monad", version: "V1" },
+            "0x7B58A24C5628881a141D630f101Db433D419B372".parse().unwrap(),
+            DexInfo { name: "Clober", version: "" },
+        );
+
+        // Kuru - On-chain orderbook exchange and trading hub
+        monad_routers.insert(
+            "0xd651346d7c789536ebf06dc72aE3C8502cd695CC".parse().unwrap(),
+            DexInfo { name: "Kuru", version: "" },
+        );
+
+        // Uniswap on Monad - Universal Router
+        monad_routers.insert(
+            "0x0d97dc33264bfc1c226207428a79b26757fb9dc3".parse().unwrap(),
+            DexInfo { name: "Uniswap", version: "V3" },
+        );
+
+        // PancakeSwap on Monad - Smart Router
+        monad_routers.insert(
+            "0x21114915Ac6d5A2e156931e20B20b038dEd0Be7C".parse().unwrap(),
+            DexInfo { name: "PancakeSwap", version: "V3" },
+        );
+
+        // Curve Finance on Monad - Main Router
+        monad_routers.insert(
+            "0xFF5Cb29241F002fFeD2eAa224e3e996D24A6E8d1".parse().unwrap(),
+            DexInfo { name: "Curve", version: "" },
+        );
+
+        // LFJ - High-performance DEX with DLMM
+        monad_routers.insert(
+            "0x18556DA13313f3532c54711497A8FedAC273220E".parse().unwrap(),
+            DexInfo { name: "LFJ", version: "" },
         );
 
         routers.insert(143, monad_routers);
@@ -583,8 +613,8 @@ impl DexRouters {
             43114 => "TraderJoe", // Avalanche - TraderJoe dominant
             137 => "QuickSwap", // Polygon - QuickSwap dominant
             250 => "SpookySwap", // Fantom - SpookySwap dominant
-            143 => "MonadSwap", // Monad - Default
-            _ => "DEX V2",      // Generic fallback
+            143 => "Clober", // Monad - Clober is the primary on-chain CLOB DEX
+            _ => "DEX V2",   // Generic fallback
         }
     }
 
