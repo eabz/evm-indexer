@@ -65,7 +65,7 @@ cargo build --release
 ```bash
 ./target/release/indexer \
   --chain 1 \
-  --database clickhouse://user:password@localhost:9000/indexer \
+  --database clickhouse://user:password@localhost:8123/indexer \
   --rpcs https://eth.llamarpc.com \
   --start-block 0 \
   --batch-size 100
@@ -93,11 +93,19 @@ cargo build --release
 
 Create a `.env` file (see `.env.example`):
 ```bash
+# ClickHouse Configuration
 CLICKHOUSE_DB=indexer
 CLICKHOUSE_USER=indexer
 CLICKHOUSE_PASSWORD=indexer
+
+# Indexer Configuration
 CHAIN_ID=1
+START_BLOCK=0
+BATCH_SIZE=10
 RPC_URL=https://eth.llamarpc.com
+DEBUG=true
+FETCH_UNCLES=false
+TRACES=true
 ```
 
 ## Database Schema
