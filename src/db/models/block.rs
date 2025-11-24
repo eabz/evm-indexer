@@ -4,7 +4,9 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::utils::format::SerU256;
+use crate::utils::format::{
+    SerAddress, SerB256, SerB64, SerBloom, SerBytes, SerU256, SerVecB256,
+};
 
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
@@ -13,27 +15,40 @@ pub struct DatabaseBlock {
     pub chain: u64,
     #[serde_as(as = "SerU256")]
     pub difficulty: U256,
+    #[serde_as(as = "SerBytes")]
     pub extra_data: Bytes,
     pub gas_limit: u32,
     pub gas_used: u32,
+    #[serde_as(as = "SerB256")]
     pub hash: B256,
     pub is_uncle: bool,
+    #[serde_as(as = "SerBloom")]
     pub logs_bloom: Bloom,
+    #[serde_as(as = "SerAddress")]
     pub miner: Address,
+    #[serde_as(as = "Option<SerB256>")]
     pub mix_hash: Option<B256>,
+    #[serde_as(as = "SerB64")]
     pub nonce: B64,
     pub number: u32,
+    #[serde_as(as = "SerB256")]
     pub parent_hash: B256,
+    #[serde_as(as = "SerB256")]
     pub receipts_root: B256,
+    #[serde_as(as = "SerB256")]
     pub sha3_uncles: B256,
     pub size: u32,
+    #[serde_as(as = "SerB256")]
     pub state_root: B256,
     pub timestamp: u32,
     #[serde_as(as = "Option<SerU256>")]
     pub total_difficulty: Option<U256>,
     pub transactions: u16,
+    #[serde_as(as = "SerB256")]
     pub transactions_root: B256,
+    #[serde_as(as = "SerVecB256")]
     pub uncles: Vec<B256>,
+    #[serde_as(as = "Option<SerB256>")]
     pub withdrawals_root: Option<B256>,
 }
 

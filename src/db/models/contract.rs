@@ -4,13 +4,18 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
+use crate::utils::format::{SerAddress, SerB256};
+
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseContract {
     pub block_number: u32,
     pub chain: u64,
+    #[serde_as(as = "SerAddress")]
     pub contract_address: Address,
+    #[serde_as(as = "SerAddress")]
     pub creator: Address,
+    #[serde_as(as = "SerB256")]
     pub transaction_hash: B256,
 }
 

@@ -2,6 +2,9 @@ use alloy::primitives::{Address, B256};
 use alloy::rpc::types::Log;
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
+
+use crate::utils::format::{SerAddress, SerB256};
 
 /// Negate a 256-bit two's complement number to get absolute value
 /// Used for converting negative int256 values from V3 swap events
@@ -24,14 +27,19 @@ fn negate_i256(bytes: &[u8]) -> [u8; 32] {
     result
 }
 
+#[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseDexTrade {
     pub block_number: u32,
     pub chain: u64,
+    #[serde_as(as = "SerB256")]
     pub transaction_hash: B256,
     pub log_index: u16,
+    #[serde_as(as = "SerAddress")]
     pub pool_address: Address,
+    #[serde_as(as = "SerAddress")]
     pub sender: Address,
+    #[serde_as(as = "SerAddress")]
     pub recipient: Address,
     pub amount0_in: String,
     pub amount1_in: String,

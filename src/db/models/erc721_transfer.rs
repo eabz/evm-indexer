@@ -4,14 +4,16 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::log::DatabaseLog;
-use crate::utils::format::SerU256;
+use crate::utils::format::{SerAddress, SerB256, SerU256};
 
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseERC721Transfer {
+    #[serde_as(as = "SerAddress")]
     pub address: Address,
     pub block_number: u32,
     pub chain: u64,
+    #[serde_as(as = "SerAddress")]
     pub from: Address,
     #[serde_as(as = "SerU256")]
     pub id: U256,
@@ -19,8 +21,11 @@ pub struct DatabaseERC721Transfer {
     pub log_type: Option<String>,
     pub removed: bool,
     pub timestamp: u32,
+    #[serde_as(as = "SerAddress")]
     pub to: Address,
+    #[serde_as(as = "SerAddress")]
     pub token_address: Address,
+    #[serde_as(as = "SerB256")]
     pub transaction_hash: B256,
     pub transaction_log_index: Option<u16>,
 }

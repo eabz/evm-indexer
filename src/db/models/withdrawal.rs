@@ -4,11 +4,12 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::utils::format::SerU256;
+use crate::utils::format::{SerAddress, SerU256};
 
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseWithdrawal {
+    #[serde_as(as = "SerAddress")]
     pub address: Address,
     #[serde_as(as = "SerU256")]
     pub amount: U256,

@@ -1,4 +1,4 @@
-use crate::utils::format::SerU256;
+use crate::utils::format::{SerAddress, SerB256, SerBytes, SerU256};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_trace::parity::{
     Action, CallType as AlloyCallType, LocalizedTransactionTrace as Trace,
@@ -41,27 +41,38 @@ pub enum RewardType {
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTrace {
     pub action_type: String,
+    #[serde_as(as = "Option<SerAddress>")]
     pub address: Option<Address>,
+    #[serde_as(as = "Option<SerAddress>")]
     pub author: Option<Address>,
     #[serde_as(as = "Option<SerU256>")]
     pub balance: Option<U256>,
+    #[serde_as(as = "SerB256")]
     pub block_hash: B256,
     pub block_number: u32,
     pub call_type: Option<String>,
     pub chain: u64,
+    #[serde_as(as = "Option<SerBytes>")]
     pub code: Option<Bytes>,
     pub error: Option<String>,
+    #[serde_as(as = "Option<SerAddress>")]
     pub from: Option<Address>,
     pub gas: Option<u32>,
     pub gas_used: Option<u32>,
+    #[serde_as(as = "Option<SerBytes>")]
     pub init: Option<Bytes>,
+    #[serde_as(as = "Option<SerBytes>")]
     pub input: Option<Bytes>,
+    #[serde_as(as = "Option<SerBytes>")]
     pub output: Option<Bytes>,
+    #[serde_as(as = "Option<SerAddress>")]
     pub refund_address: Option<Address>,
     pub reward_type: Option<String>,
     pub subtraces: u16,
+    #[serde_as(as = "Option<SerAddress>")]
     pub to: Option<Address>,
     pub trace_address: Vec<u16>,
+    #[serde_as(as = "Option<SerB256>")]
     pub transaction_hash: Option<B256>,
     pub transaction_position: Option<u16>,
     #[serde_as(as = "Option<SerU256>")]

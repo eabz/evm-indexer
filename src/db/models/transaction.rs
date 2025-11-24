@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
 
-use crate::utils::format::SerU256;
+use crate::utils::format::{
+    SerAccessList, SerAddress, SerB256, SerBytes, SerU256,
+};
 
 #[derive(Debug, Clone, Serialize_repr, Deserialize_repr, PartialEq)]
 #[repr(u8)]
@@ -28,21 +30,27 @@ pub enum TransactionStatus {
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseTransaction {
+    #[serde_as(as = "SerAccessList")]
     pub access_list: Vec<(Address, Vec<B256>)>,
     pub base_fee_per_gas: Option<u64>,
+    #[serde_as(as = "SerB256")]
     pub block_hash: B256,
     pub block_number: u32,
     pub chain: u64,
+    #[serde_as(as = "Option<SerAddress>")]
     pub contract_created: Option<Address>,
     pub cumulative_gas_used: Option<u32>,
     #[serde_as(as = "Option<SerU256>")]
     pub effective_gas_price: Option<U256>,
+    #[serde_as(as = "SerAddress")]
     pub from: Address,
     pub gas: u32,
     #[serde_as(as = "Option<SerU256>")]
     pub gas_price: Option<U256>,
     pub gas_used: Option<u32>,
+    #[serde_as(as = "SerB256")]
     pub hash: B256,
+    #[serde_as(as = "SerBytes")]
     pub input: Bytes,
     #[serde_as(as = "Option<SerU256>")]
     pub max_fee_per_gas: Option<U256>,
@@ -52,6 +60,7 @@ pub struct DatabaseTransaction {
     pub nonce: u32,
     pub status: Option<String>,
     pub timestamp: u32,
+    #[serde_as(as = "SerAddress")]
     pub to: Address,
     pub transaction_index: u16,
     pub transaction_type: String,
