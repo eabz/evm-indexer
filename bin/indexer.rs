@@ -103,6 +103,8 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
             erc721_transfers: Vec::new(),
             erc1155_transfers: Vec::new(),
             dex_trades: Vec::new(),
+            dex_pairs: Vec::new(),
+            dex_liquidity_updates: Vec::new(),
             tokens: Vec::new(),
         };
 
@@ -119,6 +121,8 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
                     mut erc721_transfers,
                     mut erc1155_transfers,
                     mut dex_trades,
+                    mut dex_pairs,
+                    mut dex_liquidity_updates,
                     mut tokens,
                 )) => {
                     fetched_data.blocks.append(&mut blocks);
@@ -137,6 +141,10 @@ async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
                         .erc1155_transfers
                         .append(&mut erc1155_transfers);
                     fetched_data.dex_trades.append(&mut dex_trades);
+                    fetched_data.dex_pairs.append(&mut dex_pairs);
+                    fetched_data
+                        .dex_liquidity_updates
+                        .append(&mut dex_liquidity_updates);
                     fetched_data.tokens.append(&mut tokens);
                 }
                 None => continue,

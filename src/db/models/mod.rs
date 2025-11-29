@@ -1,5 +1,7 @@
 pub mod block;
 pub mod contract;
+pub mod dex_liquidity_update;
+pub mod dex_pair;
 pub mod dex_trade;
 pub mod erc1155_transfer;
 pub mod erc20_transfer;

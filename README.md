@@ -14,7 +14,9 @@ A production-ready indexer that fetches and stores blockchain data for later ana
 
 - ✅ **Complete blockchain primitives**: blocks, transactions, receipts, logs, traces, withdrawals
 - ✅ **Token transfers**: ERC20, ERC721, ERC1155
-- ✅ **DEX trades**: Uniswap V2, V3 and multiple high-volume AMM.
+- ✅ **DEX trades**: Uniswap V2/V3, Curve, Balancer, and multiple high-volume AMMs
+- ✅ **DEX pairs**: Track pair/pool creation across all supported DEXes
+- ✅ **Liquidity tracking**: Monitor liquidity additions, removals, and reserve updates
 - ✅ **Contract tracking**: Automatically indexes deployed contracts
 - ✅ **Parallel processing**: Configurable batch size for optimal throughput
 - ✅ **Smart RPC usage**: Auto-detects `eth_getBlockReceipts` support
@@ -119,7 +121,9 @@ The indexer creates the following tables in ClickHouse:
 - `erc20_transfers` - ERC20 token transfers
 - `erc721_transfers` - NFT transfers
 - `erc1155_transfers` - Multi-token transfers
-- `dex_trades` - DEX trades
+- `dex_trades` - DEX swap transactions
+- `dex_pairs` - DEX pair/pool creation events
+- `dex_liquidity_updates` - Liquidity additions, removals, and sync events
 
 See `migrations/create_tables.sql` for full schema.
 

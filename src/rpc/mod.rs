@@ -3,7 +3,8 @@ use crate::{
     db::{
         models::{
             block::DatabaseBlock, contract::DatabaseContract,
-            dex_trade::DatabaseDexTrade,
+            dex_liquidity_update::DatabaseDexLiquidityUpdate,
+            dex_pair::DatabaseDexPair, dex_trade::DatabaseDexTrade,
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
@@ -14,18 +15,30 @@ use crate::{
         BlockFetchedData, Database,
     },
     utils::{
-        dex_factories::DexRouters,
+        dex_factories::{DexFactories, DexRouters},
         events::{
+            BALANCER_POOL_BALANCE_CHANGED_EVENT_SIGNATURE,
+            BALANCER_POOL_REGISTERED_EVENT_SIGNATURE,
             BALANCER_SWAP_EVENT_SIGNATURE,
+            CURVE_ADD_LIQUIDITY_2_EVENT_SIGNATURE,
+            CURVE_ADD_LIQUIDITY_3_EVENT_SIGNATURE,
+            CURVE_REMOVE_LIQUIDITY_2_EVENT_SIGNATURE,
+            CURVE_REMOVE_LIQUIDITY_3_EVENT_SIGNATURE,
+            CURVE_REMOVE_LIQUIDITY_IMBALANCE_2_EVENT_SIGNATURE,
+            CURVE_REMOVE_LIQUIDITY_ONE_EVENT_SIGNATURE,
             CURVE_TOKEN_EXCHANGE_EVENT_SIGNATURE,
             CURVE_TOKEN_EXCHANGE_UNDERLYING_EVENT_SIGNATURE,
-            DODO_SWAP_EVENT_SIGNATURE,
             ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
             ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
-            KYBER_SWAPPED_EVENT_SIGNATURE,
             MAVERICK_SWAP_FILLED_EVENT_SIGNATURE,
+            PAIR_CREATED_EVENT_SIGNATURE, POOL_CREATED_EVENT_SIGNATURE,
             TRADERJOE_LB_SWAP_EVENT_SIGNATURE, TRANSFER_EVENTS_SIGNATURE,
+            UNISWAP_V2_BURN_EVENT_SIGNATURE,
+            UNISWAP_V2_MINT_EVENT_SIGNATURE,
             UNISWAP_V2_SWAP_EVENT_SIGNATURE,
+            UNISWAP_V2_SYNC_EVENT_SIGNATURE,
+            UNISWAP_V3_BURN_EVENT_SIGNATURE,
+            UNISWAP_V3_MINT_EVENT_SIGNATURE,
             UNISWAP_V3_SWAP_EVENT_SIGNATURE, WOOFI_SWAP_EVENT_SIGNATURE,
         },
     },
@@ -83,6 +96,7 @@ pub struct Rpc {
     pub supports_blocks_receipts: bool,
     pub fetch_uncles: bool,
     pub dex_routers: DexRouters,
+    pub dex_factories: DexFactories,
     pub known_tokens: Arc<RwLock<HashSet<Address>>>,
 }
 
@@ -125,6 +139,7 @@ impl Rpc {
             supports_blocks_receipts: false,
             fetch_uncles: config.fetch_uncles,
             dex_routers: DexRouters::new(),
+            dex_factories: DexFactories::new(),
             known_tokens: Arc::new(RwLock::new(HashSet::new())),
         };
 
@@ -318,6 +333,8 @@ impl Rpc {
         Vec<DatabaseERC721Transfer>,
         Vec<DatabaseERC1155Transfer>,
         Vec<DatabaseDexTrade>,
+        Vec<DatabaseDexPair>,
+        Vec<DatabaseDexLiquidityUpdate>,
         Vec<DatabaseToken>,
     )> {
         let block_data = self.get_block(block_number).await;
@@ -555,6 +572,10 @@ impl Rpc {
 
                 // Decode DEX trades with automatic DEX detection
                 let mut db_dex_trades: Vec<DatabaseDexTrade> = Vec::new();
+                let mut db_dex_pairs: Vec<DatabaseDexPair> = Vec::new();
+                let mut db_dex_liquidity_updates: Vec<
+                    DatabaseDexLiquidityUpdate,
+                > = Vec::new();
 
                 // Create mapping of transaction_hash -> to_address (router) for DEX detection
                 let mut tx_routers: HashMap<B256, Address> =
@@ -615,14 +636,10 @@ impl Rpc {
                                 .unwrap(),
                         )
                     {
-                        // For V2 swaps, use chain-specific default DEX when router not detected
-                        // This properly labels Solidly forks (Velodrome, Aerodrome, Thena, etc.)
-                        let v2_dex_name =
-                            router_dex_name.clone().unwrap_or_else(|| {
-                                self.dex_routers
-                                    .get_default_v2_dex(self.chain_id)
-                                    .to_string()
-                            });
+                        // Use Unknown if router not detected
+                        let v2_dex_name = router_dex_name
+                            .clone()
+                            .unwrap_or_else(|| "Unknown".to_string());
                         if let Some(trade) =
                             DatabaseDexTrade::from_uniswap_v2_swap(
                                 &alloy_log,
@@ -646,13 +663,10 @@ impl Rpc {
                                 .unwrap(),
                         )
                     {
-                        // For V3 swaps, use chain-specific default DEX when router not detected
-                        let v3_dex_name =
-                            router_dex_name.clone().unwrap_or_else(|| {
-                                self.dex_routers
-                                    .get_default_v3_dex(self.chain_id)
-                                    .to_string()
-                            });
+                        // Use Unknown if router not detected
+                        let v3_dex_name = router_dex_name
+                            .clone()
+                            .unwrap_or_else(|| "Unknown".to_string());
                         if let Some(trade) =
                             DatabaseDexTrade::from_uniswap_v3_swap(
                                 &alloy_log,
@@ -715,52 +729,6 @@ impl Rpc {
                         }
                     }
 
-                    // DODO Swap
-                    if topic0
-                        == Some(DODO_SWAP_EVENT_SIGNATURE.parse().unwrap())
-                    {
-                        let dodo_dex_name = router_dex_name
-                            .clone()
-                            .unwrap_or_else(|| "DODO".to_string());
-                        if let Some(trade) =
-                            DatabaseDexTrade::from_dodo_swap(
-                                &alloy_log,
-                                self.chain_id,
-                                log.block_number,
-                                log.timestamp,
-                                log.transaction_hash,
-                                log.log_index,
-                                dodo_dex_name,
-                            )
-                        {
-                            db_dex_trades.push(trade);
-                        }
-                    }
-
-                    // Kyber Swapped
-                    if topic0
-                        == Some(
-                            KYBER_SWAPPED_EVENT_SIGNATURE.parse().unwrap(),
-                        )
-                    {
-                        let kyber_dex_name = router_dex_name
-                            .clone()
-                            .unwrap_or_else(|| "Kyber".to_string());
-                        if let Some(trade) =
-                            DatabaseDexTrade::from_kyber_swapped(
-                                &alloy_log,
-                                self.chain_id,
-                                log.block_number,
-                                log.timestamp,
-                                log.transaction_hash,
-                                log.log_index,
-                                kyber_dex_name,
-                            )
-                        {
-                            db_dex_trades.push(trade);
-                        }
-                    }
-
                     // Maverick SwapFilled
                     if topic0
                         == Some(
@@ -807,6 +775,213 @@ impl Rpc {
                         {
                             db_dex_trades.push(trade);
                         }
+                    }
+
+                    // Pair Creation Events
+                    if topic0
+                        == Some(
+                            PAIR_CREATED_EVENT_SIGNATURE.parse().unwrap(),
+                        )
+                    {
+                        let factory = log.address;
+                        let dex_name = self
+                            .dex_factories
+                            .get_dex_from_factory(self.chain_id, &factory)
+                            .map(|info| info.display_name())
+                            .unwrap_or_else(|| "Unknown Dex".to_string());
+
+                        if let Some(pair) =
+                            DatabaseDexPair::from_pair_created(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp as u64,
+                                log.transaction_hash.to_string(),
+                                log.log_index,
+                                dex_name,
+                            )
+                        {
+                            db_dex_pairs.push(pair);
+                        }
+                    }
+
+                    if topic0
+                        == Some(
+                            POOL_CREATED_EVENT_SIGNATURE.parse().unwrap(),
+                        )
+                    {
+                        let factory = log.address;
+                        let dex_name = self
+                            .dex_factories
+                            .get_dex_from_factory(self.chain_id, &factory)
+                            .map(|info| info.display_name())
+                            .unwrap_or_else(|| "Unknown Dex".to_string());
+
+                        if let Some(pair) =
+                            DatabaseDexPair::from_pool_created(
+                                &alloy_log,
+                                self.chain_id,
+                                log.block_number,
+                                log.timestamp as u64,
+                                log.transaction_hash.to_string(),
+                                log.log_index,
+                                dex_name,
+                            )
+                        {
+                            db_dex_pairs.push(pair);
+                        }
+                    }
+
+                    // Liquidity Events
+                    // Uniswap V2 Sync
+                    if topic0
+                        == Some(
+                            UNISWAP_V2_SYNC_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        if let Some(update) = DatabaseDexLiquidityUpdate::from_uniswap_v2_sync(
+                            &alloy_log,
+                            self.chain_id,
+                            log.block_number,
+                            log.timestamp as u64,
+                            log.transaction_hash.to_string(),
+                            log.log_index,
+                        ) {
+                            db_dex_liquidity_updates.push(update);
+                        }
+                    }
+
+                    // Uniswap V2 Mint
+                    if topic0
+                        == Some(
+                            UNISWAP_V2_MINT_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        if let Some(update) = DatabaseDexLiquidityUpdate::from_uniswap_v2_mint(
+                            &alloy_log,
+                            self.chain_id,
+                            log.block_number,
+                            log.timestamp as u64,
+                            log.transaction_hash.to_string(),
+                            log.log_index,
+                        ) {
+                            db_dex_liquidity_updates.push(update);
+                        }
+                    }
+
+                    // Uniswap V2 Burn
+                    if topic0
+                        == Some(
+                            UNISWAP_V2_BURN_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        if let Some(update) = DatabaseDexLiquidityUpdate::from_uniswap_v2_burn(
+                            &alloy_log,
+                            self.chain_id,
+                            log.block_number,
+                            log.timestamp as u64,
+                            log.transaction_hash.to_string(),
+                            log.log_index,
+                        ) {
+                            db_dex_liquidity_updates.push(update);
+                        }
+                    }
+
+                    // Uniswap V3 Mint
+                    if topic0
+                        == Some(
+                            UNISWAP_V3_MINT_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        if let Some(update) = DatabaseDexLiquidityUpdate::from_uniswap_v3_mint(
+                            &alloy_log,
+                            self.chain_id,
+                            log.block_number,
+                            log.timestamp as u64,
+                            log.transaction_hash.to_string(),
+                            log.log_index,
+                        ) {
+                            db_dex_liquidity_updates.push(update);
+                        }
+                    }
+
+                    // Uniswap V3 Burn
+                    if topic0
+                        == Some(
+                            UNISWAP_V3_BURN_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        if let Some(update) = DatabaseDexLiquidityUpdate::from_uniswap_v3_burn(
+                            &alloy_log,
+                            self.chain_id,
+                            log.block_number,
+                            log.timestamp as u64,
+                            log.transaction_hash.to_string(),
+                            log.log_index,
+                        ) {
+                            db_dex_liquidity_updates.push(update);
+                        }
+                    }
+
+                    // Curve Finance Liquidity Events
+                    // Note: Curve events have dynamic array sizes based on pool configuration
+                    // Full implementation requires pool-specific decoding logic
+                    if topic0
+                        == Some(
+                            CURVE_ADD_LIQUIDITY_2_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                        || topic0
+                            == Some(
+                                CURVE_ADD_LIQUIDITY_3_EVENT_SIGNATURE
+                                    .parse()
+                                    .unwrap(),
+                            )
+                    {
+                        // TODO: Implement Curve AddLiquidity parsing
+                        // Requires handling dynamic array sizes for different pool types
+                    }
+
+                    if topic0 == Some(CURVE_REMOVE_LIQUIDITY_2_EVENT_SIGNATURE.parse().unwrap())
+                        || topic0 == Some(CURVE_REMOVE_LIQUIDITY_3_EVENT_SIGNATURE.parse().unwrap())
+                        || topic0 == Some(CURVE_REMOVE_LIQUIDITY_ONE_EVENT_SIGNATURE.parse().unwrap())
+                        || topic0 == Some(CURVE_REMOVE_LIQUIDITY_IMBALANCE_2_EVENT_SIGNATURE.parse().unwrap())
+                    {
+                        // TODO: Implement Curve RemoveLiquidity parsing
+                        // Requires handling dynamic array sizes for different pool types
+                    }
+
+                    // Balancer V2 Liquidity Events
+                    if topic0
+                        == Some(
+                            BALANCER_POOL_REGISTERED_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        // TODO: Implement Balancer PoolRegistered parsing for dex_pairs
+                    }
+
+                    if topic0
+                        == Some(
+                            BALANCER_POOL_BALANCE_CHANGED_EVENT_SIGNATURE
+                                .parse()
+                                .unwrap(),
+                        )
+                    {
+                        // TODO: Implement Balancer PoolBalanceChanged parsing for dex_liquidity_updates
+                        // Requires handling dynamic arrays for tokens and deltas
                     }
 
                     // TraderJoe V2.1 LB Swap
@@ -897,6 +1072,8 @@ impl Rpc {
                     db_erc721_transfers,
                     db_erc1155_transfers,
                     db_dex_trades,
+                    db_dex_pairs,
+                    db_dex_liquidity_updates,
                     db_tokens,
                 ))
             }
@@ -996,6 +1173,8 @@ impl Rpc {
                                 erc721_transfers,
                                 erc1155_transfers,
                                 dex_trades,
+                                dex_pairs,
+                                dex_liquidity_updates,
                                 tokens,
                             )) => {
                                 let fetched_data = BlockFetchedData {
@@ -1009,6 +1188,8 @@ impl Rpc {
                                     erc721_transfers,
                                     erc1155_transfers,
                                     dex_trades,
+                                    dex_pairs,
+                                    dex_liquidity_updates,
                                     tokens,
                                 };
 

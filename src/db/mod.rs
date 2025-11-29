@@ -13,7 +13,8 @@ use serde::Serialize;
 use std::collections::HashSet;
 
 use self::models::{
-    erc1155_transfer::DatabaseERC1155Transfer,
+    dex_liquidity_update::DatabaseDexLiquidityUpdate,
+    dex_pair::DatabaseDexPair, erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer,
 };
@@ -29,6 +30,8 @@ pub struct BlockFetchedData {
     pub erc721_transfers: Vec<DatabaseERC721Transfer>,
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
     pub dex_trades: Vec<DatabaseDexTrade>,
+    pub dex_pairs: Vec<DatabaseDexPair>,
+    pub dex_liquidity_updates: Vec<DatabaseDexLiquidityUpdate>,
     pub tokens: Vec<DatabaseToken>,
 }
 
@@ -49,6 +52,8 @@ pub enum DatabaseTables {
     Erc721Transfers,
     Erc1155Transfers,
     DexTrades,
+    DexPairs,
+    DexLiquidityUpdates,
     Tokens,
 }
 
@@ -65,6 +70,8 @@ impl DatabaseTables {
             DatabaseTables::Erc721Transfers => "erc721_transfers",
             DatabaseTables::Erc1155Transfers => "erc1155_transfers",
             DatabaseTables::DexTrades => "dex_trades",
+            DatabaseTables::DexPairs => "dex_pairs",
+            DatabaseTables::DexLiquidityUpdates => "dex_liquidity_updates",
             DatabaseTables::Tokens => "tokens",
         }
     }
@@ -249,6 +256,33 @@ impl Database {
             stores.push(work);
         }
 
+        if !data.dex_pairs.is_empty() {
+            let dex_pairs = Arc::new(data.dex_pairs.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &dex_pairs,
+                    DatabaseTables::DexPairs.as_str(),
+                )
+                .await
+            });
+            stores.push(work);
+        }
+
+        if !data.dex_liquidity_updates.is_empty() {
+            let dex_liquidity_updates =
+                Arc::new(data.dex_liquidity_updates.clone());
+            let db = self.clone();
+            let work = tokio::spawn(async move {
+                db.store_items(
+                    &dex_liquidity_updates,
+                    DatabaseTables::DexLiquidityUpdates.as_str(),
+                )
+                .await
+            });
+            stores.push(work);
+        }
+
         if !data.tokens.is_empty() {
             let tokens = Arc::new(data.tokens.clone());
             let db = self.clone();
@@ -277,7 +311,7 @@ impl Database {
         }
 
         info!(
-            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) dex_trades ({}) tokens ({}) in ({}) blocks.",
+            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) dex_trades ({}) dex_pairs ({}) dex_liquidity_updates ({}) tokens ({}) in ({}) blocks.",
             data.contracts.len(),
             data.logs.len(),
             data.traces.len(),
@@ -287,6 +321,8 @@ impl Database {
             data.erc721_transfers.len(),
             data.erc1155_transfers.len(),
             data.dex_trades.len(),
+            data.dex_pairs.len(),
+            data.dex_liquidity_updates.len(),
             data.tokens.len(),
             data.blocks.len()
         );
