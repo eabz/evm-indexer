@@ -7,8 +7,12 @@ repository = "https://github.com/eabz/evm-indexer"
 description = "Scalable SQL indexer for EVM compatible blockchains"
 
 [dependencies]
+anyhow = "1.0.100"
+clickhouse = { version = "0.14", features = ["native-tls", "time", "inserter"] }
+dotenv = "0.15.0"
 hypersync-client = "0.23.0"
 log = "0.4"
+redis = { version = "1.0.2", features = ["tokio-comp"] }
 simple_logger = { version = "5", default-features = false, features = [
     "colors",
 ] }

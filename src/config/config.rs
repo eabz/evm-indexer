@@ -7,6 +7,7 @@ pub struct IndexerConfig {
     pub database_host: String,
     pub database_user: String,
     pub database_password: String,
+    pub redis_url: String,
 }
 
 impl IndexerConfig {
@@ -40,9 +41,14 @@ impl IndexerConfig {
             String::new()
         });
 
+        let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| {
+            missing_vars.push("REDIS_URL");
+            String::new()
+        });
+
         if !missing_vars.is_empty() {
             error!("Missing environment variables: {:?}", missing_vars);
-            panic!("Missing required environment variables: {:?}", missing_vars);
+            std::process::exit(1);
         }
 
         Self {
@@ -51,6 +57,7 @@ impl IndexerConfig {
             database_host,
             database_user,
             database_password,
+            redis_url,
         }
     }
 }
