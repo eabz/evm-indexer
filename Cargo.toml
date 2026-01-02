@@ -7,22 +7,12 @@ repository = "https://github.com/eabz/evm-indexer"
 description = "Scalable SQL indexer for EVM compatible blockchains"
 
 [dependencies]
-alloy = { version = "0.1", features = ["full", "node-bindings", "rpc-types", "json-rpc", "rpc-client"] }
-alloy-rpc-types-trace = "0.1"
-clap = { version = "4", features = ["derive"] }
-clickhouse = { version = "0.14", features = ["native-tls"] }
-futures = "0.3"
-hex = "0.4"
+hypersync-client = "0.23.0"
 log = "0.4"
-rand = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_repr = "0.1"
-serde_with = "3"
-simple_logger = { version = "5", default-features = false, features = ["colors"] }
+simple_logger = { version = "5", default-features = false, features = [
+    "colors",
+] }
 tokio = { version = "1", features = ["full"] }
-url = "2"
 
 [[bin]]
 path = "bin/indexer.rs"

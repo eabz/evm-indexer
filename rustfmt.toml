@@ -1,6 +1,30 @@
-# Basic
-max_width = 75
+# Basic formatting
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
 use_small_heuristics = "Max"
+edition = "2021"
 
 # Imports
 reorder_imports = true
+reorder_modules = true
+
+# Expressions and statements
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# Function formatting
+fn_params_layout = "Tall"
+fn_call_width = 60
+
+# Control flow
+match_block_trailing_comma = true
+
+# Chains
+chain_width = 60
+short_array_element_width_threshold = 10
+
+# Struct and enum formatting
+struct_lit_width = 0
+struct_variant_width = 0
