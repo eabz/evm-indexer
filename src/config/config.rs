@@ -7,6 +7,7 @@ pub struct IndexerConfig {
     pub database_host: String,
     pub database_user: String,
     pub database_password: String,
+    pub database_name: String,
     pub redis_url: String,
 }
 
@@ -41,13 +42,52 @@ impl IndexerConfig {
             String::new()
         });
 
+        let database_name = std::env::var("DATABASE_NAME").unwrap_or_else(|_| {
+            missing_vars.push("DATABASE_NAME");
+            String::new()
+        });
+
         let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| {
             missing_vars.push("REDIS_URL");
             String::new()
         });
 
+        let mut invalid_vars = Vec::new();
+
+        if !hypersync_url.is_empty() {
+            if let Err(_) = url::Url::parse(&hypersync_url) {
+                invalid_vars.push(format!(
+                    "HYPERSYNC_URL: Invalid URL format '{}'",
+                    hypersync_url
+                ));
+            }
+        }
+
+        if !redis_url.is_empty() {
+            match url::Url::parse(&redis_url) {
+                Ok(url) => {
+                    if url.scheme() != "redis" && url.scheme() != "rediss" {
+                        invalid_vars.push(format!(
+                            "REDIS_URL: Invalid scheme '{}'. Must be 'redis://' or 'rediss://'",
+                            url.scheme()
+                        ));
+                    }
+                },
+                Err(_) => {
+                    invalid_vars.push(format!("REDIS_URL: Invalid URL format '{}'", redis_url))
+                },
+            }
+        }
+
         if !missing_vars.is_empty() {
             error!("Missing environment variables: {:?}", missing_vars);
+            std::process::exit(1);
+        }
+
+        if !invalid_vars.is_empty() {
+            for error in invalid_vars {
+                error!("Invalid configuration: {}", error);
+            }
             std::process::exit(1);
         }
 
@@ -57,6 +97,7 @@ impl IndexerConfig {
             database_host,
             database_user,
             database_password,
+            database_name,
             redis_url,
         }
     }

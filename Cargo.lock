@@ -1335,6 +1335,7 @@ dependencies = [
  "redis",
  "simple_logger",
  "tokio",
+ "url",
 ]
 
 [[package]]

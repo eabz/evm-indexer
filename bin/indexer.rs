@@ -16,7 +16,7 @@ async fn main() {
 
     let config = IndexerConfig::new();
 
-    let db = Database::new(&config).await;
+    let db = Database::new(&config).await.unwrap();
 
     info!("Syncing chain: {}", config.chain_id);
 }

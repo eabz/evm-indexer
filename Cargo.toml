@@ -17,6 +17,7 @@ simple_logger = { version = "5", default-features = false, features = [
     "colors",
 ] }
 tokio = { version = "1", features = ["full"] }
+url = "2.5.7"
 
 [[bin]]
 path = "bin/indexer.rs"

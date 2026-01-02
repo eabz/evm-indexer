@@ -14,7 +14,7 @@ impl ClickHouseClient {
             .with_url(config.database_host.clone())
             .with_user(config.database_user.clone())
             .with_password(config.database_password.clone())
-            .with_database("indexer")
+            .with_database(config.database_name.clone())
             .with_validation(false);
 
         // Test connection with retry logic

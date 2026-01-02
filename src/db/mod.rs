@@ -1,4 +1,4 @@
-use crate::db::{clickhouse::ClickHouseClient, redis::RedisClient};
+use self::{clickhouse::ClickHouseClient, redis::RedisClient};
 
 pub mod clickhouse;
 pub mod redis;
