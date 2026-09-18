@@ -19,19 +19,41 @@
 //! returns (in memory), and [`TokenResolver::mark_stored`] persists them to
 //! Redis once the writer has durably inserted the rows.
 //!
+//! The pipeline does not call the resolver directly: it hands the tokens it
+//! sees to the [`TokenWorker`] (non blocking, off the commit path), which
+//! resolves them in the background over a [`MultiEndpointCaller`] (several
+//! RPC endpoints with failover, optionally discovered with `--rpc auto`)
+//! and heals anything it missed from the database itself.
+//!
 //! Redis keys are `evm-indexer:token:{chain_id}:{0xaddress-lowercase}` and
 //! hold a compact JSON `{"name","symbol","decimals","type"}` without TTL.
 //! When the ClickHouse `tokens` table is reset, those keys must be flushed
 //! too.
 
+pub mod breaker;
 pub mod cache;
 pub mod decode;
+pub mod discovery;
+pub mod endpoints;
 pub mod multicall;
 pub mod redact;
+pub mod worker;
+
+pub use self::{
+    discovery::{build_caller, discover_public_rpcs},
+    endpoints::MultiEndpointCaller,
+    worker::{
+        MissingTokenSource, TokenSink, TokenWorker, TokenWorkerOptions,
+        TokenWorkerStats,
+    },
+};
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
@@ -43,8 +65,17 @@ use crate::db::models::token::DatabaseToken;
 
 use self::{
     cache::{KnownTokens, RedisTokenCache, TokenCache},
-    multicall::{AlloyCaller, ChainCheck, FetchOptions, MetadataFetcher},
+    multicall::{
+        AlloyCaller, CallerHealth, ChainCheck, EthCaller, FetchOptions,
+        MetadataFetcher,
+    },
 };
+
+/// "Now" for the in-memory TTLs. Goes through the tokio clock so tests can
+/// drive it with `tokio::time::pause`.
+fn now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
 
 /// Token standard hint, derived by the caller from the transfer event that
 /// revealed the token.
@@ -84,6 +115,13 @@ pub struct TokenResolverOptions {
     pub empty_ttl: Duration,
     /// Maximum number of code-less addresses remembered.
     pub empty_capacity: usize,
+    /// After this many fetches in a row (each at least `empty_ttl` apart)
+    /// found no code at an address, that becomes the definitive answer
+    /// and a blank row is produced ("checked, nothing there": a
+    /// self-destructed contract). A lagging node cannot explain it any
+    /// more by then, and without it such addresses would be reported by
+    /// the database backfill forever. `0` never gives up.
+    pub empty_strikes: u32,
     pub fetch: FetchOptions,
 }
 
@@ -95,6 +133,7 @@ impl Default for TokenResolverOptions {
             max_pending_writes: 100_000,
             empty_ttl: cache::DEFAULT_EMPTY_TTL,
             empty_capacity: cache::DEFAULT_EMPTY_CAPACITY,
+            empty_strikes: 3,
             fetch: FetchOptions::default(),
         }
     }
@@ -108,6 +147,58 @@ struct Inner {
     /// Rows stored in ClickHouse whose Redis write failed.
     pending_writes: Mutex<VecDeque<DatabaseToken>>,
     max_pending_writes: usize,
+    empty_strikes: u32,
+    counters: Counters,
+}
+
+#[derive(Default)]
+struct Counters {
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    resolved: AtomicU64,
+    negative: AtomicU64,
+    codeless: AtomicU64,
+    rpc_failures: AtomicU64,
+}
+
+/// Counters of a [`TokenResolver`] since it was created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolverStats {
+    /// Tokens found in the persistent cache (no RPC needed).
+    pub cache_hits: u64,
+    /// Tokens that were not in the persistent cache.
+    pub cache_misses: u64,
+    /// Rows produced (including the negative ones).
+    pub resolved: u64,
+    /// Rows without any metadata (reverts, garbage, no contract).
+    pub negative: u64,
+    /// Fetches that found no code at the address (not definitive yet).
+    pub codeless: u64,
+    /// Tokens that could not be fetched because the RPC was unavailable.
+    pub rpc_failures: u64,
+    /// The RPC circuit breaker is open (or the RPC serves another chain).
+    pub breaker_open: bool,
+}
+
+/// How [`TokenResolver::resolve`] treats what it already knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveMode {
+    /// Skip the tokens known in memory or in the persistent cache.
+    Normal,
+    /// The database says these tokens are NOT stored, whatever the caches
+    /// believe (a `tokens` table that was reset, a lost insert): fetch
+    /// them again. Tokens currently in flight are still left alone.
+    Forced,
+}
+
+/// Result of [`TokenResolver::resolve`].
+#[derive(Debug, Default)]
+pub struct Resolution {
+    /// Rows to insert, claimed until `mark_stored` / `release`.
+    pub rows: Vec<DatabaseToken>,
+    /// Tokens that could not be fetched (RPC unavailable); their claims
+    /// are already released. Worth trying again later.
+    pub unresolved: Vec<(Address, TokenStandard)>,
 }
 
 /// Resolves metadata of newly seen tokens. Cheap to clone and safe to use
@@ -223,6 +314,33 @@ impl TokenResolver {
         Ok(Self::from_parts(chain_id, fetcher, cache, &options))
     }
 
+    /// Creates a resolver over an injected RPC backend (typically the
+    /// [`MultiEndpointCaller`] made by [`build_caller`]).
+    ///
+    /// No I/O: Redis is connected lazily and the chain id is verified
+    /// before the first fetch. Only an invalid Redis URL is an error.
+    /// Must be called from within a tokio runtime.
+    pub fn from_caller(
+        chain_id: u64,
+        caller: Option<Arc<dyn EthCaller>>,
+        redis_url: Option<&str>,
+        options: &TokenResolverOptions,
+    ) -> anyhow::Result<Self> {
+        let fetcher = caller.map(|caller| {
+            MetadataFetcher::new(caller, options.fetch.clone())
+                .expect_chain_id(chain_id)
+        });
+
+        let cache: Option<Arc<dyn TokenCache>> = match redis_url {
+            Some(url) if fetcher.is_some() => {
+                Some(Arc::new(RedisTokenCache::lazy(chain_id, url)?))
+            }
+            _ => None,
+        };
+
+        Ok(Self::from_parts(chain_id, fetcher, cache, options))
+    }
+
     /// Assembles a resolver from explicit backends (tests, custom caches).
     pub fn from_parts(
         chain_id: u64,
@@ -247,8 +365,85 @@ impl TokenResolver {
                 ),
                 pending_writes: Mutex::new(VecDeque::new()),
                 max_pending_writes: options.max_pending_writes,
+                empty_strikes: options.empty_strikes,
+                counters: Counters::default(),
             }),
         }
+    }
+
+    /// `false` when no RPC is configured: nothing is ever resolved.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.fetcher.is_some()
+    }
+
+    /// `false` while resolving would not even try the RPC (circuit
+    /// breaker open, wrong chain, or no RPC at all).
+    pub fn rpc_available(&self) -> bool {
+        self.inner.fetcher.as_ref().is_some_and(|f| f.is_available())
+    }
+
+    /// The RPC serves another chain: resolution is disabled for good.
+    pub fn wrong_chain(&self) -> bool {
+        self.inner.fetcher.as_ref().is_some_and(|f| f.wrong_chain())
+    }
+
+    /// When the open RPC circuit breaker lets the next probe through.
+    pub fn rpc_retry_at(&self) -> Option<tokio::time::Instant> {
+        self.inner.fetcher.as_ref().and_then(|f| f.breaker_open_until())
+    }
+
+    /// Health of the RPC backend, when it tracks any.
+    pub fn rpc_health(&self) -> Option<CallerHealth> {
+        self.inner.fetcher.as_ref().and_then(|f| f.caller().health())
+    }
+
+    pub fn stats(&self) -> ResolverStats {
+        let counters = &self.inner.counters;
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+
+        ResolverStats {
+            cache_hits: load(&counters.cache_hits),
+            cache_misses: load(&counters.cache_misses),
+            resolved: load(&counters.resolved),
+            negative: load(&counters.negative),
+            codeless: load(&counters.codeless),
+            rpc_failures: load(&counters.rpc_failures),
+            breaker_open: self.is_enabled() && !self.rpc_available(),
+        }
+    }
+
+    /// The subset of `tokens` that `resolve_new` would have to work on
+    /// according to memory alone (not known, not in flight, not recently
+    /// seen without code). Synchronous and cheap: no I/O, claims nothing.
+    pub fn filter_unknown(
+        &self,
+        tokens: &HashMap<Address, TokenStandard>,
+    ) -> Vec<(Address, TokenStandard)> {
+        if !self.is_enabled() || tokens.is_empty() {
+            return Vec::new();
+        }
+
+        let now = now();
+        let mut known = self.inner.known();
+
+        tokens
+            .iter()
+            .filter(|(address, _)| known.needs_resolution(address, now))
+            .map(|(address, standard)| (*address, *standard))
+            .collect()
+    }
+
+    /// Whether the token is known in memory to be stored.
+    pub fn is_known(&self, address: &Address) -> bool {
+        self.inner.known().is_known(address)
+    }
+
+    /// Gives back the claims of rows returned by `resolve_new` that could
+    /// not be stored, so the tokens can be resolved again.
+    pub fn release(&self, tokens: &[DatabaseToken]) {
+        self.inner
+            .known()
+            .release(tokens.iter().map(|token| &token.address));
     }
 
     /// Returns metadata rows for tokens not seen before (rows to insert
@@ -270,22 +465,44 @@ impl TokenResolver {
         &self,
         tokens: &HashMap<Address, TokenStandard>,
     ) -> Vec<DatabaseToken> {
+        self.resolve(tokens, ResolveMode::Normal).await.rows
+    }
+
+    /// [`resolve_new`](Self::resolve_new) that also reports the tokens
+    /// the RPC could not be asked about, see [`Resolution`].
+    pub async fn resolve(
+        &self,
+        tokens: &HashMap<Address, TokenStandard>,
+        mode: ResolveMode,
+    ) -> Resolution {
         let inner = &*self.inner;
+        let mut resolution = Resolution::default();
+        let with_standard = |addresses: &[Address]| {
+            addresses
+                .iter()
+                .filter_map(|a| tokens.get(a).map(|s| (*a, *s)))
+                .collect::<Vec<_>>()
+        };
 
         let Some(fetcher) = &inner.fetcher else {
-            return Vec::new();
+            return resolution;
         };
 
         if tokens.is_empty() {
-            return Vec::new();
+            return resolution;
         }
 
         // 1. Memory: atomically claim what nobody knows / works on.
-        let claimed =
-            inner.known().claim(tokens.keys().copied(), Instant::now());
+        let claimed = {
+            let mut known = inner.known();
+            if mode == ResolveMode::Forced {
+                known.forget(tokens.keys());
+            }
+            known.claim(tokens.keys().copied(), now())
+        };
 
         if claimed.is_empty() {
-            return Vec::new();
+            return resolution;
         }
 
         let mut guard = ClaimGuard {
@@ -296,7 +513,13 @@ impl TokenResolver {
         // 2. Redis: one pipelined lookup for the whole batch.
         let mut missing = claimed;
 
-        if let Some(cache) = &inner.cache {
+        let cache = match mode {
+            ResolveMode::Normal => inner.cache.as_ref(),
+            // The cache is what is being doubted.
+            ResolveMode::Forced => None,
+        };
+
+        if let Some(cache) = cache {
             match cache.contains_many(&missing).await {
                 Ok(found) if found.len() == missing.len() => {
                     let (hits, misses): (Vec<_>, Vec<_>) = missing
@@ -310,6 +533,10 @@ impl TokenResolver {
                     missing = misses.into_iter().map(|(a, _)| a).collect();
 
                     inner.known().confirm(&hits);
+                    inner
+                        .counters
+                        .cache_hits
+                        .fetch_add(hits.len() as u64, Ordering::Relaxed);
                     for address in &hits {
                         guard.unresolved.remove(address);
                     }
@@ -327,9 +554,23 @@ impl TokenResolver {
             }
         }
 
+        inner
+            .counters
+            .cache_misses
+            .fetch_add(missing.len() as u64, Ordering::Relaxed);
+
+        if missing.is_empty() {
+            return resolution;
+        }
+
         // Dead RPC / wrong chain: give the claims back right away.
-        if missing.is_empty() || !fetcher.is_available() {
-            return Vec::new();
+        if !fetcher.is_available() {
+            inner
+                .counters
+                .rpc_failures
+                .fetch_add(missing.len() as u64, Ordering::Relaxed);
+            resolution.unresolved = with_standard(&missing);
+            return resolution;
         }
 
         // 3. RPC.
@@ -348,15 +589,40 @@ impl TokenResolver {
         // No code at the address as far as the node knows: not definitive
         // (lagging node), so no row and nothing persisted. Skipped for a
         // while in memory, then fetched again when seen.
+        //
+        // Unless it keeps being the answer, `empty_strikes` fetches in a
+        // row each `empty_ttl` apart: then the address really holds no
+        // contract (self-destructed) and gets its blank row.
         if !outcome.empty.is_empty() {
+            let (dead, retry): (Vec<Address>, Vec<Address>) = {
+                let mut known = inner.known();
+                let (dead, retry): (Vec<Address>, Vec<Address>) =
+                    outcome.empty.iter().copied().partition(|address| {
+                        inner.empty_strikes > 0
+                            && known.empty_strikes(address) + 1
+                                >= inner.empty_strikes
+                    });
+                known.mark_empty(&retry, now());
+                (dead, retry)
+            };
+
             debug!(
                 "{} token addresses have no code on the RPC node yet, \
-                 they will be retried later",
-                outcome.empty.len()
+                 they will be retried later; {} never had any and are \
+                 stored blank",
+                retry.len(),
+                dead.len()
             );
-            inner.known().mark_empty(&outcome.empty, Instant::now());
-            for address in &outcome.empty {
+
+            inner
+                .counters
+                .codeless
+                .fetch_add(retry.len() as u64, Ordering::Relaxed);
+            for address in &retry {
                 guard.unresolved.remove(address);
+            }
+            for address in dead {
+                fetched.insert(address, Default::default());
             }
         }
 
@@ -364,8 +630,15 @@ impl TokenResolver {
         for (address, standard) in to_fetch {
             let Some(metadata) = fetched.remove(&address) else {
                 // Transport failure: claim is released by the guard.
+                if guard.unresolved.contains(&address) {
+                    resolution.unresolved.push((address, standard));
+                }
                 continue;
             };
+
+            if metadata.name.is_empty() && metadata.symbol.is_empty() {
+                inner.counters.negative.fetch_add(1, Ordering::Relaxed);
+            }
 
             // The row now owns the claim until `mark_stored`.
             guard.unresolved.remove(&address);
@@ -387,12 +660,22 @@ impl TokenResolver {
         if !guard.unresolved.is_empty() {
             debug!(
                 "Unable to fetch metadata for {} tokens, they will be \
-                 retried when seen again",
+                 retried later",
                 guard.unresolved.len()
             );
         }
 
-        rows
+        inner
+            .counters
+            .resolved
+            .fetch_add(rows.len() as u64, Ordering::Relaxed);
+        inner.counters.rpc_failures.fetch_add(
+            resolution.unresolved.len() as u64,
+            Ordering::Relaxed,
+        );
+
+        resolution.rows = rows;
+        resolution
     }
 
     /// Called by the writer after the rows were durably inserted into
