@@ -22,6 +22,15 @@ Deferred (NOT in scope): F1 Arrow passthrough.
 | enumerations (status, tx type, action/call/reward type, token type, dex protocol) | `LowCardinality(String)` | |
 | timestamps | `DateTime CODEC(DoubleDelta, ZSTD)` | u32 |
 
+- **256-bit arithmetic rule.** Raw columns are always exact `UInt256`/`Int256`
+  (`Decimal256` is not an option: 76 digits < the 78 a `uint256` needs). But
+  `sum()` over `UInt256`/`Int256` **wraps silently on overflow**, and hostile tokens
+  routinely emit `2^256-1` amounts, so:
+  analytics aggregates (volume, candles, USD) sum `toFloat64(amount) / pow(10, decimals)`
+  — never the raw integer; exact accounting (balances) sums signed `Int256` per
+  (token, account) only, where wrap-around needs an economically impossible supply.
+  Wire format is 32 bytes little-endian (4 LE `u64` limbs of alloy's `U256`); every
+  table's integration test round-trips a value > 2^128 and compares `toString()`.
 - **No hex strings anywhere in storage.** Readers format with `concat('0x', lower(hex(x)))`.
 - **`Nullable` only where NULL differs from the default in meaning** (`base_fee_per_gas`
   pre-London, tx `status` pre-Byzantium, EIP-1559 fee fields on legacy txs, tx `to` on
