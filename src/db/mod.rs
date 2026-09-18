@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod integration_tests;
+pub mod migrate;
 pub mod models;
 pub mod ranges;
 
