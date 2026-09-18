@@ -193,3 +193,33 @@ impl<'de> DeserializeAs<'de, Vec<(Address, Vec<B256>)>> for SerAccessList {
             .collect()
     }
 }
+
+// STUB - replaced by schema engineer at merge
+//
+/// Signed 256 bit integer for ClickHouse `Int256`: 32 raw bytes,
+/// little-endian two's complement (docs/design.md §1).
+pub struct SerI256(());
+
+impl SerializeAs<alloy::primitives::I256> for SerI256 {
+    fn serialize_as<S>(
+        x: &alloy::primitives::I256,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        x.to_le_bytes::<32>().serialize(serializer)
+    }
+}
+
+impl<'de> DeserializeAs<'de, alloy::primitives::I256> for SerI256 {
+    fn deserialize_as<D>(
+        deserializer: D,
+    ) -> Result<alloy::primitives::I256, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
+        Ok(alloy::primitives::I256::from_le_bytes(bytes))
+    }
+}

@@ -1,3 +1,5 @@
+// STUB - replaced by schema engineer at merge
+pub mod derived;
 #[cfg(test)]
 mod integration_tests;
 pub mod models;
