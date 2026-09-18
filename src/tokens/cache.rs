@@ -20,6 +20,7 @@ use lru::LruCache;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use serde::{Deserialize, Serialize};
 
+use super::redact::Redactor;
 use crate::db::models::token::DatabaseToken;
 
 /// Namespace prefix of every key written by the indexer.
@@ -114,6 +115,9 @@ pub struct RedisTokenCache {
     connection: ConnectionManager,
     down_until: Mutex<Option<Instant>>,
     is_down: AtomicBool,
+    /// The URL may carry a password: errors go through this before they
+    /// are returned or logged.
+    redactor: Redactor,
 }
 
 impl RedisTokenCache {
@@ -123,7 +127,10 @@ impl RedisTokenCache {
         chain_id: u64,
         url: &str,
     ) -> anyhow::Result<Self> {
+        let redactor = Redactor::for_url(url);
+
         let client = redis::Client::open(url)
+            .map_err(|error| anyhow!(redactor.redact(&error.to_string())))
             .context("invalid redis url for the token cache")?;
 
         // Keep the manager's internal retries short: a batch must never
@@ -137,6 +144,9 @@ impl RedisTokenCache {
 
         let connection =
             ConnectionManager::new_lazy_with_config(client, config)
+                .map_err(|error| {
+                    anyhow!(redactor.redact(&error.to_string()))
+                })
                 .context(
                     "unable to create the redis connection manager",
                 )?;
@@ -146,6 +156,7 @@ impl RedisTokenCache {
             connection,
             down_until: Mutex::new(None),
             is_down: AtomicBool::new(false),
+            redactor,
         };
 
         let mut conn = cache.connection.clone();
@@ -192,7 +203,9 @@ impl RedisTokenCache {
         .await
         {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(anyhow!(error)),
+            Ok(Err(error)) => {
+                Err(anyhow!(self.redactor.redact(&error.to_string())))
+            }
             Err(_) => Err(anyhow!("redis operation timed out")),
         };
 
@@ -291,15 +304,26 @@ impl TokenCache for RedisTokenCache {
 /// (claimed by a `resolve_new` call and not yet confirmed by
 /// `mark_stored`).
 ///
+/// It also remembers, for a short while and never persistently, the
+/// addresses that had no code when they were fetched ("empty"): they are
+/// not definitive (the node may lag behind the indexed head) but must not
+/// be refetched on every sighting either.
+///
 /// Purely synchronous; callers wrap it in a mutex.
 pub struct KnownTokens {
     known: LruCache<Address, ()>,
     in_flight: HashMap<Address, Instant>,
     in_flight_ttl: Duration,
     prune_at: usize,
+    empty: LruCache<Address, Instant>,
+    empty_ttl: Duration,
 }
 
 const MIN_PRUNE_AT: usize = 1_024;
+
+/// Defaults of the "empty" negative cache.
+pub const DEFAULT_EMPTY_CAPACITY: usize = 50_000;
+pub const DEFAULT_EMPTY_TTL: Duration = Duration::from_secs(600);
 
 impl KnownTokens {
     pub fn new(capacity: usize, in_flight_ttl: Duration) -> Self {
@@ -311,7 +335,25 @@ impl KnownTokens {
             in_flight: HashMap::new(),
             in_flight_ttl,
             prune_at: MIN_PRUNE_AT,
+            empty: LruCache::new(
+                NonZeroUsize::new(DEFAULT_EMPTY_CAPACITY)
+                    .unwrap_or(NonZeroUsize::MIN),
+            ),
+            empty_ttl: DEFAULT_EMPTY_TTL,
         }
+    }
+
+    /// Overrides the size / TTL of the "empty" negative cache.
+    pub fn with_empty_cache(
+        mut self,
+        capacity: usize,
+        ttl: Duration,
+    ) -> Self {
+        self.empty = LruCache::new(
+            NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN),
+        );
+        self.empty_ttl = ttl;
+        self
     }
 
     /// Atomically claims every address that is neither known nor already
@@ -331,6 +373,14 @@ impl KnownTokens {
             // `get` (not `contains`) so hot tokens stay most recently used.
             if self.known.get(&address).is_some() {
                 continue;
+            }
+
+            // Recently seen without code: leave it alone until the TTL.
+            if let Some(since) = self.empty.peek(&address).copied() {
+                if now.saturating_duration_since(since) < self.empty_ttl {
+                    continue;
+                }
+                self.empty.pop(&address);
             }
 
             let expired = match self.in_flight.get(&address) {
@@ -368,8 +418,26 @@ impl KnownTokens {
     {
         for address in addresses {
             self.in_flight.remove(address);
+            self.empty.pop(address);
             self.known.put(*address, ());
         }
+    }
+
+    /// Records addresses that had no code when fetched: the claim is
+    /// released and they are skipped until the "empty" TTL elapses. Never
+    /// marks them as known and never reaches the persistent cache.
+    pub fn mark_empty<'a, I>(&mut self, addresses: I, now: Instant)
+    where
+        I: IntoIterator<Item = &'a Address>,
+    {
+        for address in addresses {
+            self.in_flight.remove(address);
+            self.empty.put(*address, now);
+        }
+    }
+
+    pub fn empty_len(&self) -> usize {
+        self.empty.len()
     }
 
     pub fn is_known(&self, address: &Address) -> bool {
@@ -545,6 +613,40 @@ mod tests {
         assert_eq!(tokens.claim([addr(1)], start + TTL), vec![addr(1)]);
         // The re-claim restarted the clock.
         assert!(tokens.claim([addr(1)], start + TTL + TTL / 2).is_empty());
+    }
+
+    #[test]
+    fn empty_addresses_are_skipped_until_their_ttl() {
+        let empty_ttl = Duration::from_secs(10);
+        let mut tokens =
+            KnownTokens::new(16, TTL).with_empty_cache(2, empty_ttl);
+        let start = Instant::now();
+
+        assert_eq!(tokens.claim([addr(1)], start), vec![addr(1)]);
+        tokens.mark_empty(&[addr(1)], start);
+
+        // Claim released, not known, but not claimable for a while.
+        assert!(!tokens.is_in_flight(&addr(1)));
+        assert!(!tokens.is_known(&addr(1)));
+        assert!(tokens.claim([addr(1)], start + empty_ttl / 2).is_empty());
+
+        // After the TTL it is fetched again.
+        assert_eq!(
+            tokens.claim([addr(1)], start + empty_ttl),
+            vec![addr(1)]
+        );
+        assert_eq!(tokens.empty_len(), 0);
+
+        // Once it turns out to be a real token it is simply known.
+        tokens.mark_empty(&[addr(1)], start);
+        tokens.confirm(&[addr(1)]);
+        assert_eq!(tokens.empty_len(), 0);
+        assert!(tokens.is_known(&addr(1)));
+
+        // Bounded.
+        let many: Vec<_> = (100..200).map(addr).collect();
+        tokens.mark_empty(&many, start);
+        assert_eq!(tokens.empty_len(), 2);
     }
 
     #[test]
@@ -809,5 +911,34 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(8));
 
         assert!(RedisTokenCache::connect(1, "not a url").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn redis_errors_do_not_leak_the_password() {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let cache = RedisTokenCache::connect(
+            1,
+            &format!("redis://user:hunter2secret@127.0.0.1:{port}/0"),
+        )
+        .await
+        .unwrap();
+
+        *cache.down_until.lock().unwrap() = None;
+        let error = cache.contains_many(&[addr(1)]).await.unwrap_err();
+        assert!(!format!("{error:#}").contains("hunter2secret"));
+
+        let error = RedisTokenCache::connect(
+            1,
+            "redis://user:hunter2secret@:bad-port/0",
+        )
+        .await
+        .err()
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_default();
+        assert!(!error.contains("hunter2secret"), "{error}");
     }
 }

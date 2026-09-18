@@ -7,6 +7,13 @@
 //! 3. Multicall3 `aggregate3` over JSON-RPC (individual `eth_call`s when the
 //!    chain has no Multicall3).
 //!
+//! Only definitive answers are ever cached: a token whose calls revert or
+//! return garbage is stored (blank) so it is never fetched again, but an
+//! address without code (the node may lag behind the indexed head) or an
+//! unreachable RPC produce no row at all and are retried later. A dead or
+//! hanging RPC trips a circuit breaker instead of stalling the indexer, and
+//! the RPC must report the indexed chain id.
+//!
 //! Writes are two-phase so the cache can never claim a token that is not in
 //! ClickHouse: [`TokenResolver::resolve_new`] only *claims* the tokens it
 //! returns (in memory), and [`TokenResolver::mark_stored`] persists them to
@@ -20,6 +27,7 @@
 pub mod cache;
 pub mod decode;
 pub mod multicall;
+pub mod redact;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -28,13 +36,14 @@ use std::{
 };
 
 use alloy::primitives::Address;
+use anyhow::bail;
 use log::{debug, info, warn};
 
 use crate::db::models::token::DatabaseToken;
 
 use self::{
     cache::{KnownTokens, RedisTokenCache, TokenCache},
-    multicall::{AlloyCaller, FetchOptions, MetadataFetcher},
+    multicall::{AlloyCaller, ChainCheck, FetchOptions, MetadataFetcher},
 };
 
 /// Token standard hint, derived by the caller from the transfer event that
@@ -70,6 +79,11 @@ pub struct TokenResolverOptions {
     /// Maximum number of rows kept in memory waiting for Redis to come back
     /// so they can be persisted.
     pub max_pending_writes: usize,
+    /// Addresses without code are not refetched for this long (memory
+    /// only, never persisted).
+    pub empty_ttl: Duration,
+    /// Maximum number of code-less addresses remembered.
+    pub empty_capacity: usize,
     pub fetch: FetchOptions,
 }
 
@@ -79,6 +93,8 @@ impl Default for TokenResolverOptions {
             memory_capacity: 500_000,
             in_flight_ttl: Duration::from_secs(600),
             max_pending_writes: 100_000,
+            empty_ttl: cache::DEFAULT_EMPTY_TTL,
+            empty_capacity: cache::DEFAULT_EMPTY_CAPACITY,
             fetch: FetchOptions::default(),
         }
     }
@@ -131,6 +147,9 @@ impl TokenResolver {
     ///
     /// * `rpc_url: None` disables token metadata (`resolve_new` returns
     ///   nothing).
+    ///   When set, the node must serve `chain_id` (`eth_chainId`): a
+    ///   mismatch is an error. If the node is unreachable at startup this
+    ///   is only a warning and the check is repeated before the first fetch.
     /// * `redis_url: None` keeps the cache in memory only. An unreachable
     ///   Redis is not an error (it is connected lazily), an invalid URL is.
     pub async fn new(
@@ -157,10 +176,23 @@ impl TokenResolver {
             Some(url) => {
                 let caller =
                     AlloyCaller::new(url, options.fetch.call_timeout)?;
-                Some(MetadataFetcher::new(
+                let fetcher = MetadataFetcher::new(
                     Arc::new(caller),
                     options.fetch.clone(),
-                ))
+                )
+                .expect_chain_id(chain_id);
+
+                match fetcher.check_chain_id().await {
+                    ChainCheck::Verified => {}
+                    ChainCheck::Mismatch(actual) => bail!(
+                        "the token metadata RPC serves chain {actual} but                          chain {chain_id} is being indexed"
+                    ),
+                    ChainCheck::Unavailable(error) => warn!(
+                        "Unable to verify the chain id of the token                          metadata RPC, it will be checked again before                          the first fetch: {error}"
+                    ),
+                }
+
+                Some(fetcher)
             }
             None => {
                 info!(
@@ -203,10 +235,16 @@ impl TokenResolver {
                 chain_id,
                 fetcher,
                 cache,
-                known: Mutex::new(KnownTokens::new(
-                    options.memory_capacity,
-                    options.in_flight_ttl,
-                )),
+                known: Mutex::new(
+                    KnownTokens::new(
+                        options.memory_capacity,
+                        options.in_flight_ttl,
+                    )
+                    .with_empty_cache(
+                        options.empty_capacity,
+                        options.empty_ttl,
+                    ),
+                ),
                 pending_writes: Mutex::new(VecDeque::new()),
                 max_pending_writes: options.max_pending_writes,
             }),
@@ -223,8 +261,9 @@ impl TokenResolver {
     ///
     /// Tokens whose calls revert or return garbage still produce a row
     /// (empty strings, hinted type) so they are never fetched again. Tokens
-    /// that could not be fetched because the RPC is unreachable produce no
-    /// row and are retried the next time they are seen.
+    /// that could not be fetched because the RPC is unreachable (or its
+    /// circuit breaker is open) and addresses that have no code on the node
+    /// produce no row and are retried when they are seen again.
     ///
     /// With no `rpc_url` configured returns an empty `Vec`.
     pub async fn resolve_new(
@@ -288,7 +327,8 @@ impl TokenResolver {
             }
         }
 
-        if missing.is_empty() {
+        // Dead RPC / wrong chain: give the claims back right away.
+        if missing.is_empty() || !fetcher.is_available() {
             return Vec::new();
         }
 
@@ -302,7 +342,23 @@ impl TokenResolver {
         // Deterministic chunks (HashMap order is random).
         to_fetch.sort_unstable();
 
-        let mut fetched = fetcher.fetch(&to_fetch).await;
+        let outcome = fetcher.fetch(&to_fetch).await;
+        let mut fetched = outcome.resolved;
+
+        // No code at the address as far as the node knows: not definitive
+        // (lagging node), so no row and nothing persisted. Skipped for a
+        // while in memory, then fetched again when seen.
+        if !outcome.empty.is_empty() {
+            debug!(
+                "{} token addresses have no code on the RPC node yet, \
+                 they will be retried later",
+                outcome.empty.len()
+            );
+            inner.known().mark_empty(&outcome.empty, Instant::now());
+            for address in &outcome.empty {
+                guard.unresolved.remove(address);
+            }
+        }
 
         let mut rows = Vec::with_capacity(fetched.len());
         for (address, standard) in to_fetch {
@@ -327,8 +383,9 @@ impl TokenResolver {
             });
         }
 
+        // The outage itself is reported (once) by the fetcher's breaker.
         if !guard.unresolved.is_empty() {
-            warn!(
+            debug!(
                 "Unable to fetch metadata for {} tokens, they will be \
                  retried when seen again",
                 guard.unresolved.len()
@@ -702,6 +759,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codeless_addresses_produce_no_row_and_are_never_persisted() {
+        let chain = FakeChain::new();
+        chain.add(addr(1), FakeToken::erc20("USD Coin", "USDC", 6));
+        // addr(2) is deployed in a block the node has not seen yet.
+        let cache = FakeCache::new(1);
+        let resolver = TokenResolver::from_parts(
+            1,
+            Some(MetadataFetcher::new(chain.clone(), fast_options())),
+            Some(cache.clone() as Arc<dyn TokenCache>),
+            &TokenResolverOptions {
+                empty_ttl: Duration::from_millis(30),
+                ..options()
+            },
+        );
+        let tokens = batch(&[
+            (1, TokenStandard::Erc20),
+            (2, TokenStandard::Erc20),
+            (3, TokenStandard::Erc1155),
+        ]);
+
+        let rows = resolver.resolve_new(&tokens).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].address, addr(1));
+        resolver.mark_stored(&rows).await;
+        assert_eq!(cache.len(), 1);
+        {
+            let known = resolver.inner.known();
+            assert!(!known.is_known(&addr(2)));
+            assert!(!known.is_in_flight(&addr(2)));
+            assert_eq!(known.empty_len(), 2);
+        }
+
+        // Within the TTL the dead addresses cost no RPC call...
+        let calls = rpc_calls(&chain);
+        assert!(resolver.resolve_new(&tokens).await.is_empty());
+        assert_eq!(rpc_calls(&chain), calls);
+
+        // ...afterwards the node caught up and the token is resolved.
+        chain.add(addr(2), FakeToken::erc20("Tether", "USDT", 6));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let rows = resolver.resolve_new(&tokens).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, "USDT");
+        resolver.mark_stored(&rows).await;
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&addr(3)).is_none());
+    }
+
+    #[tokio::test]
+    async fn open_rpc_breaker_releases_claims_immediately() {
+        let chain = FakeChain::new();
+        chain.add(addr(1), FakeToken::erc20("USD Coin", "USDC", 6));
+        chain.offline.store(true, Ordering::SeqCst);
+        let fetch = FetchOptions {
+            breaker_cooldown: Duration::from_millis(60),
+            breaker_max_cooldown: Duration::from_millis(60),
+            ..fast_options()
+        };
+        let resolver = TokenResolver::from_parts(
+            1,
+            Some(MetadataFetcher::new(chain.clone(), fetch)),
+            None,
+            &options(),
+        );
+        let tokens = batch(&[(1, TokenStandard::Erc20)]);
+
+        assert!(resolver.resolve_new(&tokens).await.is_empty());
+        let attempts = chain.attempts.load(Ordering::SeqCst);
+
+        // Breaker open: no RPC, no lingering claim, even if it is back.
+        chain.offline.store(false, Ordering::SeqCst);
+        for _ in 0..5 {
+            assert!(resolver.resolve_new(&tokens).await.is_empty());
+            assert!(!resolver.inner.known().is_in_flight(&addr(1)));
+        }
+        assert_eq!(chain.attempts.load(Ordering::SeqCst), attempts);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(resolver.resolve_new(&tokens).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_chain_rpc_is_rejected_lazily_too() {
+        let chain = FakeChain::new();
+        chain.add(addr(1), FakeToken::erc20("USD Coin", "USDC", 6));
+        let resolver = TokenResolver::from_parts(
+            56,
+            Some(
+                MetadataFetcher::new(chain.clone(), fast_options())
+                    .expect_chain_id(56),
+            ),
+            None,
+            &options(),
+        );
+
+        let rows = resolver
+            .resolve_new(&batch(&[(1, TokenStandard::Erc20)]))
+            .await;
+        assert!(rows.is_empty());
+        assert_eq!(chain.attempts.load(Ordering::SeqCst), 0);
+        assert!(!resolver.inner.known().is_in_flight(&addr(1)));
+    }
+
+    #[tokio::test]
     async fn concurrent_batches_fetch_every_token_once() {
         let chain = FakeChain::new();
         let mut all = Vec::new();
@@ -814,6 +975,9 @@ mod tests {
     #[tokio::test]
     async fn pending_writes_are_bounded() {
         let chain = FakeChain::new();
+        for n in 0..50u64 {
+            chain.add(addr(n), FakeToken::reverting());
+        }
         let cache = FakeCache::new(1);
         cache.down.store(true, Ordering::SeqCst);
         let resolver = TokenResolver::from_parts(
@@ -836,6 +1000,9 @@ mod tests {
     #[tokio::test]
     async fn memory_is_bounded_and_falls_back_to_redis() {
         let chain = FakeChain::new();
+        for n in 0..100u64 {
+            chain.add(addr(n), FakeToken::reverting());
+        }
         let cache = FakeCache::new(1);
         let resolver = TokenResolver::from_parts(
             1,
@@ -888,7 +1055,9 @@ mod tests {
         let row = |address: Address| {
             rows.iter().find(|row| row.address == address).unwrap()
         };
-        assert_eq!(rows.len(), 4);
+        // The code-less address yields no row at all.
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.address != eoa));
         assert_eq!(row(weth).name, "Wrapped Ether");
         assert_eq!(row(weth).symbol, "WETH");
         assert_eq!(row(weth).decimals, 18);
@@ -899,8 +1068,14 @@ mod tests {
         assert_eq!(row(bayc).symbol, "BAYC");
         assert_eq!(row(bayc).r#type, "ERC721");
         assert_eq!(row(bayc).decimals, 0);
-        assert_eq!(row(eoa).name, "");
-        assert_eq!(row(eoa).r#type, "ERC1155");
+
+        // Wrong chain id for this node: refused at startup.
+        let error = TokenResolver::new(56, Some(&url), None)
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("serves chain 1"), "{error}");
     }
 
     /// Integration tests against a real Redis / Dragonfly.
