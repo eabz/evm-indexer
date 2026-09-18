@@ -1,6 +1,6 @@
-# v3 design (binding for all engineers)
+# Design (binding for all engineers)
 
-Context: **no data is loaded anywhere.** v3 is a clean schema; no backward
+Context: **no data is loaded anywhere.** This is a clean schema; no backward
 compatibility, no backfill, no 2.x migration path. This document turns
 `docs/data-model-proposals.md` into decisions. If something here is wrong or
 impossible, message `lead` on tirith — do not silently deviate.
