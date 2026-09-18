@@ -1,33 +1,44 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+# syntax=docker/dockerfile:1
 
-USER root
-
-RUN cargo install cargo-chef
-
+# Builder and runtime are pinned to the same Debian release (bookworm) so the
+# binary links against the glibc / OpenSSL versions that exist at runtime.
+FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 WORKDIR /app
 
+# ---- planner: compute the dependency recipe -------------------------------
 FROM chef AS planner
-
-WORKDIR /app
-
-COPY . .
-
+COPY Cargo.toml Cargo.lock ./
+COPY bin ./bin
+COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
+# ---- builder: cook dependencies (cached layer), then build the binary ------
+# No extra system packages are needed here:
+#   - hypersync-net-types ships pre-generated Cap'n Proto code (no build.rs),
+#     so the `capnp` compiler is not required.
+#   - libssl-dev / pkg-config (for the clickhouse crate's native-tls) are
+#     already part of the rust base image.
 FROM chef AS builder
-
-WORKDIR /app
-
 COPY --from=planner /app/recipe.json recipe.json
-
 RUN cargo chef cook --release --recipe-path recipe.json
 
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY bin ./bin
+COPY src ./src
+RUN cargo build --release --locked --bin indexer
 
-RUN cargo build --release
+# ---- runtime ---------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
 
-FROM debian:stable AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 indexer \
+    && useradd --system --uid 10001 --gid indexer --no-create-home --shell /usr/sbin/nologin indexer
 
-RUN apt update && apt install -y libpq5 ca-certificates
+COPY --from=builder /app/target/release/indexer /usr/local/bin/indexer
 
-COPY --from=builder /app/target/release/indexer /usr/local/bin/
+USER indexer
+
+# All flags can also be supplied as environment variables (see README.md).
+ENTRYPOINT ["indexer"]

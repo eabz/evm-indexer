@@ -1,25 +1,64 @@
+# Configuration comes from `.env` (copy `.env.example` to `.env` first).
+# `ENVIO_API_TOKEN` is the only value without a default.
+
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    # 25.8 is a ClickHouse LTS release line.
+    image: clickhouse/clickhouse-server:25.8
     container_name: evm-indexer-clickhouse
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      # Published on localhost only. Change to "8123:8123" to expose it.
+      - "127.0.0.1:8123:8123" # HTTP interface (used by the indexer)
+      - "127.0.0.1:9000:9000" # native protocol (clickhouse-client)
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      # Executed once, on first start with an empty data volume.
       - ./migrations:/docker-entrypoint-initdb.d:ro
     environment:
-      CLICKHOUSE_DB: indexer
-      CLICKHOUSE_USER: indexer
-      CLICKHOUSE_PASSWORD: indexer
+      # The migrations create their tables in the `indexer` database.
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-indexer}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-indexer}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-indexer}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 10s
+      # While the init scripts run, the entrypoint's temporary server only
+      # listens on 127.0.0.1. Pinging through the container hostname makes the
+      # service healthy only once the real server (migrations applied) is up.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):8123/ping || exit 1"]
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 20
+      start_period: 10s
     networks:
       - indexer-network
+    restart: unless-stopped
+
+  dragonfly:
+    # Redis-compatible cache for token metadata (name / symbol / decimals).
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.40.2
+    container_name: evm-indexer-dragonfly
+    # Dragonfly needs 256MB of maxmemory per thread, so keep both in step.
+    command:
+      - dragonfly
+      - --logtostderr
+      - --cache_mode=true
+      - --proactor_threads=2
+      - --maxmemory=1gb
+    ulimits:
+      memlock: -1
+    # It is only a cache, so no volume: an empty cache is refilled on demand.
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - indexer-network
+    restart: unless-stopped
 
   indexer:
     build:
@@ -29,16 +68,20 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+      dragonfly:
+        condition: service_healthy
+    # Every indexer setting (CHAIN_ID, START_BLOCK, END_BLOCK, RPC_URL, TRACES,
+    # FLUSH_ROWS, ...) is read from `.env`. Variables that are commented out
+    # there are simply not set, so the indexer falls back to its defaults.
+    env_file:
+      - path: .env
+        required: false
+    # These take precedence over `.env`: inside compose the indexer always
+    # talks to the bundled ClickHouse and Dragonfly services.
     environment:
-      - RUST_LOG=info
-    command: >
-      indexer
-      --chain 1
-      --database clickhouse://indexer:indexer@clickhouse:8123/indexer
-      --rpcs https://0xrpc.io/eth
-      --ws wss://0xrpc.io/eth
-      --start-block 15000000
-      --batch-size 10
+      ENVIO_API_TOKEN: ${ENVIO_API_TOKEN:?Set ENVIO_API_TOKEN in .env - get one at https://docs.envio.dev/docs/HyperSync/api-tokens}
+      DATABASE_URL: http://${CLICKHOUSE_USER:-indexer}:${CLICKHOUSE_PASSWORD:-indexer}@clickhouse:8123/${CLICKHOUSE_DB:-indexer}
+      REDIS_URL: redis://dragonfly:6379
     networks:
       - indexer-network
     restart: unless-stopped

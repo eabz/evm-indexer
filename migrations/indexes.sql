@@ -77,14 +77,6 @@ ALTER TABLE indexer.withdrawals ADD INDEX IF NOT EXISTS idx_withdrawals_address 
 ALTER TABLE indexer.withdrawals ADD INDEX IF NOT EXISTS idx_withdrawals_validator validator_index TYPE minmax GRANULARITY 4;
 ALTER TABLE indexer.withdrawals ADD INDEX IF NOT EXISTS idx_withdrawals_timestamp timestamp TYPE minmax GRANULARITY 4;
 
--- DEX trades table indexes
-ALTER TABLE indexer.dex_trades ADD INDEX IF NOT EXISTS idx_dex_pool pool_address TYPE bloom_filter GRANULARITY 4;
-ALTER TABLE indexer.dex_trades ADD INDEX IF NOT EXISTS idx_dex_sender sender TYPE bloom_filter GRANULARITY 4;
-ALTER TABLE indexer.dex_trades ADD INDEX IF NOT EXISTS idx_dex_recipient recipient TYPE bloom_filter GRANULARITY 4;
-ALTER TABLE indexer.dex_trades ADD INDEX IF NOT EXISTS idx_dex_tx_hash transaction_hash TYPE bloom_filter GRANULARITY 1;
-ALTER TABLE indexer.dex_trades ADD INDEX IF NOT EXISTS idx_dex_name dex_name TYPE set(20) GRANULARITY 4;
-ALTER TABLE indexer.dex_trades ADD INDEX IF NOT EXISTS idx_dex_timestamp timestamp TYPE minmax GRANULARITY 4;
-
 -- Tokens table indexes
 ALTER TABLE indexer.tokens ADD INDEX IF NOT EXISTS idx_tokens_name name TYPE tokenbf_v1(10240, 3, 0) GRANULARITY 4;
 ALTER TABLE indexer.tokens ADD INDEX IF NOT EXISTS idx_tokens_symbol symbol TYPE tokenbf_v1(10240, 3, 0) GRANULARITY 4;
@@ -143,21 +135,6 @@ AS SELECT
     uniqExact(`to`) AS unique_receivers
 FROM indexer.erc20_transfers
 GROUP BY chain, token_address, toDate(timestamp);
-
--- Daily DEX trade statistics per pool
-CREATE MATERIALIZED VIEW IF NOT EXISTS indexer.mv_daily_dex_stats
-ENGINE = SummingMergeTree()
-PARTITION BY toYYYYMM(date)
-ORDER BY (chain, dex_name, pool_address, date)
-AS SELECT
-    chain,
-    dex_name,
-    pool_address,
-    toDate(timestamp) AS date,
-    count() AS trade_count,
-    uniqExact(sender) AS unique_traders
-FROM indexer.dex_trades
-GROUP BY chain, dex_name, pool_address, toDate(timestamp);
 
 -- Contract deployment statistics per chain per day
 CREATE MATERIALIZED VIEW IF NOT EXISTS indexer.mv_daily_contract_deployments
@@ -230,7 +207,6 @@ GROUP BY chain, toDate(fromUnixTimestamp(block_number));
 -- OPTIMIZE TABLE indexer.traces FINAL;
 -- OPTIMIZE TABLE indexer.contracts FINAL;
 -- OPTIMIZE TABLE indexer.withdrawals FINAL;
--- OPTIMIZE TABLE indexer.dex_trades FINAL;
 -- OPTIMIZE TABLE indexer.tokens FINAL;
 
 -- Materialize indexes after adding them (if index was added after data)

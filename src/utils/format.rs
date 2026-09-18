@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bloom, Bytes, B256, B64, U256};
+use alloy::primitives::{Address, Bytes, B256, B64, U256};
 use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{DeserializeAs, SerializeAs};
 
@@ -43,28 +43,6 @@ impl SerializeAs<Address> for SerAddress {
 
 impl<'de> DeserializeAs<'de, Address> for SerAddress {
     fn deserialize_as<D>(deserializer: D) -> Result<Address, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s: String = Deserialize::deserialize(deserializer)?;
-        s.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-/// Serializer for Bloom (256-byte bloom filter) as hex string with 0x prefix
-pub struct SerBloom(());
-
-impl SerializeAs<Bloom> for SerBloom {
-    fn serialize_as<S>(x: &Bloom, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        format!("{:?}", x).serialize(serializer)
-    }
-}
-
-impl<'de> DeserializeAs<'de, Bloom> for SerBloom {
-    fn deserialize_as<D>(deserializer: D) -> Result<Bloom, D::Error>
     where
         D: Deserializer<'de>,
     {

@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::log::DatabaseLog;
-use crate::utils::format::{SerAddress, SerB256, SerU256};
+use crate::utils::{
+    events::TRANSFER_EVENT_SIGNATURE,
+    format::{SerAddress, SerB256, SerU256},
+};
 
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
@@ -31,41 +34,131 @@ pub struct DatabaseERC20Transfer {
 }
 
 impl DatabaseERC20Transfer {
+    /// `Transfer(address indexed from, address indexed to, uint256 value)`:
+    /// exactly three topics and the amount as the first data word.
+    ///
+    /// Log data is attacker controlled. Only the first 32 bytes are read
+    /// (extra bytes are ignored) and a log with less than one full word is
+    /// not a decodable ERC20 transfer, so it is skipped (`None`).
     pub fn from_log(log: &DatabaseLog) -> Option<Self> {
-        let topic0 = log.topic0?;
-        let topic1 = log.topic1?;
-        let topic2 = log.topic2?;
-
-        if topic0
-            != "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-                .parse::<B256>()
-                .unwrap()
-        {
+        if log.topic0? != TRANSFER_EVENT_SIGNATURE {
             return None;
         }
+
+        let topic1 = log.topic1?;
+        let topic2 = log.topic2?;
 
         if log.topic3.is_some() {
             return None;
         }
 
-        let from = Address::from_word(topic1);
-        let to = Address::from_word(topic2);
-        let amount = U256::from_be_slice(&log.data);
+        let amount = U256::from_be_slice(log.data.get(..32)?);
 
         Some(Self {
             address: log.address,
             amount,
             block_number: log.block_number,
             chain: log.chain,
-            from,
+            from: Address::from_word(topic1),
             log_index: log.log_index,
             log_type: log.log_type.clone(),
             removed: log.removed,
             timestamp: log.timestamp,
-            to,
+            to: Address::from_word(topic2),
             token_address: log.address,
             transaction_hash: log.transaction_hash,
             transaction_log_index: log.transaction_log_index,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::log::test_support::{
+        address_topic, log_with, word,
+    };
+
+    fn topics() -> Vec<B256> {
+        vec![TRANSFER_EVENT_SIGNATURE, address_topic(1), address_topic(2)]
+    }
+
+    #[test]
+    fn decodes_a_standard_transfer() {
+        let log = log_with(&topics(), word(1_000));
+        let transfer = DatabaseERC20Transfer::from_log(&log).unwrap();
+
+        assert_eq!(transfer.from, Address::repeat_byte(1));
+        assert_eq!(transfer.to, Address::repeat_byte(2));
+        assert_eq!(transfer.amount, U256::from(1_000u64));
+        assert_eq!(transfer.token_address, log.address);
+        assert_eq!(transfer.log_index, 7);
+        assert_eq!(transfer.transaction_log_index, Some(3));
+    }
+
+    #[test]
+    fn data_longer_than_one_word_does_not_panic() {
+        // A hostile token can emit Transfer with arbitrary extra data.
+        let mut data = word(5);
+        data.extend_from_slice(&[0xff; 100]);
+
+        let transfer =
+            DatabaseERC20Transfer::from_log(&log_with(&topics(), data))
+                .unwrap();
+
+        // Only the first word is the amount.
+        assert_eq!(transfer.amount, U256::from(5u64));
+    }
+
+    #[test]
+    fn max_amount_is_kept() {
+        let transfer = DatabaseERC20Transfer::from_log(&log_with(
+            &topics(),
+            vec![0xff; 32],
+        ))
+        .unwrap();
+        assert_eq!(transfer.amount, U256::MAX);
+    }
+
+    #[test]
+    fn short_or_empty_data_is_skipped() {
+        assert!(DatabaseERC20Transfer::from_log(&log_with(
+            &topics(),
+            vec![]
+        ))
+        .is_none());
+        assert!(DatabaseERC20Transfer::from_log(&log_with(
+            &topics(),
+            vec![1; 31]
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn other_shapes_are_not_erc20() {
+        // ERC721: four topics.
+        let mut four = topics();
+        four.push(B256::repeat_byte(9));
+        assert!(DatabaseERC20Transfer::from_log(&log_with(
+            &four,
+            word(1)
+        ))
+        .is_none());
+
+        // Too few topics.
+        assert!(DatabaseERC20Transfer::from_log(&log_with(
+            &topics()[..2],
+            word(1)
+        ))
+        .is_none());
+
+        // Another event.
+        let mut other = topics();
+        other[0] = B256::repeat_byte(1);
+        assert!(DatabaseERC20Transfer::from_log(&log_with(
+            &other,
+            word(1)
+        ))
+        .is_none());
     }
 }

@@ -1,25 +1,50 @@
+#[cfg(test)]
+mod integration_tests;
 pub mod models;
+pub mod ranges;
 
+use anyhow::{anyhow, bail, Context, Result};
 use clickhouse::{Client, Row};
-use futures::future::join_all;
-use log::{error, info};
+use log::{info, warn};
 use models::{
     block::DatabaseBlock, contract::DatabaseContract,
-    dex_trade::DatabaseDexTrade, log::DatabaseLog, token::DatabaseToken,
-    trace::DatabaseTrace, transaction::DatabaseTransaction,
-    withdrawal::DatabaseWithdrawal,
+    erc1155_transfer::DatabaseERC1155Transfer,
+    erc20_transfer::DatabaseERC20Transfer,
+    erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
+    token::DatabaseToken, trace::DatabaseTrace,
+    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
+};
+use ranges::{
+    assemble_missing_ranges, gaps_sql, is_dense, stats_sql, BlockRange,
+    GapRow, MissingRanges, RangeStats, MAX_GAPS_PER_PASS,
 };
 use serde::Serialize;
-use std::collections::HashSet;
+use std::time::Duration;
 
-use self::models::{
-    dex_liquidity_update::DatabaseDexLiquidityUpdate,
-    dex_pair::DatabaseDexPair, erc1155_transfer::DatabaseERC1155Transfer,
-    erc20_transfer::DatabaseERC20Transfer,
-    erc721_transfer::DatabaseERC721Transfer,
-};
+/// Attempts per table insert before the flush is reported as failed.
+const INSERT_ATTEMPTS: u32 = 6;
+const INSERT_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const INSERT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-pub struct BlockFetchedData {
+const CONNECT_ATTEMPTS: u32 = 10;
+
+/// Client side insert timeouts. Without them a black-holed connection
+/// blocks the flush (and with it the whole indexer) forever, because
+/// `wait_for_async_insert=1` makes the server hold the response.
+///
+/// Sending one chunk to the socket.
+const INSERT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Waiting for the server's answer after the last chunk. Must stay ABOVE
+/// the server's `wait_for_async_insert_timeout` (120s by default) so the
+/// server's own, more descriptive, timeout error wins when it is alive.
+const INSERT_END_TIMEOUT: Duration = Duration::from_secs(180);
+/// Fetching the table schema for the insert (cached after the first time).
+const INSERT_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Rows produced from one or more HyperSync responses. Always holds WHOLE
+/// blocks: every row that belongs to a block in `blocks` is in here too.
+#[derive(Debug, Default)]
+pub struct RowBatch {
     pub blocks: Vec<DatabaseBlock>,
     pub contracts: Vec<DatabaseContract>,
     pub logs: Vec<DatabaseLog>,
@@ -29,10 +54,147 @@ pub struct BlockFetchedData {
     pub erc20_transfers: Vec<DatabaseERC20Transfer>,
     pub erc721_transfers: Vec<DatabaseERC721Transfer>,
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
-    pub dex_trades: Vec<DatabaseDexTrade>,
-    pub dex_pairs: Vec<DatabaseDexPair>,
-    pub dex_liquidity_updates: Vec<DatabaseDexLiquidityUpdate>,
     pub tokens: Vec<DatabaseToken>,
+}
+
+impl RowBatch {
+    /// Total rows over all tables.
+    pub fn rows(&self) -> usize {
+        self.blocks.len()
+            + self.contracts.len()
+            + self.logs.len()
+            + self.traces.len()
+            + self.transactions.len()
+            + self.withdrawals.len()
+            + self.erc20_transfers.len()
+            + self.erc721_transfers.len()
+            + self.erc1155_transfers.len()
+            + self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows() == 0
+    }
+
+    /// Moves every row of `other` into `self`.
+    pub fn append(&mut self, other: &mut RowBatch) {
+        self.blocks.append(&mut other.blocks);
+        self.contracts.append(&mut other.contracts);
+        self.logs.append(&mut other.logs);
+        self.traces.append(&mut other.traces);
+        self.transactions.append(&mut other.transactions);
+        self.withdrawals.append(&mut other.withdrawals);
+        self.erc20_transfers.append(&mut other.erc20_transfers);
+        self.erc721_transfers.append(&mut other.erc721_transfers);
+        self.erc1155_transfers.append(&mut other.erc1155_transfers);
+        self.tokens.append(&mut other.tokens);
+    }
+
+    /// Lowest and highest block number in the batch.
+    pub fn block_span(&self) -> Option<(u32, u32)> {
+        let min = self.blocks.iter().map(|b| b.number).min()?;
+        let max = self.blocks.iter().map(|b| b.number).max()?;
+        Some((min, max))
+    }
+}
+
+/// Connection settings extracted from the database url.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseParams {
+    /// `scheme://host:port` of the ClickHouse HTTP interface.
+    pub endpoint: String,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+    /// Things the operator should know about how the url was interpreted
+    /// (logged at startup; never contain the password).
+    pub warnings: Vec<String>,
+}
+
+/// Ports of the ClickHouse NATIVE protocol (plain / TLS). The client speaks
+/// HTTP, so these never work; they show up when a 2.x url is reused.
+const NATIVE_PORT: u16 = 9000;
+const NATIVE_TLS_PORT: u16 = 9440;
+const HTTP_PORT: u16 = 8123;
+const HTTPS_PORT: u16 = 8443;
+
+impl DatabaseParams {
+    /// `scheme://user:password@host[:port]/database`.
+    ///
+    /// The clickhouse crate speaks HTTP, so the port defaults to 8123
+    /// (`http`) / 8443 (`https`). The legacy `clickhouse://` scheme found in
+    /// older compose files is accepted as an alias of `http://`; since such
+    /// urls usually carry the native port, `clickhouse://host:9000` is
+    /// rewritten to `http://host:8123` (and `:9440` to `https://host:8443`)
+    /// with a warning. An explicit `http(s)://` url is never rewritten,
+    /// only warned about.
+    pub fn parse(database_url: &str) -> Result<Self> {
+        // Errors never echo the url: it contains the password.
+        let url = url::Url::parse(database_url).map_err(|e| {
+            anyhow!(
+                "invalid database url ({e}), expected \
+                 http://user:password@host:port/database"
+            )
+        })?;
+
+        let mut warnings = Vec::new();
+
+        let (scheme, port) = match (url.scheme(), url.port()) {
+            ("clickhouse", Some(NATIVE_PORT)) => {
+                warnings.push(format!(
+                    "The database url uses the legacy clickhouse:// scheme \
+                     with the native protocol port {NATIVE_PORT}. The \
+                     indexer speaks HTTP: using http on port {HTTP_PORT} \
+                     instead. Update the url to http://host:{HTTP_PORT}/db."
+                ));
+                ("http", HTTP_PORT)
+            }
+            ("clickhouse", Some(NATIVE_TLS_PORT)) => {
+                warnings.push(format!(
+                    "The database url uses the legacy clickhouse:// scheme \
+                     with the native TLS port {NATIVE_TLS_PORT}. The \
+                     indexer speaks HTTP: using https on port {HTTPS_PORT} \
+                     instead. Update the url to https://host:{HTTPS_PORT}/db."
+                ));
+                ("https", HTTPS_PORT)
+            }
+            ("clickhouse", port) => ("http", port.unwrap_or(HTTP_PORT)),
+            ("http", port) => ("http", port.unwrap_or(HTTP_PORT)),
+            ("https", port) => ("https", port.unwrap_or(HTTPS_PORT)),
+            (other, _) => bail!(
+                "unsupported database url scheme '{other}', \
+                 use http:// or https://"
+            ),
+        };
+
+        // Explicit http(s): respected as written, but almost certainly a
+        // mistake.
+        if warnings.is_empty()
+            && (port == NATIVE_PORT || port == NATIVE_TLS_PORT)
+        {
+            warnings.push(format!(
+                "The database url points at port {port}, which is normally \
+                 the ClickHouse NATIVE protocol. The indexer speaks HTTP \
+                 (default ports {HTTP_PORT} / {HTTPS_PORT}); if the \
+                 connection fails, fix the port."
+            ));
+        }
+
+        let host = url.host_str().context("no host in database url")?;
+
+        let database = url.path().trim_matches('/');
+        if database.is_empty() {
+            bail!("no database name in database url");
+        }
+
+        Ok(Self {
+            endpoint: format!("{scheme}://{host}:{port}"),
+            user: url.username().to_string(),
+            password: url.password().unwrap_or("").to_string(),
+            database: database.to_string(),
+            warnings,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -41,315 +203,380 @@ pub struct Database {
     pub db: Client,
 }
 
-pub enum DatabaseTables {
-    Blocks,
-    Contracts,
-    Logs,
-    Traces,
-    Transactions,
-    Withdrawals,
-    Erc20Transfers,
-    Erc721Transfers,
-    Erc1155Transfers,
-    DexTrades,
-    DexPairs,
-    DexLiquidityUpdates,
-    Tokens,
-}
-
-impl DatabaseTables {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            DatabaseTables::Blocks => "blocks",
-            DatabaseTables::Contracts => "contracts",
-            DatabaseTables::Logs => "logs",
-            DatabaseTables::Traces => "traces",
-            DatabaseTables::Transactions => "transactions",
-            DatabaseTables::Withdrawals => "withdrawals",
-            DatabaseTables::Erc20Transfers => "erc20_transfers",
-            DatabaseTables::Erc721Transfers => "erc721_transfers",
-            DatabaseTables::Erc1155Transfers => "erc1155_transfers",
-            DatabaseTables::DexTrades => "dex_trades",
-            DatabaseTables::DexPairs => "dex_pairs",
-            DatabaseTables::DexLiquidityUpdates => "dex_liquidity_updates",
-            DatabaseTables::Tokens => "tokens",
-        }
-    }
-}
-
 impl Database {
-    pub async fn new(database_url: &str, chain_id: u64) -> Self {
-        info!("Connecting to database: {}", database_url);
+    pub async fn new(database_url: &str, chain_id: u64) -> Result<Self> {
+        let params = DatabaseParams::parse(database_url)?;
 
-        // Parse the database URL to extract components
-        let url = url::Url::parse(database_url)
-            .expect("Failed to parse database URL. Expected format: clickhouse://user:password@host:port/database");
-
-        let host = url.host_str().expect("No host in database URL");
-        let port = url.port().unwrap_or(9000);
-        let username = url.username();
-        let password = url.password().unwrap_or("");
-        let database = url.path().trim_start_matches('/');
-
-        let db = clickhouse::Client::default()
-            .with_url(format!("{}://{}:{}", url.scheme(), host, port))
-            .with_user(username)
-            .with_password(password)
-            .with_database(database);
-
-        // Retry connection test up to 10 times with exponential backoff
-        let mut retries = 0;
-        let max_retries = 10;
-
-        loop {
-            match db.query("SELECT 1").fetch_one::<u8>().await {
-                Ok(_) => {
-                    info!("Successfully connected to ClickHouse database '{}'", database);
-                    break;
-                }
-                Err(e) => {
-                    retries += 1;
-                    if retries >= max_retries {
-                        error!("Failed to connect to database after {} attempts: {}", max_retries, e);
-                        panic!("Could not connect to ClickHouse. Please check your database configuration and ensure ClickHouse is running.");
-                    }
-
-                    let wait_time = std::time::Duration::from_secs(
-                        2_u64.pow(retries.min(5)),
-                    );
-                    log::warn!("Database connection attempt {}/{} failed: {}. Retrying in {:?}...", 
-                        retries, max_retries, e, wait_time);
-                    tokio::time::sleep(wait_time).await;
-                }
-            }
-        }
-
-        Self { chain_id, db }
-    }
-
-    pub async fn get_indexed_blocks(&self) -> HashSet<u32> {
-        let query = format!(
-            "SELECT number FROM blocks WHERE chain = {} AND is_uncle = false",
-            self.chain_id
-        );
-
-        let tokens = (self.db.query(&query).fetch_all::<u32>().await)
-            .unwrap_or_default();
-
-        let blocks: HashSet<u32> = HashSet::from_iter(tokens.into_iter());
-
-        blocks
-    }
-
-    pub async fn store_data(&self, data: &BlockFetchedData) {
-        use std::sync::Arc;
-
-        let mut stores = vec![];
-
-        if !data.contracts.is_empty() {
-            let contracts = Arc::new(data.contracts.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &contracts,
-                    DatabaseTables::Contracts.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.logs.is_empty() {
-            let logs = Arc::new(data.logs.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(&logs, DatabaseTables::Logs.as_str()).await
-            });
-            stores.push(work);
-        }
-
-        if !data.traces.is_empty() {
-            let traces = Arc::new(data.traces.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(&traces, DatabaseTables::Traces.as_str())
-                    .await
-            });
-            stores.push(work);
-        }
-
-        if !data.transactions.is_empty() {
-            let transactions = Arc::new(data.transactions.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &transactions,
-                    DatabaseTables::Transactions.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.withdrawals.is_empty() {
-            let withdrawals = Arc::new(data.withdrawals.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &withdrawals,
-                    DatabaseTables::Withdrawals.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.erc20_transfers.is_empty() {
-            let transfers = Arc::new(data.erc20_transfers.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &transfers,
-                    DatabaseTables::Erc20Transfers.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.erc721_transfers.is_empty() {
-            let transfers = Arc::new(data.erc721_transfers.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &transfers,
-                    DatabaseTables::Erc721Transfers.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.erc1155_transfers.is_empty() {
-            let transfers = Arc::new(data.erc1155_transfers.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &transfers,
-                    DatabaseTables::Erc1155Transfers.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.dex_trades.is_empty() {
-            let dex_trades = Arc::new(data.dex_trades.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &dex_trades,
-                    DatabaseTables::DexTrades.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.dex_pairs.is_empty() {
-            let dex_pairs = Arc::new(data.dex_pairs.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &dex_pairs,
-                    DatabaseTables::DexPairs.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.dex_liquidity_updates.is_empty() {
-            let dex_liquidity_updates =
-                Arc::new(data.dex_liquidity_updates.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(
-                    &dex_liquidity_updates,
-                    DatabaseTables::DexLiquidityUpdates.as_str(),
-                )
-                .await
-            });
-            stores.push(work);
-        }
-
-        if !data.tokens.is_empty() {
-            let tokens = Arc::new(data.tokens.clone());
-            let db = self.clone();
-            let work = tokio::spawn(async move {
-                db.store_items(&tokens, DatabaseTables::Tokens.as_str())
-                    .await
-            });
-            stores.push(work);
-        }
-
-        let res = join_all(stores).await;
-
-        let errored: Vec<_> =
-            res.iter().filter(|res| res.is_err()).collect();
-
-        if !errored.is_empty() {
-            panic!("failed to store all chain primitive elements")
-        }
-
-        if !data.blocks.is_empty() {
-            self.store_items(
-                &data.blocks,
-                DatabaseTables::Blocks.as_str(),
-            )
-            .await;
+        for warning in &params.warnings {
+            warn!("{warning}");
         }
 
         info!(
-            "Inserted: contracts ({}) logs ({}) traces ({}) transactions ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) dex_trades ({}) dex_pairs ({}) dex_liquidity_updates ({}) tokens ({}) in ({}) blocks.",
-            data.contracts.len(),
-            data.logs.len(),
-            data.traces.len(),
-            data.transactions.len(),
-            data.withdrawals.len(),
-            data.erc20_transfers.len(),
-            data.erc721_transfers.len(),
-            data.erc1155_transfers.len(),
-            data.dex_trades.len(),
-            data.dex_pairs.len(),
-            data.dex_liquidity_updates.len(),
-            data.tokens.len(),
-            data.blocks.len()
+            "Connecting to ClickHouse at {} (database '{}').",
+            params.endpoint, params.database
         );
+
+        let db = Client::default()
+            .with_url(&params.endpoint)
+            .with_user(&params.user)
+            .with_password(&params.password)
+            .with_database(&params.database)
+            // Server side batching of the inserts. Waiting for the async
+            // insert to be flushed is REQUIRED: an acknowledged insert must
+            // mean durable data, otherwise writing `blocks` last would not
+            // make it a commit marker.
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "1");
+
+        let database = Self { chain_id, db };
+
+        database.wait_until_ready().await?;
+
+        Ok(database)
     }
 
-    pub async fn store_items<T>(&self, items: &Vec<T>, table: &str)
+    async fn wait_until_ready(&self) -> Result<()> {
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+
+            match self.db.query("SELECT 1").fetch_one::<u8>().await {
+                Ok(_) => {
+                    info!("Connected to ClickHouse.");
+                    return Ok(());
+                }
+                Err(e) if attempt >= CONNECT_ATTEMPTS => {
+                    return Err(anyhow!(e).context(format!(
+                        "could not connect to ClickHouse after \
+                         {CONNECT_ATTEMPTS} attempts"
+                    )));
+                }
+                Err(e) => {
+                    let wait =
+                        Duration::from_secs(2_u64.pow(attempt.min(5)));
+                    warn!(
+                        "ClickHouse connection attempt {attempt}/\
+                         {CONNECT_ATTEMPTS} failed: {e}. Retrying in {wait:?}."
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+
+    /// Missing block ranges inside `range`, computed in ClickHouse.
+    pub async fn missing_ranges(
+        &self,
+        range: BlockRange,
+    ) -> Result<MissingRanges> {
+        if range.is_empty() {
+            return Ok(assemble_missing_ranges(
+                range,
+                RangeStats { indexed: 0, max_number: 0 },
+                &[],
+                MAX_GAPS_PER_PASS,
+            ));
+        }
+
+        let stats = self
+            .db
+            .query(&stats_sql(self.chain_id, range))
+            .fetch_one::<RangeStats>()
+            .await
+            .context("query indexed block stats")?;
+
+        // Common case (nothing indexed, or no holes): no gap scan needed.
+        let gaps = if stats.indexed == 0 || is_dense(range, stats) {
+            Vec::new()
+        } else {
+            self.db
+                .query(&gaps_sql(self.chain_id, range, MAX_GAPS_PER_PASS))
+                .fetch_all::<GapRow>()
+                .await
+                .context("query missing block ranges")?
+        };
+
+        Ok(assemble_missing_ranges(range, stats, &gaps, MAX_GAPS_PER_PASS))
+    }
+
+    /// Hash of an indexed canonical block (`0x` hex), if present.
+    pub async fn block_hash(&self, number: u64) -> Result<Option<String>> {
+        let query = format!(
+            "SELECT hash FROM blocks WHERE chain = {} AND number = {} \
+             AND is_uncle = false LIMIT 1",
+            self.chain_id, number
+        );
+
+        self.db
+            .query(&query)
+            .fetch_optional::<String>()
+            .await
+            .context("query block hash")
+    }
+
+    /// Stores a batch. Every non-block table is written concurrently, then
+    /// `blocks` LAST: a block row only exists once all of its data is
+    /// durable, which is what resume / gap detection relies on.
+    ///
+    /// Returns an error only after every retry is exhausted, in which case
+    /// NO block row of this batch was written.
+    pub async fn store(&self, batch: &RowBatch) -> Result<()> {
+        let results = tokio::join!(
+            self.insert_rows("contracts", &batch.contracts),
+            self.insert_rows("logs", &batch.logs),
+            self.insert_rows("traces", &batch.traces),
+            self.insert_rows("transactions", &batch.transactions),
+            self.insert_rows("withdrawals", &batch.withdrawals),
+            self.insert_rows("erc20_transfers", &batch.erc20_transfers),
+            self.insert_rows("erc721_transfers", &batch.erc721_transfers),
+            self.insert_rows(
+                "erc1155_transfers",
+                &batch.erc1155_transfers
+            ),
+            self.insert_rows("tokens", &batch.tokens),
+        );
+
+        let (r0, r1, r2, r3, r4, r5, r6, r7, r8) = results;
+        let failures: Vec<String> = [r0, r1, r2, r3, r4, r5, r6, r7, r8]
+            .into_iter()
+            .filter_map(|r| r.err())
+            .map(|e| format!("{e:#}"))
+            .collect();
+
+        if !failures.is_empty() {
+            bail!("failed to store batch: {}", failures.join("; "));
+        }
+
+        self.insert_rows("blocks", &batch.blocks).await
+    }
+
+    /// Inserts `rows` into `table`, retrying with exponential backoff.
+    pub async fn insert_rows<T>(
+        &self,
+        table: &str,
+        rows: &[T],
+    ) -> Result<()>
     where
         T: Serialize,
         for<'a> T: Row<Value<'a> = T>,
     {
-        if items.is_empty() {
-            return;
+        if rows.is_empty() {
+            return Ok(());
         }
 
-        let mut inserter = self.db.insert::<T>(table).await.unwrap();
+        let mut attempt = 0;
 
-        // Write all items - ClickHouse client handles batching internally
-        for item in items {
-            inserter.write(item).await.unwrap();
-        }
+        loop {
+            attempt += 1;
 
-        match inserter.end().await {
-            Ok(_) => (),
-            Err(err) => {
-                error!("{}", err);
-                panic!("Unable to store {} into database", table)
+            match self.insert_once(table, rows).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt >= INSERT_ATTEMPTS => {
+                    return Err(e.context(format!(
+                        "insert of {} rows into '{table}' failed after \
+                         {INSERT_ATTEMPTS} attempts",
+                        rows.len()
+                    )));
+                }
+                Err(e) => {
+                    let wait = insert_backoff(attempt);
+                    warn!(
+                        "Insert of {} rows into '{table}' failed (attempt \
+                         {attempt}/{INSERT_ATTEMPTS}): {e}. Retrying in \
+                         {wait:?}.",
+                        rows.len()
+                    );
+                    tokio::time::sleep(wait).await;
+                }
             }
         }
+    }
+
+    async fn insert_once<T>(&self, table: &str, rows: &[T]) -> Result<()>
+    where
+        T: Serialize,
+        for<'a> T: Row<Value<'a> = T>,
+    {
+        // Timeouts surface as ordinary errors, so the caller retries them
+        // like any other failed insert.
+        let insert = tokio::time::timeout(
+            INSERT_PREPARE_TIMEOUT,
+            self.db.insert::<T>(table),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out after {INSERT_PREPARE_TIMEOUT:?} preparing the \
+                 insert"
+            )
+        })??;
+
+        let mut insert = insert.with_timeouts(
+            Some(INSERT_SEND_TIMEOUT),
+            Some(INSERT_END_TIMEOUT),
+        );
+
+        for row in rows {
+            insert.write(row).await?;
+        }
+
+        insert.end().await?;
+
+        Ok(())
+    }
+}
+
+fn insert_backoff(attempt: u32) -> Duration {
+    INSERT_BACKOFF_BASE
+        .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+        .min(INSERT_BACKOFF_MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_url_defaults_to_the_http_port() {
+        let params =
+            DatabaseParams::parse("http://default:secret@ch/indexer")
+                .unwrap();
+
+        assert_eq!(params.endpoint, "http://ch:8123");
+        assert_eq!(params.user, "default");
+        assert_eq!(params.password, "secret");
+        assert_eq!(params.database, "indexer");
+    }
+
+    #[test]
+    fn https_url_defaults_to_the_https_port() {
+        let params =
+            DatabaseParams::parse("https://u:p@ch.example.com/db")
+                .unwrap();
+        assert_eq!(params.endpoint, "https://ch.example.com:8443");
+    }
+
+    #[test]
+    fn explicit_port_wins() {
+        let params =
+            DatabaseParams::parse("http://u:p@localhost:18123/db")
+                .unwrap();
+        assert_eq!(params.endpoint, "http://localhost:18123");
+    }
+
+    #[test]
+    fn legacy_clickhouse_scheme_maps_to_http() {
+        let params =
+            DatabaseParams::parse("clickhouse://u:p@clickhouse/indexer")
+                .unwrap();
+        assert_eq!(params.endpoint, "http://clickhouse:8123");
+
+        let params = DatabaseParams::parse(
+            "clickhouse://u:p@clickhouse:8123/indexer",
+        )
+        .unwrap();
+        assert_eq!(params.endpoint, "http://clickhouse:8123");
+    }
+
+    #[test]
+    fn legacy_scheme_with_native_ports_is_rewritten_with_a_warning() {
+        let params = DatabaseParams::parse(
+            "clickhouse://u:hunter2@ch:9000/indexer",
+        )
+        .unwrap();
+        assert_eq!(params.endpoint, "http://ch:8123");
+        assert_eq!(params.warnings.len(), 1);
+        assert!(params.warnings[0].contains("9000"));
+        assert!(params.warnings[0].contains("8123"));
+        assert!(!params.warnings[0].contains("hunter2"));
+
+        let params = DatabaseParams::parse(
+            "clickhouse://u:hunter2@ch:9440/indexer",
+        )
+        .unwrap();
+        assert_eq!(params.endpoint, "https://ch:8443");
+        assert_eq!(params.warnings.len(), 1);
+        assert!(params.warnings[0].contains("9440"));
+
+        // Any other explicit port is respected silently.
+        let params =
+            DatabaseParams::parse("clickhouse://u:p@ch:18123/indexer")
+                .unwrap();
+        assert_eq!(params.endpoint, "http://ch:18123");
+        assert!(params.warnings.is_empty());
+    }
+
+    #[test]
+    fn explicit_http_with_a_native_port_is_kept_but_warned_about() {
+        let params =
+            DatabaseParams::parse("http://u:hunter2@ch:9000/db").unwrap();
+        assert_eq!(params.endpoint, "http://ch:9000");
+        assert_eq!(params.warnings.len(), 1);
+        assert!(!params.warnings[0].contains("hunter2"));
+
+        let params =
+            DatabaseParams::parse("https://u:p@ch:9440/db").unwrap();
+        assert_eq!(params.endpoint, "https://ch:9440");
+        assert_eq!(params.warnings.len(), 1);
+
+        let params = DatabaseParams::parse("http://u:p@ch/db").unwrap();
+        assert!(params.warnings.is_empty());
+    }
+
+    #[test]
+    fn insert_end_timeout_outlasts_the_server_side_wait() {
+        // Server default wait_for_async_insert_timeout.
+        assert!(INSERT_END_TIMEOUT > Duration::from_secs(120));
+        assert!(INSERT_SEND_TIMEOUT < INSERT_END_TIMEOUT);
+    }
+
+    #[test]
+    fn password_is_optional() {
+        let params =
+            DatabaseParams::parse("http://default@ch/db").unwrap();
+        assert_eq!(params.password, "");
+    }
+
+    #[test]
+    fn bad_urls_are_errors_and_do_not_leak_the_password() {
+        for url in [
+            "not a url with hunter2",
+            "tcp://u:hunter2@ch:9000/db",
+            "http://u:hunter2@ch:8123",
+            "http://u:hunter2@ch:8123/",
+        ] {
+            let error = DatabaseParams::parse(url).unwrap_err();
+            assert!(!format!("{error:#}").contains("hunter2"), "{url}");
+        }
+    }
+
+    #[test]
+    fn backoff_is_exponential_and_capped() {
+        assert_eq!(insert_backoff(1), Duration::from_secs(1));
+        assert_eq!(insert_backoff(2), Duration::from_secs(2));
+        assert_eq!(insert_backoff(3), Duration::from_secs(4));
+        assert_eq!(insert_backoff(10), Duration::from_secs(30));
+        assert_eq!(insert_backoff(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn row_batch_append_moves_rows() {
+        let mut a = RowBatch::default();
+        let mut b = RowBatch::default();
+        b.tokens.push(DatabaseToken {
+            address: Default::default(),
+            name: "n".into(),
+            symbol: "s".into(),
+            decimals: 18,
+            r#type: "ERC20".into(),
+            chain: 1,
+        });
+
+        assert!(a.is_empty());
+        a.append(&mut b);
+        assert_eq!(a.rows(), 1);
+        assert!(b.is_empty());
+        assert_eq!(a.block_span(), None);
     }
 }

@@ -1,24 +1,24 @@
 [package]
 name = "evm-indexer"
-version = "2.0.0"
+version = "3.0.0"
 license = "MIT"
 edition = "2021"
 repository = "https://github.com/eabz/evm-indexer"
 description = "Scalable SQL indexer for EVM compatible blockchains"
 
 [dependencies]
-alloy = { version = "0.1", features = ["full", "node-bindings", "rpc-types", "json-rpc", "rpc-client"] }
-alloy-rpc-types-trace = "0.1"
-clap = { version = "4", features = ["derive"] }
+alloy = { version = "1", default-features = false, features = ["std", "providers", "reqwest", "reqwest-rustls-tls", "rpc-types", "sol-types"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
 clickhouse = { version = "0.14", features = ["native-tls"] }
 futures = "0.3"
 hex = "0.4"
+hypersync-client = "1.4"
 log = "0.4"
-rand = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+lru = "0.16"
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_repr = "0.1"
 serde_with = "3"
 simple_logger = { version = "5", default-features = false, features = ["colors"] }
 tokio = { version = "1", features = ["full"] }

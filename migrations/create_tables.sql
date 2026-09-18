@@ -125,7 +125,6 @@ PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, log_index, transaction_hash)
 SETTINGS index_granularity = 8192;
 
-
 CREATE TABLE IF NOT EXISTS indexer.traces (
   action_type String,
   address Nullable(String),
@@ -201,26 +200,6 @@ PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, withdrawal_index)
 SETTINGS index_granularity = 8192;
 
-CREATE TABLE IF NOT EXISTS indexer.dex_trades (
-  block_number UInt32 CODEC(Delta, ZSTD),
-  chain UInt64,
-  transaction_hash String,
-  log_index UInt16 CODEC(Delta, ZSTD),
-  pool_address String,
-  sender String,
-  recipient String,
-  amount0_in String,
-  amount1_in String,
-  amount0_out String,
-  amount1_out String,
-  dex_name String,
-  timestamp DateTime CODEC(Delta, ZSTD)
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (chain, pool_address, block_number, log_index)
-SETTINGS index_granularity = 8192;
-
 CREATE TABLE IF NOT EXISTS indexer.tokens (
   address String,
   name String,
@@ -231,42 +210,4 @@ CREATE TABLE IF NOT EXISTS indexer.tokens (
 )
 ENGINE = ReplacingMergeTree()
 ORDER BY (chain, address)
-SETTINGS index_granularity = 8192;
-
-CREATE TABLE IF NOT EXISTS indexer.dex_pairs (
-  block_number UInt32 CODEC(Delta, ZSTD),
-  chain UInt64,
-  transaction_hash String,
-  log_index UInt16 CODEC(Delta, ZSTD),
-  factory String,
-  pair String,
-  token0 String,
-  token1 String,
-  reserve0 String,
-  reserve1 String,
-  dex_name String,
-  timestamp DateTime CODEC(Delta, ZSTD)
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (chain, pair, block_number, log_index)
-SETTINGS index_granularity = 8192;
-
-CREATE TABLE IF NOT EXISTS indexer.dex_liquidity_updates (
-  block_number UInt32 CODEC(Delta, ZSTD),
-  chain UInt64,
-  transaction_hash String,
-  log_index UInt16 CODEC(Delta, ZSTD),
-  pool_address String,
-  type String,
-  amount0 String,
-  amount1 String,
-  reserve0 String,
-  reserve1 String,
-  liquidity String,
-  timestamp DateTime CODEC(Delta, ZSTD)
-)
-ENGINE = ReplacingMergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (chain, pool_address, block_number, log_index)
 SETTINGS index_granularity = 8192;
