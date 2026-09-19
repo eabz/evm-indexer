@@ -186,6 +186,7 @@ Options of `indexer run`:
 | `--max-reorg-depth` | `MAX_REORG_DEPTH` | `512` | Deepest rollback the indexer performs on its own. A deeper fork stops the process with an error |
 | `--no-dex` | `NO_DEX` | `false` | Turn [DEX analytics](#dex-analytics) off |
 | `--no-predictions` | `NO_PREDICTIONS` | `false` | Turn prediction-market analytics off (see [below](#prediction-markets-and-perps)) |
+| `--no-launchpads` | `NO_LAUNCHPADS` | `false` | Turn token-launchpad analytics off (see [below](#token-launchpads)) |
 | `--no-migrate` | `NO_MIGRATE` | `false` | Do not apply pending schema migrations at startup (run `indexer migrate` yourself) |
 | `--metrics-addr` | `METRICS_ADDR` | *off* | `ip:port` to serve `/metrics`, `/healthz` and `/readyz` on. See [Metrics and health checks](#metrics-and-health-checks) |
 | `--flush-rows` | `FLUSH_ROWS` | `100000` | Flush to ClickHouse once this many rows are buffered |
@@ -470,6 +471,12 @@ Conventions, precision, the pool resolver and the known gaps (forged events, agg
 
 - **Prediction markets: on by default** (`--no-predictions` to opt out). Same shape as DEX analytics: decoded by event family, candles of implied probability, trades, positions. Tables, views and the query cookbook are in [`src/predictions/README.md`](src/predictions/README.md).
 - **Perpetual futures: deferred.** Only a few percent of perp volume is readable from EVM logs on HyperSync chains; the numbers are in [`docs/perps-research.md`](docs/perps-research.md).
+
+## Token launchpads
+
+**On by default** (`--no-launchpads` to opt out). Decoded by event family from the same logs, so it costs no extra HyperSync traffic: bonding-curve launches, buys and sells, fee sweeps and graduations into a DEX pool, plus launch attribution for venues that launch straight into a Uniswap V3 / V4 pool (their trading is already in `dex_swaps`).
+
+Nothing is trusted by default: a trade leg counts only when the asset contract reported the movement in the same transaction, and the headline views count only emitters an operator listed in `launchpad_trusted_emitters` (the module README ships the verified addresses as ready-to-run `INSERT`s; migrations seed nothing). Tables, views and the query cookbook are in [`src/launchpads/README.md`](src/launchpads/README.md).
 
 ## Metrics and health checks
 

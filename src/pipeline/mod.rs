@@ -378,12 +378,15 @@ pub async fn run_with<S: BlockSource>(
     let enabled = EnabledModules {
         dex: config.dex,
         predictions: config.predictions,
+        launchpads: config.launchpads,
     };
 
     info!(
-        "Modules: DEX {}, prediction markets {}. RPC metadata: {}.",
+        "Modules: DEX {}, prediction markets {}, launchpads {}. \
+         RPC metadata: {}.",
         if enabled.dex { "on" } else { "off (--no-dex)" },
         if enabled.predictions { "on" } else { "off (--no-predictions)" },
+        if enabled.launchpads { "on" } else { "off (--no-launchpads)" },
         if runtime.caller.is_some() { "on" } else { "off (--rpc none)" },
     );
 

@@ -122,8 +122,8 @@ pub struct VerifyArgs {
 pub struct BackfillArgs {
     #[arg(
         long,
-        help = "Module to re-decode from the stored logs. Available: dex, predictions.",
-        value_parser = ["dex", "predictions"]
+        help = "Module to re-decode from the stored logs. Available: dex, predictions, launchpads.",
+        value_parser = ["dex", "predictions", "launchpads"]
     )]
     pub module: String,
 
@@ -303,6 +303,15 @@ pub struct IndexerArgs {
 
     #[arg(
         long,
+        env = "NO_LAUNCHPADS",
+        action = ArgAction::SetTrue,
+        value_parser = parse_flag,
+        help = "Do not decode token launchpad events (launchpad analytics are ON by default)."
+    )]
+    pub no_launchpads: bool,
+
+    #[arg(
+        long,
         env = "METRICS_ADDR",
         help = "ip:port to serve Prometheus metrics, /healthz and /readyz on. Off when unset."
     )]
@@ -348,6 +357,8 @@ pub struct Config {
     pub dex: bool,
     /// Prediction market decoding (on unless `--no-predictions`).
     pub predictions: bool,
+    /// Token launchpad decoding (on unless `--no-launchpads`).
+    pub launchpads: bool,
     /// Where to serve metrics; `None` = off.
     pub metrics_addr: Option<std::net::SocketAddr>,
     pub new_blocks_only: bool,
@@ -445,6 +456,7 @@ impl TryFrom<IndexerArgs> for Config {
             max_reorg_depth: args.max_reorg_depth,
             dex: !args.no_dex,
             predictions: !args.no_predictions,
+            launchpads: !args.no_launchpads,
             metrics_addr: parse_metrics_addr(args.metrics_addr)?,
             new_blocks_only: args.new_blocks_only,
             flush_rows: args.flush_rows.max(1),
@@ -507,7 +519,7 @@ impl TryFrom<Cli> for Command {
 }
 
 /// Environment variables read by the CLI.
-const ENV_VARS: [&str; 18] = [
+const ENV_VARS: [&str; 19] = [
     "CHAIN_ID",
     "DATABASE_URL",
     "HYPERSYNC_URL",
@@ -520,6 +532,7 @@ const ENV_VARS: [&str; 18] = [
     "MAX_REORG_DEPTH",
     "NO_DEX",
     "NO_PREDICTIONS",
+    "NO_LAUNCHPADS",
     "METRICS_ADDR",
     "NEW_BLOCKS_ONLY",
     "FLUSH_ROWS",
@@ -683,6 +696,7 @@ mod tests {
         // back up to 512 blocks, metrics off.
         assert!(config.dex);
         assert!(config.predictions);
+        assert!(config.launchpads);
         assert_eq!(config.max_reorg_depth, 512);
         assert_eq!(config.metrics_addr, None);
     }
@@ -704,11 +718,21 @@ mod tests {
         let mut args = REQUIRED.to_vec();
         args.push("--no-predictions");
         let config = parse_with_env(&[], &args).unwrap();
-        assert!(config.dex && !config.predictions);
+        assert!(config.dex && !config.predictions && config.launchpads);
         assert!(
             !parse_with_env(&[("NO_PREDICTIONS", "true")], &REQUIRED)
                 .unwrap()
                 .predictions
+        );
+
+        let mut args = REQUIRED.to_vec();
+        args.push("--no-launchpads");
+        let config = parse_with_env(&[], &args).unwrap();
+        assert!(config.dex && config.predictions && !config.launchpads);
+        assert!(
+            !parse_with_env(&[("NO_LAUNCHPADS", "true")], &REQUIRED)
+                .unwrap()
+                .launchpads
         );
 
         // The old opt-in flag is gone: asking for it is an error, not a
@@ -826,10 +850,20 @@ mod tests {
         .is_err());
         assert!(parse_command(
             &[("DATABASE_URL", DATABASE)],
-            &["backfill", "--module", "launchpads"],
+            &["backfill", "--module", "nope"],
             false
         )
         .is_err());
+
+        // Every module of the seam can be backfilled.
+        for module in crate::pipeline::modules::ALL_MODULES {
+            parse_command(
+                &[("DATABASE_URL", DATABASE)],
+                &["backfill", "--module", module.name],
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", module.name));
+        }
     }
 
     #[test]

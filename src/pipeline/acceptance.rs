@@ -18,7 +18,7 @@ use super::*;
 use crate::{
     configs::Command,
     db::{self, migrate, next_version, DatabaseParams, FlushKey},
-    dex,
+    dex, launchpads,
     pipeline::{backfill, modules::ALL_MODULES, verify},
     tokens::{
         discovery::{
@@ -66,6 +66,9 @@ struct TestLog {
 struct TestTx {
     from: Address,
     to: Address,
+    /// Native coin sent with the transaction (launchpad curve buys pay in
+    /// it, and `launchpad_trades.tx_value` records it).
+    value: U256,
     logs: Vec<TestLog>,
 }
 
@@ -114,6 +117,7 @@ fn creations() -> TestTx {
     TestTx {
         from: TRADER,
         to: V2_FACTORY,
+        value: U256::ZERO,
         logs: vec![
             TestLog {
                 address: V2_FACTORY,
@@ -153,6 +157,7 @@ fn v2_swap(amount_in: u64, amount_out: u64) -> TestTx {
     TestTx {
         from: TRADER,
         to: ROUTER,
+        value: U256::ZERO,
         logs: vec![
             transfer(TOKEN0, TRADER, V2_PAIR, amount_in),
             TestLog {
@@ -186,6 +191,7 @@ fn v3_swap(amount_in: i64, amount_out: i64) -> TestTx {
     TestTx {
         from: TRADER,
         to: ROUTER,
+        value: U256::ZERO,
         logs: vec![
             transfer(TOKEN0, TRADER, V3_POOL, amount_in as u64),
             TestLog {
@@ -211,6 +217,7 @@ fn busy_block(number: u64) -> Vec<TestTx> {
             let mut txs = vec![TestTx {
                 from: TRADER,
                 to: TOKEN0,
+                value: U256::ZERO,
                 logs: vec![transfer(TOKEN0, TRADER, ROUTER, n)],
             }];
             txs.push(v2_swap(100 * n, 50 * n));
@@ -220,6 +227,78 @@ fn busy_block(number: u64) -> Vec<TestTx> {
             txs
         }
     }
+}
+
+/// Real launchpad transactions (`src/launchpads/fixtures*.rs`: every log
+/// verbatim from `eth_getTransactionReceipt` on a public endpoint), one
+/// per block from block 1 on. Block 0 stays empty, so the launch is never
+/// the genesis block.
+const LAUNCHPAD_FIXTURES: &[&launchpads::fixtures::RawTx] =
+    launchpads::fixtures::ALL;
+
+/// `LAUNCHPAD_FIXTURES[number - 1]` as a block of this test chain.
+fn launchpad_block(number: u64) -> Vec<TestTx> {
+    let Some(raw) = number
+        .checked_sub(1)
+        .and_then(|index| LAUNCHPAD_FIXTURES.get(index as usize))
+    else {
+        return vec![];
+    };
+
+    vec![TestTx {
+        from: launchpads::fixtures::address(raw.from),
+        to: launchpads::fixtures::address(raw.to),
+        value: launchpads::fixtures::unsigned(raw.value),
+        logs: raw
+            .logs
+            .iter()
+            .map(|log| TestLog {
+                address: launchpads::fixtures::address(log.address),
+                topics: log
+                    .topics
+                    .iter()
+                    .map(|topic| launchpads::fixtures::hash(topic))
+                    .collect(),
+                data: log
+                    .data
+                    .parse::<alloy::primitives::Bytes>()
+                    .unwrap()
+                    .to_vec(),
+            })
+            .collect(),
+    }]
+}
+
+/// What the launchpad decoder makes of the whole canned chain: the numbers
+/// the pipeline must end up with, taken from the module itself so this
+/// test checks the SEAM and never freezes the decoder's behaviour.
+fn decoded_launchpads() -> launchpads::LaunchpadRows {
+    let mut rows = launchpads::LaunchpadRows::default();
+
+    for number in 1..=LAUNCHPAD_FIXTURES.len() as u64 {
+        for tx in launchpad_block(number) {
+            let logs: Vec<crate::db::models::log::DatabaseLog> = tx
+                .logs
+                .iter()
+                .enumerate()
+                .map(|(index, log)| {
+                    let mut row =
+                        crate::db::models::log::test_support::log_with(
+                            &log.topics,
+                            log.data.clone(),
+                        );
+                    row.chain = CHAIN;
+                    row.address = log.address;
+                    row.block_number = number;
+                    row.log_index = index as u32;
+                    row
+                })
+                .collect();
+            rows.append(&mut launchpads::decode(CHAIN, &logs));
+        }
+    }
+
+    rows
 }
 
 /// The same height after a reorg: FEWER swaps (no V3 swap, another V2
@@ -239,6 +318,18 @@ impl TestChain {
     /// 12 s blocks: the whole chain within one UTC day.
     fn new(length: u64) -> Self {
         Self::with_block_time(length, 12)
+    }
+
+    /// `length` blocks whose content comes from `content` instead of
+    /// [`busy_block`].
+    fn of(length: u64, content: fn(u64) -> Vec<TestTx>) -> Self {
+        let chain = Self {
+            blocks: Arc::default(),
+            blocks_per_response: 4,
+            block_seconds: 12,
+        };
+        chain.extend(length, 0, content);
+        chain
     }
 
     fn with_block_time(length: u64, block_seconds: u32) -> Self {
@@ -331,6 +422,13 @@ impl TestChain {
                     gas_used: Some(Quantity::from(21_000u64)),
                     gas_price: Some(Quantity::from(9u64)),
                     effective_gas_price: Some(Quantity::from(9u64)),
+                    // A Quantity is canonical: never empty, and only
+                    // one byte long when it is zero.
+                    value: Some(Quantity::from(
+                        Some(tx.value.to_be_bytes_trimmed_vec())
+                            .filter(|bytes| !bytes.is_empty())
+                            .unwrap_or_else(|| vec![0]),
+                    )),
                     status: Some(TransactionStatus::Success),
                     ..Default::default()
                 }]);
@@ -1214,6 +1312,160 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
         &fixed.snapshot().await,
         &clean.snapshot().await,
     );
+}
+
+// ------------------------------------------------------------ (g)
+
+/// Token launchpads through the module seam: ON with zero flags, nothing
+/// at all with `--no-launchpads`. The stream is canned from the module's
+/// real fixtures, and the expected counts come from the module's own
+/// decoder, so this proves the SEAM (decode -> stamp -> insert order ->
+/// side tables -> aggregates -> views), never the decoder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
+    let scenario = Scenario::new("g_launchpads").await;
+    let length = LAUNCHPAD_FIXTURES.len() as u64 + 1;
+    let chain = TestChain::of(length, launchpad_block);
+    let rpc = FakeRpc::new();
+
+    let expected = decoded_launchpads();
+    assert!(expected.tokens.len() >= 4, "{}", expected.tokens.len());
+    assert!(expected.trades.len() >= 6, "{}", expected.trades.len());
+    assert!(!expected.graduations.is_empty());
+    assert!(!expected.creator_fees.is_empty());
+
+    // Zero flags: launchpads are on, like DEX and prediction markets.
+    let config = scenario.config(&[]);
+    assert!(config.launchpads);
+
+    let wanted = expected.graduations.len() as u64;
+    scenario
+        .run(config, &chain, &rpc, move |db| async move {
+            db.db
+                .query(
+                    "SELECT toUInt64(count()) FROM launchpad_graduations \
+                     FINAL",
+                )
+                .fetch_one::<u64>()
+                .await
+                .unwrap_or(0)
+                >= wanted
+        })
+        .await
+        .unwrap();
+
+    // Every table of the module's INSERT_ORDER holds exactly what the
+    // decoder produced.
+    for (table, rows) in [
+        ("launchpad_tokens", expected.tokens.len()),
+        ("launchpad_trades", expected.trades.len()),
+        ("launchpad_graduations", expected.graduations.len()),
+        ("launchpad_creator_fees", expected.creator_fees.len()),
+    ] {
+        assert_eq!(scenario.rows(table).await, rows as u64, "{table}");
+    }
+
+    // The side tables followed through their materialized views.
+    for table in launchpads::SIDE_TABLES {
+        assert!(scenario.rows(table).await > 0, "{table}");
+    }
+
+    // The aggregates saw every trade exactly once, through the validity
+    // rule of `epoch_floor_v` (no reorg here, so the floor is 0).
+    assert_eq!(
+        scenario
+            .count(
+                "SELECT toUInt64(sum(trades)) FROM \
+                 launchpad_venue_trades_1d_v"
+            )
+            .await,
+        expected.trades.len() as u64
+    );
+    assert!(
+        scenario
+            .count("SELECT toUInt64(count()) FROM launchpad_candles_1m_v")
+            .await
+            > 0
+    );
+
+    // The seam passes the transaction's native value through: a curve buy
+    // paid in the chain's coin records it.
+    assert!(
+        scenario
+            .count(
+                "SELECT toUInt64(count()) FROM launchpad_trades FINAL \
+                 WHERE tx_value > 0"
+            )
+            .await
+            > 0,
+        "no launchpad trade carries the transaction value"
+    );
+
+    // Trust is operator data: the headline feed is empty until an emitter
+    // is listed, and the `_all_v` twin shows everything meanwhile.
+    let since = format!(
+        "SELECT toUInt64(count()) FROM launchpad_new_launches_{{}}(\
+         chain = {CHAIN}, since = 0)"
+    );
+    let trusted_sql = since.replace("{}", "v");
+    let all_sql = since.replace("{}", "all_v");
+
+    assert_eq!(scenario.count(&trusted_sql).await, 0);
+    assert_eq!(
+        scenario.count(&all_sql).await,
+        expected.tokens.len() as u64
+    );
+
+    let emitters = expected.emitters();
+    assert!(!emitters.is_empty());
+    let values: Vec<String> = emitters
+        .iter()
+        .map(|(emitter, family)| {
+            format!(
+                "({CHAIN}, unhex('{}'), '{}', '', 1)",
+                hex::encode(emitter.0),
+                family.as_str()
+            )
+        })
+        .collect();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO launchpad_trusted_emitters \
+             (chain, emitter, family, label, _version) VALUES {}",
+            values.join(", ")
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        scenario.count(&trusted_sql).await,
+        expected.tokens.len() as u64,
+        "every launch of the canned chain comes from a listed emitter"
+    );
+
+    scenario.assert_consistent().await;
+
+    // `--no-launchpads`: not one row, and the core tables are unaffected.
+    let off = Scenario::new("g_launchpads_off").await;
+    off.index_until(&chain, length, &["--no-launchpads"]).await;
+
+    assert_eq!(off.rows("blocks").await, length);
+    assert!(off.rows("logs").await > 0);
+    for table in launchpads::BLOCK_SCOPED_TABLES
+        .iter()
+        .chain(launchpads::LAUNCHPADS_DERIVED.iter().map(|t| &t.name))
+    {
+        assert_eq!(
+            off.count(&format!("SELECT toUInt64(count()) FROM `{table}`"))
+                .await,
+            0,
+            "{table}"
+        );
+    }
 }
 
 // ------------------------------------------------------------ deep purge
