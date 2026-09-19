@@ -1,5 +1,11 @@
 # How the indexer handles reorgs
 
+> **What this is** — how the indexer notices that a chain replaced its newest blocks, and repairs what is stored without ever deleting a row.
+> **What tables** — `reorgs`, the audit trail of every rollback and gap repair (query it with `WHERE completed = 1`). The repair itself touches every other module's tables, through tombstones and epochs.
+> **Where the queries are** — the audit query is in the main [README](../../README.md#the-audit-table-and-alerts); the alert rules are in [`src/metrics/README.md`](../metrics/README.md#alerts).
+> **Read this first** — an ordinary reorg needs no action from you at all. If you query base tables with `FINAL` and aggregates through their `*_v` views, you never see a rolled-back row.
+> **Binding design** — `docs/design.md` section 2.
+
 Written for the person who runs the indexer, not for the person who
 programs it. The code next to this file (`src/reorg/`) is the "brain": it
 decides what to do. It contains no database code and no HyperSync code, so

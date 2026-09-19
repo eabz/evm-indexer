@@ -1,5 +1,11 @@
 # fleet
 
+> **What this is** — `indexer fleet`: one process indexing many chains, with a supervisor that restarts a failing chain on its own and the control panel on top.
+> **What tables** — `fleet_chains` only: which chains to run and their settings. It owns no chain data; every chain writes the same tables `indexer run` writes.
+> **Where the queries are** — nowhere here. The read surfaces are the panel, one `/metrics` for the whole process, and the datasets listed in the main [README](../../README.md#what-is-indexed).
+> **Read this first** — every chain calls the same `run_with` that `indexer run` calls, so no safety property changes: its own lease, its own epoch, its own tombstones, its own writer.
+> **Binding design** — `docs/design.md` section 15.
+
 `indexer fleet`: **one process, many chains** (docs/design.md section 15).
 `indexer run` is unchanged and stays the way to index a single chain.
 

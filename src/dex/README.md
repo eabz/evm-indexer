@@ -1,7 +1,13 @@
 # DEX analytics (`src/dex`, migrations `0010`-`0012`)
 
-Chain agnostic, DEX agnostic swap / liquidity / pool indexing, enabled with
-`--dex`. Design: `docs/design.md` §5 and §13.
+> **What this is** — swaps, pools and liquidity, decoded by event family so a fork of any known AMM works on day one. ON by default; `--no-dex` turns it off.
+> **What tables** — `dex_pools`, `dex_swaps`, `dex_liquidity`, the lookup tables `dex_swaps_by_pool` / `dex_swaps_by_trader` / `dex_pools_by_token`, the candles `dex_candles_1m` / `_1h` / `_1d`, `dex_pool_volume_1h`, and the operator-populated `quote_tokens` and `dex_trusted_emitters`.
+> **Where the queries are** — the [analyst views](#analyst-views-0012_dex_viewssql) below. Read those, never the aggregate tables underneath them.
+> **Before you query** — USD columns are `NULL` until you populate `quote_tokens`, and every identity column is 32 bytes (an EVM address is left-padded with 12 zero bytes, not stored as 20).
+> **Binding design** — `docs/design.md` sections 5 and 13.
+
+Chain agnostic, DEX agnostic swap / liquidity / pool indexing, ON by default
+(`--no-dex` opts out). Design: `docs/design.md` §5 and §13.
 
 **The `dex_*` tables are chain neutral**: they are meant to hold Solana (and any
 other family) beside the EVM chains, so every id is 32 bytes and every position is

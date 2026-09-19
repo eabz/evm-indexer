@@ -1,5 +1,11 @@
 # Prediction markets (`src/predictions`)
 
+> **What this is** — prediction markets decoded by event family: markets and their outcomes, trades, positions, portfolios, leaderboards, and candles of implied probability. ON by default; `--no-predictions` turns it off.
+> **What tables** — `prediction_markets`, `prediction_questions`, `prediction_outcome_tokens`, `prediction_trades`, `prediction_position_events`, `prediction_resolutions`, the candles `prediction_candles_1m` / `_1h` / `_1d`, their lookup tables and daily rollups, plus the operator-populated `prediction_trusted`.
+> **Where the queries are** — [the query cookbook](#query-cookbook); the reference is [Tables and views](#tables-and-views).
+> **Before you query** — the headline views count only the registry and exchange addresses you have listed in `prediction_trusted`; the migrations seed nothing. Markets created below the chain's coverage floor get their metadata and settlement events from a one-off background pass, and no trades.
+> **Binding design** — `docs/design.md` sections 10 and 16; migrations `0020`-`0029`.
+
 Display first (docs/design.md §10): the tables were designed backwards from
 the screens of a trading UI. Every screen is ONE query against a view, with
 no joins or arithmetic left to the client - see the [query cookbook](#query-cookbook).

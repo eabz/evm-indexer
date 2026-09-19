@@ -1,5 +1,11 @@
 # The core EVM dataset (docs/design.md §12)
 
+> **What this is** — everything an EVM chain gives you without interpreting anybody's contract: blocks, transactions, logs, withdrawals and token transfers.
+> **What tables** — `blocks`, `transactions`, `logs`, `withdrawals`, `erc20_transfers`, `erc721_transfers`, `erc1155_transfers`, the `contracts` view, the lookup tables (`tx_lookup`, `block_lookup`, `transactions_by_address`, `logs_by_address`, `erc20_transfers_by_account`, `nft_transfers_by_account`) and the daily stats views.
+> **Where the queries are** — the main [README](../../README.md#querying-the-data); the table reference is [below](#tables).
+> **Two reading rules** — base and lookup tables with `FINAL`, aggregates through their `*_v` views. Follow those and a reorg is invisible to you.
+> **Binding design** — `docs/design.md` sections 1, 2 and 12; migrations `0001`-`0004`.
+
 Everything an EVM chain gives you without interpreting anybody's contract:
 blocks, transactions, logs, withdrawals, and the ERC-20 / ERC-721 / ERC-1155
 transfers that are decoded out of the logs by signature alone. No registry, no

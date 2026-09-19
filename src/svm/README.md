@@ -1,5 +1,11 @@
 # `svm` — Solana
 
+> **What this is** — Solana, in the same database and the same analytics tables as every EVM chain. Analytics only, and filtered to about two dozen programs.
+> **What tables** — `sol_slots` (the commit marker; `block_number` holds the slot), `sol_transactions`, `sol_tokens`, `sol_token_balances`, `sol_dex_swaps`, the candles `sol_dex_candles_1m` / `_1h` / `_1d`, the operator-extendable `sol_dex_programs` registry, and the shared `launchpad_*` tables.
+> **Where the queries are** — the Solana section of the main [README](../../README.md#solana); the table reference is [below](#tables).
+> **Read this first** — there is no wallet history, no chain-wide transfer table and deliberately no daily chain statistics here. `sol_transactions` holds *the matched transactions*, not the chain's. The next section says exactly what that rules out.
+> **Binding design** — `docs/design.md` sections 13 and 14; migrations `0040`-`0049`.
+
 Solana DEX data, in the same database and the same analytics tables as every
 EVM chain. Owns `migrations/0040`–`0049` and the `sol_*` tables.
 
