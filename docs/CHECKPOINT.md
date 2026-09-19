@@ -63,6 +63,15 @@ given the handoff file plus `git status`/`git log` of the worktree can continue.
 9. END cleanup: delete research docs (`perps-`, `launchpads-`, `solana-research.md`,
    `data-model-proposals.md`) and this file; `docs/` keeps decisions only.
 
+## Standing instructions from the owner (2026-09-18, before going offline)
+
+"Continue the process; if Solana phase 1 finishes, continue until everything is ready."
+So, without asking: validate + merge + push each finished stream; launch Solana phase 2
+when phase 1 lands; send review findings back for fixes; then layout refactor, final
+combined gate, live end-to-end run, docs final pass; research cleanup LAST. Decisions
+only the owner can make (none open right now) wait on the tirith board. Stop only at the
+usage thresholds below.
+
 ## Usage policy (owner, 2026-09-18)
 
 Fable only for the lead and the pipeline engineer (or something that truly needs it);
