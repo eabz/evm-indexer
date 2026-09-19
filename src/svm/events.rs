@@ -268,26 +268,47 @@ fn event_of<'a>(
 
 /// Runs the per-program decoder for `venue` over `row`, cross-checking it
 /// against what the movement layer found.
+///
+/// `nth` is the index of this swap among the swaps the SAME instruction
+/// produced. It is zero for every venue but Orca, whose `two_hop_swap`
+/// emits two `Traded` log lines from one instruction and needs to know
+/// which hop is being enriched.
 pub fn enrich(
     tx: &SvmTransaction,
     instruction: &SvmInstruction,
     venue: Venue,
     swap: &MovementSwap,
     row: &mut SvmSwap,
+    nth: usize,
 ) -> Enrichment {
-    let Some(event) = event_of(tx, instruction) else {
-        return Enrichment::None;
-    };
-
     match venue {
-        Venue::PumpSwap => enrich_pumpswap(&event.data, swap, row),
-        Venue::PumpFun => enrich_pumpfun(&event.data, swap, row),
-        // Named but not decoded yet. The row keeps `movement` confidence,
-        // which is exactly what it is: price, size and trader are exact,
-        // pool state is not available.
-        Venue::BisonFi | Venue::MeteoraDlmm | Venue::RaydiumCpmm => {
-            Enrichment::None
-        }
+        Venue::PumpSwap => match event_of(tx, instruction) {
+            Some(event) => enrich_pumpswap(&event.data, swap, row),
+            None => Enrichment::None,
+        },
+        Venue::PumpFun => match event_of(tx, instruction) {
+            Some(event) => enrich_pumpfun(&event.data, swap, row),
+            None => Enrichment::None,
+        },
+        // Phase 2. Half of these read a LOG line rather than a self-CPI
+        // instruction, so they cannot go through `event_of`.
+        Venue::RaydiumAmmV4
+        | Venue::RaydiumCpmm
+        | Venue::RaydiumClmm
+        | Venue::OrcaWhirlpool
+        | Venue::MeteoraDlmm
+        | Venue::MeteoraDammV2 => crate::svm::venues::enrich(
+            tx,
+            instruction,
+            venue,
+            swap,
+            row,
+            nth,
+        ),
+        // Publishes nothing. The row keeps `movement` confidence, which is
+        // exactly what it is: price, size and trader are exact, pool state
+        // is not available.
+        Venue::BisonFi => Enrichment::None,
     }
 }
 

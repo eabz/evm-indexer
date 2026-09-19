@@ -461,6 +461,7 @@ pub fn to_batch(response: SolanaResponse) -> SolanaBatch {
                 dropped_logs: tx.has_dropped_log_messages.unwrap_or(false),
                 instructions: Vec::new(),
                 activity: Vec::new(),
+                logs: Vec::new(),
             },
         );
     }

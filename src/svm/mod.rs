@@ -20,12 +20,17 @@ pub mod fixtures;
 pub mod models;
 pub mod pda;
 pub mod programs;
+pub mod venues;
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod integration_tests;
+
+/// Ignored decode-speed measurements, see `profile.rs`.
+#[cfg(test)]
+mod profile;
 
 /// Ignored, network bound proof against mainnet and the public Solana RPC.
 #[cfg(test)]

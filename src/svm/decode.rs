@@ -149,6 +149,101 @@ impl SvmAccountActivity {
     }
 }
 
+/// One log row: a `Program log:` or `Program data:` line, attributed to the
+/// instruction that wrote it.
+///
+/// **Phase 1 did not select this table, and that turned out to be the single
+/// thing standing between the module and half the chain's volume.** Only
+/// pump.fun, PumpSwap and the two Meteora programs publish their swap event
+/// as a self-CPI INSTRUCTION; Raydium (all three programs) and Orca use
+/// Anchor's plain `emit!` or a bare `msg!`, which writes a LOG LINE and
+/// nothing else. The research assumed `Program data:` events "arrive via the
+/// log table for free" - true, but only if the log table is asked for.
+///
+/// `path` is HyperSync's `instruction_address` for the log row, i.e. the
+/// instruction that emitted it, which is what makes a log attributable to
+/// one subtree in exactly the way an instruction is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SvmLog {
+    pub path: Vec<u32>,
+    pub program: Pubkey,
+    /// `true` for a `Program data: <base64>` line (an Anchor `emit!`),
+    /// `false` for a plain `Program log: <text>` line.
+    pub is_data: bool,
+    /// The line with its `Program data: ` / `Program log: ` prefix already
+    /// stripped, which is how HyperSync stores it.
+    pub message: String,
+}
+
+impl SvmLog {
+    /// The base64 body of an Anchor `emit!` event, decoded.
+    pub fn event_bytes(&self) -> Option<Vec<u8>> {
+        if !self.is_data {
+            return None;
+        }
+        base64_decode(self.message.trim())
+    }
+
+    /// The 8-byte event discriminator of an Anchor `emit!` event.
+    pub fn event_discriminator(&self) -> Option<[u8; 8]> {
+        let bytes = self.event_bytes()?;
+        bytes.get(..8).map(|head| {
+            let mut out = [0u8; 8];
+            out.copy_from_slice(head);
+            out
+        })
+    }
+}
+
+/// Standard base64 (RFC 4648, `+/`, optional `=` padding) -> bytes.
+///
+/// Written out rather than pulled in as a dependency: the crate has no
+/// base64 crate today, this module needs exactly one direction of the
+/// simplest variant, and a new dependency in `Cargo.toml` for thirty lines
+/// of table lookup is a poor trade. Returns `None` on any invalid input
+/// rather than decoding partially - an event body that is not valid base64
+/// is not an event.
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    /// `byte -> 6-bit value`, 0xff where the byte is not a base64 digit.
+    static TABLE: std::sync::OnceLock<[u8; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = [0xffu8; 256];
+        let alphabet =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (value, byte) in alphabet.iter().enumerate() {
+            table[*byte as usize] = value as u8;
+        }
+        table
+    });
+
+    let bytes = input.as_bytes();
+    let body = bytes.strip_suffix(b"==").unwrap_or_else(|| {
+        bytes.strip_suffix(b"=").unwrap_or(bytes)
+    });
+    // 4 base64 digits carry 3 bytes; a final group of 2 or 3 digits carries
+    // 1 or 2. A remainder of exactly 1 digit cannot encode anything.
+    if body.len() % 4 == 1 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(body.len() / 4 * 3 + 2);
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in body {
+        let value = table[*byte as usize];
+        if value == 0xff {
+            return None;
+        }
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// One matched transaction with everything the decoder needs.
 #[derive(Debug, Clone)]
 pub struct SvmTransaction {
@@ -166,6 +261,9 @@ pub struct SvmTransaction {
     /// NOT return its children (research section 4.3).
     pub instructions: Vec<SvmInstruction>,
     pub activity: Vec<SvmAccountActivity>,
+    /// Log rows of this transaction. Raydium's and Orca's swap events live
+    /// here and nowhere else; see [`SvmLog`].
+    pub logs: Vec<SvmLog>,
 }
 
 impl Default for SvmTransaction {
@@ -183,6 +281,7 @@ impl Default for SvmTransaction {
             dropped_logs: false,
             instructions: Vec::new(),
             activity: Vec::new(),
+            logs: Vec::new(),
         }
     }
 }
@@ -246,6 +345,13 @@ pub struct Movements<'a> {
     tx: &'a SvmTransaction,
     registry: &'a Registry,
     movements: Vec<Movement>,
+    /// For each movement, the path of its NEAREST registered venue ancestor.
+    ///
+    /// Computed once here rather than per lookup. It used to be recomputed
+    /// inside `owned_by`, which made the whole step
+    /// O(venues x movements x instructions) for every transaction; a profile
+    /// of the decoder put it among the top costs after the curve test.
+    nearest_venue: Vec<Option<&'a [u32]>>,
     /// account -> its activity row.
     by_account: HashMap<Pubkey, &'a SvmAccountActivity>,
 }
@@ -266,7 +372,31 @@ impl<'a> Movements<'a> {
             }
         }
 
-        Self { tx, registry, movements, by_account }
+        // The venue instructions, once: `venue()` is a linear scan of the
+        // registry and this used to run per (movement, instruction) pair.
+        let venue_instructions: Vec<&SvmInstruction> = tx
+            .instructions
+            .iter()
+            .filter(|candidate| {
+                !candidate.is_event()
+                    && registry.venue(&candidate.program).is_some()
+            })
+            .collect();
+
+        let nearest_venue = movements
+            .iter()
+            .map(|movement| {
+                venue_instructions
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.is_ancestor_of(&movement.path)
+                    })
+                    .max_by_key(|candidate| candidate.path.len())
+                    .map(|candidate| candidate.path.as_slice())
+            })
+            .collect();
+
+        Self { tx, registry, movements, nearest_venue, by_account }
     }
 
     /// Movements inside `instruction`'s subtree whose NEAREST registered
@@ -279,27 +409,13 @@ impl<'a> Movements<'a> {
     fn owned_by(&self, instruction: &SvmInstruction) -> Vec<&Movement> {
         self.movements
             .iter()
-            .filter(|movement| {
+            .zip(&self.nearest_venue)
+            .filter(|(movement, nearest)| {
                 instruction.is_ancestor_of(&movement.path)
-                    && self
-                        .nearest_venue_ancestor(&movement.path)
-                        .map(|nearest| nearest == instruction.path)
-                        .unwrap_or(false)
+                    && **nearest == Some(instruction.path.as_slice())
             })
+            .map(|(movement, _)| movement)
             .collect()
-    }
-
-    fn nearest_venue_ancestor(&self, path: &[u32]) -> Option<Vec<u32>> {
-        self.tx
-            .instructions
-            .iter()
-            .filter(|candidate| {
-                candidate.is_ancestor_of(path)
-                    && !candidate.is_event()
-                    && self.registry.venue(&candidate.program).is_some()
-            })
-            .max_by_key(|candidate| candidate.path.len())
-            .map(|candidate| candidate.path.clone())
     }
 
     /// Nearest ancestor that is a registered ROUTER, for attribution.
@@ -504,6 +620,11 @@ pub fn decode_transaction_with(
 
     // How many venue instructions resolve to each authority: a pool touched
     // twice in one transaction cannot borrow a native lamport delta.
+    //
+    // The candidate sets are computed ONCE here and handed to `classify`.
+    // They used to be recomputed there, so every venue instruction paid for
+    // `pool_candidates` twice and `native_candidates` - which runs the
+    // ed25519 curve test - twice as well.
     let mut authority_uses: HashMap<Pubkey, u32> = HashMap::new();
     let mut candidates = Vec::new();
 
@@ -519,25 +640,27 @@ pub fn decode_transaction_with(
             outcome.diagnostics.no_movement += 1;
             continue;
         }
-        for authority in
-            pool_candidates(&owned).into_iter().chain(native_candidates(
-                &owned,
-                &movements.movements,
-                &instruction.path,
-            ))
-        {
-            *authority_uses.entry(authority).or_insert(0) += 1;
+        let pools = pool_candidates(&owned);
+        let natives = native_candidates(
+            &owned,
+            &movements.movements,
+            &instruction.path,
+        );
+        for authority in pools.iter().chain(natives.iter()) {
+            *authority_uses.entry(*authority).or_insert(0) += 1;
         }
-        candidates.push((instruction, venue, owned));
+        candidates.push((instruction, venue, owned, pools, natives));
     }
 
-    for (instruction, venue, owned) in candidates {
+    for (instruction, venue, owned, pools, natives) in candidates {
         match classify(
             &movements,
             registry,
             venue,
             instruction,
             &owned,
+            &pools,
+            &natives,
             &authority_uses,
         ) {
             Classified::Swap(swap) => {
@@ -549,6 +672,7 @@ pub fn decode_transaction_with(
                     venue,
                     &swap,
                     &mut row,
+                    0,
                 );
                 if enriched == crate::svm::events::Enrichment::Disagreed {
                     outcome.diagnostics.decoder_disagreed += 1;
@@ -571,6 +695,7 @@ pub fn decode_transaction_with(
                         venue,
                         swap,
                         &mut row,
+                        0,
                     ) {
                         crate::svm::events::Enrichment::Applied => {
                             accepted = Some(row);
@@ -672,11 +797,10 @@ fn pool_candidates(movements: &[&Movement]) -> Vec<Pubkey> {
 ///    private key can exist for a pool; a user's wallet is a real public key
 ///    and is on the curve. See [`crate::svm::pda`].
 fn resolve_pool(
-    owned: &[&Movement],
+    candidates: &[Pubkey],
     all: &[Movement],
     subtree: &[u32],
 ) -> Option<Pubkey> {
-    let candidates = pool_candidates(owned);
     if candidates.len() <= 1 {
         return candidates.first().copied();
     }
@@ -697,7 +821,8 @@ fn resolve_pool(
         return local.first().copied();
     }
 
-    let narrowed = if local.is_empty() { candidates } else { local };
+    let narrowed =
+        if local.is_empty() { candidates.to_vec() } else { local };
     let derived: Vec<Pubkey> = narrowed
         .into_iter()
         .filter(|candidate| !crate::svm::pda::is_on_curve(candidate))
@@ -739,6 +864,11 @@ fn native_candidates(
         }
     }
 
+    // The order of these three filters is a PERFORMANCE decision and not a
+    // semantic one: they are conjunctive and `is_on_curve` is pure, so the
+    // result is identical whichever way round they run. The curve test costs
+    // a modular exponentiation, so it goes last, after the two cheap
+    // structural filters have thrown most candidates away.
     let mut candidates: Vec<Pubkey> = owners
         .into_iter()
         // Must be a counterparty of EVERY movement of the single mint.
@@ -748,8 +878,6 @@ fn native_candidates(
                     || movement.destination_owner == Some(*owner)
             })
         })
-        // A pool is program derived; a plain wallet never is.
-        .filter(|owner| !crate::svm::pda::is_on_curve(owner))
         // A pool takes part in its own hop only.
         .filter(|owner| {
             !all.iter()
@@ -759,6 +887,8 @@ fn native_candidates(
                         || movement.destination_owner == Some(*owner)
                 })
         })
+        // A pool is program derived; a plain wallet never is.
+        .filter(|owner| !crate::svm::pda::is_on_curve(owner))
         .collect();
 
     candidates.sort_unstable();
@@ -766,12 +896,15 @@ fn native_candidates(
     candidates
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify(
     movements: &Movements<'_>,
     registry: &Registry,
     venue: Venue,
     instruction: &SvmInstruction,
     owned: &[&Movement],
+    pools: &[Pubkey],
+    natives: &[Pubkey],
     authority_uses: &HashMap<Pubkey, u32>,
 ) -> Classified {
     if owned.is_empty() {
@@ -779,7 +912,7 @@ fn classify(
     }
 
     if let Some(authority) =
-        resolve_pool(owned, &movements.movements, &instruction.path)
+        resolve_pool(pools, &movements.movements, &instruction.path)
     {
         return classify_two_sided(venue, instruction, owned, authority);
     }
@@ -798,14 +931,13 @@ fn classify(
         return Classified::Unclassified;
     }
 
-    let proposals =
-        native_candidates(owned, &movements.movements, &instruction.path);
-    if proposals.is_empty() {
+    if natives.is_empty() {
         return Classified::AmbiguousNative;
     }
 
-    let swaps: Vec<MovementSwap> = proposals
-        .into_iter()
+    let swaps: Vec<MovementSwap> = natives
+        .iter()
+        .copied()
         .filter_map(|authority| {
             classify_native(
                 movements,

@@ -320,6 +320,10 @@ fn the_per_program_decoders_agree_with_the_movement_layer() {
 }
 
 /// A venue with no per-program decoder still produces rows, marked honestly.
+///
+/// BisonFi publishes nothing at all, so its fill can only ever be
+/// `movement` - and that is not a defect, it is the honest label: the price,
+/// the size and the trader are exact and only the pool state is missing.
 #[test]
 fn a_venue_without_a_decoder_is_marked_movement() {
     let fixture = fixtures::get("jupiter_three_hop");
@@ -329,15 +333,67 @@ fn a_venue_without_a_decoder_is_marked_movement() {
         &fixture.transaction,
         &Registry::with_venues(&Venue::ALL),
     );
-    for swap in &outcome.swaps {
+
+    let bisonfi: Vec<_> = outcome
+        .swaps
+        .iter()
+        .filter(|swap| swap.protocol == "bisonfi")
+        .collect();
+    assert!(!bisonfi.is_empty(), "the route's BisonFi hop went missing");
+    for swap in bisonfi {
         assert_eq!(
             swap.confidence, "movement",
-            "{} has no per-program decoder yet",
-            swap.protocol
+            "BisonFi publishes no event, so nothing can confirm it"
         );
         assert_eq!(swap.reserve0, U256::ZERO);
         assert_eq!(swap.reserve1, U256::ZERO);
     }
+}
+
+/// The phase 2 payoff, on a transaction recorded before these decoders
+/// existed: the Meteora DLMM hop of the recorded Jupiter route now decodes
+/// from the venue's OWN self-CPI events, and agrees with the movement layer.
+///
+/// This is the strongest evidence in the suite that the `Swap` / `Swap2Evt`
+/// offsets are right, because nothing about the recording was chosen to suit
+/// them - it is a phase 1 fixture, captured for an entirely different
+/// purpose, and the decoder either reproduces the amounts the SPL transfers
+/// independently prove or it does not.
+#[test]
+fn the_meteora_hop_of_the_recorded_route_decodes_from_its_own_events() {
+    let fixture = fixtures::get("jupiter_three_hop");
+    let outcome = decode_transaction_with(
+        CHAIN,
+        fixture.timestamp(),
+        &fixture.transaction,
+        &Registry::with_venues(&Venue::ALL),
+    );
+
+    let dlmm = outcome
+        .swaps
+        .iter()
+        .find(|swap| swap.protocol == "meteora_dlmm")
+        .expect("the route's Meteora DLMM hop");
+
+    assert_eq!(
+        dlmm.confidence, "decoded",
+        "the DLMM self-CPI events must confirm the movement layer"
+    );
+    // A confirmed row carries the pool the VENUE names, which the movement
+    // layer found independently as the common owner of the two vaults.
+    assert_ne!(dlmm.pool_id, crate::svm::models::ZERO_PUBKEY);
+    // And the fee is the venue's own number, not something inferred.
+    assert!(
+        dlmm.fee_amount > U256::ZERO,
+        "a DLMM swap always pays a bin fee"
+    );
+
+    // The route is still one swap per venue, and still credited to the
+    // venues rather than to Jupiter.
+    let venues: Vec<&str> =
+        outcome.swaps.iter().map(|s| s.protocol.as_str()).collect();
+    assert!(venues.contains(&"bisonfi"));
+    assert!(venues.contains(&"meteora_dlmm"));
 }
 
 // --- invariants over every fixture --------------------------------------

@@ -19,7 +19,9 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 use crate::svm::{
-    decode::{SvmAccountActivity, SvmInstruction, SvmTransaction},
+    decode::{
+        SvmAccountActivity, SvmInstruction, SvmLog, SvmTransaction,
+    },
     models::{Pubkey, SigBytes},
     programs::pubkey,
 };
@@ -38,6 +40,24 @@ struct RawFixture {
     transaction: RawTransaction,
     instruction_calls: Vec<RawInstruction>,
     account_activity: Vec<RawActivity>,
+    /// Phase 2. Absent from the phase 1 recordings, which is why it
+    /// defaults: Raydium's and Orca's swap events are LOG lines, so a
+    /// fixture for those venues has to carry the log table too.
+    #[serde(default)]
+    logs: Vec<RawLog>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLog {
+    #[serde(default)]
+    instruction_address: Vec<u32>,
+    program_id: String,
+    /// HyperSync's `LogKind`: `data` for a `Program data:` line, `log` for a
+    /// `Program log:` one. The message is stored with the prefix already
+    /// stripped, exactly as the server serves it.
+    kind: String,
+    #[serde(default)]
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +193,17 @@ fn parse() -> Vec<Fixture> {
                 })
                 .collect();
 
+            let logs = fixture
+                .logs
+                .into_iter()
+                .map(|log| SvmLog {
+                    path: log.instruction_address,
+                    program: pubkey(&log.program_id),
+                    is_data: log.kind == "data",
+                    message: log.message,
+                })
+                .collect();
+
             Fixture {
                 name: fixture.name,
                 slot: fixture.slot,
@@ -197,6 +228,7 @@ fn parse() -> Vec<Fixture> {
                         .has_dropped_log_messages,
                     instructions,
                     activity,
+                    logs,
                 },
             }
         })
