@@ -16,6 +16,12 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 clap = { version = "4", features = ["derive", "env"] }
 clickhouse = { version = "0.14", features = ["native-tls"] }
 futures = "0.3"
+# The control panel's accept loop (src/admin/server.rs). `axum::serve` sets
+# no timeout and no connection cap, and the panel lives in the process that
+# indexes every chain, so the loop is hyper's own with limits added.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "service", "tokio"] }
+tower = { version = "0.5", default-features = false }
 # Session tokens and the password salt come from the operating system's
 # CSPRNG, never from a hash of the clock (src/admin/auth.rs).
 getrandom = "0.3"

@@ -35,6 +35,15 @@ impl Panel {
         chains: &[u64],
         tweak: impl FnOnce(&mut Admin),
     ) -> Self {
+        Self::start_limited(chains, server::Limits::default(), tweak).await
+    }
+
+    /// The same panel with the connection limits a test wants to prove.
+    async fn start_limited(
+        chains: &[u64],
+        limits: server::Limits,
+        tweak: impl FnOnce(&mut Admin),
+    ) -> Self {
         let runner = FakeRunner::new();
         let store = MemoryStore::new();
         let mut settings = config();
@@ -60,13 +69,14 @@ impl Panel {
         let addr = listener.local_addr().unwrap();
         let app = router(Arc::new(admin));
 
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await;
-        });
+        // The REAL accept loop, with its real limits: a test that spoke to
+        // a bare `axum::serve` would not have caught MAJOR 1.
+        let server = tokio::spawn(server::serve(
+            listener,
+            app,
+            limits,
+            Box::pin(std::future::pending()),
+        ));
 
         Self { addr, supervisor, runner, server }
     }
@@ -157,6 +167,32 @@ async fn request(
     Reply { status, headers, body }
 }
 
+/// Opens a socket, sends a request head that never ends, and keeps it.
+/// Slowloris in three lines.
+async fn half_open(addr: SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"POST /api/login HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    stream
+}
+
+/// Has the server let go of this connection?
+///
+/// A read that COMPLETES means yes, whether it ended in EOF (the server
+/// sent a 408 and closed) or in `ConnectionReset` (it dropped the socket
+/// with unread bytes in flight, which is what a refused connection looks
+/// like on macOS). Only a read that is still waiting when the deadline
+/// passes means the server is still holding it.
+async fn was_closed(stream: &mut TcpStream, within: Duration) -> bool {
+    let mut sink = Vec::new();
+    tokio::time::timeout(within, stream.read_to_end(&mut sink))
+        .await
+        .is_ok()
+}
+
 /// Signs in and returns the `Cookie` header value to send afterwards.
 async fn sign_in(panel: &Panel) -> String {
     let reply = request(
@@ -171,6 +207,147 @@ async fn sign_in(panel: &Panel) -> String {
     assert_eq!(reply.status, 200, "{reply:?}");
     let cookie = reply.header("set-cookie").expect("a session cookie");
     cookie.split(';').next().unwrap().to_string()
+}
+
+// --------------------------------------- MAJOR 1: connections and time
+
+/// The review held 4000 half-open sockets for 76 seconds without a
+/// password. They are file descriptors of the process that indexes every
+/// chain, so past its limit ALL INDEXING STOPS.
+#[tokio::test]
+async fn a_request_that_never_finishes_is_dropped_instead_of_held_for_ever(
+) {
+    let panel = Panel::start_limited(
+        &[],
+        server::Limits {
+            header_read: Duration::from_millis(200),
+            ..server::Limits::default()
+        },
+        |_| {},
+    )
+    .await;
+
+    let mut held = half_open(panel.addr).await;
+
+    // Nothing more is ever sent. The server has to let go anyway.
+    assert!(
+        was_closed(&mut held, Duration::from_secs(5)).await,
+        "the server was still holding a half-open connection"
+    );
+
+    panel.stop().await;
+}
+
+#[tokio::test]
+async fn the_panel_never_holds_more_connections_than_its_cap() {
+    let cap = 4;
+    let panel = Panel::start_limited(
+        &[],
+        server::Limits {
+            max_connections: cap,
+            // Long enough that no timeout fires during the test: the cap
+            // alone has to do the work here.
+            header_read: Duration::from_secs(30),
+            ..server::Limits::default()
+        },
+        |_| {},
+    )
+    .await;
+
+    let mut sockets = Vec::new();
+    for _ in 0..(cap * 5) {
+        sockets.push(half_open(panel.addr).await);
+    }
+
+    let mut still_held = 0;
+    for socket in &mut sockets {
+        if !was_closed(socket, Duration::from_millis(300)).await {
+            still_held += 1;
+        }
+    }
+
+    assert!(
+        still_held <= cap,
+        "{still_held} connections held with a cap of {cap}"
+    );
+
+    panel.stop().await;
+}
+
+/// The cap alone would let an attacker park `max_connections` sockets for
+/// ever and lock the owner out of the panel. The timeouts are what give the
+/// slots back, so it takes both.
+#[tokio::test]
+async fn a_flood_of_half_open_sockets_does_not_keep_the_owner_out() {
+    let panel = Panel::start_limited(
+        &[1],
+        server::Limits {
+            max_connections: 4,
+            header_read: Duration::from_millis(200),
+            ..server::Limits::default()
+        },
+        |_| {},
+    )
+    .await;
+
+    let mut flood = Vec::new();
+    for _ in 0..40 {
+        flood.push(half_open(panel.addr).await);
+    }
+
+    // Once the header timeout has run, every slot is free again.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let reply = request(panel.addr, "GET", "/", &[], None).await;
+    assert_eq!(reply.status, 200, "the owner could not reach the panel");
+
+    drop(flood);
+    panel.stop().await;
+}
+
+/// A panic in a handler must stay inside its own task: the chains this
+/// process is indexing must never notice.
+#[tokio::test]
+async fn a_panic_in_a_handler_never_reaches_the_supervisor() {
+    let runner = FakeRunner::new();
+    let store = MemoryStore::new();
+    let mut settings = config();
+    settings.chains = vec![1];
+
+    let supervisor = Supervisor::new(settings, runner.clone(), store);
+    supervisor.load_and_start().await.unwrap();
+    until("indexing", || runner.is_live(1)).await;
+
+    async fn boom() -> &'static str {
+        panic!("a handler fell over")
+    }
+
+    let app = Router::new()
+        .route("/boom", get(boom))
+        .route("/fine", get(|| async { "ok" }));
+
+    let listener =
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(server::serve(
+        listener,
+        app,
+        server::Limits::default(),
+        Box::pin(std::future::pending()),
+    ));
+
+    let _ = request(addr, "GET", "/boom", &[], None).await;
+
+    // The panel is still there ...
+    let reply = request(addr, "GET", "/fine", &[], None).await;
+    assert_eq!(reply.status, 200, "the panel died with its handler");
+
+    // ... and so is the chain.
+    assert!(runner.is_live(1), "a handler panic stopped the indexing");
+    assert_eq!(runner.starts(1), 1);
+
+    server.abort();
+    supervisor.shutdown().await;
 }
 
 // ------------------------------------------------------------- the tests

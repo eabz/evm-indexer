@@ -2190,6 +2190,8 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "hex",
+ "hyper",
+ "hyper-util",
  "hypersync-client",
  "hypersync-client-solana",
  "hypersync-solana-net-types",
@@ -2204,6 +2206,7 @@ dependencies = [
  "simple_logger",
  "subtle",
  "tokio",
+ "tower",
  "url",
 ]
 

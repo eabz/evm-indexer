@@ -33,6 +33,7 @@
 
 pub mod auth;
 pub mod page;
+pub mod server;
 
 #[cfg(test)]
 mod tests;
@@ -41,7 +42,7 @@ use crate::{
     configs::{ChainSettings, CHAIN_SETTINGS},
     fleet::supervisor::{ChainView, CommandError, Supervisor},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use auth::{Allowed, LoginRefused, Password, RateLimiter, Sessions};
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, State},
@@ -112,13 +113,7 @@ pub async fn start(
         csp: page::content_security_policy(),
     });
 
-    let listener =
-        tokio::net::TcpListener::bind(addr).await.with_context(|| {
-            format!(
-                "cannot bind the control panel to {addr} (is the port \
-                 already in use?)"
-            )
-        })?;
+    let listener = server::bind(addr).await?;
 
     let bound = listener.local_addr().unwrap_or(addr);
     info!("Control panel on http://{bound}/ (password protected).");
@@ -132,18 +127,12 @@ pub async fn start(
 
     let app = router(admin);
 
-    Ok(Some(tokio::spawn(async move {
-        let served = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown)
-        .await;
-
-        if let Err(e) = served {
-            warn!("The control panel stopped: {e:#}");
-        }
-    })))
+    Ok(Some(tokio::spawn(server::serve(
+        listener,
+        app,
+        server::Limits::default(),
+        shutdown,
+    ))))
 }
 
 pub fn router(admin: Arc<Admin>) -> Router {
