@@ -655,3 +655,31 @@ chain without stopping the process, a status surface, and the panel.
   surface with bodies, cookies and routing is not the place for a home-made parser.
 
 Order of work: after the review round 4 core fixes merge (both touch `src/pipeline/mod.rs`).
+
+## 16. Coverage floor: one consistent window, live data first (owner decision 2026-09-19)
+
+The product promise is "gap-free and consistent from a known date to now, everything kept",
+not "all of history". History is fetched only where consistency needs it.
+
+- **Default start = one year before the chain's FIRST launch** (EVM). With no `--start-block`
+  and no `--start-date`, the first `run`/`fleet` start of a chain resolves "now - 365 days" to
+  a block (binary search over block headers by timestamp) and PERSISTS it as the chain's
+  coverage floor. It is fixed from then on: it does not roll forward, and a restart, a new
+  flag value or the panel cannot move it silently (moving it EARLIER is an explicit
+  `indexer backfill`; moving it later is refused - data is never dropped).
+- `--start-date YYYY-MM-DD` and `--start-block N` override the default on the first start
+  only; `--new-blocks-only` still means "start at the head".
+- **Solana default = the head on first launch** (live first). Envio serves history from
+  2026-01-03 and the free tier is slow; going back is an explicit choice, never a default.
+- The floor lives with the chain (`chains` registry row: `coverage_from_block`,
+  `coverage_from_ts`, insert-only, first writer wins). `coverage_v` exposes, per chain, the
+  floor and the contiguous stored head; `indexer verify` prints "gap-free from DATE to now"
+  or says exactly what is missing. The control panel shows the same line per chain.
+- Readers must treat "all-time" numbers as "since the floor"; READMEs and view comments say so.
+- **The one dataset that needs older data to be correct: prediction markets.** A market
+  created before the floor has no question/outcomes and its open interest can go negative.
+  Fix: a registry-only history pass (log-filtered by the trusted registry/exchange addresses,
+  from their deployment block to the floor) that stores market metadata and
+  split/merge/redeem events but no trades outside the window. Cheap: a handful of addresses.
+- Launchpad tokens launched before the floor keep DEX data but have no launch attribution;
+  documented, not fixed.
