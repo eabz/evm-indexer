@@ -1060,3 +1060,752 @@ Metaplex Token Metadata `metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s`
 See section 4.7 (eight questions), plus: does the JSON-RPC facade
 (`POST /` / `POST /rpc`) serve `getAccountInfo` / `getMultipleAccounts`? If it
 does, Solana token metadata needs no external RPC at all.
+
+## 11. Phase 2 plan: head following, history backfill, cost
+
+STATUS: COMPLETE. Analyst: `solana-plan`, 2026-09-19.
+Basis: 14 live requests to `solana.hypersync.xyz` / `1.hypersync.xyz` between
+07:05:39 and 07:09:37 UTC (every one recorded, with its headers, in appendix E),
+3 free `/height` + public-RPC samples at 07:10:03-07:10:13 UTC, and the Envio
+and Old Faithful documentation retrieved 2026-09-19 (URLs in appendix F).
+Section 1-10 above is unchanged; where this section contradicts it, this
+section is the later measurement and wins.
+
+### The ten lines: what the owner has to decide
+
+1. **The free Envio token is 30 queries a minute, per endpoint.** Measured, not
+   guessed: `x-ratelimit-limit: 30000, 30000;w=60` with a flat
+   `x-ratelimit-cost: 1000` on every single query. `GET /height` carries no
+   rate-limit headers at all and needs no token - it is free.
+2. **That is enough to follow the Solana head forever.** Keeping up needs 7 to
+   15 of those 30 queries a minute. **No paid tier is required for live data**,
+   now or later.
+3. **It is not enough to load the history.** The 8.5 months Envio has is 57.3
+   million slots; at the ~35 slots a query the server will actually return that
+   is 1.64 million queries, which is **48 days of the entire free budget**.
+4. **DECISION 1 - pay Envio $70 for one month, or wait.** "Starter" ($70/month,
+   100 queries a minute) does the backfill in **~13 days** while still
+   following the head. Free does it in 48 days with the head paused, or ~11
+   weeks if you follow the head at the same time. $70 once, then back to free.
+5. **DECISION 2 - how deep is the history.** Envio starts at 2026-01-03 and
+   nothing will change that. Older than that exists only in the free Old
+   Faithful archive, which means pulling **~113 TB** and writing a second
+   ingest path. Recommendation: take Envio's 8.5 months, and treat "since
+   pump.fun launched" as a separate project that is not worth it yet.
+6. **DECISION 3 - hardware.** Solana alone writes **~12 GB a day compressed,
+   ~4.3 TB a year** - **26x the measured Base swap rate**, and 2.5 to 10 times
+   all the EVM chains put together.
+   Budget an **8 TB NVMe** and 64-128 GB of RAM for year one, plus ~220 Mbit/s
+   of sustained download for the fortnight the backfill runs.
+7. **Reorgs can be switched off, carefully.** Envio serves Solana at (just
+   behind) `finalized` - re-measured today, 5 to 19 slots behind it. So the
+   Solana pipeline needs **no fork-point search and no confirmations**, but it
+   must keep the tombstone/epoch machinery for gap heals and keep the
+   parent-hash check as a tripwire that stops the indexer loudly if the
+   assumption ever breaks.
+8. **A bug found while measuring, and it is the first thing to fix.** The query
+   the merged code sends returns **one slot per request**, because it raises
+   only `max_num_instructions` and a different, unset cap binds first. Raising
+   all the caps turns 1 slot per query into 35. An hour's work, and nothing
+   else in this plan is possible without it.
+9. **Freshness will be ~14-20 seconds behind the live chain**, of which 10-13
+   seconds is Envio's own lag and no amount of polling changes it. Measured
+   against Solana's own `finalized`, we would be 3-9 seconds behind.
+10. **The engineering is ~12 working days in eleven tasks**, five of which can
+    run in parallel (section 11.5).
+
+### 11.1 The rate limit: what it is, and it is not what section 4.6 says
+
+Section 4.6 records `x-ratelimit-cost: 0` on all twelve probes of 2026-09-19
+04:40-04:44 UTC. The phase-1 engineer then observed cost 1000. I re-measured at
+07:05-07:09 UTC on the same token: **cost is 1000 on every query, and it was
+1000 on the very first one of the session**. Either the grace period ended in
+those two hours, or the earlier probes read the header from a client that did
+not surface it. Either way, **the section 4.6 conclusion "no separate plan
+appears to be needed" is dead, and the section 8 table row saying probes billed
+0 must be read as superseded.**
+
+What the headers say (`https://solana.hypersync.xyz/query`, all 9 metered
+Solana requests identical):
+
+```
+x-ratelimit-cost: 1000
+x-ratelimit-limit: 30000, 30000;w=60
+x-ratelimit-remaining: 29000        (then 28000, 27000, ...)
+x-ratelimit-reset: 39               (seconds until the window resets)
+```
+
+| Question | Answer, and the evidence |
+|---|---|
+| Which headers come back | `x-ratelimit-cost`, `-limit`, `-remaining`, `-reset`. Nothing else; no `retry-after` was seen (no 429 was provoked) |
+| Window length | **60 seconds**, stated in the header itself: `30000;w=60` is the RFC "RateLimit" quota-policy form, `w` = window in seconds. Confirmed by watching `x-ratelimit-reset` count down 39 → 38 → 37 over three back-to-back requests and reset to a fresh 30000 budget in the next minute |
+| Budget and therefore queries | 30,000 budget units / 1,000 per query = **30 queries per 60 s** |
+| Does cost depend on the query | **No - it is flat.** A query returning **378 bytes** (p06: one slot, a filter that matches nothing, one field) and a query returning **46.2 MB** (p08: 40 slots, 110,931 rows across four tables) both cost exactly 1000. Rows returned, slots scanned, number of selections and number of field-selection columns all make no difference |
+| Is `/height` free | **Yes, and it is not even metered.** `GET /height` with and without a token returned **no `x-ratelimit-*` headers at all** (p01, p02). The docs confirm it needs no token. `GET /height/sse` is the same endpoint as a stream |
+| Arrow vs JSON | Same cost. `POST /query/arrow` billed 1000 (p12) and returned **19.9 MB against JSON's 46.2 MB for the identical query - 43%** |
+| The EVM endpoint | **Identical, and on a separate counter.** `https://1.hypersync.xyz` returns the same `30000;w=60` with flat cost 1000 (p13: 214 bytes, p14: 40.1 MB, both 1000). Crucially, a Solana query had just taken the Solana counter to 29,000 when the first EVM query reported its own fresh 29,000 with a different `reset` offset - so **each chain endpoint has its own 30,000/60 s pool. Adding Solana does not eat the EVM chains' budget.** (Caveat: this is two data points; it could in principle be per edge node rather than per chain. Re-check if it ever matters financially.) |
+
+Envio's own documentation (retrieved 2026-09-19, `docs.envio.dev/docs/HyperSync/
+stream-config-tuning`) describes exactly this contract - `remaining` "counts
+budget units, not requests - divide it by `cost` for the number of requests you
+have left" - but **publishes no numbers**: the free tier is described only as
+"Fair-use based rate limiting", and neither the window length nor the cost
+formula appears anywhere. The runtime headers are the only source of truth, and
+the client must read them rather than hard-code 30.
+
+**The paid tiers** (`https://envio.dev/pricing/hypersync`, retrieved
+2026-09-19):
+
+| Plan | Price | Stated limit | Queries/day | Slots/day at 35 slots/query |
+|---|---|---|---|---|
+| Free | $0 | "fair-use" - **measured 30/min** | 43,200 | 1.51M |
+| Starter | **$70/month** | "100 requests per minute", burst to 250 | 144,000 | 5.04M |
+| Pro | **$480/month** | "1,000 requests per minute", burst to 2,500 | 1,440,000 | 50.4M |
+| Custom | "talk to us" | custom, SLA, support | | |
+
+The page also states "Rate limits cap how fast you can query, never how much
+per month" and "All plans include data for every supported chain. There are no
+strict data volume limits." Yearly billing is "2 months free". Nothing on the
+page mentions Solana pricing separately; Solana is labelled "Beta" in the
+product navigation.
+
+### 11.1.1 The measurement that changes the plan: 35 slots per query, not 107
+
+Section 4.6 records "107 slots, 33,886 instruction rows, 5.99 MB in 2.7 s" with
+`max_num_instructions: 200000`. That was an instruction-only query. **The query
+the merged code actually sends** (`src/source/solana.rs::build_query`: 20+ venue
+programs OR the SPL/Token-2022/System transfer union, plus
+`account_activity: [{}]` and `include_all_blocks: true`) behaves completely
+differently:
+
+| Probe | Query | `max_num_*` set | Slots returned | Bytes | Wall |
+|---|---|---|---|---|---|
+| p05 | the production shape, slots 448,300,000+ | only `instructions: 200000` (**what the code does today**) | **1** | 1.25 MB | 1.8 s |
+| p08 | the same query | `blocks`, `transactions`, `instructions`, `account_activity` all raised to 10^6 | **40** | 46.2 MB | 7.8 s |
+| p15 | the same query, slots 448,320,000+ | same | **30** | 26.8 MB | 5.7 s |
+| p11 | headers only (instruction/activity selections that match nothing) | same | **10,000** (the whole requested range) | 3.6 MB | 12.1 s |
+
+Three findings, in order of importance:
+
+1. **The merged source gets one slot per query.** `max_num_instructions` is
+   raised but `max_num_account_activity` and `max_num_transactions` are not,
+   and one of them binds first. At 30 queries a minute that is 0.5 slots/s
+   against a chain producing 3.76 - **the pipeline cannot even follow the head
+   as written.** This is the wall phase 1 hit and it is a one-line fix.
+2. **With every cap raised, the binding limit becomes the server's own
+   execution budget, and it lands at 30-40 slots.** Not bytes (26.8 MB and
+   46.2 MB both stopped) and not rows; the Envio EVM docs state a "5-second
+   query execution limit" and the two wall times (5.7 s, 7.8 s, transfer
+   included) fit that. **Use 35 slots per query as the planning number, and
+   never assume it: the client must follow `next_slot` and not its own
+   arithmetic.**
+3. **Header-only queries are ~300x cheaper per slot** (10,000 slots in one
+   query). That is what makes the `parent_slot` / `block_height` verification
+   sweep in section 11.4 affordable: a full re-verification of 8.5 months of
+   headers is 5,734 queries, i.e. **3.2 hours of the free budget**, against 48
+   days for the data.
+
+There is also a **client-side trap** waiting in the same place. The Solana
+`StreamConfig` defaults (documented at `docs.envio.dev/docs/HyperSync/
+solana-client`) are `response_bytes_ceiling: 500_000` and
+`response_bytes_floor: 250_000`, and the client auto-tunes `batch_size` to keep
+responses inside that band. Measured Arrow density is **0.50 MB per slot**, so
+the auto-tuner will converge on a batch of **one slot** and quietly re-create
+the same problem after the query caps are fixed. Both ceilings must be raised
+to the tens of megabytes in `StreamConfig`, with a test that asserts it.
+
+### 11.2 Head following: cadence, latency, and whether we must pay
+
+**The chain's own rate, re-measured from my own probes and not taken from
+section 5.1.** Slot 448,300,000 has `block_time` 1789792277 (p04); the
+`rollback_guard` in the same response puts slot 448,334,809 at timestamp
+1789801544. That is 34,809 slots in 9,267 s = **0.2662 s/slot = 3.756 slots/s =
+324,538 slots/day.** Independently, the public RPC's `processed` slot advanced
+40 slots in the 10 s between my first and third `/height` sample (4.0 slots/s).
+Every number below scales inversely with this and it has moved before (it was
+0.40 s until ~slot 430M).
+
+**The minimum.** Keeping up needs 324,538 slots/day. At the measured 35 slots
+per response that is 9,272 queries/day = **6.4 queries/minute against a free
+budget of 30.** So the answer to "is a paid tier required for live following"
+is **no, with 4.7x of headroom**, and that headroom is what pays for retries,
+gap heals and the header sweeps.
+
+**But at the head you cannot batch 35 slots** - they have not happened yet. The
+cadence, not the cap, sets the query rate:
+
+| Poll interval | Slots per query | Queries/min | % of free budget | Instruction rows per response | Arrow per response | End-to-end lag behind the live chain |
+|---|---|---|---|---|---|---|
+| 2 s | 7.5 | 30 | 100% | 7,600 | 3.7 MB | 13-18 s |
+| **4 s** | **15.0** | **15** | **50%** | **15,200** | **7.5 MB** | **14-20 s** |
+| 6 s | 22.5 | 10 | 33% | 22,700 | 11.2 MB | 16-22 s |
+| 8 s | 30.0 | 7.5 | 25% | 30,300 | 15.0 MB | 18-24 s |
+| 10 s | 37.6 | 6 | 20% | — | — | the server truncates at ~35, so this costs 2 queries and buys nothing |
+
+Row counts use the measured per-slot rates of the production selection (below);
+the `~1.4x` child-SPL-transfer ride-along section 4.3 identified is already
+inside them, because the transfer union is part of the selection that was
+measured.
+
+**Recommendation: a 4-second cadence, 15 queries a minute, half the free budget
+left over.** Cheaper cadences buy nothing because of the next paragraph.
+
+**Where the latency actually goes.** Three `/height` samples against the public
+RPC at 07:10:03-07:10:13 UTC:
+
+| Sample | Envio head | RPC `finalized` | RPC `processed` | Behind finalized | Behind processed |
+|---|---|---|---|---|---|
+| 07:10:03 | 448,335,737 | 448,335,756 | 448,335,786 | 19 slots | 49 slots |
+| 07:10:08 | 448,335,763 | 448,335,776 | 448,335,807 | 13 slots | 44 slots |
+| 07:10:13 | 448,335,790 | 448,335,795 | 448,335,826 | 5 slots | 36 slots |
+
+At 0.2662 s/slot: **Envio is 9.6-13.0 s behind the live chain and 1.3-5.1 s
+behind `finalized`.** (Section 4.5 measured 33-44 and 4-12 slots at 01:38 UTC;
+the two sessions agree.) The budget, at a 4 s cadence:
+
+```
+  9.6 - 13.0 s   Envio's own ingest lag          <- we cannot change this
+  2.0 s          average half of the poll interval
+  1.5 - 3.5 s    query + transfer of a 15-slot response
+  0.5 - 1.5 s    decode + writer flush (tip_interval)
+  -------------
+  13.6 - 20.0 s  from a Solana transaction executing to it being queryable
+   3.3 -  9.1 s  from that transaction being FINALIZED to it being queryable
+```
+
+**The second number is the honest one.** "18 seconds behind the chain" is
+mostly "Solana's finality plus Envio's ingest", and a sub-second Solana feed is
+a different product (Yellowstone gRPC / Helius LaserStream, section 8) with no
+history behind it. For candles, volume and a launch feed, 3-9 seconds behind
+finality is fine.
+
+**Two free things the follower must use.**
+- `GET /height/sse` is an unauthenticated, **unmetered** server-sent-events
+  stream of the head slot (confirmed: `/height` carries no `x-ratelimit-*`
+  headers at all). The follower should take its head signal from there and
+  never spend a metered query discovering that nothing happened. On a quiet
+  endpoint that turns the poll loop into "wake on SSE, query only when
+  `head > committed`".
+- Header-only queries cost the same 1000 but return 10,000 slots (p11), so the
+  `parent_slot` / `block_height` verification of section 11.4 is essentially
+  free.
+
+**Bandwidth at the head:** 324,538 slots/day x 0.499 MB/slot Arrow =
+**162 GB/day = 1.87 MB/s = 15 Mbit/s** sustained, or 375 GB/day in JSON. Use
+Arrow (`POST /query/arrow`, 43% of JSON, same cost).
+
+**Row rates the decoder must chew at the head**, measured over the 70 slots of
+p08 + p15 with the real production selection:
+
+| Table | Rows/slot | Rows/day | Rows/s at the head |
+|---|---|---|---|
+| `instruction_calls` (venues + SPL/T22/System transfers) | 1,011 | 328M | 3,800 |
+| `account_activity` | 1,286 | 418M | 4,830 |
+| `transactions` | 210 | 68M | 790 |
+| `blocks` | 1 | 0.32M | 3.8 |
+| **total source rows** | **2,508** | **814M** | **9,420** |
+
+Section 5.2 modelled 346 matched instruction rows/slot for the DEX programs and
+494 SPL transfer rows/slot separately; my 1,011 is those two plus the System
+transfers and the extra venues the merged registry streams, so the two
+measurements agree. **9,400 source rows a second is not a problem.** 146,000 a
+second, which is what a Starter-tier backfill implies, might be - see 11.3.
+
+### 11.3 History backfill: 8.5 months, three ways
+
+**The size of the job.** Envio serves from slot **391,000,000** (2026-01-03
+07:37 UTC, section 4.4); the head was **448,334,753** at 07:05:39 UTC today.
+That is **57,334,753 slots**, 8 months and 16 days, **132.7 Solana epochs**.
+
+At the measured 35 slots per response: **1,638,136 queries**, and **28.6 TB** of
+Arrow over the wire (66 TB as JSON).
+
+| Path | Queries/day | Calendar time for 57.3M slots | Money | Sustained download |
+|---|---|---|---|---|
+| Envio **free**, head follower paused, one forward sweep | 43,200 | **48.3 days** | $0 | 55 Mbit/s |
+| Envio **free**, head followed at 4 s in parallel | 21,600 for the sweep | **75.8 days** | $0 | 28 Mbit/s |
+| Envio **Starter**, one forward sweep | 144,000 | **12.2 days** | **$70 once** | 220 Mbit/s |
+| Envio **Starter**, head followed at 4 s in parallel | 122,400 for the sweep | **13.4 days** | **$70 once** | 200 Mbit/s |
+| Envio **Pro** | 1,440,000 | 1.2 days *by budget* — not achievable, see below | $480/month | 2.2 Gbit/s |
+| **Old Faithful + Jetstreamer** | n/a | 10.5 days at a saturated 1 Gbps; 8.4 h at 30 Gbps | $0 (egress free today) | **113 TB total** |
+
+The "one forward sweep" rows account for the head moving while you sweep (net
+drain = 1.51M − 0.32M slots/day on free). The parallel rows do not, because a
+separate follower is already handling the new slots.
+
+**Why Pro is not worth considering.** 1,000 queries/minute is 16.7 queries a
+second; each takes 5-8 s server-side, so it needs 100-130 concurrent requests in
+flight, and 50.4M slots/day is **1.46 million source rows a second** to decode
+and insert. That is not a single-node number. **Pro's money buys throughput this
+project cannot consume.**
+
+**The honest caveat on Starter, and it should be tested before the money is
+spent.** Starter implies 5.04M slots/day = **146,000 source rows a second**
+through the decoder. Nobody has measured what `svm::decode` sustains. If it
+does 50,000 rows/s, the real rate is 1.7M slots/day = **34 days regardless of
+tier**, and Starter is wasted. **Task S0: run the recorded fixtures through
+`svm::decode` in a loop and measure rows/s before buying anything.** Size the
+tier to the decoder, not to the API.
+
+#### 11.3.1 Old Faithful / Jetstreamer, with the numbers their docs give
+
+Sources retrieved 2026-09-19: `github.com/rpcpool/yellowstone-faithful`,
+`docs.old-faithful.net`, `github.com/anza-xyz/jetstreamer` (note: the repo is
+Anza's; `github.com/rpcpool/jetstreamer` is a 404), and the project's
+auto-generated CAR report at
+`raw.githubusercontent.com/rpcpool/yellowstone-faithful/gha-report/docs/CAR-REPORT.md`.
+
+- **Depth: genesis to the epoch before the current one.** The only free path to
+  anything older than 2026-01-03. CARs land "within 10-20h after epoch end"
+  (target "within 4 epochs").
+- **Size per epoch, measured in their own report:** recent epochs run
+  **586 GB (epoch 966), 604 GB (979), 715 GB (1000), 1,215 GB (1019), 1,059 GB
+  (1023), 917 GB (1036)** of CAR, plus 40-123 GB of indexes each. Our 8.5 months
+  is **epochs 905-1037**, mean ~849 GB → **~113 TB** of CAR to pull. The total
+  archive size is **not published anywhere**; extrapolating their report over
+  1,000+ epochs puts it in the hundreds of TB.
+- **No server-side filtering.** Jetstreamer selects by epoch or slot range only
+  (`900-950`, `358560000:367631999`, `--reverse`); the plugin filters locally.
+  **Narrowing to our 26 programs saves zero bandwidth** - all 113 TB crosses the
+  wire. This is the single fact that decides it.
+- **Throughput:** "over 2.7M TPS to a local Jetstreamer plugin or geyser
+  plugin", achieved on "64 core CPU, 30 Gbps+ network". Default
+  `JETSTREAMER_NETWORK_CAPACITY_MB=1000` assumes ~8 Gbps. Memory default is
+  `min(4 GiB, 15% of RAM)`. Requires Clang 16 exactly. No epochs/hour or MB/s
+  figure is published; the only calendar claim is "a full ingest within days".
+- **Cost:** "This archive is currently completely free to use." Hosted in
+  **Amsterdam** ("download using servers nearby for best throughput"). The
+  repo still says "RFC stage … not intended for production use". Triton's
+  *hosted* archive RPC is separate and is paid ($10 per million queries, $10/mo
+  minimum) - that is not the bulk path.
+- **It writes to ClickHouse by design** (built-in sinks: any geyser plugin,
+  ClickHouse, or a custom plugin), but not to *our* schema, so it is still a
+  second ingest path: a Jetstreamer plugin that feeds `svm::decode`.
+- Caveats from their feature table that matter if this is ever built: epochs
+  0-156 are "incompatible with modern Geyser plugins", epochs 0-449 report
+  compute units as 0, and "Old Faithful does not contain account updates".
+  Transactions arrive "in their already-executed state as they originally
+  appeared to Geyser", which is exactly what the movement layer needs.
+
+#### 11.3.2 Recommendation
+
+**Buy one month of Envio Starter ($70), run the backfill in ~13 days, then go
+back to free.** Reasons, in order:
+
+1. For the *same* 8.5 months, Envio moves **28.6 TB** and Old Faithful moves
+   **113 TB** - a 4x difference, entirely because Envio filters server-side and
+   Jetstreamer cannot.
+2. Envio needs **no new code**: the same client, the same query, the same
+   decoder, the same writer. Old Faithful needs a second ingest path and a
+   10 Gbps-class machine just to match Envio's calendar time.
+3. $70 is less than a fortnight of the electricity the alternative burns.
+4. Free is a legitimate answer if the owner does not mind waiting: 48 days with
+   the head paused, and the tip can be switched on the moment the sweep
+   finishes. It is the difference between "history in October" and "history in
+   late November".
+
+**Do not build the hybrid now.** Old Faithful's only unique value is
+**pre-2026-01-03**, which Envio cannot serve at any price. Keep it in the drawer
+for a future "since pump.fun launched" project and size it then; the archive is
+not going anywhere and it is getting cheaper to consume, not dearer.
+
+**Date-based estimate.** The backfill cannot start until tasks S1 and S10 of
+section 11.5 land. Taking ~2 weeks of engineering from a start on 2026-09-22,
+the driver is ready around **2026-10-06**:
+
+| Plan | Sweep | Complete | Covering |
+|---|---|---|---|
+| Starter, $70 | 13.4 days | **~2026-10-20** | 2026-01-03 → live |
+| Free, head paused | 48.3 days | ~2026-11-23 | 2026-01-03 → live |
+| Free, head followed | 75.8 days | ~2026-12-21 | 2026-01-03 → live |
+
+All three stretch if `svm::decode` turns out to be the bottleneck (task S0).
+Sweep **backwards from the head**, not forwards from 391M: the recent months are
+the ones a chart needs first, and an interrupted backward sweep still leaves a
+contiguous, useful window.
+
+### 11.4 Commitment, reorgs and contiguity
+
+#### 11.4.1 What commitment Envio serves, and what follows
+
+**Not documented.** I re-read `docs.envio.dev/docs/HyperSync/solana`,
+`/solana-query`, `/solana-client` and `/solana-curl-examples` on 2026-09-19:
+the words `confirmed`, `finalized` and `commitment` do not appear as a
+guarantee anywhere. The closest the docs come is the `rollback_guard` advice to
+"re-sync from a finalized slot", which presupposes you work finality out
+yourself. **This remains question 1 for Envio (section 4.7) and it is now the
+only question on that list that blocks a design decision.**
+
+**What measurement says, across two independent sessions:**
+
+| Session | Samples | Behind RPC `finalized` | Behind RPC `processed` |
+|---|---|---|---|
+| 2026-09-19 01:38 UTC (section 4.5) | 3 | 4-12 slots | 33-44 slots |
+| 2026-09-19 07:10 UTC (this section) | 3 | 5-19 slots | 36-49 slots |
+
+**Six of six samples put Envio's head behind `finalized`, never ahead of it.**
+`finalized` on Solana means rooted by a supermajority of stake; a rooted slot is
+not abandoned by the normal fork-choice rule at all - abandoning one requires a
+cluster restart from a snapshot, which has happened (September 2021, February
+2024) and whose documented recovery procedure restarts from the last
+*optimistically confirmed* slot, i.e. at or above the last rooted one.
+
+#### 11.4.2 The proposal: no fork search, keep the tombstones
+
+**Yes, the Solana pipeline should skip reorg handling - specifically, it should
+skip the fork-point search - and no, it should not lose the machinery.**
+
+| Layer (`src/reorg/README.md`) | EVM | Solana | Why |
+|---|---|---|---|
+| 1. `--confirmations N` | tunable, default 0 | **0, and reject any other value with a message** | staying behind a head that is already behind `finalized` buys nothing and costs freshness twice |
+| 2. Detection (parent hash + `rollback_guard`) | on | **on** — and add the `block_height` chain (11.4.3) | it costs one comparison per slot and it is the tripwire that tells us the finality assumption broke. Deleting it would mean discovering a problem as a wrong chart |
+| 3. Fork-point search (`fork.rs`, k = 8, 16, 32 …) | on | **off** | there is no fork to find. A mismatch on finalized data is not a fork, so walking backwards looking for agreement is answering the wrong question, and it costs metered queries to do it |
+| 4. Rollback = `purge_range` + resume | on | **on, unchanged** | it is the only repair routine there is, and gap healing needs it whatever finality does |
+| Tombstones + epochs + `epoch_floor_v` | on | **on, unchanged** | they cost nothing when unused and everything if absent when needed. `SvmRows::set_epoch` / `set_version` already do their half |
+
+**What a mismatch should do instead of a fork search.** On a parent-hash,
+`block_height` or `rollback_guard` mismatch at slot S:
+
+1. WARN loudly with both hashes and a dedicated `reason = 'parent_mismatch'`
+   row in `reorgs` - this is an event that is *not supposed to happen*, and it
+   must be visible rather than silently repaired.
+2. `purge_range(chain, S, ∞)` and re-stream from S. The fork point **is** S,
+   because everything below it was finalized when we stored it.
+3. If the re-streamed S mismatches again against S-1, the same rule fires one
+   slot lower. That converges, one slot per pass, and `--max-reorg-depth`
+   (default 512) is still the fuse: reaching it is fatal with a clear message,
+   exactly as today. A finalized chain that disagrees with us 512 slots deep is
+   a wrong endpoint or a re-ingest bug, not a reorg.
+
+**Residual risk, stated plainly.**
+
+| Risk | Likelihood | What it would look like | Mitigation in this design |
+|---|---|---|---|
+| Envio's commitment is not what six samples say, or changes | **medium** - it is undocumented, the product is labelled Beta, and the wire format already changed once in `0.2.0-rc.4` | the parent/height tripwire fires | detection stays on; a purge-and-restream repairs it; the `reorgs` table records it |
+| Envio re-ingests a slot from a different source and `transaction_index` changes | **medium** - section 4.7 question 8 is still unanswered | the position key `(chain, slot, tx_index, ordinal)` points at a different instruction; **no hash check catches this**, because the block itself is identical | this is the one hole. Mitigate by storing `sol_slots.blockhash` (already) *and* by making `indexer verify` re-fetch a random sample of stored slots and compare row counts per slot. A cheap nightly 100-slot sample is 3 metered queries |
+| A Solana cluster restart discards rooted slots | **low** - twice in five years, and the recovery targets a slot at or above the last rooted one | the tripwire fires, possibly over a wide range | `--max-reorg-depth` turns it into a loud stop rather than a silent half-purge; the operator re-runs with a larger value |
+| We set `--confirmations 0` and Envio later starts serving `confirmed` | low | frequent tripwire firing | the metric `solana_parent_mismatch_total` should page. If it ever becomes routine, the answer is `--confirmations 32`, not re-adding the fork search |
+
+#### 11.4.3 Contiguity: how a gap is detected when skipped slots are normal
+
+**First, a measurement that reframes the problem.** The 10,000-slot header
+sweep (p11, slots 448,300,000-448,309,999) returned **10,000 block rows, with
+zero missing slot integers, zero `block_height` breaks and zero parent-chain
+breaks.** Solana's skip rate in this region is below 0.01%. That does **not**
+license an integer-gap check - the skip rate has been percent-scale
+historically and one leader outage brings it back - but it does mean skipped
+slots are an exception to handle correctly, not a constant background hum.
+
+**The structural fact that makes this easy.** With `include_all_blocks: true`
+the server returns a block row for **every slot it has** inside the window it
+served. So inside one response's `[from_slot, next_slot)` a missing integer is
+a genuinely skipped slot, full stop. **A gap can therefore only exist *between*
+served windows - it is a property of the cursor, not of the block rows.** That
+single sentence is the whole Solana contiguity design.
+
+**Three witnesses, in increasing strength. Use all three; they are cheap.**
+
+1. **The cursor (`next_slot`), and it is the primary one.** Checkpoint windows
+   must tile `[start_slot, head)` with no hole and no overlap. This is pure
+   `from`/`to` arithmetic - `db::ranges::contiguous_until` already does exactly
+   it for EVM - and it works unchanged provided `to_block` is written as the
+   server's `next_slot`, **not** as `max(slot) + 1`. That is the one semantic
+   change, and getting it wrong is what would produce endless false gaps.
+2. **`block_height`.** Solana's `block_height` counts *produced blocks*, so it
+   increments by exactly 1 per block **regardless of how many slots were
+   skipped**. For consecutive stored slots P < S with nothing stored between:
+   `S.block_height == P.block_height + 1` **proves no block was lost**, and it
+   is immune to skipped slots in a way `parent_slot` arithmetic is not.
+   Verified over all 10,000 rows of p11 and all 40 of p08: not one break.
+   `BlockField::BlockHeight` is already selected in `src/source/solana.rs`, so
+   this costs nothing but the comparison. **This is the Solana replacement for
+   the EVM "every integer has a `blocks` row" gap query.**
+3. **`parent_slot` + `parent_blockhash`.** `S.parent_slot == P.slot` and
+   `S.parent_blockhash == P.blockhash`. Witness 2 counts; this one *identifies*.
+   It is what catches a wrong block rather than a missing one, and it is the
+   tripwire of 11.4.2.
+
+**Do not use Envio's `next_slot` as a substitute for witness 2 or 3.** It tells
+you what the server *served*, which is what you asked for plus a truncation; it
+cannot tell you the server served the right thing.
+
+#### 11.4.4 What the checkpoint row must contain
+
+`checkpoints` today is `(chain, from_block, to_block, _version)`. Since no data
+is loaded anywhere (design.md's opening line), extending it in migration `0004`
+is free, and three of the four additions help the EVM side too.
+
+| Column | Meaning on Solana | Meaning on EVM | Why |
+|---|---|---|---|
+| `from_block` | first slot of the served window, inclusive | unchanged | |
+| `to_block` | **the server's `next_slot`**, exclusive | unchanged | the cursor, not `max(slot)+1`. This is the change that makes witness 1 work |
+| `blocks_present UInt32` *(new)* | how many `sol_slots` rows landed in the window | how many `blocks` rows landed | `to_block - from_block - blocks_present` = the skipped slots, and on EVM it is always 0. It is what lets `verify` say "5 skipped" instead of "5 missing" |
+| `last_block UInt64` *(new)* | highest slot with a row in the window | highest block | the anchor the next window's parent check compares against |
+| `last_hash FixedString(32)` *(new)* | its `blockhash` | its `hash` | **removes a `blocks FINAL` read on every resume**, on both families |
+| `last_height UInt64` *(new)* | its `block_height` | = `last_block` | carries witness 2 across a restart and across a window boundary |
+| `epoch`, `_version`, `is_deleted` | unchanged | unchanged | `purge_range` already tombstones overlapping checkpoints |
+
+#### 11.4.5 What `indexer verify` must check for Solana
+
+`src/pipeline/verify.rs` runs three checks today (gaps, orphan children,
+checkpoints). Check 1 as written - "blocks without a live `blocks` row" - would
+report every skipped slot as a gap forever, so it needs a family switch (or
+Solana needs its own entry point; a switch on `chains.family` is smaller).
+
+| # | Check | Notes |
+|---|---|---|
+| 1 | **Cursor tiling.** Live checkpoints tile `[start_slot, head]` with no hole and no overlap | replaces the EVM integer-gap query. It is the only thing that can detect "we never asked for these slots" |
+| 2 | **Height chain.** For consecutive stored slots with nothing between: `S.block_height == P.block_height + 1`; across a window boundary, against the previous checkpoint's `last_height` | detects a *lost produced block* without false-positiving on skipped slots. This is the strong one |
+| 3 | **Parent chain.** `S.parent_slot == P.slot` and `S.parent_blockhash == P.blockhash` for the same pairs | detects a *wrong* block. Redundant with 2 for the missing case, which is the point |
+| 4 | **Orphan children.** Every live `sol_transactions` / `sol_dex_swaps` row's slot has a live `sol_slots` row | **carries over from EVM unchanged.** It is the gap-heal invariant and it is the check that matters most in practice, because a flush that dies before its `sol_slots` insert is far more likely than anything in 11.4.2 |
+| 5 | **Epoch floor.** Every live row's `epoch >= epoch_floor_v` for the chain | unchanged |
+| 6 | **Sample re-fetch** *(new, optional, nightly)* | re-query 100 random stored slots and compare per-slot row counts against what is stored. 3 metered queries. This is the **only** defence against the `transaction_index` re-ingest risk of 11.4.2, which no hash can catch |
+
+Checks 1-5 are read-only over ClickHouse and cost no Envio budget. Check 6 costs
+3 queries a night out of 43,200.
+
+### 11.5 Integration shape: the task list for `indexer run --chain solana`
+
+Phase 1 merged `src/svm/` (tables, decoders, fixtures, live tests) and
+`src/source/solana.rs`. **Nothing is wired to the pipeline**: `SolanaSource` is
+referenced only by `src/svm/live_tests.rs`. Everything below is the wiring, and
+it is deliberately a list of small, separable jobs rather than "build the
+Solana pipeline".
+
+Effort tags: **S** = half a day or less, **M** = one to two days, **L** = three
+to five days.
+
+| # | Task | Effort | Depends on | Can run in parallel with |
+|---|---|---|---|---|
+| **S0** | **Measure `svm::decode` throughput** on the recorded fixtures: rows/s, single core and with the pipeline's real channel. It decides which Envio tier is worth buying (11.3) | S | — | everything |
+| **S1** | **Fix the query caps.** Raise `max_num_blocks` / `max_num_transactions` / `max_num_account_activity` alongside the existing `max_num_instructions` in `build_query`; raise `StreamConfig::response_bytes_ceiling` / `_floor` well above the measured 0.5 MB/slot Arrow. Add a live test asserting a response covers **more than 10 slots** | S | — | everything |
+| **S2** | **Rate-limit governor.** A per-endpoint token bucket seeded from `x-ratelimit-limit` / `-cost` / `-remaining` / `-reset` (never hard-code 30), with priorities: head follower > gap heal > verify > backfill. Use `get_with_rate_limit` and `proactive_rate_limit_sleep`. Note the client asymmetry Envio documents: the Solana `*_with_rate_limit` methods retry a 429, the EVM ones do not | M | — | S3, S4, S7, S8 |
+| **S3** | **The `BlockSource` seam.** `SourceResponse.data` is `ResponseRows` (EVM). Make it an enum `ChainRows { Evm(ResponseRows), Svm(SvmRows) }` and match once in `Writer::flush` and once in `ClickhouseSink` — see the note below | M | S1 (for testing) | S2, S4, S7, S8 |
+| **S4** | **Slot-aware checkpoints and `Progress`.** Write `to_block = next_slot`; add `blocks_present`, `last_block`, `last_hash`, `last_height` to migration `0004` (11.4.4); make `missing_ranges` / `contiguous_until` cursor-based rather than "every integer has a row" | M | — | S2, S3, S7, S8 |
+| **S5** | **Solana reorg variant.** A `CanonicalChain` over `SolanaSource::headers`; parent-hash **and** `block_height` continuity; **no** fork-point search — a mismatch purges from the mismatching slot up (11.4.2). Reject `--confirmations != 0` | M | S4 | S6, S9 |
+| **S6** | **Writer + commit marker.** `sol_slots` written **last**, `svm::BASE_TABLES` order for the purge, epoch/version stamping (`SvmRows::set_epoch` / `set_version` already exist), and an `svm` entry alongside `ModuleSpec` so `purge_range` and `verify` can enumerate its tables | M | S3 | S5, S9 |
+| **S7** | **CLI and chain registration.** `--chain` accepts a **name or a number** via a `clap` value parser (try `u64`, else a tiny const table containing `solana → 1399811149`); `CHAIN_ID` keeps working; run `svm::REGISTER_CHAIN_SQL` once after migrations (idempotent — `chains` is a `ReplacingMergeTree` keyed on `chain`); reject EVM-only flags with a message that names the Solana one; add `--sol-rpc` (default the public endpoint, documented as best-effort) | S | — | everything |
+| **S8** | **Metrics.** See the note below — the important part is that lag is reported in **seconds as well as slots** | S | — | everything |
+| **S9** | **`indexer verify` for Solana.** A switch on `chains.family`, then the six checks of 11.4.5 | M | S4 | S5, S6 |
+| **S10** | **Backfill driver.** A **backward** sweep from the head to slot 391,000,000 in cursor-following windows, resumable from `checkpoints`, Arrow, budget-aware through S2, stopping when `next_slot` stops advancing (the documented below-history condition) | M | S1, S2, S4 | — |
+| **S11** | **Lease: verify, do not rewrite.** `src/pipeline/lease.rs` keys `indexer_instances` on `chain` and has no EVM in it; a Solana process with `chain = 1399811149` gets the one-process-per-chain guarantee for free. The job is a test that proves it, not a change | S | — | everything |
+
+**Total ~12.75 days.** Order, with waves that run in parallel:
+
+```
+wave 0  S0  S1  S7  S11        (day 1 - S1 unblocks every measurement)
+wave 1  S2  S3  S4  S8
+wave 2  S5  S6  S9
+wave 3  S10
+then    the phase-1 acceptance test from section 7: 24 h of live slots
+        streamed and resumed, plus a forced purge_range on a synthetic
+        mismatch, with candles correct afterwards
+```
+
+**The one architectural decision, in S3.** Three ways to carry Solana rows
+through the sync loop:
+
+- *(a)* an associated type on `BlockSource` — the "right" abstraction, but it
+  makes `Writer`, `ClickhouseSink`, `ModuleRows` and `DecodeState` generic and
+  costs three or four times the diff for no change in behaviour;
+- *(b)* **an enum `ChainRows { Evm(..), Svm(..) }` on `SourceResponse`,
+  matched once in the writer** — small, explicit, and leaves exactly one sync
+  loop, one lease and one reorg guard;
+- *(c)* a parallel `run_svm_with` — duplicates the crash-tested sync loop,
+  which is the single thing in this codebase you least want two of.
+
+**Take (b).** Section 6.1 already argues that the shared layer is shared and the
+trait boundaries should not be guessed at before the second caller exists; (b)
+is the smallest change that makes the second caller exist, and (a) remains a
+mechanical refactor afterwards if a third family ever appears.
+
+**Metrics (S8), specifically.** Lag must be published **in seconds, not only in
+heights**: a Solana slot is 0.27 s and an Ethereum block is 12 s, so one
+`indexer_block_lag` panel comparing them is meaningless and would be read wrong
+on the first bad day.
+
+| Metric | Source |
+|---|---|
+| `indexer_head_block{chain}` | Solana: `GET /height`, which is **free and unmetered** — or `/height/sse` |
+| `indexer_committed_block{chain}` | the last committed `sol_slots` |
+| `indexer_block_lag{chain}` | head − committed, in slots on Solana |
+| **`indexer_seconds_lag{chain}`** | `now() − block_time` of the last committed slot. **This is the number the owner should look at**, and it is the only one comparable across families |
+| `hypersync_ratelimit_remaining{endpoint}` / `_cost{endpoint}` | straight from the response headers |
+| `hypersync_queries_total{endpoint,purpose}` | `purpose` in `head` / `backfill` / `headers` / `verify` — so 30 queries a minute can be seen being spent |
+| `solana_parent_mismatch_total{chain}` | should be **0 forever**; page on it (11.4.2) |
+| `solana_skipped_slots_total{chain}` | `to_block − from_block − blocks_present`, from the checkpoint. Measured 0 in 10,000 slots today; worth watching because every rows/day figure assumes it |
+
+**What needs no change at all**, and it is worth writing down so nobody
+"abstracts" it: `db/` (client, `format.rs`, `tombstone_sql`, ranges,
+`DerivedTable`), `reorg/purge.rs` (slots substitute for block numbers with no
+code change), the tombstone/epoch/validity machinery, `epoch_floor_v`, the
+migrator, and `lease.rs`. The chain-neutral analytics tables of section 13 are
+already the right shape because decision A was taken.
+
+### 11.6 Cost of ownership at steady state
+
+Row rates are the measured ones (11.2); bytes-per-row use section 5.3's
+assumption of **80 compressed bytes for a swap row** (range 60-120; Solana
+pubkeys are random and ZSTD buys little on them).
+
+| Stream | Rows/day | Compressed/day | Per year |
+|---|---|---|---|
+| `sol_dex_swaps` (52M swaps — section 5.2) | 52M | 4.2 GB | 1.5 TB |
+| `sol_transactions` (210 matched tx/slot measured) | 68M | 3.4 GB | 1.2 TB |
+| `sol_slots`, `sol_tokens` | 0.33M | <0.01 GB | negligible |
+| candles 1m/1h/1d per pool | ~7M | 0.4 GB | 0.16 TB |
+| **subtotal, base tables + candles** | | **~8.0 GB** | **~2.9 TB** |
+| \+ side tables **slim** (`_by_pool` / `_by_trader` / `_by_token` as key + position, ~25 B) | 156M | +3.9 GB | +1.4 TB |
+| \+ side tables **as full row copies** (what the EVM design does today) | 156M | **+12.6 GB** | **+4.6 TB** |
+| **Solana total, slim side tables** | | **~12 GB/day** | **~4.3 TB/yr** |
+| **Solana total, wide side tables** | | **~21 GB/day** | **~7.5 TB/yr** |
+
+**Against the EVM chains.** The only EVM swap rate this project has measured is
+Base: **2.0M swaps/day** (section 5.3, `eth_getLogs` over 6 x 50 blocks).
+Solana at 52M/day is **26x Base**. A realistic EVM portfolio lands somewhere
+between 5M and 20M swaps/day across every chain, so **Solana alone is 2.5x to
+10x all the EVM chains put together**, and it is the only chain where the
+schema decisions below change the hardware bill.
+
+**A single-node ClickHouse over 12 months.**
+
+| | Slim side tables | Wide side tables |
+|---|---|---|
+| Solana live data after 12 months | 4.3 TB | 7.5 TB |
+| \+ EVM (5-20M swaps/day) | 0.4-1.7 TB | 0.7-3.0 TB |
+| **live compressed total** | **4.7-6.0 TB** | **8.2-10.5 TB** |
+| largest monthly partition (Solana base) | ~360 GB | ~630 GB |
+| merge headroom (a merge needs the partition's size free again) | ~700 GB | ~1.3 TB |
+| **recommended disk for year 1** | **8 TB NVMe** | **16 TB NVMe** |
+
+- **RAM: 64 GB minimum, 128 GB comfortable.** `do_not_merge_across_partitions_
+  select_final = 1` keeps a `FINAL` read inside one month, so the working set is
+  per-partition rather than per-table; the mark cache and the candle aggregate
+  states are what want the rest.
+- **CPU: sized by the backfill, not the head.** Steady state is 9,400 source
+  rows/s to decode, which is nothing; a Starter-tier backfill is **146,000
+  rows/s**, which is the real number. 16 cores minimum.
+- **Write rate is not the problem.** 52M swaps/day is 600 rows/s into
+  `dex_swaps`. What matters is the *flush cadence*: every flush is a synchronous
+  ClickHouse part and 50+ chains share the server, so `tip_interval` should be
+  seconds, not milliseconds.
+- **Network:** 15 Mbit/s at the head, ~220 Mbit/s for the fortnight of the
+  backfill (11.3).
+
+#### The three levers that actually matter
+
+**1. Keep raw swaps for N months; keep candles forever.** This is the biggest
+lever and it is a product decision, not an engineering one. A
+`TTL timestamp + INTERVAL 6 MONTH` on `sol_dex_swaps` / `dex_swaps` /
+`sol_transactions`, with the 1m/1h/1d candle tables and `launchpad_*` keeping
+everything, turns a linear 4.3 TB/year into a **steady state around 2.2 TB**.
+Nothing on a chart is lost; what goes away is "show me every individual fill of
+this pool last March". Two conditions before committing: set
+`ttl_only_drop_parts = 1` so a TTL drops whole parts instead of rewriting them,
+and confirm that a part-drop cannot race the tombstone/epoch logic the way
+design.md section 2 forbids `ALTER DELETE` from doing. **A TTL is a merge-time
+part drop, not a `DELETE`, so it is compatible in principle — verify it before
+depending on it.**
+
+**2. Side tables must be slim or projections, never full row copies.** Three
+wide copies of `dex_swaps` cost **12.6 GB/day — three times the base table** and
+more than everything else in the budget put together. Store the lookup key plus
+`(chain, block_number, tx_index, ordinal)` and join back, or use a ClickHouse
+`PROJECTION`. At EVM row rates the wide form was affordable and nobody noticed;
+at Solana rates it is the single largest line.
+
+**3. Only write `sol_transactions` for transactions that contain a venue
+instruction.** The SPL/Token-2022 transfer selections match transfers
+chain-wide, so the matched-transaction set is the measured **210/slot** where
+the venue programs alone are ~168/slot (section 5.2) — a 25% inflation whose
+extra rows contain no venue instruction and therefore no analytic value. The
+transfer rows are still needed **in flight** for the movement layer; they simply
+should not land on disk. It saves ~0.7 GB/day, and more importantly it keeps
+`count()` over `sol_transactions` meaning *"transactions that touched a venue"*
+rather than *"transactions that moved a token"* — which is exactly the
+partial-table-presented-as-complete trap section 5.5 and `src/svm/README.md`
+both warn about.
+
+### Appendix E. Every request made for section 11
+
+14 HTTP requests, 2026-09-19 07:05:39 - 07:09:37 UTC, plus 3 free `/height` +
+public-RPC lag samples at 07:10:03 - 07:10:13 UTC (tabulated in 11.2). The
+`ENVIO_API_TOKEN` was read from the git-ignored `.env` into a shell variable
+inside each command; it is not printed, stored or reproduced anywhere in this
+document, in the scratch files, or in the repository.
+
+| # | Time (UTC) | Endpoint | Request | `cost` | `limit` | `remaining` | `reset` | Result |
+|---|---|---|---|---|---|---|---|---|
+| p01 | 07:05:39 | `solana.hypersync.xyz` | GET /height, **no token** | **(absent)** | **(absent)** | **(absent)** | **(absent)** | `448334753` |
+| p02 | 07:05:39 | `solana.hypersync.xyz` | GET /height, with token | **(absent)** | **(absent)** | **(absent)** | **(absent)** | `448334747` |
+| p03 | 07:05:40 | `1.hypersync.xyz` | GET /height, with token | **(absent)** | **(absent)** | **(absent)** | **(absent)** | `{"height":26009954}` |
+| p04 | 07:05:59 | `solana.hypersync.xyz` | POST /query - 1 slot, `block` field selection only, no `max_num_*` | `1000` | `30000, 30000;w=60` | `29000` | `1` | 1 slot, 1.27 MB |
+| p05 | 07:07:21 | `solana.hypersync.xyz` | POST /query - **the production query as merged**: 20 venues + SPL/T22/System transfer union + `account_activity:[{}]`, 10,000-slot range, only `max_num_instructions: 200000` | `1000` | `30000, 30000;w=60` | `29000` | `39` | **1 slot**, 1.25 MB, 1.8 s |
+| p06 | 07:07:22 | `solana.hypersync.xyz` | POST /query - featherweight: 1 slot, a filter that matches nothing, one field | `1000` | `30000, 30000;w=60` | `28000` | `38` | 0 rows, 378 B |
+| p07 | 07:07:23 | `solana.hypersync.xyz` | POST /query - 100,000-slot header sweep, `max_num_blocks: 100000` | `1000` | `30000, 30000;w=60` | `27000` | `37` | 1 slot, 2.81 MB |
+| p08 | 07:08:08 | `solana.hypersync.xyz` | POST /query - **the production query with every `max_num_*` raised to 10^6**, 10,000-slot range | `1000` | `30000, 30000;w=60` | `29000` | `52` | **40 slots**, 46.18 MB, 7.8 s; 8,848 tx / 44,212 instr / 57,791 activity |
+| p11 | 07:08:26 | `solana.hypersync.xyz` | POST /query - headers only (instruction + activity selections that match nothing), 10,000-slot range | `1000` | `30000, 30000;w=60` | `28000` | `44` | **10,000 slots** of headers, 3.59 MB, 12.1 s; 0 skipped slots, 0 height breaks, 0 parent breaks |
+| p09 | 07:08:28 | `solana.hypersync.xyz` | POST /query - header sweep with `max_num_account_activity: 0` (bad probe: `next_slot` did not advance) | `1000` | `30000, 30000;w=60` | `27000` | `32` | `next_slot` did not advance; 378 B |
+| p12 | 07:09:21 | `solana.hypersync.xyz` | POST **/query/arrow** - byte-for-byte the same query as p08 | `1000` | `30000, 30000;w=60` | `29000` | `39` | 40 slots, **19.94 MB Arrow** (43% of p08's JSON) |
+| p13 | 07:09:27 | `1.hypersync.xyz` | POST /query - EVM, 1 block, 2 fields | `1000` | `30000, 30000;w=60` | `29000` | `33` | 1 block, 214 B |
+| p14 | 07:09:27 | `1.hypersync.xyz` | POST /query - EVM, 10,000 blocks, all logs + all transactions, caps raised | `1000` | `30000, 30000;w=60` | `28000` | `33` | 66 blocks, 40.06 MB, 90,742 rows |
+| p15 | 07:09:32 | `solana.hypersync.xyz` | POST /query - the p08 query at a different slot range (448,320,000) | `1000` | `30000, 30000;w=60` | `28000` | `28` | **30 slots**, 26.85 MB, 5.7 s; 5,851 tx / 26,588 instr / 32,263 activity |
+
+Reading the table:
+
+- **`cost` is 1000 on all 11 metered requests**, from a 378-byte response to a
+  46 MB one, on both the Solana and the EVM endpoint, on `/query` and on
+  `/query/arrow`. It is flat.
+- **`/height` carries no rate-limit headers at all**, with or without a token.
+  It is free.
+- **`remaining` decrements by exactly 1000** within a window (p04→p07:
+  29000 → 28000 → 27000; p12→p15 on Solana: 29000 → 28000; p13→p14 on EVM:
+  29000 → 28000) and returns to 30000 when `reset` elapses.
+- **`w=60`** in `x-ratelimit-limit` is the window length in seconds, confirmed
+  by `reset` counting 39 → 38 → 37 across three back-to-back requests.
+- **The two endpoints have independent counters.** p12 left Solana at 29000;
+  one second later p13 on the EVM endpoint reported its own 29000 with a
+  different `reset` offset (33 vs 39). Two data points, so treat "per chain
+  endpoint" as likely rather than proven.
+- **p05 against p08 is the bug**: the same query, the same slot range, the only
+  difference being which `max_num_*` caps are set. 1 slot versus 40.
+- **p08 against p15** shows that with all caps raised the stop is the server's
+  own execution budget: 40 slots / 46 MB / 7.8 s in one place, 30 slots /
+  27 MB / 5.7 s in another.
+
+### Appendix F. Sources retrieved for section 11
+
+| What | URL | Retrieved (UTC) |
+|---|---|---|
+| Rate-limit header contract, `concurrency`, the EVM/Solana 429 asymmetry | `docs.envio.dev/docs/HyperSync/stream-config-tuning` | 2026-09-19 |
+| API tokens, the "Credits" notion, the token requirement | `docs.envio.dev/docs/HyperSync/api-tokens` | 2026-09-19 |
+| **Paid tiers and prices** (Free / Starter $70 / Pro $480 / Custom) | `envio.dev/pricing/hypersync` | 2026-09-19 |
+| Solana history depth (slot 403,000,000 documented), `/height` open, Beta status | `docs.envio.dev/docs/HyperSync/solana` | 2026-09-19 |
+| `max_num_*` caps, pagination to head, `rollback_guard` rules | `docs.envio.dev/docs/HyperSync/solana-query` | 2026-09-19 |
+| `StreamConfig` defaults (`response_bytes_ceiling` 500,000 etc.) | `docs.envio.dev/docs/HyperSync/solana-client` | 2026-09-19 |
+| `/height` and `/height/sse` need no token | `docs.envio.dev/docs/HyperSync/solana-curl-examples` | 2026-09-19 |
+| EVM "5-second query execution limit" | `docs.envio.dev/docs/HyperSync/hypersync-query`, `/hypersync-usage` | 2026-09-19 |
+| Old Faithful: what it is, CAR format, free archive, Amsterdam hosting, "RFC stage" | `github.com/rpcpool/yellowstone-faithful`, `docs.old-faithful.net` | 2026-09-19 |
+| **CAR size per epoch** (586 GB / 604 / 715 / 1215 / 1059 / 917 GB for epochs 966-1036) | `raw.githubusercontent.com/rpcpool/yellowstone-faithful/gha-report/docs/CAR-REPORT.md` | 2026-09-19 |
+| Jetstreamer: 2.7M TPS on 64 cores / 30 Gbps+, epoch and slot ranges, ClickHouse sink, no wire-level filter, Clang 16 | `github.com/anza-xyz/jetstreamer`, `docs.rs/jetstreamer/0.7.0` | 2026-09-19 |
+| Triton's *hosted* archive RPC pricing ($10 per million queries) - not the bulk path | `docs.triton.one/chains/solana/old-faithful-historical-archive-1` | 2026-09-19 |
+| Live probes (appendix E) | `solana.hypersync.xyz/query`, `/query/arrow`, `/height`; `1.hypersync.xyz/query`, `/height` | 2026-09-19 07:05-07:10 |
+| Head-lag comparison | `api.mainnet-beta.solana.com` `getSlot` at `processed` and `finalized` | 2026-09-19 07:10 |
+
+Not found, and stated as not found rather than guessed: Envio's free-tier rpm
+(published only as "fair-use"), the rate-limit **window length** (nowhere in the
+docs - the `w=60` in the header is the only source), the `cost` formula, the
+`max_num_*` default values, Envio's Solana **commitment level**, the total size
+of the Old Faithful archive, and any published Jetstreamer epochs/hour or MB/s
+figure.
+
+### Appendix G. What section 11 supersedes
+
+| Where | What it says | Replace with |
+|---|---|---|
+| §4.6, §8 table, §9 bullet 3, appendix C item 2 | "every probe `x-ratelimit-cost: 0`", "no separate plan appears to be needed" | cost is a flat **1000**, budget **30,000 per 60 s** = **30 queries/min**, free (§11.1) |
+| §4.6 | "107 slots, 33,886 instruction rows, 5.99 MB in 2.7 s" | true for an instruction-only query; **the production query returns 30-40 slots with all caps raised and 1 slot with only `max_num_instructions` set** (§11.1.1) |
+| §5.4 | "~20 GB/day of JSON at head", "~3.5 TB over the wire" for the backfill | **375 GB/day JSON / 162 GB/day Arrow** at head; **66 TB JSON / 28.6 TB Arrow** for the backfill (§11.2, §11.3) |
+| §7.1 | pricing is "blocking on Envio" | answered by measurement; the remaining blocker is the **commitment level** (§11.4.1) |
+| §8 | Old Faithful "total size not published (100s of GB per epoch)" | **586-1,215 GB per epoch measured** in their own report; our 8.5 months = **133 epochs ≈ 113 TB** (§11.3.1) |
+| §6.3 "Commitment vs our reorg detection" | "Set `--confirmations 0` and rely on the guard + parent-hash chain, same as EVM" | same, **plus drop the fork-point search** and add the `block_height` witness (§11.4) |

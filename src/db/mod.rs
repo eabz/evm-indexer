@@ -382,6 +382,21 @@ impl Database {
         Ok(database)
     }
 
+    /// A handle that was never connected, for the unit tests of the code
+    /// that only BUILDS statements (the purge's table lists and
+    /// predicates). Every query on it fails.
+    #[cfg(test)]
+    pub(crate) fn offline(chain_id: u64) -> Self {
+        let db = Client::default().with_url("http://127.0.0.1:1");
+        Self {
+            chain_id,
+            small: db.clone(),
+            db,
+            metrics: Metrics::disabled(),
+            epoch: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
     /// Same database, reporting rows / retries to `metrics`.
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = metrics;

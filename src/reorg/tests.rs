@@ -12,8 +12,8 @@ use super::{
         FakeChain, FakeStore, FlushFault, Node, NodeOptions, PassOutcome,
         Rng, Row,
     },
-    BlockHeader, CanonicalChain, PurgeReason, PurgeStep, ReorgConfig,
-    ReorgError, ReorgStore, StreamGuard, Verdict,
+    BlockHeader, CanonicalChain, PurgeOptions, PurgeReason, PurgeStep,
+    Purger, ReorgConfig, ReorgError, ReorgStore, StreamGuard, Verdict,
 };
 use alloy::primitives::B256;
 use futures::{future::BoxFuture, FutureExt};
@@ -390,9 +390,16 @@ async fn purge_steps_run_in_the_documented_order() {
             PurgeStep::MinTimestamp,
             PurgeStep::InsertReorg,
             PurgeStep::RebuildDerived,
-            // The commit marker is the last write.
+            // The commit marker is the last write of the base tables.
             PurgeStep::TombstoneBlocks,
             PurgeStep::Verify,
+            // After it, so the mirror of `blocks` is covered too. Writes
+            // nothing when the materialized views did their job.
+            PurgeStep::TombstoneSideTables,
+            PurgeStep::Verify,
+            // Everything is durable: the `reorgs` row is written again,
+            // completed. Its absence is what marks a purge that died.
+            PurgeStep::InsertReorg,
         ]
     );
     // The writer was quiesced before the search AND before the purge.
@@ -781,6 +788,205 @@ async fn a_guard_purge_that_reads_nothing_is_not_reported_as_done() {
     assert!(node.data().reorgs.is_empty());
 }
 
+// ------------------------------------------------- the chain got shorter
+
+/// A rollback whose new fork is SHORTER than what was stored leaves
+/// tombstoned children above the new head, at block numbers the chain does
+/// not have any more. Nothing will ever stream them again, so they stay -
+/// and they look exactly like the debris of a gap heal that died half way.
+///
+/// The first pass after every start therefore purged that tail again:
+/// a new epoch and a rebuild of every aggregate from the day of those rows
+/// to now, on EVERY restart, until the chain outgrew the old head.
+#[tokio::test]
+async fn a_restart_after_a_rollback_that_shortened_the_chain_does_nothing()
+{
+    let mut node = indexed(60, NodeOptions::new(CHAIN)).await;
+
+    // Blocks 50..59 are replaced by five different ones: the chain is
+    // five blocks SHORTER than what is stored.
+    node.chain.reorg(10, 5);
+    let head = node.chain.block(54).unwrap().header;
+    node.guard
+        .repair(&super::Rollback {
+            fork_point: 50,
+            purge_to: None,
+            depth: 10,
+            mismatch_height: 59,
+            old_head: 59,
+            old_hash: B256::ZERO,
+            new_hash: head.hash,
+        })
+        .await
+        .unwrap();
+
+    node.restart();
+    node.settle(false).await.unwrap();
+    assert_clean(&node, "after the rollback");
+
+    // Blocks 55..59 hold tombstoned children and no block at all.
+    let data = node.data();
+    assert_eq!(data.live_blocks().keys().max(), Some(&54));
+    assert!(data.children.iter().any(|table| table
+        .keys()
+        .any(|(number, _)| (55..60).contains(number))));
+
+    let purges = data.reorgs.len();
+    let epoch = node.writer.epoch();
+
+    for restart in 1..=3 {
+        node.restart();
+        node.settle(false).await.unwrap();
+
+        assert_eq!(
+            node.data().reorgs.len(),
+            purges,
+            "restart {restart} purged the tail again"
+        );
+        assert_eq!(node.writer.epoch(), epoch, "restart {restart}");
+        assert_clean(&node, "after a restart");
+    }
+
+    // And when the chain finally outgrows the old head, those blocks are
+    // indexed like any other.
+    node.chain.extend(10);
+    node.settle(false).await.unwrap();
+    assert_clean(&node, "after the chain outgrew the old head");
+}
+
+// --------------------------------------------------- side table orphans
+
+/// A side table is written ONLY by the materialized view of its base
+/// table. If the base part lands and the push into one of its views does
+/// not (a failure between the parts, a process killed mid insert), the
+/// base row is dead and the mirror row stays alive FOR EVER: nothing else
+/// ever rewrites it, and every reader of that access path keeps seeing a
+/// transaction / swap of an abandoned fork.
+///
+/// So the purge verifies the side tables after the base tables and repairs
+/// them by tombstoning them directly.
+#[tokio::test]
+async fn a_lost_materialized_view_push_is_repaired_by_the_purge() {
+    let mut node = indexed(60, NodeOptions::new(CHAIN)).await;
+
+    // Every tombstone statement of the coming purge lands in its base
+    // table without reaching the mirrors.
+    node.store.lose_side_push(20);
+    node.chain.reorg(5, 6);
+
+    node.settle(false).await.unwrap();
+
+    // The base tables alone would look perfect.
+    let data = node.data();
+    let clean = super::model::clean_index(&node.chain, 0, node.target());
+    assert_eq!(data.live_blocks(), clean.live_blocks());
+
+    // And the mirrors are clean too, because the purge repaired them.
+    assert_clean(&node, "after a lost view push");
+}
+
+/// NEGATIVE CONTROL: a purge that trusts its materialized views (what this
+/// one did before the repair step existed) leaves the orphans behind, and
+/// no later pass ever notices.
+#[tokio::test]
+async fn trusting_the_views_leaves_permanent_orphans() {
+    let chain = FakeChain::new(CHAIN + 7, 20_000);
+    chain.extend(59);
+    let mut node = Node::new(
+        NodeOptions::new(CHAIN),
+        chain,
+        FakeStore::with_trusted_views(),
+    );
+    node.settle(false).await.unwrap();
+    assert_clean(&node, "initial index");
+
+    node.store.lose_side_push(20);
+    node.chain.reorg(5, 6);
+    node.settle(false).await.unwrap();
+
+    let problem = check_clean(&node)
+        .expect_err("the orphaned mirror rows must be visible");
+    assert!(problem.contains("side table"), "{problem}");
+
+    // Running for ever does not help: nothing rewrites a mirror row.
+    node.settle(false).await.unwrap();
+    assert!(check_clean(&node).is_err());
+}
+
+/// The repair is part of the purge, so a crash inside it is healed like
+/// any other step: the range is purged again and converges.
+#[tokio::test]
+async fn a_crash_inside_the_side_table_repair_converges() {
+    for partial in [false, true] {
+        let mut node = indexed(60, NodeOptions::new(CHAIN)).await;
+
+        node.store.lose_side_push(20);
+        node.store.fail_at(CHAIN, PurgeStep::TombstoneSideTables, partial);
+        node.chain.reorg(4, 5);
+
+        node.settle(true).await.unwrap();
+
+        assert!(
+            !node.store.fault_pending(CHAIN),
+            "partial = {partial}: the fault never fired"
+        );
+        assert_clean(&node, &format!("partial = {partial}"));
+    }
+}
+
+/// A module scoped purge (`indexer backfill --module ...`) repairs the
+/// module's OWN read path and touches nobody else's.
+#[tokio::test]
+async fn a_module_purge_repairs_only_its_own_side_tables() {
+    let node = indexed(40, NodeOptions::new(CHAIN)).await;
+    node.store.lose_side_push(20);
+
+    let store = Arc::new(ModuleStore {
+        inner: node.store.clone(),
+        rebuild_like_a_rollback: false,
+    });
+    let purger = Purger::new(
+        store,
+        node.writer.clone(),
+        node.recorder.clone(),
+        node.recorder.clone(),
+    )
+    .with_options(PurgeOptions {
+        tombstone_attempts: 4,
+        retry_delay: Duration::ZERO,
+    });
+
+    let report = purger
+        .purge_range(CHAIN, 10, Some(20), PurgeReason::Redecode)
+        .await
+        .unwrap();
+
+    let data = node.data();
+    let in_range = |(number, _): &&(u64, u32)| (10..20).contains(number);
+
+    // The module's own mirror follows its (tombstoned) base rows ...
+    assert!(report.children_tombstoned > 0);
+    assert_eq!(
+        data.live_side_children(1).keys().filter(in_range).count(),
+        0
+    );
+    // ... and the other module's mirror is untouched, because its base
+    // rows are untouched.
+    assert_eq!(
+        data.live_side_children(0).keys().filter(in_range).count(),
+        data.live_children(0).keys().filter(in_range).count()
+    );
+    assert!(data.live_children(0).keys().any(|key| in_range(&key)));
+
+    // `blocks` and its mirror are never touched by a module purge.
+    assert_eq!(data.live_side_blocks(), data.live_blocks());
+
+    // Outside the purged range the module's mirror still matches its base
+    // table exactly: the repair is scoped to the range, like everything
+    // else in a purge.
+    assert_eq!(data.live_side_children(1), data.live_children(1));
+}
+
 // ---------------------------------------------------------- re-decoding
 
 /// A [`ReorgStore`] scoped to one module (child table 1), the way the
@@ -849,6 +1055,35 @@ impl ReorgStore for ModuleStore {
                 .count() as u64)
         }
         .boxed()
+    }
+
+    /// The module's own side tables. `FakeStore` mirrors child table 1
+    /// in `side_children[1]`, which is exactly the module's read path.
+    fn live_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        async move {
+            let data = self.inner.snapshot(chain);
+            Ok(data
+                .live_side_children(1)
+                .keys()
+                .filter(|(n, _)| *n >= from && to.is_none_or(|to| *n < to))
+                .count() as u64)
+        }
+        .boxed()
+    }
+
+    fn tombstone_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        self.inner.tombstone_side_rows_of(chain, from, to, version, &[1])
     }
 
     fn live_blocks(

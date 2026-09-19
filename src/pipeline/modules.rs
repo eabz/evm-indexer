@@ -395,7 +395,8 @@ pub async fn known_registries(
     #[serde_with::serde_as]
     #[derive(clickhouse::Row, serde::Deserialize)]
     struct RegistryRow {
-        #[serde_as(as = "crate::utils::format::SerAddress")]
+        // `prediction_*.registry` is FixedString(32) (design section 13).
+        #[serde_as(as = "crate::utils::format::SerId32")]
         registry: Address,
     }
 
@@ -517,6 +518,10 @@ pub struct ModuleSpec {
     /// Block scoped tables the indexer writes, in insert order (which is
     /// also the order a purge tombstones them in, before `blocks`).
     pub base_tables: &'static [&'static str],
+    /// Read-path tables fed by materialized views of `base_tables`. Never
+    /// written directly; a purge only tombstones them directly to REPAIR a
+    /// view push that was lost (`pipeline::store`).
+    pub side_tables: &'static [&'static str],
     pub derived: &'static [DerivedTable],
     /// Column holding the block number of a base table.
     pub block_column: fn(&str) -> &'static str,
@@ -570,6 +575,21 @@ fn dex_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
     )
 }
 
+/// Predictions: one statement per month, bounded by `to_ts`. Its own
+/// renderer (the module aligns `from_ts` to each table's bucket) and, like
+/// the DEX one, no purge-range exclusion: every aggregate reads a child
+/// table, which the purge tombstones before it rebuilds.
+fn predictions_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
+    predictions::derived::rebuild_statements(
+        table,
+        r.chain,
+        r.from_ts,
+        r.to_ts,
+        r.epoch,
+        (r.purged_from, r.purged_to),
+    )
+}
+
 fn no_filter(_table: &str) -> Option<&'static str> {
     None
 }
@@ -587,6 +607,7 @@ fn dex_tombstone_sql(
 pub const DEX: ModuleSpec = ModuleSpec {
     name: "dex",
     base_tables: dex::BASE_TABLES,
+    side_tables: dex::SIDE_TABLES,
     derived: dex::DEX_DERIVED,
     block_column: dex::block_column,
     purge_filter: dex::purge_filter,
@@ -597,19 +618,20 @@ pub const DEX: ModuleSpec = ModuleSpec {
 pub const PREDICTIONS: ModuleSpec = ModuleSpec {
     name: "predictions",
     base_tables: predictions::BASE_TABLES,
+    side_tables: predictions::SIDE_TABLES,
     derived: predictions::PREDICTIONS_DERIVED,
     block_column: predictions::block_column,
     purge_filter: no_filter,
     // Plain `block_number` tables: the generic statement built from the
     // embedded migration DDL.
     tombstone_sql: db::tombstone_sql,
-    // Sliced by month as soon as its SQL carries `{to_ts}`.
-    rebuild_statements: plain_rebuild,
+    rebuild_statements: predictions_rebuild,
 };
 
 pub const LAUNCHPADS: ModuleSpec = ModuleSpec {
     name: "launchpads",
     base_tables: launchpads::BASE_TABLES,
+    side_tables: launchpads::SIDE_TABLES,
     derived: launchpads::LAUNCHPADS_DERIVED,
     block_column: launchpads::block_column,
     purge_filter: no_filter,

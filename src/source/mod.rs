@@ -3,6 +3,11 @@
 //! One generic query (every block, transaction and log) streamed over a bounded block range. No chain specific logic:
 //! the endpoint is derived from the chain id unless a url is given.
 
+/// Envio Solana HyperSync (docs/design.md section 14). A separate client
+/// crate with its own query language, so it shares no code with the EVM
+/// source in this file; the seam is the same head / headers / stream.
+pub mod solana;
+
 use crate::{
     db::ranges::BlockRange,
     pipeline::{transform::ResponseRows, BlockSource, SourceResponse},

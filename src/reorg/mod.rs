@@ -167,8 +167,7 @@ pub struct ReorgRecord {
     pub from_ts: u32,
     /// First purged block.
     pub fork_block: u64,
-    /// Exclusive end of the purged range, `None` = open ended. Not a
-    /// column today; kept for logs.
+    /// Exclusive end of the purged range, `None` = open ended.
     pub to_block: Option<u64>,
     pub old_head: u64,
     pub old_hash: B256,
@@ -179,6 +178,21 @@ pub struct ReorgRecord {
     pub rows_tombstoned: u64,
     /// `reorg` | `gap_heal` | `redecode`
     pub reason: &'static str,
+    /// `_version` this purge stamps on every tombstone it writes.
+    ///
+    /// With [`Self::completed`] it says which tombstones are settled: one
+    /// written by a purge that FINISHED is debris, one with a HIGHER
+    /// version was written by a purge that died half way and whose rows
+    /// the aggregates still count.
+    pub version: u64,
+    /// False while the purge is running (the row ARMS the validity rule
+    /// before the bucket repair), true once every step finished.
+    ///
+    /// This is what tells the debris of a finished purge - tombstoned rows
+    /// at block numbers a chain that got SHORTER does not have any more,
+    /// which nothing will ever stream again - from the leftovers of a
+    /// purge that died half way, which have to be purged again.
+    pub completed: bool,
 }
 
 /// What is stored, plus the insert-only steps of a purge. One method = one
@@ -211,11 +225,19 @@ pub trait ReorgStore: Send + Sync {
         to: u64,
     ) -> BoxFuture<'_, anyhow::Result<Vec<(u64, B256)>>>;
 
-    /// True when any child table holds a row, LIVE OR TOMBSTONED (no
-    /// `FINAL`), at a block number in the range that has no live `blocks`
-    /// row. Tombstoned rows count on purpose: they are the only trace a
-    /// gap-heal purge that died half way leaves behind (see README,
-    /// "What is guaranteed after a crash").
+    /// True when any child table holds a row at a block number in the
+    /// range that has no live `blocks` row, and that row is not already
+    /// accounted for:
+    ///
+    /// * a LIVE row always counts (a flush that died before its `blocks`
+    ///   insert; its contributions are in the aggregates);
+    /// * a TOMBSTONED row counts too - it is the only trace a gap-heal
+    ///   purge that died half way leaves behind (see README, "What is
+    ///   guaranteed after a crash") - UNLESS its `_version` is one a
+    ///   COMPLETED purge of that block wrote. Then it is the debris of a
+    ///   purge that finished, and re-purging it would bump the epoch and
+    ///   rebuild every aggregate on every single restart for as long as
+    ///   the chain stays shorter than the old head.
     fn has_orphan_children(
         &self,
         chain: u64,
@@ -251,6 +273,34 @@ pub trait ReorgStore: Send + Sync {
         to: Option<u64>,
     ) -> BoxFuture<'_, anyhow::Result<u64>>;
 
+    /// LIVE rows (`FINAL`) of the READ-PATH SIDE TABLES of the scope in
+    /// the range, after the base tables were tombstoned: what a lost
+    /// materialized-view push left behind.
+    ///
+    /// A side row is written only by the view of its base row, so once the
+    /// base row is dead nothing ever rewrites the side row: without this
+    /// check an orphan there is permanent (a `tx_lookup` entry pointing at
+    /// a block that was rolled back, a `dex_swaps_by_pool` row of a swap
+    /// that never happened).
+    fn live_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+    ) -> BoxFuture<'_, anyhow::Result<u64>>;
+
+    /// Tombstones those rows DIRECTLY, with the same statement shape the
+    /// base tables use. Only ever a REPAIR: in the normal case the views
+    /// already did it and this writes nothing. Returns the rows
+    /// tombstoned.
+    fn tombstone_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+    ) -> BoxFuture<'_, anyhow::Result<u64>>;
+
     /// LIVE checkpoints overlapping the range.
     fn live_checkpoints(
         &self,
@@ -282,7 +332,13 @@ pub trait ReorgStore: Send + Sync {
         version: u64,
     ) -> BoxFuture<'_, anyhow::Result<u64>>;
 
-    /// Appends the audit row that also arms the validity rule.
+    /// Appends the audit row that also arms the validity rule. Called
+    /// TWICE per purge: first with `completed = false` (before the bucket
+    /// repair), then, once every step is durable, with `completed = true`.
+    /// The two rows are NOT collapsed into one: an epoch can be reused by
+    /// a purge that ran while the `reorgs` row of the previous one was not
+    /// readable yet, and replacing by `(chain, epoch)` would then lose a
+    /// purge's `from_ts`.
     fn insert_reorg<'a>(
         &'a self,
         record: &'a ReorgRecord,

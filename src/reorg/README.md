@@ -78,7 +78,9 @@ The order of a rollback:
    (never too much).
 5. Recompute the totals of the affected days from what is left.
 6. Cross out the **blocks** of the range. Last, on purpose (next section).
-7. Forget cached token / pool discoveries from the range, update metrics.
+7. Check the **read-path copies** and repair them if needed (next section).
+8. Write the `reorgs` line again, marked *finished*.
+9. Forget cached token / pool discoveries from the range, update metrics.
 
 Then streaming resumes at the fork point.
 
@@ -106,6 +108,26 @@ same totals. Nothing has to be remembered between runs to get there:
   are already crossed out still count as evidence: they are the only trace
   of a heal that died half way.
 * A checkpoint never claims a block that is not stored, at any moment.
+* **A chain that got shorter.** A rollback can leave crossed-out rows at
+  block numbers the chain does not have any more; nothing will ever
+  download them again, and they look exactly like the leftovers of a heal
+  that died. So every rollback records, in the same line, the row version
+  it stamped on everything it crossed out, and marks that line *finished*
+  once every step is done. Crossed-out rows of a *finished* rollback are
+  left alone; anything newer than that is a rollback that died and is done
+  again. Without this the indexer redid the whole rollback on every single
+  start - a new generation and a recount of every total from that day on -
+  until the chain grew past its old end.
+* **Read-path copies.** Some tables are copies of others, kept for a
+  different lookup (a transaction by hash, the swaps of one pool). The
+  database maintains them itself: crossing out the original normally
+  crosses out the copy for free. *Normally*: if the original lands and the
+  copy is not written (the process dies between the two, the database
+  drops the follow-up write), the original is gone and the copy stays -
+  and nothing in the system ever writes that copy again, so it would be
+  wrong for ever. So step 7 counts what is still alive in every copy of
+  the range and, if anything is, crosses it out directly. It writes
+  nothing in the normal case.
 
 This is tested by stopping the rollback at every single step (not done at
 all, and done half way), restarting or retrying, and comparing the result
@@ -127,6 +149,10 @@ Chain 1: healed gap [18999000, 18999250) left by an interrupted write: 9120 rows
 ```
 
 The `reorgs` table, one line per rollback / heal, never deleted:
+
+(`reorgs` holds two lines per rollback: one when it starts and one when it
+finishes, so `WHERE completed = 1` is the list of rollbacks that really
+went through, and a line without a partner is one that died.)
 
 ```sql
 SELECT detected_at, reason, fork_block, old_head, depth, rows_tombstoned, epoch

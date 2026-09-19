@@ -2,8 +2,27 @@
 -- aggregates (docs/design.md, sections 2 and 3). Everything is insert only:
 -- the indexer never issues DELETE, ALTER ... DELETE or DROP PARTITION.
 
--- One row per purge (rollback or gap heal). Append only: audit trail,
--- metric source, and the input of the validity rule.
+-- One row per purge (rollback, gap heal or module re-decode). Insert only,
+-- like everything else: audit trail, metric source, and the input of the
+-- validity rule.
+--
+-- Two rows per purge: one when it ARMS the validity rule (completed = 0,
+-- before the bucket repair, so readers under-count rather than double
+-- count) and one when it has FINISHED (completed = 1, everything durable).
+-- They are not collapsed into one row on purpose - an epoch can be reused
+-- by a purge that started while the `reorgs` row of the previous one was
+-- not readable yet (ClickHouse gives no read-your-writes), and replacing by
+-- (chain, epoch) would then lose a purge's `from_ts` and let the
+-- contributions it hid come back. A purge with no completed row is one that
+-- died: `SELECT ... FROM reorgs WHERE completed = 1` is the audit trail of
+-- what really happened.
+--
+-- `completed` + `tombstone_version` are not cosmetic: they are how the next
+-- start tells the debris of a FINISHED purge - tombstoned rows at block
+-- numbers a shorter chain does not have any more, which nothing will ever
+-- stream again - from the leftovers of a purge that died half way, which
+-- must be run again. Without them every restart purged that tail once more
+-- (a new epoch and a rebuild of every aggregate from that day to now).
 CREATE TABLE IF NOT EXISTS reorgs (
   chain UInt64,
   -- The purge generation this purge started. Rows written afterwards
@@ -13,8 +32,10 @@ CREATE TABLE IF NOT EXISTS reorgs (
   -- UTC): buckets from here on only count contributions of epoch >= epoch.
   from_ts DateTime('UTC'),
   detected_at DateTime('UTC') DEFAULT now(),
-  -- First purged block.
+  -- The purged block range [fork_block, to_block); to_block = max UInt64
+  -- means open ended (a rollback at the tip).
   fork_block UInt64,
+  to_block UInt64 DEFAULT 18446744073709551615,
   -- Highest stored block when the purge started.
   old_head UInt64,
   -- Stored / canonical hash at the height the mismatch was detected
@@ -23,8 +44,16 @@ CREATE TABLE IF NOT EXISTS reorgs (
   new_hash FixedString(32),
   depth UInt64,
   rows_tombstoned UInt64,
-  -- 'reorg' | 'gap_heal'
-  reason LowCardinality(String)
+  -- 'reorg' | 'gap_heal' | 'redecode'
+  reason LowCardinality(String),
+  -- `_version` this purge stamped on every tombstone it wrote. Together
+  -- with `completed` it says which tombstones are settled: one written by
+  -- a purge that FINISHED needs no further attention, one with a higher
+  -- version was written by a purge that died and has to be run again
+  -- (its rows are still counted by the aggregates).
+  tombstone_version UInt64 DEFAULT 0,
+  -- 1 once every step of this purge finished, the bucket repair included.
+  completed UInt8 DEFAULT 0
 )
 ENGINE = MergeTree
 ORDER BY (chain, epoch);

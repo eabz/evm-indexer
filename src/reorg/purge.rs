@@ -18,7 +18,17 @@
 //!                                the writer adopts the epoch right away
 //!  5 rebuild every aggregate     from from_ts on, under the new epoch
 //!  6 tombstone `blocks`          LAST durable write = the commit marker
-//!  7 evict caches, metrics
+//!  7 repair the side tables       normally a no-op: their views already
+//!                                 tombstoned them. A view push that was
+//!                                 LOST (the base part landed, the push
+//!                                 did not) is the one case nothing else
+//!                                 can ever fix, so it is verified and
+//!                                 repaired directly.
+//!  8 mark the `reorgs` row completed
+//!                                everything is durable; the next start
+//!                                must not mistake the debris of THIS
+//!                                purge for an unfinished one
+//!  9 evict caches, metrics
 //! ```
 //!
 //! Why a crash anywhere is harmless:
@@ -81,6 +91,8 @@ pub enum PurgeStep {
     InsertReorg,
     RebuildDerived,
     TombstoneBlocks,
+    /// Repair of the read-path side tables whose view push was lost.
+    TombstoneSideTables,
     /// Reads that check a tombstone statement caught everything.
     Verify,
 }
@@ -98,6 +110,7 @@ impl PurgeStep {
             PurgeStep::InsertReorg => "insert reorgs row",
             PurgeStep::RebuildDerived => "rebuild aggregates",
             PurgeStep::TombstoneBlocks => "tombstone blocks",
+            PurgeStep::TombstoneSideTables => "repair side tables",
             PurgeStep::Verify => "verify tombstones",
         }
     }
@@ -120,6 +133,9 @@ pub struct PurgeReport {
     pub checkpoints_tombstoned: u64,
     pub children_tombstoned: u64,
     pub blocks_tombstoned: u64,
+    /// Rows a lost materialized-view push left alive in a side table and
+    /// this purge had to tombstone itself. Normally 0.
+    pub side_rows_tombstoned: u64,
 }
 
 /// Knobs of a purge.
@@ -163,6 +179,7 @@ enum Target {
     Checkpoints,
     Children,
     Blocks,
+    SideTables,
 }
 
 impl Purger {
@@ -293,6 +310,7 @@ impl Purger {
                 checkpoints_tombstoned: 0,
                 children_tombstoned: 0,
                 blocks_tombstoned: 0,
+                side_rows_tombstoned: 0,
             });
         }
 
@@ -352,7 +370,7 @@ impl Purger {
             }
         };
 
-        let record = ReorgRecord {
+        let mut record = ReorgRecord {
             chain,
             epoch,
             from_ts,
@@ -364,6 +382,8 @@ impl Purger {
             depth,
             rows_tombstoned: children_tombstoned,
             reason: reason.as_str(),
+            version,
+            completed: false,
         };
 
         // Remembered BEFORE the insert: if its acknowledgement is lost the
@@ -393,7 +413,41 @@ impl Purger {
             .tombstone_until_gone(Target::Blocks, chain, from, to, version)
             .await?;
 
-        // 7. In memory only: a restart starts with empty caches.
+        // 7. The side tables should be empty now: their views saw every
+        //    tombstone of steps 3 and 6. Whatever is still alive is the
+        //    debris of a push that was lost, and nothing but this repairs
+        //    it. Last, so `blocks` (and its `block_lookup`) are covered.
+        let side_rows_tombstoned = self
+            .tombstone_until_gone(
+                Target::SideTables,
+                chain,
+                from,
+                to,
+                version,
+            )
+            .await?;
+
+        if side_rows_tombstoned > 0 {
+            warn!(
+                "Chain {chain}: {side_rows_tombstoned} row(s) survived in \
+                 the read-path side tables of blocks [{from}, {to:?}) \
+                 although their base rows are gone (a materialized view \
+                 push was lost); tombstoned directly."
+            );
+        }
+
+        // 8. Every write of this purge is durable: mark it finished, so
+        //    the next start can tell its debris (tombstoned rows at block
+        //    numbers a chain that got SHORTER does not have any more) from
+        //    the leftovers of a purge that died half way. Same
+        //    `(chain, epoch)` row, replaced.
+        record.completed = true;
+        self.store
+            .insert_reorg(&record)
+            .await
+            .map_err(at(PurgeStep::InsertReorg))?;
+
+        // 9. In memory only: a restart starts with empty caches.
         self.cache.evict_range(from, to);
 
         let elapsed = started.elapsed();
@@ -432,6 +486,7 @@ impl Purger {
             checkpoints_tombstoned,
             children_tombstoned,
             blocks_tombstoned,
+            side_rows_tombstoned,
         })
     }
 
@@ -457,6 +512,7 @@ impl Purger {
             Target::Checkpoints => PurgeStep::TombstoneCheckpoints,
             Target::Children => PurgeStep::TombstoneChildren,
             Target::Blocks => PurgeStep::TombstoneBlocks,
+            Target::SideTables => PurgeStep::TombstoneSideTables,
         };
 
         for attempt in 1..=attempts {
@@ -470,6 +526,9 @@ impl Purger {
                 Target::Blocks => {
                     store.tombstone_blocks(chain, from, to, version)
                 }
+                Target::SideTables => {
+                    store.tombstone_side_rows(chain, from, to, version)
+                }
             }
             .await
             .map_err(|source| ReorgError::Step { step, source })?;
@@ -480,6 +539,9 @@ impl Purger {
                 }
                 Target::Children => store.live_children(chain, from, to),
                 Target::Blocks => store.live_blocks(chain, from, to),
+                Target::SideTables => {
+                    store.live_side_rows(chain, from, to)
+                }
             }
             .await
             .map_err(|source| ReorgError::Step {

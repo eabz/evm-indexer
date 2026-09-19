@@ -136,6 +136,25 @@ impl ReorgStore for MemoryStore {
         Box::pin(async { Ok(false) })
     }
 
+    fn live_side_rows(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn tombstone_side_rows(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+        _: u64,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+
     fn min_timestamp(
         &self,
         _: u64,

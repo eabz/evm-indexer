@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 00:20 (America/Mexico_City)
+**Last updated:** 2026-09-19 01:00 (America/Mexico_City)
 
 ## Where things are
 
@@ -35,14 +35,20 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
-| pipeline | DONE (HEAD 8d39855, pushed) | main tree, clean | wire tokens/DEX/predictions/metrics/reorg into the running binary, checkpoints, insert dedup (migration 0090), `indexer verify` / `backfill`, zero-flag acceptance tests | commits prefixed `pipeline:` when the tree compiles; WIP notes on tirith |
-| launchpads | Opus | worktree `.claude/worktrees/agent-ab96eb1af8d691753` | `src/launchpads/` (Pons V2, Flap Portal; design section 11) | commits in the worktree + tirith notes |
-| migrator | Opus | worktree `.claude/worktrees/agent-a81326682e269a32c` | review fixes 14-19 for the migration runner | commits in the worktree |
-| solana-research | done | `docs/solana-research.md` | finished and committed | - |
-| dex-neutral | Opus | new worktree (see `git worktree list`) | DEX tables chain-neutral (design 13) + shared `SerId32`/`SerTxId` + `chains` registry (0006) | commits + tirith notes |
-| predictions-neutral | Opus | new worktree | predictions tables chain-neutral (design 13) | commits + tirith notes |
-| solana | Opus | new worktree | Solana phase 1: `src/svm/`, `src/source/solana.rs`, migrations 0040+, generic token-movement decoder + PumpSwap/pump.fun, live proof (design 14, `docs/solana-research.md`) | commits + tirith notes |
-| review-c | Opus | read-only | review round 2: predictions, reorg proof, core schema SQL | findings sent to `lead` on tirith |
+| hardening | Opus | MAIN tree (uncommitted edits possible) | launchpads wired (done, 050326b); now the pipeline hardening backlog (tirith task 64ed4968): side-table orphans, shrinking chain, bounded rebuilds, checkpoint compaction, lease fencing... | commits prefixed `hardening:` + tirith notes |
+| solana phase 1 | DONE, merged 442ac35 | - | live proof: 40/40 trades matched a public Solana RPC | - |
+| solana-venues | Opus | worktree | phase 2: Raydium / Orca / Meteora decoders + decode speed | commit after each venue + tirith notes |
+| solana-plan | Opus | writes only `docs/solana-research.md` section 11 | Envio rate limits (cost 1000/query, ~30 queries/window?), head following, history backfill, cost | the file itself |
+| launchpads-align | Opus | worktree | align launchpads with shared ids (`SerId32`, `tx_id String`) | commits |
+| review-d | Opus | read-only | review round 3: pipeline wiring, chain-neutral change, launchpads | findings sent to `lead` on tirith |
+
+QUEUED for Solana phase 2: Solana launchpads into `launchpad_*` (after launchpads-align lands); head follower + `indexer run --chain solana` integration (after hardening releases src/pipeline; contiguity = parent_slot chain, never slot+1).
+
+MERGED tonight (all pushed): Solana phase 1, pipeline wiring + zero-flag proof, migrator review fixes,
+review round 2 + its fixes, launchpads module, chain-neutral DEX (+ shared id helpers,
+`chains` registry), chain-neutral predictions + its review fixes. Last combined gate on the
+merged state: 593 unit tests, 59/59 ClickHouse tests (run them on a FRESH throwaway
+server: one that has accumulated dozens of test databases runs out of memory).
 
 Briefs for the four Opus agents: `<session scratchpad>/handoff/*.md` (original brief +
 lead follow-ups + progress notes). Agent sessions do not survive a cut, but a fresh agent

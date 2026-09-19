@@ -20,6 +20,7 @@ use crate::{
     db::{self, migrate, next_version, DatabaseParams, FlushKey},
     dex, launchpads,
     pipeline::{backfill, modules::ALL_MODULES, verify},
+    reorg::ReorgStore,
     tokens::{
         discovery::{
             build_caller_with, CallerOptions, ChainRegistry, Connector,
@@ -235,6 +236,15 @@ fn busy_block(number: u64) -> Vec<TestTx> {
 /// the genesis block.
 const LAUNCHPAD_FIXTURES: &[&launchpads::fixtures::RawTx] =
     launchpads::fixtures::ALL;
+
+/// `bytes` as a 32 byte id: 12 zero bytes, then the value (the chain
+/// neutral identity convention of docs/design.md section 13).
+fn left_padded_32(bytes: &[u8]) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    let start = 32 - bytes.len().min(32);
+    id[start..].copy_from_slice(&bytes[bytes.len() - (32 - start)..]);
+    id
+}
 
 /// `LAUNCHPAD_FIXTURES[number - 1]` as a block of this test chain.
 fn launchpad_block(number: u64) -> Vec<TestTx> {
@@ -1053,7 +1063,7 @@ async fn a_flush_killed_before_blocks_is_healed_on_restart() {
 
     let reasons: Vec<String> = db
         .db
-        .query("SELECT toString(reason) FROM reorgs")
+        .query("SELECT toString(reason) FROM reorgs WHERE completed = 1")
         .fetch_all()
         .await
         .unwrap();
@@ -1153,7 +1163,8 @@ async fn a_reorg_of_depth_3_ends_up_equal_to_a_clean_index() {
         .db
         .db
         .query(
-            "SELECT toString(reason), fork_block, depth, epoch FROM reorgs",
+            "SELECT toString(reason), fork_block, depth, epoch FROM \
+             reorgs WHERE completed = 1",
         )
         .fetch_all()
         .await
@@ -1205,7 +1216,11 @@ async fn a_reorg_deeper_than_max_reorg_depth_is_a_clear_fatal_error() {
     // Nothing was purged, nothing was written.
     assert_same("after the refusal", &scenario.snapshot().await, &before);
     assert_eq!(
-        scenario.count("SELECT toUInt64(count()) FROM reorgs").await,
+        scenario
+            .count(
+                "SELECT toUInt64(count()) FROM reorgs WHERE completed = 1"
+            )
+            .await,
         0
     );
 }
@@ -1230,7 +1245,11 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
         &expected,
     );
     assert_eq!(
-        clean.count("SELECT toUInt64(count()) FROM reorgs").await,
+        clean
+            .count(
+                "SELECT toUInt64(count()) FROM reorgs WHERE completed = 1"
+            )
+            .await,
         0
     );
     assert_eq!(
@@ -1295,7 +1314,7 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     let reasons: Vec<String> = fixed
         .db
         .db
-        .query("SELECT toString(reason) FROM reorgs")
+        .query("SELECT toString(reason) FROM reorgs WHERE completed = 1")
         .fetch_all()
         .await
         .unwrap();
@@ -1431,7 +1450,10 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
         .map(|(emitter, family)| {
             format!(
                 "({CHAIN}, unhex('{}'), '{}', '', 1)",
-                hex::encode(crate::utils::format::id32(*emitter)),
+                // The column is FixedString(32) and an EVM address is 12
+                // zero bytes + the 20 address bytes: hex-encoding the
+                // address alone would RIGHT pad it.
+                hex::encode(left_padded_32(emitter.as_slice())),
                 family.as_str()
             )
         })
@@ -1473,6 +1495,368 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
             "{table}"
         );
     }
+}
+
+// ----------------------------------------------- the workers' queries
+
+/// Every query the background workers run, EXECUTED against ClickHouse.
+///
+/// None of them was: the unit tests assert on the SQL string, and the
+/// pipeline tests never store a prediction registry or a venue. So when
+/// the analytics tables became chain neutral (32 byte identity columns,
+/// docs/design.md section 13) and the read-back structs kept reading 20
+/// raw bytes, nothing failed - except a real indexer, which cannot even
+/// START on a chain with a stored prediction registry (`known_registries`
+/// is awaited before the writer exists).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_worker_queries_run_against_a_real_database() {
+    use crate::{
+        dex::worker::MissingPoolSource,
+        pipeline::workers::ClickhouseWorkerStore,
+        predictions::{
+            worker::{MissingVenueSource, VenueSink},
+            Protocol,
+        },
+        tokens::worker::MissingTokenSource,
+    };
+
+    let scenario = Scenario::new("workers").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let id = |address: Address| {
+        hex::encode(crate::utils::format::id32(address).0)
+    };
+    let exec = |sql: String| {
+        let db = scenario.db.clone();
+        async move {
+            db.db
+                .query(&sql)
+                .execute()
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+        }
+    };
+
+    // A registry and a venue, which no test chain of this file produces.
+    let registry = Address::repeat_byte(0x11);
+    let exchange = Address::repeat_byte(0x22);
+    let unknown = Address::repeat_byte(0x33);
+
+    exec(format!(
+        "INSERT INTO prediction_markets (chain, registry, market_id, \
+         block_number, timestamp, _version) VALUES ({CHAIN}, \
+         unhex('{}'), unhex('{}'), 1, toDateTime({BASE_TIMESTAMP}), 1)",
+        id(registry),
+        "11".repeat(32)
+    ))
+    .await;
+    exec(format!(
+        "INSERT INTO prediction_venues (chain, exchange, _version) \
+         VALUES ({CHAIN}, unhex('{}'), 1)",
+        id(exchange)
+    ))
+    .await;
+    // A trade of a venue nobody has resolved yet: the work list.
+    exec(format!(
+        "INSERT INTO prediction_trades (chain, exchange, protocol, \
+         block_number, timestamp, _version) VALUES ({CHAIN}, \
+         unhex('{}'), 'ctf_exchange', 1, now(), 1)",
+        id(unknown)
+    ))
+    .await;
+
+    let store = ClickhouseWorkerStore::new(scenario.db.clone(), true);
+
+    // 1. The token work list, both pages. `seen_tokens.address` is 20
+    //    bytes and `dex_pools_by_token.token` is 32: the union used to
+    //    widen both to String and desynchronise the row stream.
+    let all = store.missing_tokens(50).await.unwrap();
+    assert!(
+        all.iter().any(|(address, _)| *address == TOKEN0)
+            && all.iter().any(|(address, _)| *address == TOKEN1),
+        "{all:?}"
+    );
+
+    let first = store.missing_tokens_after(None, 1).await.unwrap();
+    assert_eq!(first.len(), 1);
+    let second =
+        store.missing_tokens_after(Some(first[0].0), 1).await.unwrap();
+    assert_eq!(
+        second.len(),
+        1,
+        "page 2 is empty: the cursor never matches"
+    );
+    assert_ne!(second[0].0, first[0].0);
+
+    // 2. Blank rows are verified again.
+    exec(format!(
+        "INSERT INTO tokens (chain, address, type, _version) VALUES \
+         ({CHAIN}, unhex('{}'), 'ERC20', 1)",
+        hex::encode(TOKEN0.as_slice())
+    ))
+    .await;
+    let blank = store
+        .blank_tokens(None, 50, Duration::from_millis(1))
+        .await
+        .unwrap();
+    assert_eq!(blank, vec![(TOKEN0, crate::tokens::TokenStandard::Erc20)]);
+
+    // 3. Pools that traded and have no resolved `dex_pools` row.
+    //    `dex_pools.emitter` is FixedString(32).
+    let pools = store.missing_pools(50).await.unwrap();
+    assert!(pools.iter().any(|pool| pool.address == V2_PAIR), "{pools:?}");
+
+    // 4. Venues: what is known, and what still has to be resolved.
+    //    `prediction_venues.exchange` is FixedString(32), so a 40 hex
+    //    literal in the IN list never matched.
+    let known = store.known_venues(&[exchange, unknown]).await.unwrap();
+    assert_eq!(known.into_iter().collect::<Vec<_>>(), vec![exchange]);
+
+    let venues = store.missing_venues(50).await.unwrap();
+    assert_eq!(
+        venues,
+        vec![VenueCandidateOf(unknown, Protocol::CtfExchange).into()]
+    );
+
+    // 5. The registry seed, which the binary awaits BEFORE the writer
+    //    exists: a failure here is a process that does not start.
+    let registries =
+        modules::known_registries(&scenario.db, EnabledModules::default())
+            .await
+            .unwrap();
+    assert!(registries.contains(&registry), "{registries:?}");
+}
+
+/// Sugar so the assertion above reads as a row, not as a struct literal.
+#[cfg(test)]
+struct VenueCandidateOf(Address, crate::predictions::Protocol);
+
+#[cfg(test)]
+impl From<VenueCandidateOf> for crate::predictions::VenueCandidate {
+    fn from(row: VenueCandidateOf) -> Self {
+        crate::predictions::VenueCandidate {
+            exchange: row.0,
+            protocol: row.1,
+        }
+    }
+}
+
+// ------------------------------------------------ the chain got shorter
+
+/// A rollback whose new fork is SHORTER than what was stored leaves
+/// tombstoned rows above the new head, at block numbers the chain does not
+/// have any more. Nothing will ever stream them again, and they look
+/// exactly like the debris of a gap heal that died half way - so the first
+/// pass after EVERY start purged that tail once more (a new epoch and a
+/// rebuild of every aggregate from that day to now), until the chain
+/// outgrew the old head.
+///
+/// A completed purge now records the `_version` it stamped on its
+/// tombstones, which is what tells its debris from an unfinished heal's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn debris_of_a_finished_purge_is_not_healed_again() {
+    let scenario = Scenario::new("shorter").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let store =
+        ClickhouseReorgStore::new(scenario.db.clone(), Scope::Chain);
+    let purger = Purger::new(
+        Arc::new(store.clone()),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+
+    // Blocks [9, head] are rolled back and the chain does not have them
+    // any more: the tail keeps their tombstoned rows for ever.
+    let report = purger
+        .purge_range(CHAIN, 9, None, PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert!(report.children_tombstoned > 0);
+
+    let completed: u64 = scenario
+        .count("SELECT toUInt64(count()) FROM reorgs WHERE completed = 1")
+        .await;
+    assert_eq!(completed, 1);
+
+    // Nothing left to heal: a restart is a no-op.
+    assert!(
+        !store.has_orphan_children(CHAIN, 9, None).await.unwrap(),
+        "the debris of a finished purge must not look like an \
+         unfinished one"
+    );
+
+    // A tombstone NEWER than what any completed purge wrote is the trace
+    // of a purge that died half way, and must still be found.
+    let version = next_version();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            // The filter has to run in a SUBQUERY: in a
+            // `SELECT * REPLACE (x AS c) FROM t WHERE c = ..` the WHERE
+            // sees the REPLACED value of `c`, not the stored one
+            // (measured on ClickHouse 25.12).
+            "INSERT INTO logs SELECT * REPLACE (toUInt64({version}) AS \
+             _version, toUInt8(1) AS is_deleted) FROM (SELECT * FROM logs \
+             WHERE chain = {CHAIN} AND block_number >= 9 AND \
+             is_deleted = 0)"
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    assert!(
+        store.has_orphan_children(CHAIN, 9, None).await.unwrap(),
+        "a tombstone no completed purge wrote must be healed"
+    );
+
+    // And healing it makes the tail quiet again.
+    purger
+        .purge_range(CHAIN, 9, None, PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert!(!store.has_orphan_children(CHAIN, 9, None).await.unwrap());
+
+    // The chain grows past the old head again: business as usual.
+    chain.extend(4, 0, busy_block);
+    scenario.index_until(&chain, 16, &[]).await;
+    let clean = clean_index("shorter_clean", &chain).await;
+    assert_same(
+        "after the chain outgrew the old head",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+    scenario.assert_consistent().await;
+}
+
+// ------------------------------------------------------ side tables
+
+/// Tombstones reach the read-path side tables only through their
+/// materialized views. If a base insert lands and the push into one of its
+/// views does not (a failure between the parts, a process killed mid
+/// insert), the base row is dead and the mirror row stays alive FOR EVER:
+/// nothing ever rewrites a side row except the view of its base row.
+///
+/// The state is reproduced here exactly - live side rows for blocks whose
+/// base rows are all tombstoned - and the purge has to repair it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
+    /// Every read-path side table the core and the modules declare.
+    fn side_tables() -> Vec<&'static str> {
+        let mut tables: Vec<&'static str> = db::SIDE_TABLES.to_vec();
+        for spec in ALL_MODULES {
+            tables.extend_from_slice(spec.side_tables);
+        }
+        tables
+    }
+
+    let scenario = Scenario::new("sides").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+
+    // A normal purge of blocks [9, head]: the views tombstone the mirrors.
+    let report = purger
+        .purge_range(CHAIN, 9, None, PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert!(report.blocks_tombstoned > 0);
+    assert_eq!(report.side_rows_tombstoned, 0, "the views did their job");
+
+    let live_side = |table: &'static str| {
+        let db = scenario.db.clone();
+        async move {
+            db.db
+                .query(&format!(
+                    "SELECT toUInt64(count()) FROM `{table}` FINAL WHERE \
+                     chain = {CHAIN} AND block_number >= 9"
+                ))
+                .fetch_one::<u64>()
+                .await
+                .unwrap_or_else(|e| panic!("{table}: {e}"))
+        }
+    };
+
+    for table in side_tables() {
+        assert_eq!(live_side(table).await, 0, "{table}");
+    }
+
+    // Now the failure: the tombstone reached the base tables and NOT the
+    // views. The pre-tombstone versions are still on disk, so putting them
+    // back with a newer `_version` reproduces that state exactly.
+    let version = next_version();
+    let mut injected = 0;
+    for table in side_tables() {
+        scenario
+            .db
+            .db
+            .query(&format!(
+                // The filter runs in a SUBQUERY: in a
+                // `SELECT * REPLACE (x AS c) FROM t WHERE c = ..` the
+                // WHERE sees the REPLACED value of `c` (ClickHouse 25.12).
+                "INSERT INTO `{table}` SELECT * REPLACE \
+                 (toUInt64({version}) AS _version, toUInt8(0) AS \
+                 is_deleted) FROM (SELECT * FROM `{table}` WHERE chain = \
+                 {CHAIN} AND block_number >= 9 AND is_deleted = 0)"
+            ))
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{table}: {e}"));
+        injected += live_side(table).await;
+    }
+
+    assert!(injected > 0, "nothing was resurrected");
+    // No base row explains a single one of them.
+    for table in db::BASE_TABLES.iter().filter(|t| **t != "blocks") {
+        assert_eq!(
+            scenario
+                .count(&format!(
+                    "SELECT toUInt64(count()) FROM `{table}` FINAL WHERE \
+                     chain = {CHAIN} AND block_number >= 9"
+                ))
+                .await,
+            0,
+            "{table}"
+        );
+    }
+
+    // The purge verifies the side tables and repairs them directly.
+    let report = purger
+        .purge_range(CHAIN, 9, None, PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert_eq!(report.side_rows_tombstoned, injected);
+
+    for table in side_tables() {
+        assert_eq!(live_side(table).await, 0, "{table} still has orphans");
+    }
+
+    // And the chain is still indexable to something a reader can not tell
+    // from a clean index.
+    scenario.index_until(&chain, 12, &[]).await;
+    let clean = clean_index("sides_clean", &chain).await;
+    assert_same(
+        "after the side table repair",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+    scenario.assert_consistent().await;
 }
 
 // ------------------------------------------------------------ deep purge

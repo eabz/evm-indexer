@@ -352,6 +352,15 @@ pub type ChildRows = BTreeMap<(u64, u32), Vec<Row<u64>>>;
 pub struct ChainData {
     pub blocks: BTreeMap<u64, Vec<Row<B256>>>,
     pub children: [ChildRows; CHILD_TABLES],
+    /// READ-PATH SIDE TABLES: one mirror per child table, plus one fed
+    /// from `blocks` (the model's `block_lookup`). Written ONLY by the
+    /// materialized view of their base table - which passes `_version`
+    /// and `is_deleted` through, so a tombstone in the base table
+    /// normally kills the mirror row for free. A push that gets LOST
+    /// leaves an orphan nothing else can ever remove, which is what
+    /// [`ReorgStore::tombstone_side_rows`] repairs.
+    pub side_children: [ChildRows; CHILD_TABLES],
+    pub side_blocks: BTreeMap<u64, Vec<Row<B256>>>,
     pub checkpoints: BTreeMap<(u64, u64), Vec<Row<()>>>,
     pub reorgs: Vec<ReorgRecord>,
     /// `(aggregate, bucket, epoch)` -> `(count, sum)`.
@@ -423,6 +432,27 @@ impl ChainData {
             .collect()
     }
 
+    pub fn live_side_children(
+        &self,
+        table: usize,
+    ) -> BTreeMap<(u64, u32), Vec<u64>> {
+        self.side_children[table]
+            .iter()
+            .map(|(k, v)| (*k, live(v).iter().map(|r| r.data).collect()))
+            .filter(|(_, values): &((u64, u32), Vec<u64>)| {
+                !values.is_empty()
+            })
+            .collect()
+    }
+
+    pub fn live_side_blocks(&self) -> BTreeMap<u64, Vec<B256>> {
+        self.side_blocks
+            .iter()
+            .map(|(n, v)| (*n, live(v).iter().map(|r| r.data).collect()))
+            .filter(|(_, hashes): &(u64, Vec<B256>)| !hashes.is_empty())
+            .collect()
+    }
+
     pub fn live_checkpoints(&self) -> Vec<(u64, u64)> {
         self.checkpoints
             .iter()
@@ -454,6 +484,9 @@ struct StoreState {
     lag: Option<Rng>,
     /// The next `current_epoch` read misses the newest `reorgs` row.
     stale_epoch_once: bool,
+    /// The next tombstone of a base table does NOT reach its side table:
+    /// the base part landed and the materialized view push did not.
+    lose_side_push: u32,
     /// `live_children` never reaches 0 (somebody else keeps writing).
     children_never_die: bool,
     /// The next children tombstone statement misses the upper half of the
@@ -513,9 +546,12 @@ impl StoreState {
 pub struct FakeStore {
     state: Mutex<StoreState>,
     /// NEGATIVE CONTROLS, to show the subtleties matter: compute `from_ts`
-    /// over live rows only / look for live orphans only.
+    /// over live rows only / look for live orphans only / trust the
+    /// materialized views instead of verifying the side tables (what the
+    /// purge did before this step existed).
     min_ts_live_only: bool,
     orphans_live_only: bool,
+    trust_the_views: bool,
 }
 
 fn in_range(number: u64, from: u64, to: Option<u64>) -> bool {
@@ -550,6 +586,12 @@ impl FakeStore {
         self.state.lock().unwrap().children_never_die = true;
     }
 
+    /// The next `times` tombstone statements land in their base table
+    /// WITHOUT reaching the side tables.
+    pub fn lose_side_push(&self, times: u32) {
+        self.state.lock().unwrap().lose_side_push = times;
+    }
+
     pub fn lagged_reads(&self) -> u64 {
         self.state.lock().unwrap().lagged_reads
     }
@@ -567,6 +609,13 @@ impl FakeStore {
     /// NEGATIVE CONTROL: only live rows count as orphans.
     pub fn with_orphans_live_only() -> Arc<Self> {
         Arc::new(Self { orphans_live_only: true, ..Self::default() })
+    }
+
+    /// NEGATIVE CONTROL: the purge trusts the materialized views and never
+    /// looks at the side tables (`live_side_rows` says 0,
+    /// `tombstone_side_rows` writes nothing).
+    pub fn with_trusted_views() -> Arc<Self> {
+        Arc::new(Self { trust_the_views: true, ..Self::default() })
     }
 
     /// The next time `chain` reaches `step`, fail (once).
@@ -607,6 +656,7 @@ impl FakeStore {
                 | PurgeStep::InsertReorg
                 | PurgeStep::RebuildDerived
                 | PurgeStep::TombstoneBlocks
+                | PurgeStep::TombstoneSideTables
         );
         state.journal.entry(chain).or_default().push(step);
         match state.faults.get(&chain).copied() {
@@ -629,7 +679,11 @@ impl FakeStore {
         let mut state = self.state.lock().unwrap();
         let data = state.write(chain);
         data.blocks.retain(|number, _| !in_range(*number, from, Some(to)));
-        for table in data.children.iter_mut() {
+        data.side_blocks
+            .retain(|number, _| !in_range(*number, from, Some(to)));
+        for table in
+            data.children.iter_mut().chain(data.side_children.iter_mut())
+        {
             table.retain(|(number, _), _| {
                 !in_range(*number, from, Some(to))
             });
@@ -650,6 +704,8 @@ impl FakeStore {
         let step = PurgeStep::TombstoneChildren;
         let partial = Self::enter(&mut state, chain, step)?;
         let missing = std::mem::take(&mut state.miss_children_once);
+        let lose_push = state.lose_side_push > 0;
+        state.lose_side_push = state.lose_side_push.saturating_sub(1);
         let view = state.view(chain);
         let data = state.write(chain);
 
@@ -662,6 +718,10 @@ impl FakeStore {
             .collect();
         let middle =
             affected.iter().nth(affected.len() / 2).copied().unwrap_or(0);
+
+        // The materialized view of a base table sees the tombstone insert
+        // and pushes it on - unless this push is the one that gets lost.
+        let pushes = if lose_push { None } else { Some(()) };
 
         let mut count = 0;
         for (index, table) in view.children.iter().enumerate() {
@@ -677,6 +737,12 @@ impl FakeStore {
                 }
                 let dead = dead_copies(versions, version);
                 count += dead.len() as u64;
+                if pushes.is_some() {
+                    data.side_children[index]
+                        .entry(*key)
+                        .or_default()
+                        .extend(dead.clone());
+                }
                 data.children[index].entry(*key).or_default().extend(dead);
             }
         }
@@ -685,6 +751,44 @@ impl FakeStore {
             return Err(injected(step));
         }
         Ok(count)
+    }
+
+    /// `tombstone_side_rows`, restricted to some child mirrors (a module
+    /// scoped store only owns its own read path).
+    pub fn tombstone_side_rows_of(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+        tables: &[usize],
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        let tables = tables.to_vec();
+        async move {
+            let mut state = self.state.lock().unwrap();
+            let step = PurgeStep::TombstoneSideTables;
+            Self::enter(&mut state, chain, step)?;
+            let view = state.view(chain);
+            let data = state.write(chain);
+            let mut count = 0;
+
+            for index in tables {
+                for (key, versions) in &view.side_children[index] {
+                    if !in_range(key.0, from, to) {
+                        continue;
+                    }
+                    let dead = dead_copies(versions, version);
+                    count += dead.len() as u64;
+                    data.side_children[index]
+                        .entry(*key)
+                        .or_default()
+                        .extend(dead);
+                }
+            }
+
+            Ok(count)
+        }
+        .boxed()
     }
 
     /// `rebuild_derived`; the aggregates in `keep_range_for` count the
@@ -790,16 +894,21 @@ impl FakeStore {
             let timestamp = block.header.timestamp;
             for (table, values) in block.children.iter().enumerate() {
                 for (index, value) in values.iter().enumerate() {
+                    let row = Row {
+                        version,
+                        deleted: false,
+                        epoch,
+                        timestamp,
+                        data: *value,
+                    };
                     data.children[table]
                         .entry((block.header.number, index as u32))
                         .or_default()
-                        .push(Row {
-                            version,
-                            deleted: false,
-                            epoch,
-                            timestamp,
-                            data: *value,
-                        });
+                        .push(row.clone());
+                    data.side_children[table]
+                        .entry((block.header.number, index as u32))
+                        .or_default()
+                        .push(row);
                     data.add(Agg::child(table), timestamp, epoch, *value);
                 }
             }
@@ -821,16 +930,21 @@ impl FakeStore {
             let timestamp = block.header.timestamp;
             for (index, value) in block.children[table].iter().enumerate()
             {
+                let row = Row {
+                    version,
+                    deleted: false,
+                    epoch,
+                    timestamp,
+                    data: *value,
+                };
                 data.children[table]
                     .entry((block.header.number, index as u32))
                     .or_default()
-                    .push(Row {
-                        version,
-                        deleted: false,
-                        epoch,
-                        timestamp,
-                        data: *value,
-                    });
+                    .push(row.clone());
+                data.side_children[table]
+                    .entry((block.header.number, index as u32))
+                    .or_default()
+                    .push(row);
                 data.add(Agg::child(table), timestamp, epoch, *value);
             }
         }
@@ -847,13 +961,18 @@ impl FakeStore {
         let data = state.write(chain);
         for block in blocks {
             let header = block.header;
-            data.blocks.entry(header.number).or_default().push(Row {
+            let row = Row {
                 version,
                 deleted: false,
                 epoch,
                 timestamp: header.timestamp,
                 data: header.hash,
-            });
+            };
+            data.blocks
+                .entry(header.number)
+                .or_default()
+                .push(row.clone());
+            data.side_blocks.entry(header.number).or_default().push(row);
             data.add(
                 Agg::BlocksDaily,
                 header.timestamp,
@@ -962,12 +1081,49 @@ impl ReorgStore for FakeStore {
             Self::enter(&mut state, chain, PurgeStep::FindOrphans)?;
             let view = state.view(chain);
             let blocks = view.live_blocks();
+
+            // Highest `_version` a COMPLETED purge of this block
+            // stamped on its tombstones (0 when there is none). A
+            // tombstone at or below it is that purge's debris - nothing
+            // left to do, and re-purging it would bump the epoch and
+            // rebuild every aggregate on every single restart for as long
+            // as the chain stays shorter. A NEWER tombstone was written by
+            // a purge that died half way, whose rows the aggregates still
+            // count.
+            let settled_version = |number: u64| {
+                view.reorgs
+                    .iter()
+                    .filter(|r| {
+                        r.completed
+                            && r.fork_block <= number
+                            && r.to_block.is_none_or(|to| number < to)
+                    })
+                    .map(|r| r.version)
+                    .max()
+                    .unwrap_or(0)
+            };
+
             Ok(view.children.iter().any(|table| {
                 table.iter().any(|((number, _), versions)| {
-                    in_range(*number, from, to)
-                        && !blocks.contains_key(number)
-                        && (!self.orphans_live_only
-                            || !live(versions).is_empty())
+                    if !in_range(*number, from, to)
+                        || blocks.contains_key(number)
+                    {
+                        return false;
+                    }
+                    // A LIVE row always counts (a flush that died before
+                    // its `blocks` insert), wherever it is.
+                    if !live(versions).is_empty() {
+                        return true;
+                    }
+                    if self.orphans_live_only {
+                        return false;
+                    }
+                    let newest = versions
+                        .iter()
+                        .map(|r| r.version)
+                        .max()
+                        .unwrap_or(0);
+                    newest > settled_version(*number)
                 })
             }))
         }
@@ -1070,6 +1226,88 @@ impl ReorgStore for FakeStore {
                 .filter(|(number, _)| in_range(**number, from, to))
                 .map(|(_, versions)| live(versions).len() as u64)
                 .sum())
+        }
+        .boxed()
+    }
+
+    fn live_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        async move {
+            let mut state = self.state.lock().unwrap();
+            Self::enter(&mut state, chain, PurgeStep::Verify)?;
+            if self.trust_the_views {
+                return Ok(0);
+            }
+            let view = state.view(chain);
+            let children: u64 = view
+                .side_children
+                .iter()
+                .flat_map(|table| table.iter())
+                .filter(|((number, _), _)| in_range(*number, from, to))
+                .map(|(_, versions)| live(versions).len() as u64)
+                .sum();
+            let blocks: u64 = view
+                .side_blocks
+                .iter()
+                .filter(|(number, _)| in_range(**number, from, to))
+                .map(|(_, versions)| live(versions).len() as u64)
+                .sum();
+            Ok(children + blocks)
+        }
+        .boxed()
+    }
+
+    fn tombstone_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        async move {
+            let mut state = self.state.lock().unwrap();
+            let step = PurgeStep::TombstoneSideTables;
+            // Partial: only the child mirrors, not the `blocks` mirror.
+            let partial = Self::enter(&mut state, chain, step)?;
+            if self.trust_the_views {
+                return Ok(0);
+            }
+            let view = state.view(chain);
+            let data = state.write(chain);
+            let mut count = 0;
+
+            for (index, table) in view.side_children.iter().enumerate() {
+                for (key, versions) in table {
+                    if !in_range(key.0, from, to) {
+                        continue;
+                    }
+                    let dead = dead_copies(versions, version);
+                    count += dead.len() as u64;
+                    data.side_children[index]
+                        .entry(*key)
+                        .or_default()
+                        .extend(dead);
+                }
+            }
+
+            if partial {
+                return Err(injected(step));
+            }
+
+            for (number, versions) in &view.side_blocks {
+                if !in_range(*number, from, to) {
+                    continue;
+                }
+                let dead = dead_copies(versions, version);
+                count += dead.len() as u64;
+                data.side_blocks.entry(*number).or_default().extend(dead);
+            }
+
+            Ok(count)
         }
         .boxed()
     }
@@ -1178,7 +1416,22 @@ impl ReorgStore for FakeStore {
             let chain = record.chain;
             // Partial: the row lands but the acknowledgement is lost.
             let partial = Self::enter(&mut state, chain, step)?;
-            state.write(chain).reorgs.push(record.clone());
+            // Two physical rows per purge (armed, then completed). The
+            // model keeps ONE entry per purge and flips the flag, which
+            // is what a reader that groups them sees - and, unlike
+            // replacing by `(chain, epoch)`, it never loses the row of a
+            // DIFFERENT purge that reused an epoch (which happens when
+            // the previous `reorgs` row was not readable yet).
+            let reorgs = &mut state.write(chain).reorgs;
+            let same = |r: &&mut ReorgRecord| {
+                r.epoch == record.epoch
+                    && r.fork_block == record.fork_block
+                    && r.from_ts == record.from_ts
+            };
+            match reorgs.iter_mut().find(same) {
+                Some(existing) => *existing = record.clone(),
+                None => reorgs.push(record.clone()),
+            }
             if partial {
                 return Err(injected(step));
             }
@@ -1220,6 +1473,8 @@ impl ReorgStore for FakeStore {
             let step = PurgeStep::TombstoneBlocks;
             // Partial: every other block dies.
             let partial = Self::enter(&mut state, chain, step)?;
+            let lose_push = state.lose_side_push > 0;
+            state.lose_side_push = state.lose_side_push.saturating_sub(1);
             let view = state.view(chain);
             let data = state.write(chain);
 
@@ -1233,6 +1488,12 @@ impl ReorgStore for FakeStore {
                 }
                 let dead = dead_copies(versions, version);
                 count += dead.len() as u64;
+                if !lose_push {
+                    data.side_blocks
+                        .entry(*number)
+                        .or_default()
+                        .extend(dead.clone());
+                }
                 data.blocks.entry(*number).or_default().extend(dead);
             }
 
@@ -1819,6 +2080,21 @@ pub fn check_clean(node: &Node) -> Result<(), String> {
         if data.live_children(table) != clean.live_children(table) {
             return Err(format!("child table {table} differs"));
         }
+        // A side table is a mirror: an orphan there is invisible in every
+        // base table and permanent (nothing rewrites it).
+        if data.live_side_children(table) != clean.live_children(table) {
+            return Err(format!(
+                "side table of child {table} differs from the canonical \
+                 chain (a materialized view push was lost and never \
+                 repaired)"
+            ));
+        }
+    }
+    if data.live_side_blocks() != clean.live_blocks() {
+        return Err(
+            "the `blocks` side table differs from the canonical chain"
+                .to_string(),
+        );
     }
     if data.aggregates() != clean.aggregates() {
         return Err(format!(
