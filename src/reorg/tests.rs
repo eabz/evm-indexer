@@ -788,6 +788,47 @@ async fn a_guard_purge_that_reads_nothing_is_not_reported_as_done() {
     assert!(node.data().reorgs.is_empty());
 }
 
+/// `begin_pass` must only mark as inspected what the caller really
+/// inspected. A gap listing truncated at `MAX_GAPS_PER_PASS` accounts for
+/// the blocks below its last row and no further; if the guard were told
+/// "everything up to the end of the pass", the gaps above would never be
+/// orphan-checked again - their orphans would stay live while the blocks
+/// are streamed on top, and the aggregates would count both, for ever.
+#[tokio::test]
+async fn a_truncated_gap_listing_leaves_the_rest_to_a_later_pass() {
+    let mut node = indexed(40, NodeOptions::new(CHAIN)).await;
+
+    // Two flushes died before their `blocks` inserts, at 10..12 and
+    // 30..32. Only the first gap fits in this pass's listing.
+    node.store.forget(CHAIN, 10, 12);
+    node.store.forget(CHAIN, 30, 32);
+    let orphan = |number: u64| {
+        let mut block = node.chain.block(number).unwrap();
+        block.children = [vec![7], vec![9]];
+        block
+    };
+    node.store.insert_children(
+        CHAIN,
+        &[orphan(11), orphan(31)],
+        0,
+        node.data().max_version() + 1,
+    );
+
+    // A fresh process: the first pass inspects the range.
+    node.restart();
+
+    // The pass saw the gap at 10..12 and stopped accounting there.
+    let healed = node.guard.begin_pass(&[(10, 12)], 12).await.unwrap();
+    assert_eq!(healed, 1, "the gap that WAS listed is healed");
+
+    // The next pass lists the second gap: it must still be healed.
+    let healed = node.guard.begin_pass(&[(30, 32)], 32).await.unwrap();
+    assert_eq!(
+        healed, 1,
+        "a gap above a truncated listing was never orphan-checked"
+    );
+}
+
 // ------------------------------------------------- the chain got shorter
 
 /// A rollback whose new fork is SHORTER than what was stored leaves

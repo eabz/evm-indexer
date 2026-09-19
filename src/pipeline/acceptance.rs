@@ -1497,6 +1497,79 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
     }
 }
 
+// -------------------------------------------- aggregates vs base tables
+
+/// `indexer verify` used to report CONSISTENT for the ONE corruption the
+/// whole epoch machinery exists to prevent: a range written twice. A
+/// materialized view only ever ADDS, so the totals double while every base
+/// table still reads perfectly - wrong numbers, which are worse than
+/// missing ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn verify_catches_a_doubled_aggregate() {
+    const DAY: u32 = 86_400;
+
+    let scenario = Scenario::new("doubled").await;
+    // One block per day, so the range holds complete UTC days.
+    let chain = TestChain::with_block_time(10, DAY);
+    scenario.index_until(&chain, 10, &[]).await;
+    scenario.assert_consistent().await;
+
+    // Exactly what a restart produces: the same rows again under a new
+    // `_version`. The base tables deduplicate by key, the aggregates do
+    // not.
+    let mut batch = transform::transform_with(
+        CHAIN,
+        &chain.response(BlockRange::new(4, 6)),
+        BlockRange::new(4, 6),
+        EnabledModules::default(),
+        &mut DecodeState::default(),
+    )
+    .unwrap()
+    .rows;
+    batch.set_version(next_version());
+    batch.set_epoch(0);
+    scenario.db.store(&batch).await.unwrap();
+
+    // The base tables are untouched ...
+    assert_eq!(scenario.rows("blocks").await, 10);
+
+    // ... and verify says so.
+    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    assert!(!report.is_consistent(), "{report}");
+    assert!(report.gaps.is_empty(), "{report}");
+    assert!(report.orphans.is_empty(), "{report}");
+
+    let text = report.to_string();
+    assert!(text.contains("Aggregates DISAGREE"), "{text}");
+    let wrong: Vec<&str> =
+        report.aggregates.iter().map(|a| a.view).collect();
+    assert!(wrong.contains(&"daily_block_stats_v"), "{wrong:?}");
+    for report in &report.aggregates {
+        assert!(report.days_checked > 0);
+        assert!(report.view_rows > report.base_rows, "{report:?}");
+    }
+
+    // A purge of the doubled range repairs it under a new epoch, and
+    // verify agrees again.
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    purger
+        .purge_range(CHAIN, 4, Some(6), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    scenario.index_until(&chain, 10, &[]).await;
+
+    scenario.assert_consistent().await;
+}
+
 // ----------------------------------------------- the workers' queries
 
 /// Every query the background workers run, EXECUTED against ClickHouse.

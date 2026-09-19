@@ -301,9 +301,39 @@ pub async fn backfill(
             continue;
         }
 
+        // A live indexer on the same chain can purge between two chunks
+        // (a tip reorg, a gap heal). Its `reorgs` row moves the epoch
+        // floor from that day on and its rebuild has already run, so a
+        // chunk still stamped with OUR epoch would be hidden by the
+        // validity rule for ever - and unhealable, because `fingerprints`
+        // zeroes `epoch`, so a re-run finds the stored rows equal and
+        // writes nothing.
+        //
+        // Stopping here is safe and honest: nothing written so far is
+        // wrong (it carries an epoch that was current when it was
+        // written and the other purge rebuilt from the base rows), and
+        // running the command again completes the job under the new
+        // epoch.
+        let epoch = db.refresh_epoch().await?;
+        if epoch != report.epoch {
+            bail!(
+                "chain {}: another process purged this chain while the \
+                 backfill of '{}' was writing (epoch {} -> {epoch}). \
+                 Blocks {} to {} were written, the rest was not. Nothing \
+                 is wrong with what is stored: run `indexer backfill \
+                 --module {}` again to finish under the new epoch.",
+                db.chain_id,
+                spec.name,
+                report.epoch,
+                hull.from,
+                chunk.from,
+                spec.name
+            );
+        }
+
         let version = next_version();
         decoded.set_version(version);
-        decoded.set_epoch(report.epoch);
+        decoded.set_epoch(epoch);
 
         let key = FlushKey {
             chain: db.chain_id,

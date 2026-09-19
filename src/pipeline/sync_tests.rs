@@ -379,6 +379,7 @@ async fn indexer(
     );
 
     let gate = WriterGate {
+        fence: crate::pipeline::lease::Fence::open(),
         writer: writer.handle(),
         visible: Box::new(|| Box::pin(async { Ok(()) })),
         adopt: Box::new(|_| {}),
