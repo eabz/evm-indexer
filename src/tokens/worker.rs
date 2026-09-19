@@ -56,7 +56,7 @@ use super::{
     multicall::EthCaller, redact::redact_urls, ResolveMode, TokenResolver,
     TokenResolverOptions, TokenStandard,
 };
-use crate::db::models::token::DatabaseToken;
+use crate::tokens::models::DatabaseToken;
 
 /// Where the worker stores the rows it resolved (ClickHouse `tokens`).
 pub trait TokenSink: Send + Sync + 'static {

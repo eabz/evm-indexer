@@ -1,18 +1,13 @@
 //! HyperSync response -> database rows. Pure, no I/O.
 
 use crate::{
-    db::{
-        models::{
-            block::DatabaseBlock,
-            erc1155_transfer::DatabaseERC1155Transfer,
-            erc20_transfer::DatabaseERC20Transfer,
-            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            transaction::DatabaseTransaction,
-            withdrawal::DatabaseWithdrawal,
-        },
-        ranges::BlockRange,
-        RowBatch,
+    core::models::{
+        block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
+        erc20_transfer::DatabaseERC20Transfer,
+        erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
+        transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
     },
+    db::{ranges::BlockRange, RowBatch},
     pipeline::modules::{self, DecodeState, EnabledModules},
     tokens::TokenStandard,
     utils::events::{
@@ -225,7 +220,7 @@ fn decode_transfers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::word;
+    use crate::core::models::log::test_support::word;
     use hypersync_client::format::{
         Address as HsAddress, Data, Hash, LogArgument, Quantity,
         TransactionStatus, UInt, Withdrawal,

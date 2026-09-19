@@ -1,4 +1,5 @@
 pub mod configs;
+pub mod core;
 pub mod db;
 pub mod dex;
 pub mod launchpads;

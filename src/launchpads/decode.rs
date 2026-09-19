@@ -48,8 +48,8 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, Bytes, B256, U256};
 
 use crate::{
+    core::models::log::DatabaseLog,
     db::format::{address_of_id32, id32, tx_id},
-    db::models::log::DatabaseLog,
 };
 
 use super::{
@@ -1067,7 +1067,7 @@ fn mark_sole_unverified_quotes(rows: &mut LaunchpadRows) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::log_with;
+    use crate::core::models::log::test_support::log_with;
 
     #[test]
     fn words_and_text_are_bounds_checked() {

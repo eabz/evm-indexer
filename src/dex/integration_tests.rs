@@ -26,7 +26,8 @@ use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use clickhouse::Client;
 
 use crate::{
-    db::{models::log::DatabaseLog, next_version, DatabaseParams},
+    core::models::log::DatabaseLog,
+    db::{next_version, DatabaseParams},
     dex::{
         block_column, decode,
         derived::{rebuild_statements, render_rebuild},

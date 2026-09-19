@@ -6,7 +6,7 @@
 
 use crate::{
     db::format::{id32, SerAddress, SerB256, SerId32},
-    db::{models::token::DatabaseToken, Database},
+    db::Database,
     dex::{
         self, DexPool, MissingPoolSource, PoolCandidate, PoolSink,
         PoolWorker, PoolWorkerOptions, PoolWorkerStats,
@@ -18,8 +18,9 @@ use crate::{
         VenueSink, VenueWorker, VenueWorkerOptions, VenueWorkerStats,
     },
     tokens::{
-        multicall::EthCaller, MissingTokenSource, TokenSink,
-        TokenStandard, TokenWorker, TokenWorkerOptions, TokenWorkerStats,
+        models::DatabaseToken, multicall::EthCaller, MissingTokenSource,
+        TokenSink, TokenStandard, TokenWorker, TokenWorkerOptions,
+        TokenWorkerStats,
     },
 };
 use alloy::primitives::{Address, B256};

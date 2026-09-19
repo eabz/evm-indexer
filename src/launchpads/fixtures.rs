@@ -7,7 +7,7 @@
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 
-use crate::db::models::log::{test_support::log_with, DatabaseLog};
+use crate::core::models::log::{test_support::log_with, DatabaseLog};
 
 pub use super::fixtures_data::*;
 use super::{events, TxOrigin};

@@ -76,7 +76,7 @@ impl DatabaseERC20Transfer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::{
+    use crate::core::models::log::test_support::{
         address_topic, log_with, word,
     };
 

@@ -46,8 +46,8 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, B256, U256};
 
 use crate::{
+    core::models::log::DatabaseLog,
     db::format::{address_of_id32, tx_hash_of},
-    db::models::log::DatabaseLog,
     utils::events::TRANSFER_EVENT_SIGNATURE,
 };
 
@@ -285,7 +285,7 @@ mod tests {
     use alloy::primitives::{Address, B256, I256, U256};
 
     use crate::{
-        db::models::log::DatabaseLog,
+        core::models::log::DatabaseLog,
         dex::{
             decode, events,
             fixtures::{self, address, build, same_transaction, transfer},

@@ -328,9 +328,9 @@ const VIEW_EPOCH: &str = "epoch,";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{
-        models::transaction::{STATUS_FAILURE, STATUS_SUCCESS},
-        schema::{
+    use crate::{
+        core::models::transaction::{STATUS_FAILURE, STATUS_SUCCESS},
+        db::schema::{
             tables_with_columns,
             test_support::{view_selects, CORE_MIGRATIONS},
         },

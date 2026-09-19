@@ -15,13 +15,6 @@
 use super::{
     block_number_column,
     derived::{repair_start, CORE_DERIVED},
-    models::{
-        block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
-        erc20_transfer::DatabaseERC20Transfer,
-        erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-        token::DatabaseToken, transaction::DatabaseTransaction,
-        withdrawal::DatabaseWithdrawal,
-    },
     next_version,
     ranges::BlockRange,
     schema::{live_rows_sql, min_timestamp_sql},
@@ -29,7 +22,14 @@ use super::{
     SIDE_TABLES,
 };
 use crate::{
+    core::models::{
+        block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
+        erc20_transfer::DatabaseERC20Transfer,
+        erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
+        transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
+    },
     pipeline::transform::{transform, ResponseRows},
+    tokens::models::DatabaseToken,
     utils::events::{
         ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
     },

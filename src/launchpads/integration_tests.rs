@@ -27,11 +27,9 @@ use clickhouse::{Client, Row};
 use serde::Serialize;
 
 use crate::{
+    core::models::erc20_transfer::DatabaseERC20Transfer,
     db::format::id32,
-    db::{
-        migrate, models::erc20_transfer::DatabaseERC20Transfer,
-        tombstone_sql, DatabaseParams,
-    },
+    db::{migrate, tombstone_sql, DatabaseParams},
     launchpads::{
         cookbook, decode,
         derived::rebuild_statements,

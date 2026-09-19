@@ -287,13 +287,13 @@ fn decoded_launchpads() -> launchpads::LaunchpadRows {
 
     for number in 1..=LAUNCHPAD_FIXTURES.len() as u64 {
         for tx in launchpad_block(number) {
-            let logs: Vec<crate::db::models::log::DatabaseLog> = tx
+            let logs: Vec<crate::core::models::log::DatabaseLog> = tx
                 .logs
                 .iter()
                 .enumerate()
                 .map(|(index, log)| {
                     let mut row =
-                        crate::db::models::log::test_support::log_with(
+                        crate::core::models::log::test_support::log_with(
                             &log.topics,
                             log.data.clone(),
                         );
@@ -2408,7 +2408,7 @@ async fn aggregate_views_do_not_depend_on_join_use_nulls() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs TEST_DATABASE_URL"]
 async fn contracts_view_lists_pre_byzantium_creations() {
-    use crate::db::models::transaction::DatabaseTransaction;
+    use crate::core::models::transaction::DatabaseTransaction;
 
     let scenario = Scenario::new("contracts").await;
 

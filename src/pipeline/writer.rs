@@ -301,7 +301,7 @@ async fn flush<S: Sink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::log_with;
+    use crate::core::models::log::test_support::log_with;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,

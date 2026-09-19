@@ -824,7 +824,7 @@ pub fn range_predicate(
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use crate::db::models::log::{test_support::log_with, DatabaseLog};
+    use crate::core::models::log::{test_support::log_with, DatabaseLog};
     use alloy::primitives::U256;
 
     /// topic0 of the Uniswap V2 `Sync(uint112,uint112)` event.
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn transactions_are_attached_to_liquidity_rows() {
-        use crate::db::models::transaction::DatabaseTransaction;
+        use crate::core::models::transaction::DatabaseTransaction;
         use hypersync_client::{
             format::{Address as HsAddress, Hash},
             simple_types::Transaction,

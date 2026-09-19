@@ -3,7 +3,6 @@ pub mod format;
 #[cfg(test)]
 mod integration_tests;
 pub mod migrate;
-pub mod models;
 pub mod ranges;
 pub mod schema;
 
@@ -12,17 +11,20 @@ pub use schema::{
     BASE_TABLES, SIDE_TABLES,
 };
 
-use crate::{metrics::Metrics, pipeline::modules::ModuleRows};
+use crate::{
+    core::models::{
+        block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
+        erc20_transfer::DatabaseERC20Transfer,
+        erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
+        transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
+    },
+    metrics::Metrics,
+    pipeline::modules::ModuleRows,
+};
 use alloy::primitives::B256;
 use anyhow::{anyhow, bail, Context, Result};
 use clickhouse::{Client, Row};
 use log::{info, warn};
-use models::{
-    block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
-    erc20_transfer::DatabaseERC20Transfer,
-    erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
-};
 use ranges::{
     assemble_missing_ranges, compaction_writes, contiguous_ranges,
     gaps_sql, is_dense, stats_sql, BlockRange, CheckpointWrite,
@@ -1192,7 +1194,7 @@ mod tests {
 
     #[test]
     fn row_batch_append_moves_rows() {
-        use crate::db::models::log::test_support::log_with;
+        use crate::core::models::log::test_support::log_with;
 
         let mut a = RowBatch::default();
         let mut b = RowBatch::default();
@@ -1330,7 +1332,7 @@ mod tests {
 
     #[test]
     fn set_version_stamps_every_block_scoped_row() {
-        use crate::db::models::{
+        use crate::core::models::{
             block::test_support::block_row, log::test_support::log_with,
         };
 

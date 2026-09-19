@@ -67,7 +67,9 @@ impl DatabaseERC721Transfer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::{address_topic, log_with};
+    use crate::core::models::log::test_support::{
+        address_topic, log_with,
+    };
 
     #[test]
     fn decodes_token_id_from_the_fourth_topic() {
