@@ -770,3 +770,45 @@ not "all of history". History is fetched only where consistency needs it.
   split/merge/redeem events but no trades outside the window. Cheap: a handful of addresses.
 - Launchpad tokens launched before the floor keep DEX data but have no launch attribution;
   documented, not fixed.
+
+**Where the implementation deviates from the paragraphs above (and why).** The rest of
+section 16 is implemented as written; `src/coverage/` and `src/predictions/history.rs`
+carry the detail.
+
+- **The floor lives in its own table, `chain_coverage` (migration 0008), not in two new
+  columns on `chains`.** The two answer different questions and have different writers.
+  `chains` is a naming registry - user populated, never touched by a running indexer,
+  read by views to know whether to print an id as hex or base58 - and migration 0006's
+  own header says it ships no rows and that the analytics tables never join it. The floor
+  is written by the indexer at its own first start and is per DEPLOYMENT: the same chain
+  id in two databases can honestly have two different floors. Putting it on `chains`
+  would have made every row of a naming registry half empty, and would have coupled "we
+  know what to call this chain" to "we know what this database promises".
+- **"First writer wins" is enforced twice, not once.** The code reads the stored floor
+  before it writes and refuses to write when one is there - that read is what produces the
+  warning the owner needs - but a read cannot be trusted alone under section 2's
+  no-read-your-writes rule. So `_version` is `MAX - coverage_from_block`, and the
+  ReplacingMergeTree therefore keeps the row with the LOWEST block whatever order two
+  inserts land in. "Never moves later" is a property of the engine, and the lease is not
+  load bearing for it.
+- **`--start-date` is REFUSED on Solana rather than resolved.** A slot carries no
+  timestamp, so there is nothing to bisect; rounding a date to a slot by arithmetic would
+  be a guess, and the floor it wrote could never be moved later. `--start-block <slot>`
+  and `--new-blocks-only` (the default) are the two answers there. The head's floor is
+  dated with `now`, which is what "the head" means to within a second.
+- **The Solana coverage line is printed by `bin/indexer.rs`, not by
+  `pipeline::solana_verify`.** Slots have no timestamps to date the covered head with, so
+  the line needs nothing from the report; keeping it out of that file also kept this
+  change out of another engineer's way.
+- **The registry-only pass ships no deployment blocks, and needs none.** Section 16 says
+  "from their deployment block up to the floor". It is a log filter over a handful of
+  addresses, and a source that serves those filters skips the blocks before a contract
+  existed without reading them and reports how far it got, so starting at block 0 costs
+  the same and carries no risk of a wrong number in a README. `prediction_trusted` gains
+  an optional `from_block` (migration 0023) for an operator who has verified one. A
+  constant table of addresses would also have contradicted the module's own rule, which
+  is that it ships no address list at all and the operator says what it believes.
+- **The pass reads TRUSTED addresses only, which includes the questions.** A market's
+  title comes from a NegRisk or UMA adapter, so an operator who wants titles back has to
+  have those adapters in `prediction_trusted`. This is the module's existing trust model,
+  not a new rule, and `src/predictions/README.md` now says so where it matters.

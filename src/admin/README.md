@@ -32,9 +32,13 @@ the fleet process's own flags and environment; the panel shows them as
 "set" or "not set" and can change none of them. Before the security review
 it could, and that was enough to send the owner's Envio token to any host
 on the internet (`configs::fleet::CHAIN_SETTINGS` has the whole story).
-The start block, the end block and `--new-blocks-only` are out for the
-other reason: they decide the coverage floor, which design section 16 fixes
-on a chain's first start.
+The start block, the start DATE, the end block and `--new-blocks-only`
+are out for the other reason: they decide the coverage floor, which design
+section 16 fixes on a chain's first start. The panel shows that floor - the
+same "gap-free from ... to ..." sentence `indexer verify` prints, once per
+chain card - and shows it read-only. Moving it earlier is
+`indexer backfill`; moving it later is refused everywhere, because data is
+never dropped.
 
 What IS editable: how far behind the head to stay, how deep a rollback may
 go, how big and how frequent the writes are, and which decoders run.

@@ -198,7 +198,29 @@ pub async fn resolve_floor(
             return Ok(Floor { block, timestamp, reason });
         }
         Wanted::Date(date) => date.midnight(),
-        Wanted::DefaultYear => now - DEFAULT_HISTORY,
+        // A year before NOW, or a year before the newest block the source
+        // has, whichever is earlier.
+        //
+        // Not pedantry. "A year of history" is a promise about the DATA,
+        // and the wall clock is not the data: an archive that is two days
+        // behind would otherwise give a year minus two days, and one that
+        // stopped a month ago would give eleven months - or, if it stopped
+        // over a year ago, nothing at all, because every block it has is
+        // older than the target. Anchoring on the head means a year of
+        // whatever the source can actually serve, which is what the owner
+        // asked for. On a healthy live chain the two are the same number.
+        Wanted::DefaultYear => {
+            let head_time =
+                timestamp_of(chain, head.saturating_sub(1), head).await;
+
+            let anchor = if head_time == 0 {
+                now
+            } else {
+                now.min(i64::from(head_time))
+            };
+
+            anchor - DEFAULT_HISTORY
+        }
     };
 
     let found =
@@ -507,5 +529,41 @@ mod tests {
 
         assert_eq!(floor.block, 0);
         assert_eq!(floor.timestamp, genesis as u32);
+    }
+
+    /// A SOURCE that is a long way behind must still give a year of what it
+    /// has. Anchored on the wall clock this returns the head - every block
+    /// the source has is older than "a year ago" - and the owner gets an
+    /// empty database with no explanation.
+    #[tokio::test]
+    async fn a_year_is_a_year_of_the_data_even_when_the_source_is_behind()
+    {
+        let spacing = 12;
+        let height = 10_000_000u64;
+        let genesis = 1_500_000_000;
+        let chain = FakeChain::new(genesis, spacing, height);
+
+        // The newest block this source has is years before "now".
+        let head_time = genesis + spacing * (height as i64 - 1);
+        let now = head_time + 4 * 365 * 86_400;
+
+        let floor =
+            resolve_floor(&chain, height, now, Wanted::DefaultYear)
+                .await
+                .unwrap();
+
+        assert!(
+            floor.block < height - 1,
+            "the floor collapsed onto the head: block {}",
+            floor.block
+        );
+        assert!(
+            i64::from(floor.timestamp) >= head_time - DEFAULT_HISTORY,
+            "the floor is more than a year below the head"
+        );
+        assert_eq!(
+            floor.block,
+            height - 1 - (365 * 86_400 / spacing) as u64
+        );
     }
 }

@@ -70,9 +70,10 @@ Endpoints and credentials are not on it, and that is structural rather than
 careful. The HyperSync token is process-wide and is attached to whatever url
 a chain names, so a panel that could set the endpoint could send the token
 to any host, reach the indexer host's private network, and feed the indexer
-fabricated blocks (security review MAJOR 4). The start block is not on it
-either: it fixes the coverage floor, which design section 16 decides once,
-on a chain's first start. `configs::fleet::NOT_PANEL_EDITABLE` names every
+fabricated blocks (security review MAJOR 4). The start block and the start date are not on it
+either: they fix the coverage floor, which design section 16 decides once,
+on a chain's first start. Each chain's card shows that floor and how far it
+is gap-free, read from `coverage_v` in one query for the whole fleet. `configs::fleet::NOT_PANEL_EDITABLE` names every
 excluded option with its reason, and a test walks the whole CLI and fails if
 a new flag is in neither list.
 

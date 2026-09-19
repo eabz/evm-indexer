@@ -762,7 +762,20 @@ impl Scenario {
         flags: &[&str],
     ) {
         let end = end.to_string();
-        let mut all = vec!["--end-block", end.as_str(), "--rpc", "none"];
+        // The whole fake chain, whatever dates its blocks claim. Without
+        // this the coverage floor (docs/design.md section 16) would apply
+        // its default - one year back from the newest block - and the two
+        // tests whose chain spans eleven years would index only the last
+        // year of it. `--start-date` and not `--start-block 0`, because 0
+        // IS the default and says nothing.
+        let mut all = vec![
+            "--end-block",
+            end.as_str(),
+            "--rpc",
+            "none",
+            "--start-date",
+            "1970-01-01",
+        ];
         all.extend_from_slice(flags);
 
         self.run(self.config(&all), chain, &FakeRpc::new(), |_| async {
