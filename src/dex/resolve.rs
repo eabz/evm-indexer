@@ -352,6 +352,7 @@ fn blank_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
         transaction_hash: B256::ZERO,
         log_index: 0,
         source: PoolSource::Rpc,
+        attempts: 0,
         epoch: 0,
         _version: 0,
     }
@@ -361,6 +362,16 @@ fn blank_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
 pub fn unresolved_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
     DexPool {
         source: PoolSource::Unresolved,
+        ..blank_pool(chain, candidate)
+    }
+}
+
+/// The row of a candidate that gave no usable answer: asked again after a
+/// backoff that grows with `attempts`.
+pub fn no_answer_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
+    DexPool {
+        source: PoolSource::NoAnswer,
+        attempts: candidate.attempts.saturating_add(1),
         ..blank_pool(chain, candidate)
     }
 }
@@ -552,6 +563,7 @@ mod tests {
             pool_id: pool_id_of(pool),
             address: pool,
             protocol,
+            attempts: 0,
         }
     }
 

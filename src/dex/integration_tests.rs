@@ -29,9 +29,9 @@ use crate::{
     db::{models::log::DatabaseLog, next_version, DatabaseParams},
     dex::{
         decode,
-        derived::render_rebuild,
+        derived::{rebuild_statements, render_rebuild},
         events,
-        fixtures::{self, address, hash, RawLog},
+        fixtures::{self, address, RawLog},
         models::{
             pool_id_of, DexLiquidity, DexPool, DexSwap, PoolSource,
             Protocol,
@@ -215,13 +215,14 @@ fn addresses(values: &[Address]) -> String {
 const SWAP_COLUMNS: &str = "chain, block_number, timestamp, \
     transaction_hash, log_index, pool_id, emitter, protocol, sender, \
     recipient, tx_from, tx_to, trader, amount0, amount1, token_in, \
-    token_out, amount_in, amount_out, coin_in, coin_out, underlying, \
+    token_out, amount_in, amount_out, verified_in, verified_out, reserve0, \
+    reserve1, coin_in, coin_out, underlying, \
     sqrt_price_x96, liquidity, tick, fee, epoch, _version";
 
 fn swap_sql(swap: &DexSwap) -> String {
     format!(
         "({}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, \
-         {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+         {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         swap.chain,
         swap.block_number,
         swap.timestamp,
@@ -241,6 +242,10 @@ fn swap_sql(swap: &DexSwap) -> String {
         addr(&swap.token_out),
         uint(&swap.amount_in),
         uint(&swap.amount_out),
+        addr(&swap.verified_in),
+        addr(&swap.verified_out),
+        uint(&swap.reserve0),
+        uint(&swap.reserve1),
         swap.coin_in,
         swap.coin_out,
         swap.underlying,
@@ -290,12 +295,12 @@ fn liquidity_sql(row: &DexLiquidity) -> String {
 const POOL_COLUMNS: &str = "chain, pool_id, emitter, factory, protocol, \
     token0, token1, tokens, underlying_tokens, fee, tick_spacing, hooks, \
     stable, created_block, timestamp, transaction_hash, log_index, source, \
-    epoch, _version";
+    attempts, epoch, _version";
 
 fn pool_sql(pool: &DexPool) -> String {
     format!(
         "({}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \
-         {}, '{}', {}, {})",
+         {}, '{}', {}, {}, {})",
         pool.chain,
         word(&pool.pool_id),
         addr(&pool.emitter),
@@ -314,6 +319,7 @@ fn pool_sql(pool: &DexPool) -> String {
         word(&pool.transaction_hash),
         pool.log_index,
         pool.source,
+        pool.attempts,
         pool.epoch,
         pool._version,
     )
@@ -325,10 +331,20 @@ fn number(value: u128) -> Vec<u8> {
     U256::from(value).to_be_bytes::<32>().to_vec()
 }
 
-use crate::dex::fixtures::build as constructed;
+use crate::dex::fixtures::{
+    build as constructed, same_transaction, transfer,
+};
 
-/// A V2 shaped swap on `pair`: (amount0In, amount1In, amount0Out,
-/// amount1Out).
+const TRADER_X: Address = Address::repeat_byte(0x71);
+const ROUTER: Address = Address::repeat_byte(0x70);
+
+/// Log index of the `offset`-th log of the transaction in `slot`.
+fn at(slot: u16, offset: u16) -> u16 {
+    slot * 10 + offset
+}
+
+/// A bare V2 shaped swap event (nothing proves it): (amount0In, amount1In,
+/// amount0Out, amount1Out).
 fn v2_swap(
     pair: Address,
     to: Address,
@@ -339,11 +355,7 @@ fn v2_swap(
 ) -> DatabaseLog {
     constructed(
         pair,
-        &[
-            events::V2_SWAP.topic0,
-            Address::repeat_byte(0x70).into_word(),
-            to.into_word(),
-        ],
+        &[events::V2_SWAP.topic0, ROUTER.into_word(), to.into_word()],
         amounts.iter().flat_map(|amount| number(*amount)).collect(),
         block,
         log_index,
@@ -351,34 +363,210 @@ fn v2_swap(
     )
 }
 
+/// A whole V2 trade the way a pair really emits it: the token transfers,
+/// `Sync` with the reserves after the swap, then `Swap` - one transaction.
+#[allow(clippy::too_many_arguments)]
+fn v2_trade(
+    pair: Address,
+    tokens: (Address, Address),
+    to: Address,
+    amounts: [u128; 4],
+    reserves: (u128, u128),
+    block: u32,
+    slot: u16,
+    timestamp: u32,
+) -> Vec<DatabaseLog> {
+    let mut logs = Vec::new();
+    let legs = [
+        (tokens.0, amounts[0], true),
+        (tokens.1, amounts[1], true),
+        (tokens.0, amounts[2], false),
+        (tokens.1, amounts[3], false),
+    ];
+
+    for (token, amount, incoming) in legs {
+        if amount == 0 {
+            continue;
+        }
+        let (from, recipient) =
+            if incoming { (ROUTER, pair) } else { (pair, to) };
+        logs.push(transfer(
+            token,
+            from,
+            recipient,
+            U256::from(amount),
+            block,
+            at(slot, logs.len() as u16),
+            timestamp,
+        ));
+    }
+
+    logs.push(constructed(
+        pair,
+        &[events::V2_SYNC.topic0],
+        [number(reserves.0), number(reserves.1)].concat(),
+        block,
+        at(slot, 2),
+        timestamp,
+    ));
+    logs.push(v2_swap(pair, to, amounts, block, at(slot, 3), timestamp));
+
+    same_transaction(logs, u64::from(block) * 1_000 + u64::from(slot))
+}
+
+fn usdc_weth() -> (Address, Address) {
+    (address(fixtures::USDC), address(fixtures::WETH))
+}
+
+/// A trade on the scenario's V2 USDC/WETH pair.
+fn pair_trade(
+    amounts: [u128; 4],
+    reserves: (u128, u128),
+    block: u32,
+    slot: u16,
+    timestamp: u32,
+) -> Vec<DatabaseLog> {
+    v2_trade(
+        address(fixtures::V2_USDC_WETH),
+        usdc_weth(),
+        TRADER_X,
+        amounts,
+        reserves,
+        block,
+        slot,
+        timestamp,
+    )
+}
+
+fn placed(
+    logs: &[(&RawLog, u16)],
+    block: u32,
+    slot: u16,
+    timestamp: u32,
+) -> Vec<DatabaseLog> {
+    logs.iter()
+        .map(|(raw, offset)| {
+            raw.placed(block, at(slot, *offset), timestamp)
+        })
+        .collect()
+}
+
+/// Real transactions, moved to a scenario position with their transfers.
+fn v2_real(block: u32, slot: u16, timestamp: u32) -> Vec<DatabaseLog> {
+    placed(
+        &[
+            (&fixtures::V2_SWAP_WETH_IN, 0),
+            (&fixtures::V2_SWAP_USDC_OUT, 1),
+            (&fixtures::V2_SYNC, 2),
+            (&fixtures::V2_SWAP, 3),
+        ],
+        block,
+        slot,
+        timestamp,
+    )
+}
+
+fn v3_real(block: u32, slot: u16, timestamp: u32) -> Vec<DatabaseLog> {
+    placed(
+        &[
+            (&fixtures::V3_SWAP_USDC_OUT, 0),
+            (&fixtures::V3_SWAP_WETH_IN, 1),
+            (&fixtures::V3_SWAP, 2),
+        ],
+        block,
+        slot,
+        timestamp,
+    )
+}
+
+/// The real two swap V4 transaction (one settlement per currency).
+fn v4_real(block: u32, slot: u16, timestamp: u32) -> Vec<DatabaseLog> {
+    let mut logs = placed(
+        &[
+            (&fixtures::V4_TX_USDC_TAKEN, 0),
+            (&fixtures::V4_TX_WETH_TAKEN, 1),
+            (&fixtures::V4_SWAP_USDC_IN, 2),
+            (&fixtures::V4_SWAP_USDT_IN, 3),
+            (&fixtures::V4_TX_USDC_SETTLED, 4),
+            (&fixtures::V4_TX_USDT_SETTLED, 5),
+        ],
+        block,
+        slot,
+        timestamp,
+    );
+    // The scenario's pools have ids of their own (see `v4_pool_id`).
+    logs[2].topic1 = Some(v4_pool_id(usdc_weth().0, usdc_weth().1));
+    logs[3].topic1 =
+        Some(v4_pool_id(usdc_weth().1, address(fixtures::USDT)));
+    logs
+}
+
+fn balancer_real(
+    block: u32,
+    slot: u16,
+    timestamp: u32,
+) -> Vec<DatabaseLog> {
+    placed(
+        &[
+            (&fixtures::BALANCER_SWAP, 0),
+            (&fixtures::BALANCER_SWAP_TOKEN_IN, 1),
+            (&fixtures::BALANCER_SWAP_WETH_OUT, 2),
+        ],
+        block,
+        slot,
+        timestamp,
+    )
+}
+
+fn curve_real(block: u32, slot: u16, timestamp: u32) -> Vec<DatabaseLog> {
+    placed(
+        &[
+            (&fixtures::CURVE_3POOL_USDT_IN, 0),
+            (&fixtures::CURVE_3POOL_USDC_OUT, 1),
+            (&fixtures::CURVE_3POOL_EXCHANGE, 2),
+        ],
+        block,
+        slot,
+        timestamp,
+    )
+}
+
+/// PoolKey (fee 500, tick spacing 10, no hooks) of the scenario's V4 pools.
+fn v4_key(currency0: Address, currency1: Address) -> Vec<u8> {
+    [
+        currency0.into_word().to_vec(),
+        currency1.into_word().to_vec(),
+        number(500),
+        number(10),
+        number(0),
+    ]
+    .concat()
+}
+
+fn v4_pool_id(currency0: Address, currency1: Address) -> B256 {
+    alloy::primitives::keccak256(v4_key(currency0, currency1))
+}
+
 fn pools() -> Vec<DatabaseLog> {
-    let usdc = address(fixtures::USDC);
-    let weth = address(fixtures::WETH);
+    let (usdc, weth) = usdc_weth();
     let usdt = address(fixtures::USDT);
 
-    let v4 =
-        |id: &str, currency0: Address, currency1: Address, index: u16| {
-            constructed(
-                address(fixtures::V4_POOL_MANAGER),
-                &[
-                    events::V4_INITIALIZE.topic0,
-                    hash(id),
-                    currency0.into_word(),
-                    currency1.into_word(),
-                ],
-                [
-                    number(500),
-                    number(10),
-                    number(0),
-                    number(1 << 96),
-                    number(0),
-                ]
-                .concat(),
-                90,
-                index,
-                DAY - 1_000,
-            )
-        };
+    let v4 = |currency0: Address, currency1: Address, index: u16| {
+        let key = v4_key(currency0, currency1);
+        constructed(
+            address(fixtures::V4_POOL_MANAGER),
+            &[
+                events::V4_INITIALIZE.topic0,
+                v4_pool_id(currency0, currency1),
+                currency0.into_word(),
+                currency1.into_word(),
+            ],
+            [key[64..].to_vec(), number(1 << 96), number(0)].concat(),
+            90,
+            index,
+            DAY - 1_000,
+        )
+    };
 
     vec![
         constructed(
@@ -414,71 +602,123 @@ fn pools() -> Vec<DatabaseLog> {
             1,
             DAY - 1_000,
         ),
-        v4(fixtures::V4_SWAP_USDC_IN.topics[1], usdc, weth, 2),
-        v4(fixtures::V4_SWAP_USDT_IN.topics[1], weth, usdt, 3),
+        v4(usdc, weth, 2),
+        v4(weth, usdt, 3),
     ]
 }
 
-const TRADER_X: Address = Address::repeat_byte(0x71);
+/// Reserves of the scenario pair after A (real), B, C and D.
+const RESERVES_A: (u128, u128) =
+    (10_391_705_448_638, 3_946_924_532_103_308_992_521);
+const RESERVES_B: (u128, u128) =
+    (RESERVES_A.0 + 5_000_000, RESERVES_A.1 - 1_900_000_000_000_000);
+const RESERVES_C: (u128, u128) =
+    (RESERVES_B.0 + 1_000_000, RESERVES_B.1 - 400_000_000_000_000);
+const RESERVES_D: (u128, u128) =
+    (RESERVES_C.0 + 2_000_000, RESERVES_C.1 - 900_000_000_000_000);
 
-/// Block 100 (first minute), block 101 (second minute), block 102 (next
-/// hour). Everything inside one UTC day.
+fn ratio(reserves: (u128, u128)) -> f64 {
+    reserves.1 as f64 / reserves.0 as f64
+}
+
+/// Block 100, first minute of the day: A (real) and B on the V2 pair.
+fn block_100() -> Vec<DatabaseLog> {
+    let mut logs = v2_real(100, 0, DAY + 10);
+    logs.extend(pair_trade(
+        [5_000_000, 0, 0, 1_900_000_000_000_000],
+        RESERVES_B,
+        100,
+        1,
+        DAY + 10,
+    ));
+    logs
+}
+
+/// Block 101, second minute: C, then real swaps of the other families, a
+/// Curve pool nobody knows and a pair nobody announced (nothing proves
+/// either of them).
+fn block_101() -> Vec<DatabaseLog> {
+    let mut logs = pair_trade(
+        [1_000_000, 0, 0, 400_000_000_000_000],
+        RESERVES_C,
+        101,
+        0,
+        DAY + 70,
+    );
+    logs.extend(v3_real(101, 1, DAY + 70));
+    logs.extend(v4_real(101, 2, DAY + 70));
+    logs.extend(curve_real(101, 3, DAY + 70));
+    logs.push(fixtures::CURVE_UNDERLYING_EXCHANGE.placed(
+        101,
+        at(4, 0),
+        DAY + 70,
+    ));
+    logs.push(v2_swap(
+        Address::repeat_byte(0x99),
+        TRADER_X,
+        [7_000, 0, 0, 9_000],
+        101,
+        at(5, 0),
+        DAY + 70,
+    ));
+    logs
+}
+
+/// Block 102, the next hour: D and the real Balancer swap (unknown token
+/// in, WETH out - valued with the native price of the hour before).
+fn block_102() -> Vec<DatabaseLog> {
+    let mut logs = pair_trade(
+        [2_000_000, 0, 0, 900_000_000_000_000],
+        RESERVES_D,
+        102,
+        0,
+        DAY + 3_700,
+    );
+    logs.extend(balancer_real(102, 1, DAY + 3_700));
+    logs
+}
+
+/// The 11 swaps of the scenario.
 fn swaps() -> Vec<DatabaseLog> {
-    let pair = address(fixtures::V2_USDC_WETH);
-
-    let at = |raw: &RawLog, block: u32, index: u16, timestamp: u32| {
-        raw.placed(block, index, timestamp)
-    };
-
-    vec![
-        // V2 USDC/WETH: A (real), B, C.
-        at(&fixtures::V2_SWAP, 100, 0, DAY + 10),
-        v2_swap(
-            pair,
-            TRADER_X,
-            [5_000_000, 0, 0, 1_900_000_000_000_000],
-            100,
-            1,
-            DAY + 10,
-        ),
-        v2_swap(
-            pair,
-            TRADER_X,
-            [1_000_000, 0, 0, 400_000_000_000_000],
-            101,
-            0,
-            DAY + 70,
-        ),
-        // Real swaps of the other families, same hour.
-        at(&fixtures::V3_SWAP, 101, 1, DAY + 70),
-        at(&fixtures::V4_SWAP_USDC_IN, 101, 2, DAY + 70),
-        at(&fixtures::V4_SWAP_USDT_IN, 101, 3, DAY + 70),
-        at(&fixtures::BALANCER_SWAP, 101, 4, DAY + 70),
-        at(&fixtures::CURVE_3POOL_EXCHANGE, 101, 5, DAY + 70),
-        at(&fixtures::CURVE_UNDERLYING_EXCHANGE, 101, 6, DAY + 70),
-        // A pair nobody announced: unpriceable.
-        v2_swap(
-            Address::repeat_byte(0x99),
-            TRADER_X,
-            [7, 0, 0, 9],
-            101,
-            7,
-            DAY + 70,
-        ),
-        // Next hour: D on the V2 pair.
-        v2_swap(
-            pair,
-            TRADER_X,
-            [2_000_000, 0, 0, 900_000_000_000_000],
-            102,
-            0,
-            DAY + 3_700,
-        ),
-    ]
+    [block_100(), block_101(), block_102()].concat()
 }
 
-/// Tokens, quote tokens and pools of `chain`: what both a reorged and a
-/// clean index know before the first swap.
+/// A resolver row: what the pool itself answered.
+fn rpc_pool(
+    chain: u64,
+    pool: Address,
+    protocol: Protocol,
+    tokens: Vec<Address>,
+) -> DexPool {
+    let two = tokens.len() == 2 && protocol != Protocol::Curve;
+
+    DexPool {
+        chain,
+        pool_id: pool_id_of(pool),
+        emitter: pool,
+        factory: Address::ZERO,
+        protocol,
+        token0: if two { tokens[0] } else { Address::ZERO },
+        token1: if two { tokens[1] } else { Address::ZERO },
+        tokens,
+        underlying_tokens: Vec::new(),
+        fee: 0,
+        tick_spacing: 0,
+        hooks: Address::ZERO,
+        stable: false,
+        created_block: 0,
+        timestamp: 0,
+        transaction_hash: B256::ZERO,
+        log_index: 0,
+        source: PoolSource::Rpc,
+        attempts: 0,
+        epoch: 0,
+        _version: 0,
+    }
+}
+
+/// Tokens, quote tokens, trusted singletons and pools of `chain`: what both
+/// a reorged and a clean index know before the first swap.
 async fn seed_reference(database: &TestDb, chain: u64) {
     let token = |hex: &str, symbol: &str, decimals: u8| {
         format!(
@@ -512,81 +752,103 @@ async fn seed_reference(database: &TestDb, chain: u64) {
         ))
         .await;
 
+    // The operator vouches for the real singletons.
+    database
+        .execute(&format!(
+            "INSERT INTO dex_trusted_emitters (chain, emitter, protocol, \
+             _version) VALUES ({chain}, {}, 'uniswap_v4', 1), \
+             ({chain}, {}, 'balancer_v2', 1)",
+            addr(&address(fixtures::V4_POOL_MANAGER)),
+            addr(&address(fixtures::BALANCER_VAULT)),
+        ))
+        .await;
+
     let mut created = decode(chain, &pools());
     assert_eq!(created.pools.len(), 4);
 
-    // Curve has no creation event: the row the RPC resolver would write.
-    let three_pool = address(fixtures::CURVE_3POOL_EXCHANGE.address);
-    created.pools.push(DexPool {
-        pool_id: pool_id_of(three_pool),
-        emitter: three_pool,
-        protocol: Protocol::Curve,
-        tokens: vec![
-            address(DAI),
-            address(fixtures::USDC),
-            address(fixtures::USDT),
-        ],
-        token0: Address::ZERO,
-        token1: Address::ZERO,
-        factory: Address::ZERO,
-        created_block: 0,
-        timestamp: 0,
-        source: PoolSource::Rpc,
-        ..created.pools[0].clone()
-    });
+    // What the background resolver wrote: the contract pools answered
+    // token0() / token1() / coins(i) themselves.
+    let (usdc, weth) = usdc_weth();
+    created.pools.extend([
+        rpc_pool(
+            chain,
+            address(fixtures::V2_USDC_WETH),
+            Protocol::UniswapV2,
+            vec![usdc, weth],
+        ),
+        rpc_pool(
+            chain,
+            address(fixtures::V3_USDC_WETH),
+            Protocol::UniswapV3,
+            vec![usdc, weth],
+        ),
+        rpc_pool(
+            chain,
+            address(fixtures::CURVE_3POOL_EXCHANGE.address),
+            Protocol::Curve,
+            vec![address(DAI), usdc, address(fixtures::USDT)],
+        ),
+    ]);
 
     created.set_version(next_version());
     database.insert(&created).await;
 }
 
-/// Decodes and inserts `logs` the way the pipeline flushes them.
+/// Decodes and inserts `logs` the way the pipeline flushes them. Returns
+/// how many swaps they held.
 async fn insert_logs(
     database: &TestDb,
     chain: u64,
     logs: &[DatabaseLog],
     epoch: u32,
-) {
+) -> usize {
     let mut rows = decode(chain, logs);
-    assert_eq!(rows.rows(), logs.len());
     rows.set_version(next_version());
     rows.set_epoch(epoch);
     database.insert(&rows).await;
+    rows.swaps.len()
 }
 
 async fn seed(database: &TestDb) {
     seed_reference(database, CHAIN).await;
 
     // Two inserts: the aggregate states of the views must merge.
-    let logs = swaps();
-    let (first, second) = logs.split_at(4);
-    insert_logs(database, CHAIN, first, 0).await;
-    insert_logs(database, CHAIN, second, 0).await;
+    assert_eq!(insert_logs(database, CHAIN, &block_100(), 0).await, 2);
+    let rest = [block_101(), block_102()].concat();
+    assert_eq!(insert_logs(database, CHAIN, &rest, 0).await, 9);
 }
 
 fn close(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() <= expected.abs() * 1e-12
 }
 
-/// USD per WETH implied by the scenario's native/stable pools in the first
-/// hour (stable volume / native volume, decimals adjusted).
-fn expected_native_price(include_second_hour: bool) -> f64 {
-    let mut stable = 2.624963 + 5.0 + 1.0 // V2 A, B, C
-        + 32_942.903993 // V3
-        + 1_793.58876 // V4 USDC/WETH
-        + 1_428.368405; // V4 WETH/USDT
-    let mut native = 0.001
-        + 0.0019
-        + 0.0004
-        + 12.572_743_894_898_124_8
-        + 0.685_766_237_544_796_922
-        + 0.546_044_876_340_273_314;
+/// USD per WETH of hour 1: the only pool with both legs verified AND at
+/// least 1000 stable units of volume is the V3 pool.
+fn native_price_hour_1() -> f64 {
+    32_942.903993 / 12.572_743_894_898_124_8
+}
 
-    if include_second_hour {
-        stable += 2.0;
-        native += 0.0009;
-    }
+const BALANCER_WETH_OUT: f64 = 0.001_658_625_973_383_8;
 
-    stable / native
+type Candle = (u32, f64, f64, f64, f64, f64, f64, f64, u64);
+
+/// (bucket, open, high, low, close, pool_open, pool_close, volume0, swaps)
+async fn candles(
+    database: &TestDb,
+    table: &str,
+    pool: &str,
+) -> Vec<Candle> {
+    database
+        .client
+        .query(&format!(
+            "SELECT toUInt32(bucket), ifNull(open, -1), ifNull(high, -1), \
+             ifNull(low, -1), ifNull(close, -1), ifNull(pool_open, -1), \
+             ifNull(pool_close, -1), volume0, swaps FROM {table} \
+             WHERE chain = {CHAIN} AND pool_id = {pool} ORDER BY bucket"
+        ))
+        .fetch_all::<Candle>()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -596,202 +858,165 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
     seed(&database).await;
 
     let pair = word(&pool_id_of(address(fixtures::V2_USDC_WETH)));
-
-    // ---- 1m candles of the V2 pair (raw price = WETH wei per USDC unit).
-    let candles = database
-        .client
-        .query(&format!(
-            "SELECT toUInt32(bucket), open, high, low, close, volume0, \
-             volume1, swaps, traders FROM dex_candles_1m_v \
-             WHERE chain = {CHAIN} AND pool_id = {pair} ORDER BY bucket"
-        ))
-        .fetch_all::<(u32, f64, f64, f64, f64, f64, f64, u64, u64)>()
-        .await
-        .unwrap();
-
     let price_a = 1e15 / 2_624_963.0;
-    assert_eq!(candles.len(), 3);
 
-    let first = candles[0];
+    // ---- 1m candles of the V2 pair: trade prices AND pool prices (the
+    // reserves the pair reported right before each swap).
+    let minutes = candles(&database, "dex_candles_1m_v", &pair).await;
+    assert_eq!(minutes.len(), 3);
+
+    let first = minutes[0];
     assert_eq!(first.0, DAY);
     assert!(close(first.1, price_a), "{first:?}");
     assert!(close(first.2, price_a));
     assert!(close(first.3, 3.8e8));
     assert!(close(first.4, 3.8e8));
-    assert_eq!((first.5, first.6), (7_624_963.0, 2.9e15));
-    assert_eq!((first.7, first.8), (2, 2));
+    assert!(close(first.5, ratio(RESERVES_A)), "{first:?}");
+    assert!(close(first.6, ratio(RESERVES_B)), "{first:?}");
+    assert_eq!((first.7, first.8), (7_624_963.0, 2));
 
-    let second = candles[1];
-    assert_eq!(second.0, DAY + 60);
-    assert_eq!(
-        (second.1, second.2, second.3, second.4),
-        (4e8, 4e8, 4e8, 4e8)
-    );
-    assert_eq!(
-        (second.5, second.6, second.7, second.8),
-        (1e6, 4e14, 1, 1)
-    );
+    assert_eq!(minutes[1].0, DAY + 60);
+    assert_eq!((minutes[1].1, minutes[1].4), (4e8, 4e8));
+    assert!(close(minutes[1].6, ratio(RESERVES_C)));
+    assert_eq!(minutes[2].0, DAY + 3_660);
 
-    assert_eq!(candles[2].0, DAY + 3_660);
+    // ---- 1h and 1d.
+    let hours = candles(&database, "dex_candles_1h_v", &pair).await;
+    assert_eq!(hours.len(), 2);
+    assert_eq!(hours[0].0, DAY);
+    assert!(close(hours[0].1, price_a));
+    assert_eq!((hours[0].2, hours[0].3, hours[0].4), (4e8, 3.8e8, 4e8));
+    assert!(close(hours[0].6, ratio(RESERVES_C)));
+    assert_eq!((hours[0].7, hours[0].8), (8_624_963.0, 3));
+    assert_eq!((hours[1].0, hours[1].4), (DAY + 3_600, 4.5e8));
 
-    // ---- 1h and 1d candles.
-    let hour = database
-        .client
-        .query(&format!(
-            "SELECT toUInt32(bucket), open, high, low, close, volume0, \
-             volume1, swaps, traders FROM dex_candles_1h_v \
-             WHERE chain = {CHAIN} AND pool_id = {pair} ORDER BY bucket"
-        ))
-        .fetch_all::<(u32, f64, f64, f64, f64, f64, f64, u64, u64)>()
-        .await
-        .unwrap();
+    let days = candles(&database, "dex_candles_1d_v", &pair).await;
+    assert_eq!(days.len(), 1);
+    assert!(close(days[0].1, price_a));
+    assert_eq!((days[0].2, days[0].3, days[0].4), (4.5e8, 3.8e8, 4.5e8));
+    assert!(close(days[0].5, ratio(RESERVES_A)));
+    assert!(close(days[0].6, ratio(RESERVES_D)));
+    assert_eq!((days[0].7, days[0].8), (10_624_963.0, 4));
 
-    assert_eq!(hour.len(), 2);
-    assert_eq!(hour[0].0, DAY);
-    assert!(close(hour[0].1, price_a));
-    assert_eq!((hour[0].2, hour[0].3, hour[0].4), (4e8, 3.8e8, 4e8));
-    assert_eq!((hour[0].5, hour[0].6), (8_624_963.0, 3.3e15));
-    assert_eq!((hour[0].7, hour[0].8), (3, 2));
-    assert_eq!(hour[1].0, DAY + 3_600);
-    assert_eq!(hour[1].4, 4.5e8);
-
-    let day = database
-        .client
-        .query(&format!(
-            "SELECT toUInt32(bucket), open, high, low, close, volume0, \
-             volume1, swaps, traders FROM dex_candles_1d_v \
-             WHERE chain = {CHAIN} AND pool_id = {pair}"
-        ))
-        .fetch_all::<(u32, f64, f64, f64, f64, f64, f64, u64, u64)>()
-        .await
-        .unwrap();
-
-    assert_eq!(day.len(), 1);
-    assert_eq!(day[0].0, DAY);
-    assert!(close(day[0].1, price_a));
-    assert_eq!((day[0].2, day[0].3, day[0].4), (4.5e8, 3.8e8, 4.5e8));
-    assert_eq!((day[0].5, day[0].6), (10_624_963.0, 4.2e15));
-    assert_eq!((day[0].7, day[0].8), (4, 2));
-
-    // ---- sqrt price candles (V3): (sqrtPriceX96 / 2^96)^2.
-    let v3 = database
-        .client
-        .query(&format!(
-            "SELECT close FROM dex_candles_1h_v WHERE chain = {CHAIN} \
-             AND pool_id = {}",
-            word(&pool_id_of(address(fixtures::V3_USDC_WETH)))
-        ))
-        .fetch_one::<f64>()
-        .await
-        .unwrap();
+    // ---- V3: the pool price is (sqrtPriceX96 / 2^96)^2, the trade price
+    // the amounts.
+    let v3 = candles(
+        &database,
+        "dex_candles_1h_v",
+        &word(&pool_id_of(address(fixtures::V3_USDC_WETH))),
+    )
+    .await;
     let sqrt = 1_547_521_364_678_359_767_176_169_597_843_369f64
         / 79_228_162_514_264_337_593_543_950_336f64;
-    assert!(close(v3, sqrt * sqrt), "{v3}");
+    assert!(close(v3[0].6, sqrt * sqrt), "{v3:?}");
+    assert!(close(
+        v3[0].4,
+        12_572_743_894_898_124_800f64 / 32_942_903_993f64
+    ));
 
-    // ---- decimals adjusted candle: WETH per USDC.
+    // ---- decimals adjusted candle of a TRUSTED pool: pool price series.
     let adjusted = database
         .client
         .query(&format!(
-            "SELECT symbol0, symbol1, ifNull(close, -1), ifNull(volume0_adj, -1), ifNull(volume1_adj, -1) \
+            "SELECT symbol0, symbol1, price_source, ifNull(close, -1), \
+             ifNull(volume0_adj, -1), ifNull(volume1_adj, -1) \
              FROM dex_pool_prices_1d_v WHERE chain = {CHAIN} \
              AND pool_id = {pair}"
         ))
-        .fetch_one::<(String, String, f64, f64, f64)>()
+        .fetch_one::<(String, String, String, f64, f64, f64)>()
         .await
         .unwrap();
     assert_eq!(
-        (adjusted.0.as_str(), adjusted.1.as_str()),
-        ("USDC", "WETH")
+        (adjusted.0.as_str(), adjusted.1.as_str(), adjusted.2.as_str()),
+        ("USDC", "WETH", "pool")
     );
-    assert!(close(adjusted.2, 4.5e-4));
-    assert!(close(adjusted.3, 10.624963));
-    assert!(close(adjusted.4, 0.0042));
+    assert!(close(adjusted.3, ratio(RESERVES_D) * 1e-12), "{adjusted:?}");
+    assert!(close(adjusted.4, 10.624963));
+    assert!(close(adjusted.5, 0.0042));
 
-    // ---- native price: volume weighted over the four native/stable pools.
+    // ---- native price: only verified native/stable swaps of pools above
+    // the volume floor vote. Hour 1: the V3 pool alone (the V2 pair traded
+    // 8.6 USDC, the V4 swaps are not proven on both legs). Hour 2: nobody.
     let native = database
         .client
         .query(&format!(
-            "SELECT toUInt32(bucket), ifNull(price, -1), pools FROM \
-             dex_native_price_1h_v WHERE chain = {CHAIN} ORDER BY bucket"
+            "SELECT toUInt32(bucket), toUInt32(valid_from), ifNull(price, -1), \
+             pools \
+             FROM dex_native_price_1h_v WHERE chain = {CHAIN} ORDER BY bucket"
         ))
-        .fetch_all::<(u32, f64, u64)>()
+        .fetch_all::<(u32, u32, f64, u64)>()
         .await
         .unwrap();
 
-    assert_eq!(native.len(), 2);
-    assert_eq!((native[0].0, native[0].2), (DAY, 4));
-    assert!(
-        close(native[0].1, expected_native_price(false)),
-        "{native:?}"
+    assert_eq!(native.len(), 1);
+    assert_eq!(
+        (native[0].0, native[0].1, native[0].3),
+        (DAY, DAY + 3_600, 1)
     );
-    assert!(close(native[1].1, 2.0 / 0.0009));
+    assert!(close(native[0].2, native_price_hour_1()), "{native:?}");
 
     // ---- per swap USD.
     let usd = database
         .client
         .query(&format!(
             "SELECT toUInt64(block_number), log_index, protocol, symbol_in, \
-             symbol_out, toUInt8(token_in_known), ifNull(amount_in_adj, -1), \
-             ifNull(amount_out_adj, -1), ifNull(amount_usd, -1) FROM dex_swaps_usd_v \
+             symbol_out, toUInt8(token_in_verified), \
+             toUInt8(token_out_verified), ifNull(amount_in_adj, -1), \
+             ifNull(amount_usd, -1) FROM dex_swaps_usd_v \
              WHERE chain = {CHAIN} ORDER BY block_number, log_index"
         ))
-        .fetch_all::<(
-            u64,
-            u32,
-            String,
-            String,
-            String,
-            u8,
-            f64,
-            f64,
-            f64,
-        )>()
+        .fetch_all::<(u64, u32, String, String, String, u8, u8, f64, f64)>()
         .await
         .unwrap();
 
     assert_eq!(usd.len(), 11);
-    let price = expected_native_price(false);
+    let price = native_price_hour_1();
 
-    // A: WETH in, USDC out -> the stable side wins: 2.624963 USD.
+    // A: WETH in, USDC out, both proven -> the stable side: 2.624963 USD.
+    assert_eq!((usd[0].0, usd[0].1), (100, 3));
     assert_eq!((usd[0].3.as_str(), usd[0].4.as_str()), ("WETH", "USDC"));
-    assert!(close(usd[0].6, 0.001));
+    assert_eq!((usd[0].5, usd[0].6), (1, 1));
+    assert!(close(usd[0].7, 0.001));
     assert!(close(usd[0].8, 2.624963));
-    // B: 5 USDC in.
+    // B, C: USDC in.
     assert!(close(usd[1].8, 5.0));
+    assert!(close(usd[2].8, 1.0));
     // V3: WETH in, 32,942.903993 USDC out.
     assert_eq!(usd[3].2, "uniswap_v3");
     assert!(close(usd[3].8, 32_942.903993));
-    // V4 (negated): USDC in / USDT in.
+    // V4, first swap: nothing proves it (netted settlement) -> NULL. The
+    // tokens are still KNOWN (trusted pool row), just not valued.
     assert_eq!((usd[4].3.as_str(), usd[4].4.as_str()), ("USDC", "WETH"));
-    assert!(close(usd[4].8, 1_793.58876));
-    assert_eq!((usd[5].3.as_str(), usd[5].4.as_str()), ("USDT", "WETH"));
+    assert_eq!((usd[4].5, usd[4].6, usd[4].8), (0, 0, NULL));
+    // V4, second swap: the USDT settlement proves the input.
+    assert_eq!((usd[5].3.as_str(), usd[5].5, usd[5].6), ("USDT", 1, 0));
     assert!(close(usd[5].8, 1_428.368405));
-    // Balancer: unknown token in, WETH out -> native priced.
-    assert_eq!(usd[6].2, "balancer_v2");
-    assert_eq!((usd[6].5, usd[6].6), (1, NULL));
-    assert!(close(usd[6].8, 0.0016586259733838 * price));
-    // Curve 3pool: coin 2 (USDT) -> coin 1 (USDC).
-    assert_eq!((usd[7].3.as_str(), usd[7].4.as_str()), ("USDT", "USDC"));
-    assert!(close(usd[7].8, 0.099206));
-    // Curve pool without a dex_pools row, unknown pair: NULL, never 0.
+    // Curve 3pool: the transfers name the coins, USDT in.
+    assert_eq!((usd[6].3.as_str(), usd[6].4.as_str()), ("USDT", "USDC"));
+    assert!(close(usd[6].8, 0.099206));
+    // A Curve pool and a pair nobody knows, nothing proven: NULL, never 0.
+    assert_eq!((usd[7].5, usd[7].8), (0, NULL));
     assert_eq!((usd[8].5, usd[8].8), (0, NULL));
-    assert_eq!((usd[9].5, usd[9].8), (0, NULL));
     // D, next hour: 2 USDC in.
-    assert!(close(usd[10].8, 2.0));
+    assert!(close(usd[9].8, 2.0));
+    // Balancer, next hour: a "stable" of unknown decimals in (NULL, not
+    // 1e18 of anything), WETH out at the price of the hour BEFORE.
+    assert_eq!(usd[10].2, "balancer_v2");
+    assert_eq!((usd[10].5, usd[10].6, usd[10].7), (1, 1, NULL));
+    assert!(close(usd[10].8, BALANCER_WETH_OUT * price), "{:?}", usd[10]);
 
-    // ---- daily USD volume per pool.
+    // ---- daily USD per pool = the sum of its swaps' values.
     let pool_usd = database
         .client
         .query(&format!(
-            "SELECT protocol, lower(hex(pool_id)), ifNull(volume_usd, -1), swaps, \
-             traders FROM dex_pool_volume_usd_1d_v WHERE chain = {CHAIN} \
-             ORDER BY protocol, pool_id"
+            "SELECT protocol, lower(hex(pool_id)), ifNull(volume_usd, -1), \
+             swaps, priced_swaps, traders FROM dex_pool_volume_usd_1d_v \
+             WHERE chain = {CHAIN} ORDER BY protocol, pool_id"
         ))
-        .fetch_all::<(String, String, f64, u64, u64)>()
+        .fetch_all::<(String, String, f64, u64, u64, u64)>()
         .await
         .unwrap();
 
-    let daily = expected_native_price(true);
     let of = |protocol: &str, id: &str| {
         pool_usd
             .iter()
@@ -799,27 +1024,29 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
             .unwrap_or_else(|| panic!("{protocol} {id}"))
     };
 
-    // Both legs priced: USDC inputs (5 + 1 + 2) + WETH input (0.001).
     let v2 = of("uniswap_v2", &fixtures::V2_USDC_WETH[2..]);
-    assert!(close(v2.2, 8.0 + 0.001 * daily), "{v2:?}");
-    assert_eq!((v2.3, v2.4), (4, 2));
-    // Unknown pair: NULL.
+    assert!(close(v2.2, 10.624963), "{v2:?}");
+    assert_eq!((v2.3, v2.4, v2.5), (4, 4, 2));
     let unknown = of("uniswap_v2", &"99".repeat(20));
-    assert_eq!((unknown.2, unknown.3), (NULL, 1));
-    // 3pool: USDT input.
+    assert_eq!((unknown.2, unknown.3, unknown.4), (NULL, 1, 0));
     let three = of("curve", &fixtures::CURVE_3POOL_EXCHANGE.address[2..]);
     assert!(close(three.2, 0.099206));
-    // Balancer: only the output leg is priced.
     let balancer =
         of("balancer_v2", &fixtures::BALANCER_SWAP.topics[1][2..]);
-    assert!(close(balancer.2, 0.0016586259733838 * daily));
+    assert!(close(balancer.2, BALANCER_WETH_OUT * price));
+
+    let swap_total =
+        usd.iter().filter(|row| row.8 >= 0.0).map(|row| row.8);
+    let pool_total =
+        pool_usd.iter().filter(|row| row.2 >= 0.0).map(|row| row.2);
+    assert!(close(pool_total.sum::<f64>(), swap_total.sum::<f64>()));
 
     // ---- per protocol.
     let protocols = database
         .client
         .query(&format!(
-            "SELECT protocol, ifNull(volume_usd, -1), priced_pools, pools, swaps, \
-             traders FROM dex_protocol_volume_usd_1d_v \
+            "SELECT protocol, ifNull(volume_usd, -1), priced_swaps, pools, \
+             swaps, traders FROM dex_protocol_volume_usd_1d_v \
              WHERE chain = {CHAIN} ORDER BY protocol"
         ))
         .fetch_all::<(String, f64, u64, u64, u64, u64)>()
@@ -832,21 +1059,21 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
         names,
         ["balancer_v2", "curve", "uniswap_v2", "uniswap_v3", "uniswap_v4"]
     );
-    // curve: two pools traded, one priced.
     assert_eq!(
         (protocols[1].2, protocols[1].3, protocols[1].4),
         (1, 2, 2)
     );
-    assert!(close(protocols[2].1, 8.0 + 0.001 * daily));
+    assert!(close(protocols[2].1, 10.624963));
     assert_eq!((protocols[2].3, protocols[2].4), (2, 5));
-    assert!(close(protocols[4].1, 1_793.58876 + 1_428.368405));
+    assert!(close(protocols[4].1, 1_428.368405));
+    assert_eq!((protocols[4].2, protocols[4].4), (1, 2));
 
-    // ---- per token.
+    // ---- per token: verified legs only.
     let usdc = database
         .client
         .query(&format!(
-            "SELECT symbol, ifNull(volume_adj, -1), ifNull(volume_usd, -1), swaps, pools \
-             FROM dex_token_volume_1d_v WHERE chain = {CHAIN} \
+            "SELECT symbol, ifNull(volume_adj, -1), ifNull(volume_usd, -1), \
+             swaps, pools FROM dex_token_volume_1d_v WHERE chain = {CHAIN} \
              AND token = {}",
             addr(&address(fixtures::USDC))
         ))
@@ -854,26 +1081,15 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
         .await
         .unwrap();
 
-    let usdc_volume = 10.624963 + 32_942.903993 + 1_793.58876 + 0.099112;
     assert_eq!(usdc.0, "USDC");
-    assert!(close(usdc.1, usdc_volume), "{usdc:?}");
-    assert!(close(usdc.2, usdc_volume));
-    assert_eq!((usdc.3, usdc.4), (7, 4));
+    assert!(
+        close(usdc.1, 10.624963 + 32_942.903993 + 0.099112),
+        "{usdc:?}"
+    );
+    assert!(close(usdc.2, 10.624963 + 32_942.903993 + 0.099206));
+    assert_eq!((usdc.3, usdc.4), (6, 3));
 
-    let token_usd = database
-        .client
-        .query(&format!(
-            "SELECT ifNull(volume_usd, -1), swaps, unpriced_swaps \
-             FROM dex_token_volume_usd_1d_v WHERE chain = {CHAIN} \
-             AND token = {}",
-            addr(&address(fixtures::WETH))
-        ))
-        .fetch_one::<(f64, u64, u64)>()
-        .await
-        .unwrap();
-    assert_eq!((token_usd.1, token_usd.2), (8, 0));
-
-    // ---- pools of a token, top pools.
+    // ---- read path tables.
     assert_eq!(
         database
             .count(&format!(
@@ -882,7 +1098,7 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
                 addr(&address(fixtures::USDC))
             ))
             .await,
-        4
+        6
     );
     assert_eq!(
         database
@@ -904,39 +1120,774 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
         4
     );
 
-    // ---- the backfill query: traded, resolvable, no dex_pools row.
+    // ---- the resolver's work list: traded, contract pool, never answered.
     let missing = crate::dex::MISSING_POOLS_SQL
         .replace("{chain}", &CHAIN.to_string())
         .replace("{limit}", "100");
     let missing = database
         .client
         .query(&format!(
-            "SELECT lower(hex(emitter)), protocol FROM ({missing}) \
-             ORDER BY protocol"
+            "SELECT lower(hex(emitter)), protocol, attempts FROM ({missing})"
         ))
-        .fetch_all::<(String, String)>()
+        .fetch_all::<(String, String, u32)>()
         .await
         .unwrap();
     assert_eq!(
         missing,
         vec![
+            ("99".repeat(20), "uniswap_v2".to_string(), 0),
             (
                 fixtures::CURVE_UNDERLYING_EXCHANGE.address[2..]
                     .to_string(),
-                "curve".to_string()
+                "curve".to_string(),
+                0
             ),
-            ("99".repeat(20), "uniswap_v2".to_string()),
         ]
     );
 
     database.drop().await;
 }
 
+// ------------------------------------------------------------- forgeries
+
+/// The numbers a forgery must not move: (view, rows as text).
+async fn headlines(database: &TestDb) -> Vec<(String, Vec<String>)> {
+    let mut state = Vec::new();
+
+    for (name, sql) in [
+        ("native price", "SELECT * FROM dex_native_price_1h_v".to_string()),
+        ("token volumes", "SELECT * FROM dex_token_volume_1d_v".to_string()),
+        (
+            "valued swaps",
+            "SELECT chain, block_number, log_index, amount_usd \
+             FROM dex_swaps_usd_v WHERE amount_usd IS NOT NULL"
+                .to_string(),
+        ),
+        (
+            "pool usd",
+            "SELECT chain, pool_id, emitter, bucket, volume_usd, priced_swaps \
+             FROM dex_pool_volume_usd_1d_v WHERE volume_usd IS NOT NULL"
+                .to_string(),
+        ),
+        (
+            "protocol usd",
+            "SELECT chain, protocol, bucket, volume_usd, priced_swaps \
+             FROM dex_protocol_volume_usd_1d_v"
+                .to_string(),
+        ),
+        (
+            "trusted pool prices",
+            "SELECT * FROM dex_pool_prices_1h_v".to_string(),
+        ),
+    ] {
+        let rows = database
+            .lines(&format!(
+                "SELECT hex(toString(tuple(*))) AS line FROM ({sql}) \
+                 ORDER BY line"
+            ))
+            .await;
+        assert!(!rows.is_empty(), "{name}");
+        state.push((name.to_string(), rows));
+    }
+
+    state
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn forged_events_do_not_move_any_headline() {
+    let database = TestDb::create().await;
+    seed(&database).await;
+    let before = headlines(&database).await;
+
+    let (usdc, weth) = usdc_weth();
+    let junk_vault = Address::repeat_byte(0xb1);
+    let junk_pair = Address::repeat_byte(0xb2);
+
+    let forged = vec![
+        // Path A: a Balancer shaped swap, USDC -> WETH, 1e30 for 1, from a
+        // contract that is not the Vault and moved nothing.
+        constructed(
+            junk_vault,
+            &[
+                events::BALANCER_SWAP.topic0,
+                B256::repeat_byte(0x0b),
+                usdc.into_word(),
+                weth.into_word(),
+            ],
+            [number(10u128.pow(30)), number(1)].concat(),
+            101,
+            at(60, 0),
+            DAY + 70,
+        ),
+        // Path B: anyone announces PairCreated(USDC, WETH, junk)...
+        constructed(
+            Address::repeat_byte(0xf2),
+            &[
+                events::V2_PAIR_CREATED.topic0,
+                usdc.into_word(),
+                weth.into_word(),
+            ],
+            [junk_pair.into_word().to_vec(), number(9)].concat(),
+            101,
+            at(61, 0),
+            DAY + 70,
+        ),
+        // ... and the junk contract emits a Sync and a Swap: one USDC for
+        // a million WETH.
+        constructed(
+            junk_pair,
+            &[events::V2_SYNC.topic0],
+            [number(1), number(10u128.pow(24))].concat(),
+            101,
+            at(61, 1),
+            DAY + 70,
+        ),
+        v2_swap(
+            junk_pair,
+            TRADER_X,
+            [10u128.pow(12), 0, 0, 10u128.pow(24)],
+            101,
+            at(61, 2),
+            DAY + 70,
+        ),
+        // A pre-announced / contradicting PairCreated for the REAL pair,
+        // positioned before the real creation: (NEWTOKEN, USDC).
+        constructed(
+            Address::repeat_byte(0xf9),
+            &[
+                events::V2_PAIR_CREATED.topic0,
+                Address::repeat_byte(0x01).into_word(),
+                usdc.into_word(),
+            ],
+            [
+                address(fixtures::V2_USDC_WETH).into_word().to_vec(),
+                number(1),
+            ]
+            .concat(),
+            80,
+            0,
+            DAY - 2_000,
+        ),
+    ];
+
+    let rows = decode(CHAIN, &forged);
+    assert_eq!((rows.swaps.len(), rows.pools.len()), (2, 2));
+    insert_logs(&database, CHAIN, &forged, 0).await;
+
+    let after = headlines(&database).await;
+    assert_same_state(&after, &before, "with the forged rows");
+
+    // The forgeries are IN the data - shown, never valued.
+    let seen = database
+        .client
+        .query(&format!(
+            "SELECT lower(hex(emitter)), symbol_in, \
+             toUInt8(token_in_verified), ifNull(amount_usd, -1) \
+             FROM dex_swaps_usd_v WHERE chain = {CHAIN} AND emitter IN \
+             ({}, {}) ORDER BY emitter",
+            addr(&junk_vault),
+            addr(&junk_pair)
+        ))
+        .fetch_all::<(String, String, u8, f64)>()
+        .await
+        .unwrap();
+    assert_eq!(
+        seen,
+        vec![
+            // The event NAMES USDC: displayed as a claim, not verified.
+            ("b1".repeat(20), "USDC".to_string(), 0, NULL),
+            // The junk pair is 'unverified': its tokens are not even shown.
+            ("b2".repeat(20), String::new(), 0, NULL),
+        ]
+    );
+
+    // The real pair is contested by the pre-announced event - and still
+    // resolved by what the pair itself answered.
+    let pair = database
+        .client
+        .query(&format!(
+            "SELECT status, lower(hex(token0)), toUInt64(created_block), \
+             candidates FROM dex_pool_current_v WHERE chain = {CHAIN} AND \
+             pool_id = {}",
+            word(&pool_id_of(address(fixtures::V2_USDC_WETH)))
+        ))
+        .fetch_one::<(String, String, u64, u64)>()
+        .await
+        .unwrap();
+    assert_eq!(
+        pair,
+        ("verified".to_string(), fixtures::USDC[2..].to_string(), 90, 3)
+    );
+
+    // Even a real looking swap THROUGH the fake vault, with real transfers,
+    // is not valued: the emitter is not a trusted singleton.
+    let mut washed = vec![
+        constructed(
+            junk_vault,
+            &[
+                events::BALANCER_SWAP.topic0,
+                B256::repeat_byte(0x0b),
+                usdc.into_word(),
+                weth.into_word(),
+            ],
+            [number(5_000_000_000), number(2_000_000_000_000_000_000)]
+                .concat(),
+            101,
+            at(62, 0),
+            DAY + 70,
+        ),
+        transfer(
+            usdc,
+            TRADER_X,
+            junk_vault,
+            U256::from(5_000_000_000u64),
+            101,
+            at(62, 1),
+            DAY + 70,
+        ),
+        transfer(
+            weth,
+            junk_vault,
+            TRADER_X,
+            U256::from(2_000_000_000_000_000_000u64),
+            101,
+            at(62, 2),
+            DAY + 70,
+        ),
+    ];
+    washed = same_transaction(washed, 777);
+    let rows = decode(CHAIN, &washed);
+    assert_eq!(rows.swaps[0].verified_in, usdc);
+    insert_logs(&database, CHAIN, &washed, 0).await;
+
+    let after = headlines(&database).await;
+    assert_same_state(&after, &before, "with a washed fake vault swap");
+
+    database.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn pool_metadata_is_what_the_pool_answers() {
+    let database = TestDb::create().await;
+    seed_reference(&database, CHAIN).await;
+
+    let (usdc, weth) = usdc_weth();
+    let pair = Address::repeat_byte(0xc1);
+    let pool_id = word(&pool_id_of(pair));
+
+    let creation = |token0: Address, token1: Address, block: u32| {
+        constructed(
+            Address::repeat_byte(0xf2),
+            &[
+                events::V2_PAIR_CREATED.topic0,
+                token0.into_word(),
+                token1.into_word(),
+            ],
+            [pair.into_word().to_vec(), number(1)].concat(),
+            block,
+            0,
+            DAY,
+        )
+    };
+
+    let current = |database: &TestDb| {
+        let sql = format!(
+            "SELECT status, toUInt8(trusted), lower(hex(token0)), source, \
+             toUInt64(created_block), candidates FROM dex_pool_current_v \
+             WHERE chain = {CHAIN} AND pool_id = {pool_id}"
+        );
+        let client = database.client.clone();
+        async move {
+            client
+                .query(&sql)
+                .fetch_all::<(String, u8, String, String, u64, u64)>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let usdc_hex = fixtures::USDC[2..].to_string();
+
+    // 1. A PRE-ANNOUNCED forgery: V2 pair addresses are predictable, so
+    //    PairCreated(NEWTOKEN, USDC, pair) can be emitted before the pair
+    //    exists. Alone it is a claim: 'unverified', not trusted.
+    insert_logs(
+        &database,
+        CHAIN,
+        &[creation(Address::repeat_byte(0x01), usdc, 80)],
+        0,
+    )
+    .await;
+    assert_eq!(
+        current(&database).await,
+        vec![(
+            "unverified".into(),
+            0,
+            "01".repeat(20),
+            "event".into(),
+            80,
+            1
+        )]
+    );
+
+    // A swap of that pool without proof: the claimed tokens are NOT used.
+    insert_logs(
+        &database,
+        CHAIN,
+        &[v2_swap(
+            pair,
+            TRADER_X,
+            [5_000_000, 0, 0, 2_000_000],
+            95,
+            0,
+            DAY + 5,
+        )],
+        0,
+    )
+    .await;
+    let unproven = database
+        .client
+        .query(&format!(
+            "SELECT toUInt8(token_in_known), symbol_in, \
+             ifNull(amount_usd, -1) FROM dex_swaps_usd_v WHERE chain = \
+             {CHAIN} AND pool_id = {pool_id}"
+        ))
+        .fetch_one::<(u8, String, f64)>()
+        .await
+        .unwrap();
+    assert_eq!(unproven, (0, String::new(), NULL));
+
+    // 2. The real creation arrives: two token sets -> 'contested'.
+    insert_logs(&database, CHAIN, &[creation(usdc, weth, 90)], 0).await;
+    assert_eq!(
+        current(&database).await,
+        vec![(
+            "contested".into(),
+            0,
+            "01".repeat(20),
+            "event".into(),
+            80,
+            2
+        )]
+    );
+
+    // A PROVEN swap of the contested pool is valued all the same: its
+    // token identity comes from the transfers, not from dex_pools.
+    insert_logs(
+        &database,
+        CHAIN,
+        &v2_trade(
+            pair,
+            (usdc, weth),
+            TRADER_X,
+            [7_000_000, 0, 0, 2_000_000_000_000_000],
+            (1, 1),
+            96,
+            0,
+            DAY + 6,
+        ),
+        0,
+    )
+    .await;
+    let proven = database
+        .client
+        .query(&format!(
+            "SELECT symbol_in, symbol_out, ifNull(amount_usd, -1) \
+             FROM dex_swaps_usd_v WHERE chain = {CHAIN} AND pool_id = \
+             {pool_id} AND block_number = 96"
+        ))
+        .fetch_one::<(String, String, f64)>()
+        .await
+        .unwrap();
+    assert_eq!(proven, ("USDC".to_string(), "WETH".to_string(), 7.0));
+    // ... but there are no decimals adjusted candles of an untrusted pool.
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_pool_prices_1h_v WHERE chain = \
+                 {CHAIN} AND pool_id = {pool_id}"
+            ))
+            .await,
+        0
+    );
+
+    // 3. The pool answers token0() / token1(): that WINS, and the first
+    //    event that agrees with it supplies factory / created_block.
+    let mut answered = DexRows {
+        pools: vec![rpc_pool(
+            CHAIN,
+            pair,
+            Protocol::UniswapV2,
+            vec![usdc, weth],
+        )],
+        ..DexRows::default()
+    };
+    answered.set_version(next_version());
+    database.insert(&answered).await;
+    assert_eq!(
+        current(&database).await,
+        vec![(
+            "verified".into(),
+            1,
+            usdc_hex.clone(),
+            "event".into(),
+            90,
+            3
+        )]
+    );
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_pool_prices_1h_v WHERE chain = \
+                 {CHAIN} AND pool_id = {pool_id}"
+            ))
+            .await,
+        1
+    );
+
+    // 4. A reorg drops BOTH creation events: the pool is still what it
+    //    answered (resolver rows are chain state, no purge touches them).
+    purge(&database, CHAIN, 0, 1, DAY).await;
+    assert_eq!(
+        current(&database).await,
+        vec![("verified".into(), 1, usdc_hex.clone(), "rpc".into(), 0, 1)]
+    );
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_pools_by_token FINAL WHERE chain = \
+                 {CHAIN} AND pool_id = {pool_id} AND source = 'event'"
+            ))
+            .await,
+        0
+    );
+
+    // 5. Re-created on the canonical chain at the SAME position, in the new
+    //    epoch: alive again (beats its own tombstone).
+    insert_logs(&database, CHAIN, &[creation(usdc, weth, 90)], 1).await;
+    assert_eq!(
+        current(&database).await,
+        vec![(
+            "verified".into(),
+            1,
+            usdc_hex.clone(),
+            "event".into(),
+            90,
+            2
+        )]
+    );
+
+    // 6. A forged event can not re-tokenise an rpc resolved pool, however
+    //    early it claims to be.
+    insert_logs(
+        &database,
+        CHAIN,
+        &[creation(Address::repeat_byte(0x02), usdc, 10)],
+        1,
+    )
+    .await;
+    assert_eq!(
+        current(&database).await,
+        vec![("verified".into(), 1, usdc_hex, "event".into(), 90, 3)]
+    );
+
+    // 7. Protocol attribution follows the POOL: a Solidly V1 fork emits the
+    //    V2 swap, its pool says 'solidly'.
+    let fork = Address::repeat_byte(0xc2);
+    let mut solidly =
+        rpc_pool(CHAIN, fork, Protocol::Solidly, vec![usdc, weth]);
+    solidly.stable = true;
+    let mut rows = DexRows { pools: vec![solidly], ..DexRows::default() };
+    rows.set_version(next_version());
+    database.insert(&rows).await;
+    insert_logs(
+        &database,
+        CHAIN,
+        &v2_trade(
+            fork,
+            (usdc, weth),
+            TRADER_X,
+            [3_000_000, 0, 0, 1_000_000_000_000_000],
+            (50_000_000_000, 60_000_000_000_000_000_000),
+            97,
+            0,
+            DAY + 7,
+        ),
+        1,
+    )
+    .await;
+    let attributed = database
+        .client
+        .query(&format!(
+            "SELECT protocol, ifNull(volume_usd, -1), swaps \
+             FROM dex_protocol_volume_usd_1d_v WHERE chain = {CHAIN} \
+             AND protocol = 'solidly'"
+        ))
+        .fetch_all::<(String, f64, u64)>()
+        .await
+        .unwrap();
+    assert_eq!(attributed, vec![("solidly".to_string(), 3.0, 1)]);
+    // ... and a STABLE pool's candle uses trades: reserves say nothing
+    // about the price on the x3y + y3x curve.
+    let stable = database
+        .client
+        .query(&format!(
+            "SELECT price_source, ifNull(close, -1) FROM \
+             dex_pool_prices_1h_v WHERE chain = {CHAIN} AND pool_id = {}",
+            word(&pool_id_of(fork))
+        ))
+        .fetch_one::<(String, f64)>()
+        .await
+        .unwrap();
+    assert_eq!(stable.0, "trades");
+    assert!(close(stable.1, 1e15 / 3e6 * 1e-12));
+
+    database.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn native_price_is_a_median_without_look_ahead_or_stale_prices() {
+    let database = TestDb::create().await;
+    seed_reference(&database, CHAIN).await;
+
+    let (usdc, weth) = usdc_weth();
+    // Three honest pools around 2600 USD, one wash traded at 2 USD with
+    // MORE volume than all of them together.
+    let pools: [(u8, u128, u128); 4] = [
+        (0xd1, 2_600_000_000, 1_000_000_000_000_000_000),
+        (0xd2, 2_620_000_000, 1_000_000_000_000_000_000),
+        (0xd3, 2_640_000_000, 1_000_000_000_000_000_000),
+        (0xd4, 20_000_000_000, 10_000_000_000_000_000_000_000),
+    ];
+
+    let mut hour_1 = Vec::new();
+    for (slot, (pool, usdc_in, weth_out)) in pools.iter().enumerate() {
+        hour_1.extend(v2_trade(
+            Address::repeat_byte(*pool),
+            (usdc, weth),
+            TRADER_X,
+            [*usdc_in, 0, 0, *weth_out],
+            (1, 1),
+            100,
+            slot as u16,
+            DAY + 10,
+        ));
+    }
+    // A dust pool far below the volume floor, at an absurd price.
+    hour_1.extend(v2_trade(
+        Address::repeat_byte(0xd5),
+        (usdc, weth),
+        TRADER_X,
+        [1_000_000, 0, 0, 1_000_000_000_000_000_000_000],
+        (1, 1),
+        100,
+        9,
+        DAY + 10,
+    ));
+    // A WETH -> junk swap in the SAME hour: only a native leg to value it.
+    let junk = Address::repeat_byte(0xe0);
+    let native_only = |block: u32, timestamp: u32| {
+        v2_trade(
+            Address::repeat_byte(0xd6),
+            (junk, weth),
+            TRADER_X,
+            [0, 2_000_000_000_000_000_000, 5_000, 0],
+            (1, 1),
+            block,
+            20,
+            timestamp,
+        )
+    };
+    hour_1.extend(native_only(100, DAY + 20));
+    insert_logs(&database, CHAIN, &hour_1, 0).await;
+
+    let price = database
+        .client
+        .query(&format!(
+            "SELECT ifNull(price, -1), pools FROM dex_native_price_1h_v \
+             WHERE chain = {CHAIN}"
+        ))
+        .fetch_one::<(f64, u64)>()
+        .await
+        .unwrap();
+    // The wash traded pool is ONE vote of four, the dust pool none.
+    assert_eq!(price.1, 4);
+    assert!((2_600.0..=2_640.0).contains(&price.0), "{price:?}");
+
+    // Later hours: +1 h (priced), +25 h (priced: the hour ended 24 h ago),
+    // +26 h (stale: NULL).
+    for (block, offset) in
+        [(200u32, 3_600u32), (300, 25 * 3_600), (400, 26 * 3_600)]
+    {
+        insert_logs(
+            &database,
+            CHAIN,
+            &native_only(block, DAY + offset + 5),
+            0,
+        )
+        .await;
+    }
+
+    let valued = database
+        .client
+        .query(&format!(
+            "SELECT toUInt64(block_number), ifNull(native_price, -1), \
+             ifNull(amount_usd, -1) FROM dex_swaps_usd_v WHERE chain = \
+             {CHAIN} AND emitter = {} ORDER BY block_number",
+            addr(&Address::repeat_byte(0xd6))
+        ))
+        .fetch_all::<(u64, f64, f64)>()
+        .await
+        .unwrap();
+
+    assert_eq!(valued.len(), 4);
+    // Same hour as the price's own bucket: no look ahead.
+    assert_eq!((valued[0].0, valued[0].1, valued[0].2), (100, NULL, NULL));
+    assert!(close(valued[1].2, 2.0 * price.0), "{valued:?}");
+    assert!(close(valued[2].2, 2.0 * price.0), "{valued:?}");
+    assert_eq!((valued[3].1, valued[3].2), (NULL, NULL));
+
+    // The hourly aggregate values the same swaps the same way.
+    let rolled = database
+        .client
+        .query(&format!(
+            "SELECT ifNull(sum(volume_usd), -1), toUInt64(sum(priced_swaps)) \
+             FROM dex_pool_volume_usd_1h_v WHERE chain = {CHAIN} \
+             AND emitter = {}",
+            addr(&Address::repeat_byte(0xd6))
+        ))
+        .fetch_one::<(f64, u64)>()
+        .await
+        .unwrap();
+    assert!(close(rolled.0, 4.0 * price.0), "{rolled:?}");
+    assert_eq!(rolled.1, 2);
+
+    // A fee-on-transfer token: its leg is not proven (the Transfer says
+    // more than the pair received), the WETH leg is, and values the swap.
+    let fee_token = Address::repeat_byte(0xe1);
+    let fot_pair = Address::repeat_byte(0xd7);
+    let mut fot = vec![
+        transfer(
+            fee_token,
+            ROUTER,
+            fot_pair,
+            U256::from(1_000_000u64),
+            200,
+            at(30, 0),
+            DAY + 3_700,
+        ),
+        transfer(
+            weth,
+            fot_pair,
+            TRADER_X,
+            U256::from(500_000_000_000_000_000u64),
+            200,
+            at(30, 1),
+            DAY + 3_700,
+        ),
+        v2_swap(
+            fot_pair,
+            TRADER_X,
+            [990_000, 0, 0, 500_000_000_000_000_000],
+            200,
+            at(30, 3),
+            DAY + 3_700,
+        ),
+    ];
+    fot = same_transaction(fot, 4_242);
+    insert_logs(&database, CHAIN, &fot, 0).await;
+    let fot_usd = database
+        .client
+        .query(&format!(
+            "SELECT toUInt8(token_in_verified), toUInt8(token_out_verified), \
+             ifNull(amount_usd, -1) FROM dex_swaps_usd_v WHERE chain = \
+             {CHAIN} AND emitter = {}",
+            addr(&fot_pair)
+        ))
+        .fetch_one::<(u8, u8, f64)>()
+        .await
+        .unwrap();
+    assert_eq!((fot_usd.0, fot_usd.1), (0, 1));
+    assert!(close(fot_usd.2, 0.5 * price.0));
+
+    // The operator names the price sources: only they vote.
+    database
+        .execute(&format!(
+            "INSERT INTO dex_trusted_emitters (chain, emitter, protocol, \
+             price_source) VALUES ({CHAIN}, {}, 'uniswap_v2', 1), \
+             ({CHAIN}, {}, 'uniswap_v2', 1), ({CHAIN}, {}, 'uniswap_v2', 1)",
+            addr(&Address::repeat_byte(0xd1)),
+            addr(&Address::repeat_byte(0xd2)),
+            addr(&Address::repeat_byte(0xd3)),
+        ))
+        .await;
+    let listed = database
+        .client
+        .query(&format!(
+            "SELECT ifNull(price, -1), pools FROM dex_native_price_1h_v \
+             WHERE chain = {CHAIN}"
+        ))
+        .fetch_one::<(f64, u64)>()
+        .await
+        .unwrap();
+    assert_eq!(listed, (2_620.0, 3));
+
+    database.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn dust_swaps_do_not_make_prices() {
+    let database = TestDb::create().await;
+    seed_reference(&database, CHAIN).await;
+
+    // 10 units for 1: a "price" of 0.1 where the pool stands at 4e8.
+    let dust = pair_trade(
+        [10, 0, 0, 1],
+        (10_000_000_000, 4_000_000_000_000_000_000),
+        100,
+        0,
+        DAY + 10,
+    );
+    insert_logs(&database, CHAIN, &dust, 0).await;
+
+    let pair = word(&pool_id_of(address(fixtures::V2_USDC_WETH)));
+    let candle = candles(&database, "dex_candles_1m_v", &pair).await;
+
+    assert_eq!(candle.len(), 1);
+    // No trade price at all, the pool price from the reserves, the volume
+    // counted like in dex_pool_volume_1h.
+    assert_eq!((candle[0].1, candle[0].4), (NULL, NULL));
+    assert_eq!((candle[0].5, candle[0].6), (4e8, 4e8));
+    assert_eq!((candle[0].7, candle[0].8), (10.0, 1));
+
+    let adjusted = database
+        .client
+        .query(&format!(
+            "SELECT price_source, ifNull(close, -1) FROM \
+             dex_pool_prices_1m_v WHERE chain = {CHAIN} AND pool_id = {pair}"
+        ))
+        .fetch_one::<(String, f64)>()
+        .await
+        .unwrap();
+    assert_eq!(adjusted.0, "pool");
+    assert!(close(adjusted.1, 4e-4));
+
+    database.drop().await;
+}
+
 // ------------------------------------------------ reorgs without DELETE
+
+/// Exclusive upper bound of every rebuild of the tests.
+const REBUILD_TO: u32 = DAY + 40 * 86_400;
 
 /// What `purge_range` does to the DEX tables, in its order (docs/design.md
 /// §2): tombstone the base tables from `fork_block` on, record the reorg,
-/// repair every aggregate under the new epoch. Only INSERTs.
+/// repair every aggregate under the new epoch (month by month). Only
+/// INSERTs.
 async fn purge(
     database: &TestDb,
     chain: u64,
@@ -962,9 +1913,11 @@ async fn purge(
         .await;
 
     for table in DEX_DERIVED {
-        database
-            .execute(&render_rebuild(table, chain, from_ts, new_epoch))
-            .await;
+        for statement in rebuild_statements(
+            table, chain, from_ts, REBUILD_TO, new_epoch,
+        ) {
+            database.execute(&statement).await;
+        }
     }
 }
 
@@ -1014,10 +1967,7 @@ fn assert_same_state(
             clean.len(),
             "{what}: {name} has another number of rows"
         );
-        assert!(
-            rows == clean,
-            "{what}: {name} differs from a clean index"
-        );
+        assert!(rows == clean, "{what}: {name} differs");
     }
 }
 
@@ -1034,16 +1984,14 @@ const READER_VIEWS: &[&str] = &[
     "dex_pool_prices_1m_v",
     "dex_pool_prices_1h_v",
     "dex_pool_prices_1d_v",
-    "dex_pool_volume_1d_v",
+    "dex_pool_volume_1h_v",
     "dex_pool_stats_1d_v",
-    "dex_protocol_stats_1d_v",
     "dex_native_price_1h_v",
-    "dex_native_price_1d_v",
-    "dex_pool_token_volume_1d_v",
+    "dex_pool_volume_usd_1h_v",
     "dex_pool_volume_usd_1d_v",
+    "dex_protocol_stats_1d_v",
     "dex_protocol_volume_usd_1d_v",
     "dex_token_volume_1d_v",
-    "dex_token_volume_usd_1d_v",
 ];
 
 /// A pool announced in block `block` (a creation inside a reorged range).
@@ -1064,32 +2012,29 @@ fn late_pair(pair: u8, block: u32, log_index: u16) -> DatabaseLog {
 }
 
 /// The canonical blocks 101 and 102 after the reorg: FEWER swaps than the
-/// orphaned ones (keys 101/1.. of the old fork stay dead), other amounts on
-/// the key that is reused (101/0), a liquidity event and a pool creation.
+/// orphaned ones (positions of the old fork stay dead), other amounts on
+/// the position that is reused (101/3), a native/stable swap big enough to
+/// set the native price, a pool creation, and a native-only swap in the
+/// next hour that needs that price.
 fn canonical_tail() -> Vec<DatabaseLog> {
-    let pair = address(fixtures::V2_USDC_WETH);
-
-    vec![
-        v2_swap(
-            pair,
-            TRADER_X,
-            [3_000_000, 0, 0, 1_100_000_000_000_000],
-            101,
-            0,
-            DAY + 70,
-        ),
-        fixtures::V3_SWAP.placed(101, 1, DAY + 70),
-        fixtures::V2_SYNC.placed(101, 2, DAY + 70),
-        late_pair(0x97, 101, 3),
-        v2_swap(
-            pair,
-            TRADER_X,
-            [0, 500_000_000_000_000, 1_200_000, 0],
-            102,
-            0,
-            DAY + 3_700,
-        ),
-    ]
+    let mut logs = pair_trade(
+        [3_000_000, 0, 0, 1_100_000_000_000_000],
+        RESERVES_C,
+        101,
+        0,
+        DAY + 70,
+    );
+    logs.extend(v3_real(101, 1, DAY + 70));
+    logs.push(late_pair(0x97, 101, at(7, 0)));
+    logs.extend(pair_trade(
+        [0, 500_000_000_000_000, 1_200_000, 0],
+        RESERVES_D,
+        102,
+        0,
+        DAY + 3_700,
+    ));
+    logs.extend(balancer_real(102, 1, DAY + 3_700));
+    logs
 }
 
 #[tokio::test]
@@ -1102,10 +2047,10 @@ async fn a_reorg_leaves_exactly_a_clean_index() {
         &database,
         CHAIN,
         &[
-            fixtures::V2_MINT.placed(101, 8, DAY + 70),
-            fixtures::V3_MINT.placed(102, 1, DAY + 3_700),
+            fixtures::V2_MINT.placed(101, at(8, 0), DAY + 70),
+            fixtures::V3_MINT.placed(102, at(8, 0), DAY + 3_700),
             // Created on the fork that loses.
-            late_pair(0x98, 101, 9),
+            late_pair(0x98, 101, at(9, 0)),
         ],
         0,
     )
@@ -1136,7 +2081,8 @@ async fn a_reorg_leaves_exactly_a_clean_index() {
                  WHERE chain = {CHAIN}"
             ))
             .await,
-        0
+        2,
+        "the two Syncs of block 100"
     );
     assert_eq!(
         database
@@ -1150,7 +2096,7 @@ async fn a_reorg_leaves_exactly_a_clean_index() {
     assert_eq!(
         database
             .count(&format!(
-                "SELECT toUInt64(sum(swaps)) FROM dex_protocol_stats_1d_v \
+                "SELECT toUInt64(sum(swaps)) FROM dex_pool_volume_1h_v \
                  WHERE chain = {CHAIN}"
             ))
             .await,
@@ -1172,9 +2118,8 @@ async fn a_reorg_leaves_exactly_a_clean_index() {
     // ... and the index that only ever saw the canonical chain.
     let clean = TestDb::create().await;
     seed_reference(&clean, CHAIN).await;
-    let mut canonical = swaps()[..2].to_vec();
-    canonical.extend(canonical_tail());
-    insert_logs(&clean, CHAIN, &canonical, 0).await;
+    let canonical = [block_100(), canonical_tail()].concat();
+    assert_eq!(insert_logs(&clean, CHAIN, &canonical, 0).await, 6);
 
     let after = visible_state(&database, CHAIN).await;
     let expected = visible_state(&clean, CHAIN).await;
@@ -1182,8 +2127,9 @@ async fn a_reorg_leaves_exactly_a_clean_index() {
     assert_same_state(&after, &expected, "after the reorg");
     assert!(before != after);
 
-    // Spot checks by hand: 101/0 carries the NEW amounts, the day candle
-    // of the V2 pair is A, B, the new C and the new D.
+    // Spot checks by hand: 101/3 carries the NEW amounts, the day candle
+    // of the V2 pair is A, B, the new C and the new D, and the Balancer
+    // swap of hour 2 is valued with hour 1's (rebuilt) native price.
     let pair = word(&pool_id_of(address(fixtures::V2_USDC_WETH)));
     let day = database
         .client
@@ -1202,6 +2148,16 @@ async fn a_reorg_leaves_exactly_a_clean_index() {
             4
         )
     );
+    let balancer = database
+        .client
+        .query(&format!(
+            "SELECT ifNull(amount_usd, -1) FROM dex_swaps_usd_v \
+             WHERE chain = {CHAIN} AND protocol = 'balancer_v2'"
+        ))
+        .fetch_one::<f64>()
+        .await
+        .unwrap();
+    assert!(close(balancer, BALANCER_WETH_OUT * native_price_hour_1()));
 
     // A second reorg on top, deeper than the first (fork 100), then the
     // same canonical chain again: still a clean index.
@@ -1280,25 +2236,46 @@ async fn the_validity_rule_keeps_old_buckets_and_later_additions() {
 
     assert_eq!(days, vec![(yesterday, 9e6, 2), (DAY, 4e6, 1)]);
 
-    // Open / close come from valid epochs only: today's stale epoch 0 swap
-    // had another price and an earlier position.
+    // Open / close come from valid epochs only: a stale epoch 0 row of
+    // today with another price and an earlier position must not leak.
     insert_logs(
         &database,
         CHAIN,
-        &[v2_swap(pair, TRADER_X, [1_000_000, 0, 0, 7], 99, 0, DAY + 1)],
+        &[v2_swap(
+            pair,
+            TRADER_X,
+            [1_000_000, 0, 0, 7_000],
+            99,
+            0,
+            DAY + 1,
+        )],
         0,
     )
     .await;
     let open = database
         .client
         .query(&format!(
-            "SELECT open, close, swaps FROM dex_candles_1d_v \
-             WHERE chain = {CHAIN} AND bucket = toDateTime({DAY}, 'UTC')"
+            "SELECT ifNull(open, -1), ifNull(close, -1), swaps \
+             FROM dex_candles_1d_v WHERE chain = {CHAIN} \
+             AND bucket = toDateTime({DAY}, 'UTC')"
         ))
         .fetch_one::<(f64, f64, u64)>()
         .await
         .unwrap();
     assert_eq!(open, (1_000.0, 1_000.0, 1));
+
+    // join_use_nulls = 1 in a user profile must not hide the buckets that
+    // have no reorg at or before them (yesterday).
+    let with_nulls = database
+        .client
+        .query(&format!(
+            "SELECT toUInt64(sum(swaps)) FROM dex_candles_1d_v WHERE chain = \
+             {CHAIN} SETTINGS join_use_nulls = 1"
+        ))
+        .fetch_one::<u64>()
+        .await
+        .unwrap();
+    assert_eq!(with_nulls, 3);
 
     // Another chain is not affected by this chain's reorgs.
     seed_reference(&database, 2).await;
@@ -1318,135 +2295,50 @@ async fn the_validity_rule_keeps_old_buckets_and_later_additions() {
 
 #[tokio::test]
 #[ignore = "needs TEST_DATABASE_URL"]
-async fn pool_rows_survive_forgeries_and_reorgs() {
+async fn a_rebuild_deeper_than_100_months_is_chunked() {
     let database = TestDb::create().await;
+    seed_reference(&database, CHAIN).await;
+
+    // One swap every 31 days from 2013-01-01: 130 swaps in 130 different
+    // months (base tables are monthly too: insert them in small batches).
     let pair = address(fixtures::V2_USDC_WETH);
-    let pool_id = word(&pool_id_of(pair));
+    let first: u32 = 1_356_998_400;
+    let logs: Vec<DatabaseLog> = (0..130u32)
+        .map(|step| {
+            v2_swap(
+                pair,
+                TRADER_X,
+                [1_000_000, 0, 0, 2_000_000],
+                1_000 + step,
+                0,
+                first + step * 31 * 86_400,
+            )
+        })
+        .collect();
+    for batch in logs.chunks(40) {
+        insert_logs(&database, CHAIN, batch, 0).await;
+    }
 
-    let current = |database: &TestDb| {
-        let sql = format!(
-            "SELECT lower(hex(token0)), source, toUInt64(created_block), \
-             candidates FROM dex_pool_current_v WHERE chain = {CHAIN} \
-             AND pool_id = {pool_id}"
-        );
-        let client = database.client.clone();
-        async move {
-            client
-                .query(&sql)
-                .fetch_all::<(String, String, u64, u64)>()
-                .await
-                .unwrap()
-        }
-    };
-
-    let creation = |token0: Address, block: u32| {
-        constructed(
-            Address::repeat_byte(0xf2),
-            &[
-                events::V2_PAIR_CREATED.topic0,
-                token0.into_word(),
-                address(fixtures::WETH).into_word(),
-            ],
-            [pair.into_word().to_vec(), number(1)].concat(),
-            block,
-            0,
-            DAY,
-        )
-    };
-
-    let usdc = fixtures::USDC[2..].to_string();
-    let forged_token = Address::repeat_byte(0x66);
-
-    // The real creation, a forged one 10 blocks later (inserted later, so
-    // it has the newer version) and a resolver row on top.
-    insert_logs(
-        &database,
-        CHAIN,
-        &[creation(address(fixtures::USDC), 90)],
-        0,
-    )
-    .await;
-    insert_logs(&database, CHAIN, &[creation(forged_token, 100)], 0).await;
-
-    let mut resolver =
-        decode(CHAIN, &[creation(Address::repeat_byte(0x77), 1)]);
-    resolver.pools[0].source = PoolSource::Rpc;
-    resolver.pools[0].created_block = 0;
-    resolver.set_version(next_version());
-    database.insert(&resolver).await;
-
-    assert_eq!(
-        current(&database).await,
-        vec![(usdc.clone(), "event".to_string(), 90, 3)]
+    // One INSERT over everything is refused by ClickHouse...
+    let table = &DEX_DERIVED[2];
+    let whole = render_rebuild(table, CHAIN, first, REBUILD_TO, 1);
+    let refused = database.client.query(&whole).execute().await;
+    assert!(
+        format!("{refused:?}").contains("TOO_MANY_PARTS")
+            || format!("{refused:?}").contains("Too many partitions"),
+        "{refused:?}"
     );
 
-    // An unrelated purge (from block 95, and even a gap heal from block 0
-    // of another range) leaves the resolver row alone; the forged row at
-    // block 100 goes away.
-    purge(&database, CHAIN, 95, 1, DAY).await;
-    assert_eq!(
-        current(&database).await,
-        vec![(usdc.clone(), "event".to_string(), 90, 2)]
-    );
-
-    // The creation itself is reorged out: the pool falls back to what the
-    // chain STATE said (resolver row), it does not vanish.
-    purge(&database, CHAIN, 0, 2, DAY).await;
-    assert_eq!(
-        current(&database).await,
-        vec![("77".repeat(20), "rpc".to_string(), 0, 1)]
-    );
+    // ... month by month it is not, and the result is complete.
+    purge(&database, CHAIN, 5_000, 1, first).await;
     assert_eq!(
         database
             .count(&format!(
-                "SELECT count() FROM dex_pools FINAL WHERE chain = {CHAIN} \
-                 AND source = 'event'"
+                "SELECT toUInt64(sum(swaps)) FROM dex_candles_1d_v \
+                 WHERE chain = {CHAIN}"
             ))
             .await,
-        0
-    );
-    assert_eq!(
-        database
-            .count(&format!(
-                "SELECT count() FROM dex_pools_by_token FINAL \
-                 WHERE chain = {CHAIN} AND source = 'event'"
-            ))
-            .await,
-        0
-    );
-
-    // Re-created on the canonical chain, in the new epoch: at the SAME
-    // position (must beat its own tombstone) and alive again.
-    insert_logs(
-        &database,
-        CHAIN,
-        &[creation(address(fixtures::USDC), 90)],
-        2,
-    )
-    .await;
-    assert_eq!(
-        current(&database).await,
-        vec![(usdc.clone(), "event".to_string(), 90, 2)]
-    );
-
-    // A pool without any creation event (first seen mid-history): only
-    // the resolver row, which no purge touches.
-    let other = Address::repeat_byte(0x44);
-    let mut seen = decode(CHAIN, &[late_pair(0x44, 1, 0)]);
-    seen.pools[0].source = PoolSource::Rpc;
-    seen.pools[0].created_block = 0;
-    seen.set_version(next_version());
-    database.insert(&seen).await;
-    purge(&database, CHAIN, 0, 3, DAY).await;
-    assert_eq!(
-        database
-            .count(&format!(
-                "SELECT count() FROM dex_pool_current_v WHERE chain = \
-                 {CHAIN} AND pool_id = {} AND source = 'rpc'",
-                word(&pool_id_of(other))
-            ))
-            .await,
-        1
+        130
     );
 
     database.drop().await;
@@ -1455,38 +2347,35 @@ async fn pool_rows_survive_forgeries_and_reorgs() {
 const CONCURRENT_CHAINS: u64 = 8;
 const REORG_ROUNDS: u32 = 10;
 
-/// Round `round` of a chain: the block that gets orphaned (3 swaps) and
-/// the canonical one that replaces it (1 swap, other amounts).
+/// Round `round` of a chain: the block that gets orphaned (3 proven swaps)
+/// and the canonical one that replaces it (1 swap, other amounts).
 fn round_blocks(
     chain: u64,
     round: u32,
 ) -> (Vec<DatabaseLog>, Vec<DatabaseLog>) {
-    let pair = address(fixtures::V2_USDC_WETH);
     let block = 1_000 + round;
     let timestamp = DAY + 60 * round + 10;
     let unit = 1_000_000 * u128::from(chain) * u128::from(round);
 
     let orphan = (0..3u16)
-        .map(|index| {
-            v2_swap(
-                pair,
-                TRADER_X,
+        .flat_map(|slot| {
+            pair_trade(
                 [unit * 7, 0, 0, unit * 3],
+                RESERVES_B,
                 block,
-                index,
+                slot,
                 timestamp,
             )
         })
         .collect();
 
-    let canonical = vec![v2_swap(
-        pair,
-        TRADER_X,
+    let canonical = pair_trade(
         [unit, 0, 0, unit * 2],
+        RESERVES_C,
         block,
         0,
         timestamp,
-    )];
+    );
 
     (orphan, canonical)
 }
@@ -1573,6 +2462,24 @@ async fn eight_chains_reorg_concurrently_on_the_same_tables() {
             ),
             "chain {chain}"
         );
+
+        // USD of the pair: the scenario's 10.624963 + the USDC input of
+        // every canonical round swap, none of the orphans.
+        let usd = database
+            .client
+            .query(&format!(
+                "SELECT ifNull(sum(volume_usd), -1) FROM \
+                 dex_pool_volume_usd_1d_v WHERE chain = {chain} AND \
+                 pool_id = {}",
+                word(&pool_id_of(address(fixtures::V2_USDC_WETH)))
+            ))
+            .fetch_one::<f64>()
+            .await
+            .unwrap();
+        assert!(
+            close(usd, 10.624963 + (chain * rounds) as f64),
+            "chain {chain}: {usd}"
+        );
     }
 
     // Every purge of every chain was recorded, nothing was lost.
@@ -1613,6 +2520,8 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
             DAY,
         )
     };
+    // Int256 extremes on a V3 shaped swap (-2^255 itself is refused by the
+    // decoder: it has no absolute value).
     let extreme = |index: u16| {
         constructed(
             Address::repeat_byte(0x5b),
@@ -1623,7 +2532,7 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
             ],
             [
                 I256::MAX.to_be_bytes::<32>().to_vec(),
-                I256::MIN.to_be_bytes::<32>().to_vec(),
+                (I256::MIN + I256::ONE).to_be_bytes::<32>().to_vec(),
                 number(1 << 96),
                 number(1),
                 number(0),
@@ -1639,12 +2548,11 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
         // 2^256 - 1, then 10 more: a UInt256 sum would wrap to 9.
         exchange(U256::MAX, 0),
         exchange(U256::from(10u8), 1),
-        // Int256 extremes on a V3 shaped swap, twice.
         extreme(2),
         extreme(3),
     ];
     assert_eq!(decode(CHAIN, &logs).swaps[0].amount_in, U256::MAX);
-    insert_logs(&database, CHAIN, &logs, 0).await;
+    assert_eq!(insert_logs(&database, CHAIN, &logs, 0).await, 4);
 
     let max = 1.157_920_892_373_162e77;
 
@@ -1653,8 +2561,8 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
         async move {
             let leg = client
                 .query(&format!(
-                    "SELECT volume_in FROM dex_pool_volume_1d_v WHERE chain \
-                     = {CHAIN} AND protocol = 'curve' AND leg_index = 0"
+                    "SELECT sum(volume_in) FROM dex_pool_volume_1h_v WHERE \
+                     chain = {CHAIN} AND protocol = 'curve'"
                 ))
                 .fetch_one::<f64>()
                 .await
@@ -1669,9 +2577,19 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
                 .fetch_one::<(f64, f64)>()
                 .await
                 .unwrap();
-            // 2 * (2^255 - 1) and 2 * 2^255: finite, positive, not wrapped.
+            // 2 * (2^255 - 1), twice: finite, positive, not wrapped.
             assert!(close(candle.0, max), "{candle:?}");
             assert!(close(candle.1, max), "{candle:?}");
+
+            // The swap level view takes absolute values of Int256 too.
+            let swaps = client
+                .query(&format!(
+                    "SELECT count() FROM dex_swaps_usd_v WHERE chain = {CHAIN}"
+                ))
+                .fetch_one::<u64>()
+                .await
+                .unwrap();
+            assert_eq!(swaps, 4);
         }
     };
 
