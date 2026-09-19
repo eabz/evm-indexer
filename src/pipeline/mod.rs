@@ -407,6 +407,19 @@ pub async fn run_with<S: BlockSource>(
 
     // Checkpoints say where a previous run got to; `blocks` stays the
     // truth: the first pass verifies the whole range with the gap query.
+    //
+    // They are NOT used as the cursor, although docs/design.md section 3
+    // says "resume = max contiguous to_block". Starting the cursor at the
+    // resume point would skip the first pass's inspection of everything
+    // below it - and that inspection is the ONLY thing that finds the
+    // orphan children of a flush that died before its `blocks` insert
+    // (`ReorgGuard::begin_pass`). A checkpoint is written after `blocks`,
+    // so it cannot claim such a range; but a purge that died after
+    // tombstoning children and before its `reorgs` row can leave one
+    // below it. The gap query over `blocks` costs one indexed read per
+    // pass and answers the same question without that hole, so the
+    // checkpoints stay what they are: an index for operators and for
+    // `indexer verify`, and the log line below.
     let resume =
         verify::resume_point(&db, config.start_block).await.unwrap_or(0);
     if resume > config.start_block {
