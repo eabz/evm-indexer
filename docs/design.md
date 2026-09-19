@@ -234,12 +234,18 @@ schema drops them from the query.
 
 ## 9. Traces and contracts (scope decision)
 
-DEX analytics need neither traces nor deployer data: pools come from factory events,
-tokens from transfers, liquidity providers from `dex_liquidity.tx_from` (the event
-`sender` is usually a router, never use it for attribution). Therefore:
+**Traces are removed entirely**: no `traces` table, no `traces_by_tx`, no trace model,
+no trace query to HyperSync, no `--traces` flag. DEX analytics need neither traces nor
+deployer data (pools come from factory events, tokens from transfers, liquidity providers
+from `dex_liquidity.tx_from` — the event `sender` is usually a router, never use it for
+attribution).
 
-- `--traces` stays off by default; `full` traces are for explorer/forensic deployments.
-- `contracts` always holds **directly deployed** contracts (receipt `contractAddress`,
-  free). Factory-created contracts only appear when `--traces` is on. Document as such.
-- Not built, possible later: a `creates`-only trace mode (`TraceFilter::and_type(["create"])`)
-  would complete `contracts` without storing the trace firehose.
+**`contracts` is a VIEW**, not a table: it selects from `transactions` where
+`contract_created` is set and the transaction succeeded (`contract_address`, `creator` =
+`from`, `transaction_hash`, `block_number`, `timestamp`). Nothing to insert, purge or keep
+consistent. It lists directly deployed contracts only; factory-created contracts are
+out of scope by design. The daily contract-deployment aggregate is fed from
+`transactions`, not from a contracts table.
+
+Everywhere else in this document, references to traces / `traces_by_tx` / a `contracts`
+table are superseded by this section.
