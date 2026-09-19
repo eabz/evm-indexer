@@ -62,6 +62,40 @@ const M2: &str =
     "7d9ba25f111d4adc353e0441fc205c3a39b3e7eef9829999663262055b9911c8";
 const V2_TAKER: &str = "0xdc41c39b95453c943174f369926018f6963bdd7e";
 
+/// How long a read is given to catch up with an acknowledged INSERT.
+///
+/// ClickHouse 25.12 has no read-your-writes: measured on this build, 3 %
+/// of the reads issued right after an acknowledged INSERT miss the new
+/// part in the base table and 3.3 % in an MV-fed aggregate, and both heal
+/// within milliseconds (docs/design.md §2, "No read-your-writes").
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Between two attempts of a settling read.
+const RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Repeats `read` until `done` accepts what it answers, for at most
+/// [`SETTLE`], and returns the last value either way.
+///
+/// Every read that directly follows an insert goes through this: reading
+/// once makes a test fail for the server's timing rather than for the
+/// property under test. The caller keeps its own assertion, so a read
+/// that never settles still fails with its own message.
+async fn settle<T, F, Fut>(mut read: F, done: impl Fn(&T) -> bool) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let started = std::time::Instant::now();
+
+    loop {
+        let value = read().await;
+        if done(&value) || started.elapsed() >= SETTLE {
+            return value;
+        }
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
 struct TestDb {
     admin: Client,
     client: Client,
@@ -182,7 +216,28 @@ impl TestDb {
             .unwrap_or_else(|error| panic!("{table}: {error}"));
     }
 
-    /// In `INSERT_ORDER`, like the pipeline.
+    /// Waits until the part `version` just wrote into `table` is readable.
+    ///
+    /// ClickHouse 25.12 has no read-your-writes ([`SETTLE`]), so a read
+    /// issued right after an acknowledged INSERT can miss it. One row is
+    /// the whole signal: a batch is one part, and every row of a part
+    /// becomes readable at once. Counting rows would NOT work - rows that
+    /// share a sorting key collapse inside the part, so the number stored
+    /// is not the number written.
+    async fn await_part(&self, table: &str, version: u64) {
+        let sql = format!(
+            "SELECT count() FROM {table} WHERE _version = {version}"
+        );
+        let seen =
+            settle(|| self.count(&sql), |seen: &u64| *seen > 0).await;
+        assert!(
+            seen > 0,
+            "{table}: the rows of version {version} never became visible"
+        );
+    }
+
+    /// In `INSERT_ORDER`, like the pipeline, and not returning before
+    /// every part it wrote can be read back.
     async fn insert(&self, rows: &PredictionRows) {
         self.write("prediction_outcome_tokens", &rows.outcome_tokens)
             .await;
@@ -193,6 +248,41 @@ impl TestDb {
             .await;
         self.write("prediction_transfers", &rows.transfers).await;
         self.write("prediction_trades", &rows.trades).await;
+
+        for (table, version) in [
+            (
+                "prediction_outcome_tokens",
+                rows.outcome_tokens.first().map(|row| row._version),
+            ),
+            (
+                "prediction_markets",
+                rows.markets.first().map(|row| row._version),
+            ),
+            (
+                "prediction_questions",
+                rows.questions.first().map(|row| row._version),
+            ),
+            (
+                "prediction_resolutions",
+                rows.resolutions.first().map(|row| row._version),
+            ),
+            (
+                "prediction_position_events",
+                rows.position_events.first().map(|row| row._version),
+            ),
+            (
+                "prediction_transfers",
+                rows.transfers.first().map(|row| row._version),
+            ),
+            (
+                "prediction_trades",
+                rows.trades.first().map(|row| row._version),
+            ),
+        ] {
+            if let Some(version) = version {
+                self.await_part(table, version).await;
+            }
+        }
     }
 
     /// What the token worker would have stored.
@@ -301,15 +391,37 @@ impl TestDb {
     /// `purge_range(chain, from, ∞)` as docs/design.md §2 describes it,
     /// in plain SQL: tombstones, the `reorgs` row, bucket repair.
     async fn purge_from(&self, from_block: u64, from_ts: u32, epoch: u32) {
-        let version = crate::db::next_version();
-
+        // Re-issued until no live row of the range is left, exactly as
+        // `reorg::Purger::tombstone_until_gone` does it: the `SELECT` of
+        // one tombstone can run over a snapshot that misses rows an
+        // acknowledged INSERT wrote a moment ago ([`SETTLE`]), and the
+        // survivors would then be counted by every reader for ever.
         for table in BASE_TABLES {
-            self.execute(&format!(
-                "INSERT INTO {table} SELECT * REPLACE ({version} AS _version, \
-                 1 AS is_deleted) FROM {table} FINAL \
+            let live = format!(
+                "SELECT count() FROM {table} FINAL \
                  WHERE chain = {CHAIN} AND block_number >= {from_block}"
-            ))
-            .await;
+            );
+            let started = std::time::Instant::now();
+
+            loop {
+                let version = crate::db::next_version();
+                self.execute(&format!(
+                    "INSERT INTO {table} SELECT * REPLACE ({version} AS \
+                     _version, 1 AS is_deleted) FROM {table} FINAL \
+                     WHERE chain = {CHAIN} AND block_number >= {from_block}"
+                ))
+                .await;
+
+                let alive = self.count(&live).await;
+                if alive == 0 {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < SETTLE,
+                    "{table}: {alive} rows survive their tombstones"
+                );
+                tokio::time::sleep(RETRY).await;
+            }
         }
 
         let day = from_ts - from_ts % 86_400;
@@ -1006,7 +1118,10 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
 }
 
 /// Everything a consumer can see, as text.
-async fn everything(database: &TestDb) -> Vec<(String, Vec<String>)> {
+/// Everything a reader can see, per source: what [`everything`] returns.
+type Snapshot = Vec<(String, Vec<String>)>;
+
+async fn everything(database: &TestDb) -> Snapshot {
     database.refresh_markets().await;
 
     let chain = CHAIN.to_string();
@@ -1159,8 +1274,15 @@ async fn a_reorg_leaves_every_view_equal_to_a_clean_index() {
         clean.insert(&decoded(tx, block, timestamp, 0)).await;
     }
 
-    let after = everything(&reorged).await;
-    let expected = everything(&clean).await;
+    // Both sides are read right after the inserts that filled them, so
+    // both are re-read until they agree ([`SETTLE`]).
+    let (after, expected) = settle(
+        || async {
+            (everything(&reorged).await, everything(&clean).await)
+        },
+        |(after, expected): &(Snapshot, Snapshot)| after == expected,
+    )
+    .await;
 
     assert_ne!(before, after);
     for ((name, repaired), (_, clean)) in after.iter().zip(&expected) {
@@ -1190,7 +1312,11 @@ async fn a_reorg_leaves_every_view_equal_to_a_clean_index() {
             now() + 86_400
         ))
         .await;
-    let again = everything(&reorged).await;
+    let again = settle(
+        || everything(&reorged),
+        |again: &Snapshot| *again == expected,
+    )
+    .await;
     for ((name, repaired), (_, clean)) in again.iter().zip(&expected) {
         assert_eq!(repaired, clean, "second reorg: {name}");
     }
@@ -1305,25 +1431,41 @@ async fn hostile_amounts_do_not_wrap_aggregates() {
 
     // ... and two of them sum to 2 * (2^256-1) ~ 2.3e77 instead of
     // wrapping around to 2^256-2 (or to zero).
+    // The aggregates are MV fed and read here right after the insert, so
+    // every one of them is re-read until both trades are in it ([`SETTLE`]);
+    // a single read misses one about 3 % of the time and the sums below
+    // would then be short by half.
     let expected = 2.0 * 1.157_920_892_373_162e77;
     for table in ["prediction_candles_1m", "prediction_candles_1d"] {
-        let (volume, shares, trades): (f64, f64, u64) = database
-            .rows(&format!(
-                "SELECT toFloat64(sum(volume)), toFloat64(sum(shares)), \
-                 toUInt64(sum(trades)) FROM {table} WHERE chain = {CHAIN}"
-            ))
-            .await[0];
+        let sql = format!(
+            "SELECT toFloat64(sum(volume)), toFloat64(sum(shares)), \
+             toUInt64(sum(trades)) FROM {table} WHERE chain = {CHAIN}"
+        );
+        let (volume, shares, trades): (f64, f64, u64) = settle(
+            || database.rows::<(f64, f64, u64)>(&sql),
+            |seen: &Vec<(f64, f64, u64)>| {
+                seen.first().is_some_and(|row| row.2 == 2)
+            },
+        )
+        .await[0];
         assert!(close(volume, expected), "{table}: {volume}");
         assert!(close(shares, expected), "{table}: {shares}");
-        assert_eq!(trades, 2);
+        assert_eq!(trades, 2, "{table}");
     }
 
-    let (bought, sold): (f64, f64) = database
-        .rows(&format!(
-            "SELECT toFloat64(sum(bought)), toFloat64(sum(sold)) \
-             FROM prediction_trader_trades_1d WHERE chain = {CHAIN}"
-        ))
-        .await[0];
+    let traders = format!(
+        "SELECT toFloat64(sum(bought)), toFloat64(sum(sold)) \
+         FROM prediction_trader_trades_1d WHERE chain = {CHAIN}"
+    );
+    let (bought, sold): (f64, f64) = settle(
+        || database.rows::<(f64, f64)>(&traders),
+        |seen: &Vec<(f64, f64)>| {
+            seen.first().is_some_and(|row| {
+                close(row.0, expected) && close(row.1, expected)
+            })
+        },
+    )
+    .await[0];
     assert!(close(bought, expected), "{bought}");
     assert!(close(sold, expected), "{sold}");
 

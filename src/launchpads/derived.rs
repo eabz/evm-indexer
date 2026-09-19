@@ -13,11 +13,11 @@
 //! is_deleted = 0`, [`REBUILD_EPOCH`] for the rows' own `epoch`); the unit
 //! test at the bottom redoes them and compares, so the two can not drift.
 //!
-//! Every aggregate here reads a CHILD table (trades, tokens, graduations,
-//! fees), never `blocks`, so it needs no `{purge_from}`/`{purge_to}`
-//! exclusion: those tables are tombstoned before the repair runs
-//! (docs/design.md §2, "child-sourced aggregates do not need it"). The DEX
-//! module makes the same call for the same reason.
+//! **A rebuild never depends on seeing the tombstones** (docs/design.md §2,
+//! "No read-your-writes"): the statement leaves the purged block range out
+//! by itself, with `{purge_from}` / `{purge_to}`. The canonical rows of
+//! that range add themselves through the materialized view when they are
+//! written again.
 //!
 //! **Run a rebuild through [`rebuild_statements`]**, never as one
 //! statement: the aggregates are partitioned by month and ClickHouse
@@ -27,7 +27,8 @@
 //!
 //! Placeholders: `{chain}`, `{from_ts}` (unix seconds, a multiple of
 //! `bucket_seconds`; the start of the UTC day recorded in `reorgs` always
-//! is), `{to_ts}` (exclusive) and `{epoch}` (the new epoch).
+//! is), `{to_ts}` (exclusive), `{epoch}` (the new epoch) and the purged
+//! block range `{purge_from}` / `{purge_to}`.
 
 use crate::db::derived::DerivedTable;
 
@@ -35,7 +36,9 @@ use crate::db::derived::DerivedTable;
 pub const REBUILD_RANGE: &str =
     "FINAL WHERE chain = {chain} AND timestamp \
                                  >= toDateTime({from_ts}) AND timestamp < \
-                                 toDateTime({to_ts}) AND is_deleted = 0";
+                                 toDateTime({to_ts}) AND is_deleted = 0 \
+                                 AND NOT (block_number >= {purge_from} AND \
+                                 block_number < {purge_to})";
 
 /// What a rebuild selects in place of the rows' own `epoch`.
 pub const REBUILD_EPOCH: &str = "toUInt32({epoch}) AS epoch";
@@ -62,9 +65,10 @@ pub const LAUNCHPAD_CANDLES_1M: DerivedTable = DerivedTable {
         "argMaxState(toFloat64(progress_wad), position) AS ",
         "progress_wad FROM launchpad_trades FINAL WHERE chain = ",
         "{chain} AND timestamp >= toDateTime({from_ts}) AND timestamp ",
-        "< toDateTime({to_ts}) AND is_deleted = 0 AND token != ",
-        "toFixedString('', 32) GROUP BY chain, token, emitter, ",
-        "bucket, epoch"
+        "< toDateTime({to_ts}) AND is_deleted = 0 AND NOT ",
+        "(block_number >= {purge_from} AND block_number < ",
+        "{purge_to}) AND token != toFixedString('', 32) GROUP BY ",
+        "chain, token, emitter, bucket, epoch"
     ),
 };
 
@@ -90,9 +94,10 @@ pub const LAUNCHPAD_CANDLES_1H: DerivedTable = DerivedTable {
         "argMaxState(toFloat64(progress_wad), position) AS ",
         "progress_wad FROM launchpad_trades FINAL WHERE chain = ",
         "{chain} AND timestamp >= toDateTime({from_ts}) AND timestamp ",
-        "< toDateTime({to_ts}) AND is_deleted = 0 AND token != ",
-        "toFixedString('', 32) GROUP BY chain, token, emitter, ",
-        "bucket, epoch"
+        "< toDateTime({to_ts}) AND is_deleted = 0 AND NOT ",
+        "(block_number >= {purge_from} AND block_number < ",
+        "{purge_to}) AND token != toFixedString('', 32) GROUP BY ",
+        "chain, token, emitter, bucket, epoch"
     ),
 };
 
@@ -111,8 +116,9 @@ pub const LAUNCHPAD_VENUE_TRADES_1D: DerivedTable = DerivedTable {
         "uniqState(trader) AS traders, uniqState(token) AS tokens ",
         "FROM launchpad_trades FINAL WHERE chain = {chain} AND ",
         "timestamp >= toDateTime({from_ts}) AND timestamp < ",
-        "toDateTime({to_ts}) AND is_deleted = 0 GROUP BY chain, ",
-        "family, emitter, bucket, epoch"
+        "toDateTime({to_ts}) AND is_deleted = 0 AND NOT (block_number ",
+        ">= {purge_from} AND block_number < {purge_to}) GROUP BY ",
+        "chain, family, emitter, bucket, epoch"
     ),
 };
 
@@ -126,8 +132,10 @@ pub const LAUNCHPAD_LAUNCHES_1D: DerivedTable = DerivedTable {
         "86400) * 86400, 'UTC') AS bucket, toUInt32({epoch}) AS ",
         "epoch, count() AS launches FROM launchpad_tokens FINAL WHERE ",
         "chain = {chain} AND timestamp >= toDateTime({from_ts}) AND ",
-        "timestamp < toDateTime({to_ts}) AND is_deleted = 0 GROUP BY ",
-        "chain, family, emitter, creator, bucket, epoch"
+        "timestamp < toDateTime({to_ts}) AND is_deleted = 0 AND NOT ",
+        "(block_number >= {purge_from} AND block_number < ",
+        "{purge_to}) GROUP BY chain, family, emitter, creator, ",
+        "bucket, epoch"
     ),
 };
 
@@ -142,8 +150,9 @@ pub const LAUNCHPAD_GRADUATIONS_1D: DerivedTable = DerivedTable {
         "AS graduations, sum(toFloat64(quote_amount)) AS quote_in, ",
         "uniqState(token) AS tokens FROM launchpad_graduations FINAL ",
         "WHERE chain = {chain} AND timestamp >= toDateTime({from_ts}) ",
-        "AND timestamp < toDateTime({to_ts}) AND is_deleted = 0 GROUP ",
-        "BY chain, family, emitter, bucket, epoch"
+        "AND timestamp < toDateTime({to_ts}) AND is_deleted = 0 AND ",
+        "NOT (block_number >= {purge_from} AND block_number < ",
+        "{purge_to}) GROUP BY chain, family, emitter, bucket, epoch"
     ),
 };
 
@@ -159,8 +168,9 @@ pub const LAUNCHPAD_CREATOR_FEES_1D: DerivedTable = DerivedTable {
         "events, sum(toFloat64(amount)) AS amount FROM ",
         "launchpad_creator_fees FINAL WHERE chain = {chain} AND ",
         "timestamp >= toDateTime({from_ts}) AND timestamp < ",
-        "toDateTime({to_ts}) AND is_deleted = 0 GROUP BY chain, ",
-        "family, emitter, recipient, kind, phase, bucket, epoch"
+        "toDateTime({to_ts}) AND is_deleted = 0 AND NOT (block_number ",
+        ">= {purge_from} AND block_number < {purge_to}) GROUP BY ",
+        "chain, family, emitter, recipient, kind, phase, bucket, epoch"
     ),
 };
 
@@ -176,12 +186,17 @@ pub const LAUNCHPADS_DERIVED: &[DerivedTable] = &[
 
 /// `rebuild_sql` with its placeholders filled in, for `[from_ts, to_ts)`.
 /// Keep the range inside one month: use [`rebuild_statements`].
+///
+/// `purged` is the block range the purge this repair belongs to is
+/// removing, `None` as its end meaning open ended. The statement excludes
+/// it instead of relying on the tombstones being readable already.
 pub fn render_rebuild(
     table: &DerivedTable,
     chain: u64,
     from_ts: u32,
     to_ts: u32,
     epoch: u32,
+    purged: (u64, Option<u64>),
 ) -> String {
     table
         .rebuild_sql
@@ -189,6 +204,8 @@ pub fn render_rebuild(
         .replace("{from_ts}", &from_ts.to_string())
         .replace("{to_ts}", &to_ts.to_string())
         .replace("{epoch}", &epoch.to_string())
+        .replace("{purge_from}", &purged.0.to_string())
+        .replace("{purge_to}", &purged.1.unwrap_or(u64::MAX).to_string())
 }
 
 /// The rebuild of `table` for `[from_ts, to_ts)` as one INSERT per UTC
@@ -200,6 +217,7 @@ pub fn rebuild_statements(
     from_ts: u32,
     to_ts: u32,
     epoch: u32,
+    purged: (u64, Option<u64>),
 ) -> Vec<String> {
     let mut statements = Vec::new();
     let mut start = from_ts - from_ts % table.bucket_seconds.max(1);
@@ -208,7 +226,8 @@ pub fn rebuild_statements(
         // The month arithmetic is the DEX module's, unit tested there.
         let end = crate::dex::derived::next_month_start(start)
             .min(u64::from(to_ts)) as u32;
-        statements.push(render_rebuild(table, chain, start, end, epoch));
+        statements
+            .push(render_rebuild(table, chain, start, end, epoch, purged));
         start = end;
     }
 
@@ -267,7 +286,8 @@ mod tests {
                 table.name
             );
 
-            let rendered = render_rebuild(table, 1, 0, 60, 3);
+            let rendered =
+                render_rebuild(table, 1, 0, 60, 3, (u64::MAX, None));
             assert!(!rendered.contains('{'), "{rendered}");
 
             // The bucket expression matches bucket_seconds.
@@ -373,6 +393,41 @@ mod tests {
         arguments
     }
 
+    /// Every launchpad aggregate reads a child table that carries
+    /// `block_number`, so every one of them can and must leave the purged
+    /// block range out by itself: a rebuild runs before the tombstones are
+    /// guaranteed to be readable (docs/design.md §2, "No
+    /// read-your-writes").
+    #[test]
+    fn every_rebuild_excludes_the_purged_block_range() {
+        for table in LAUNCHPADS_DERIVED {
+            assert_eq!(
+                normalize(table.rebuild_sql)
+                    .matches(
+                        "NOT (block_number >= {purge_from} AND \
+                         block_number < {purge_to})"
+                    )
+                    .count(),
+                1,
+                "{}",
+                table.name
+            );
+        }
+
+        let sql = render_rebuild(
+            &LAUNCHPAD_CANDLES_1M,
+            1,
+            0,
+            60,
+            1,
+            (100, None),
+        );
+        assert!(sql.contains(&format!(
+            "NOT (block_number >= 100 AND block_number < {})",
+            u64::MAX
+        )));
+    }
+
     #[test]
     fn a_rebuild_is_chunked_by_month() {
         // 2026-01-15 .. 2026-03-02 -> January, February, March.
@@ -382,6 +437,7 @@ mod tests {
             1_768_435_200,
             1_772_409_600,
             4,
+            (u64::MAX, None),
         );
 
         assert_eq!(statements.len(), 3);

@@ -28,7 +28,7 @@ use clickhouse::Client;
 use crate::{
     db::{models::log::DatabaseLog, next_version, DatabaseParams},
     dex::{
-        decode,
+        block_column, decode,
         derived::{rebuild_statements, render_rebuild},
         events,
         fixtures::{self, address, RawLog},
@@ -36,7 +36,7 @@ use crate::{
             pool_id_of, DexLiquidity, DexPool, DexSwap, PoolSource,
             Protocol,
         },
-        block_column, purge_filter,
+        purge_filter,
         sql::{reorg_prerequisites, statements, CHAINS_SQL, MIGRATIONS},
         tombstone_sql, DexRows, BASE_TABLES, DEX_DERIVED, SIDE_TABLES,
     },
@@ -158,12 +158,7 @@ impl TestDb {
                 values.join(", ")
             ))
             .await;
-            self.await_visible(
-                "dex_swaps",
-                rows.swaps[0]._version,
-                rows.swaps.len(),
-            )
-            .await;
+            self.await_part("dex_swaps", rows.swaps[0]._version).await;
         }
 
         if !rows.liquidity.is_empty() {
@@ -174,12 +169,8 @@ impl TestDb {
                 values.join(", ")
             ))
             .await;
-            self.await_visible(
-                "dex_liquidity",
-                rows.liquidity[0]._version,
-                rows.liquidity.len(),
-            )
-            .await;
+            self.await_part("dex_liquidity", rows.liquidity[0]._version)
+                .await;
         }
 
         if !rows.pools.is_empty() {
@@ -190,37 +181,35 @@ impl TestDb {
                 values.join(", ")
             ))
             .await;
-            self.await_visible(
-                "dex_pools",
-                rows.pools[0]._version,
-                rows.pools.len(),
-            )
-            .await;
+            self.await_part("dex_pools", rows.pools[0]._version).await;
         }
     }
 
-    /// Waits until the `rows` just written at `version` are all readable.
+    /// Waits until the part `version` just wrote into `table` is readable.
     ///
     /// ClickHouse 25.12 has no read-your-writes ([`SETTLE`]), so a read
     /// issued right after an acknowledged INSERT can miss the new part.
     /// Every row batch of this harness carries its own `_version`
-    /// (`next_version` is strictly increasing), which makes the count
-    /// exact and unaffected by what other chains write meanwhile.
-    async fn await_visible(&self, table: &str, version: u64, rows: usize) {
+    /// (`next_version` is strictly increasing), which keeps the question
+    /// unaffected by what the other chains write meanwhile. One row is
+    /// the whole signal: a batch is one part and a part becomes readable
+    /// as a whole. Counting rows would NOT work - rows that share a
+    /// sorting key collapse inside the part, so the number stored is not
+    /// the number written.
+    async fn await_part(&self, table: &str, version: u64) {
         let sql = format!(
             "SELECT count() FROM {table} WHERE _version = {version}"
         );
         let started = std::time::Instant::now();
 
         loop {
-            let seen = self.count(&sql).await;
-            if seen >= rows as u64 {
+            if self.count(&sql).await > 0 {
                 return;
             }
             assert!(
                 started.elapsed() < SETTLE,
-                "{table}: only {seen} of {rows} rows of version \
-                 {version} became visible"
+                "{table}: the rows of version {version} never became \
+                 visible"
             );
             tokio::time::sleep(RETRY).await;
         }
@@ -2808,8 +2797,13 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
     let before = visible_state(&database, CHAIN).await;
     purge(&database, CHAIN, 1_000, 1, DAY).await;
     check(&database).await;
-    assert_state_settles_to(&database, CHAIN, &before, "after the rebuild")
-        .await;
+    assert_state_settles_to(
+        &database,
+        CHAIN,
+        &before,
+        "after the rebuild",
+    )
+    .await;
 
     database.drop().await;
 }

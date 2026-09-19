@@ -63,6 +63,17 @@ const GRADUATION_BLOCK: u64 = 66_679_555;
 /// The graduation threshold of that curve, in wei of the native coin.
 const THRESHOLD: f64 = 4.2e18;
 
+/// How long a read is given to catch up with an acknowledged INSERT.
+///
+/// ClickHouse 25.12 has no read-your-writes: measured on this build, 3 %
+/// of the reads issued right after an acknowledged INSERT miss the new
+/// part, and they heal within milliseconds (docs/design.md §2, "No
+/// read-your-writes").
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Between two attempts of a settling read.
+const RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
 struct TestDb {
     admin: Client,
     client: Client,
@@ -186,11 +197,63 @@ impl TestDb {
         insert.end().await.unwrap();
     }
 
+    /// Waits until the part `version` just wrote into `table` is readable.
+    ///
+    /// ClickHouse 25.12 has no read-your-writes ([`SETTLE`]), so a read
+    /// issued right after an acknowledged INSERT can miss it. One row is
+    /// the whole signal: a batch is one part and a part becomes readable
+    /// as a whole. Counting rows would NOT work - rows that share a
+    /// sorting key collapse inside the part, so the number stored is not
+    /// the number written.
+    async fn await_part(&self, table: &str, version: u64) {
+        let sql = format!(
+            "SELECT count() FROM {table} WHERE _version = {version}"
+        );
+        let started = std::time::Instant::now();
+
+        loop {
+            if self.count(&sql).await > 0 {
+                return;
+            }
+            assert!(
+                started.elapsed() < SETTLE,
+                "{table}: the rows of version {version} never became \
+                 visible"
+            );
+            tokio::time::sleep(RETRY).await;
+        }
+    }
+
+    /// In `INSERT_ORDER`, like the pipeline, and not returning before
+    /// every part it wrote can be read back.
     async fn store(&self, rows: &LaunchpadRows) {
         self.write("launchpad_tokens", &rows.tokens).await;
         self.write("launchpad_trades", &rows.trades).await;
         self.write("launchpad_graduations", &rows.graduations).await;
         self.write("launchpad_creator_fees", &rows.creator_fees).await;
+
+        for (table, version) in [
+            (
+                "launchpad_tokens",
+                rows.tokens.first().map(|row| row._version),
+            ),
+            (
+                "launchpad_trades",
+                rows.trades.first().map(|row| row._version),
+            ),
+            (
+                "launchpad_graduations",
+                rows.graduations.first().map(|row| row._version),
+            ),
+            (
+                "launchpad_creator_fees",
+                rows.creator_fees.first().map(|row| row._version),
+            ),
+        ] {
+            if let Some(version) = version {
+                self.await_part(table, version).await;
+            }
+        }
     }
 
     /// The operator data every headline view depends on.
@@ -647,10 +710,19 @@ async fn a_purge_and_a_rebuild_equal_a_clean_index() {
          {GRADUATION_BLOCK}, 12, 0, 'reorg')"
     ))
     .await;
+    // `(fork, None)`: the block range the purge above removed. The
+    // rebuild leaves it out by itself rather than trusting the tombstones
+    // to be readable already (docs/design.md §2, "No read-your-writes");
+    // the canonical tail below adds itself through the materialized view.
     for table in LAUNCHPADS_DERIVED {
-        for sql in
-            rebuild_statements(table, CHAIN, from_ts, 1_790_000_000, epoch)
-        {
+        for sql in rebuild_statements(
+            table,
+            CHAIN,
+            from_ts,
+            1_790_000_000,
+            epoch,
+            (fork, None),
+        ) {
             db.execute(&sql).await;
         }
     }
