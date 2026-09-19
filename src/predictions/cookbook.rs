@@ -21,9 +21,19 @@
 //! `prediction_holders_v`, `prediction_positions_v`,
 //! `prediction_activity_v`) left pad it with 12 zero bytes themselves, and
 //! the primary key range read survives the padding (it is a constant
-//! expression, verified with `EXPLAIN indexes = 1`). Queries against
-//! `prediction_markets_v` take ids that are 32 bytes on every chain
-//! (`market_id`, `event_id`), so they `unhex()` the same hex string.
+//! expression, verified with `EXPLAIN indexes = 1`).
+//!
+//! **Anything that is not 40 or 64 hex characters matches nothing.**
+//! `unhex('')` is the empty string and `toFixedString('', 32)` is 32 zero
+//! bytes, a real populated value in these tables, so an empty parameter
+//! used to select the zero bucket instead of returning nothing. Each
+//! parameterized view now carries `AND length({id:String}) IN (40, 64)`,
+//! folded at analysis time, so a valid id keeps its key range read and an
+//! empty or truncated one reads no part.
+//!
+//! Queries against `prediction_markets_v` take ids that are 32 bytes on
+//! every chain (`market_id`, `event_id`), so they `unhex()` the same hex
+//! string.
 //!
 //! # The text these queries return is HOSTILE
 //!

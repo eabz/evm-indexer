@@ -1868,6 +1868,152 @@ async fn a_32_byte_collateral_never_borrows_a_truncated_tokens_row() {
     database.drop().await;
 }
 
+/// Review round 3, item 3. An id parameter is hex without `0x` and the
+/// views pad a 40 character one, but an EMPTY string went through the
+/// same path: `unhex('')` is the empty string and `toFixedString('', 32)`
+/// is 32 ZERO BYTES, which is a real, storable value in these tables: an
+/// unknown `registry`, `market_id` or `collateral_token` is the 32 zero
+/// bytes, never a missing row. So an empty parameter, which is exactly
+/// what a UI sends when its field is unset, selected the zero bucket
+/// instead of returning nothing; a truncated 39 or 63 character id padded
+/// the same way.
+///
+/// The `holder` views were the one lucky case - the MVs that fill
+/// `prediction_ledger_by_holder` drop the zero holder on purpose, so the
+/// mint and burn legs of a split never land there - but the guard is
+/// applied uniformly rather than resting on that.
+///
+/// Every parameterized view now carries `AND length({id}) IN (40, 64)`.
+/// The positive direction - a valid id still answers - is covered by the
+/// other five tests in this file, which read these same views.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn an_empty_or_wrong_length_id_parameter_matches_nothing() {
+    let database = TestDb::create().await;
+    let traded_at = now() - 3_600;
+    let version = crate::db::next_version();
+    let token_id = U256::from(5u8).to_string();
+    let zero = "0".repeat(64);
+
+    // The premise: plant rows under the 32 zero bytes, on the holder, the
+    // market and the registry, so "matches nothing" is a filter doing
+    // work rather than an empty table.
+    for sql in [
+        format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) \
+             VALUES ({CHAIN}, 'registry', unhex('{zero}'), unhex('{zero}'))"
+        ),
+        format!(
+            "INSERT INTO prediction_outcome_tokens (chain, registry, \
+             outcome_token_id, market_id, outcome_index, collateral_token, \
+             first_seen_block, first_seen_timestamp, _version) VALUES \
+             ({CHAIN}, unhex('{zero}'), toUInt256('{token_id}'), \
+             unhex('{zero}'), 0, unhex('{zero}'), 10, {traded_at}, {version})"
+        ),
+        // A market and an exchange under the zero id, so the market list
+        // really holds a zero-id market ...
+        format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) \
+             VALUES ({CHAIN}, 'exchange', unhex('{zero}'), unhex('{zero}'))"
+        ),
+        format!(
+            "INSERT INTO prediction_markets (chain, market_id, registry, \
+             protocol, oracle, question_id, outcome_count, block_number, \
+             timestamp, tx_id, tx_index, ordinal, tx_from, source, epoch, \
+             _version) VALUES ({CHAIN}, unhex('{zero}'), unhex('{zero}'), 'ctf', \
+             unhex('{zero}'), unhex('{zero}'), 2, 10, {traded_at}, unhex('aa'), \
+             0, 1, unhex('{zero}'), 'event', 0, {version})"
+        ),
+        // ... and a verified trade on it, which feeds the candles and the
+        // trades tape under the zero registry / zero market.
+        format!(
+            "INSERT INTO prediction_trades (chain, block_number, timestamp, \
+             tx_id, tx_index, ordinal, protocol, exchange, registry, order_hash, \
+             maker, taker, tx_from, tx_to, outcome_token_id, side, share_amount, \
+             collateral_amount, match_type, verified, maker_outcome_token_id, \
+             maker_side, maker_collateral_amount, maker_fee_amount, \
+             maker_fee_unit, taker_fee_amount, taker_fee_unit, epoch, _version) \
+             VALUES ({CHAIN}, 11, {traded_at}, unhex('aa'), 1, 2, 'ctf_exchange', \
+             unhex('{zero}'), unhex('{zero}'), unhex('{zero}'), unhex('{zero}'), \
+             unhex('{zero}'), unhex('{zero}'), unhex('{zero}'), \
+             toUInt256('{token_id}'), 'buy', 400000, 240000, 'complementary', 1, \
+             toUInt256('{token_id}'), 'sell', 240000, 0, 'collateral', 0, \
+             'collateral', 0, {version})"
+        ),
+    ] {
+        database.execute(&sql).await;
+    }
+    database.refresh_markets().await;
+
+    for (table, column) in [
+        ("prediction_outcome_tokens", "registry"),
+        ("prediction_outcome_tokens_by_market", "market_id"),
+    ] {
+        assert!(
+            database
+                .count(&format!(
+                    "SELECT count() FROM {table} FINAL WHERE chain = {CHAIN} \
+                     AND {column} = toFixedString('', 32)"
+                ))
+                .await
+                > 0,
+            "{table}.{column}: the zero bucket is empty, this proves nothing"
+        );
+    }
+
+    let chain = CHAIN.to_string();
+    // Every parameterized view of 0022, with the id it scopes on.
+    let views: [(&str, &str); 8] = [
+        ("prediction_candles_1m_v", "registry"),
+        ("prediction_candles_1h_v", "registry"),
+        ("prediction_candles_1d_v", "registry"),
+        ("prediction_trades_v", "market_id"),
+        ("prediction_trades_all_v", "market_id"),
+        ("prediction_holders_v", "market_id"),
+        ("prediction_positions_v", "holder"),
+        ("prediction_activity_v", "holder"),
+    ];
+
+    // An empty field, an address one character short, a 32 byte id one
+    // short, and a stray byte. None of them may match anything.
+    for bad in ["", &"a".repeat(39), &"a".repeat(63), "00"] {
+        let parameters: [(&str, &str); 6] = [
+            ("chain", &chain),
+            ("registry", bad),
+            ("market_id", bad),
+            ("holder", bad),
+            ("outcome_token_id", &token_id),
+            ("from_block", "0"),
+        ];
+        database.set(&parameters);
+
+        for (view, id) in views {
+            let sql = match id {
+                "registry" => format!(
+                    "SELECT count() FROM {view}(chain = {{chain:UInt64}}, \
+                     registry = {{registry:String}}, \
+                     outcome_token_id = {{outcome_token_id:UInt256}})"
+                ),
+                "market_id" => format!(
+                    "SELECT count() FROM {view}(chain = {{chain:UInt64}}, \
+                     market_id = {{market_id:String}})"
+                ),
+                _ => format!(
+                    "SELECT count() FROM {view}(chain = {{chain:UInt64}}, \
+                     holder = {{holder:String}})"
+                ),
+            };
+            assert_eq!(
+                database.count(&sql).await,
+                0,
+                "{view}: id {bad:?} matched rows"
+            );
+        }
+    }
+
+    database.drop().await;
+}
+
 /// A contract nobody trusts, emitting the same events the real one does.
 const FORGER: &str = "0xF0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0";
 /// A worthless ERC-20 the forger splits one unit of.

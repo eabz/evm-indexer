@@ -417,10 +417,25 @@ crate) and NEVER pasted into its text - which is why no placeholder is
 inside quotes. Ids are plain hex without `0x`: 64 characters for a 32 byte
 id, or the 40 of an EVM address, which the parameterized views left pad
 themselves (a constant expression, so the primary key range read
-survives). Anything else can only fail to match, with one exception worth
-knowing: an EMPTY string pads to the 32 zero bytes, which here is the real
-bucket holding the trades whose token leg stayed unverified. `tx_id` comes
-back as the raw transaction bytes - `hex(tx_id)` to print it.
+survives).
+
+**Anything that is not 40 or 64 hex characters matches nothing**, and that
+is enforced rather than assumed. `unhex('')` is the empty string and
+`toFixedString('', 32)` is 32 zero bytes, which here is a *real* bucket -
+the trades whose token leg stayed unverified - so an empty parameter used
+to return that bucket, which is what a UI sends when its field is unset.
+Every parameterized view now carries `AND length({id:String}) IN (40, 64)`
+exactly once, in the filter that gates its output. The conjunct names no
+column, so ClickHouse folds it while analysing the query: a valid id keeps
+its primary key range read (`EXPLAIN indexes = 1` still shows the key
+condition on the id and one granule), an empty or truncated one reads no
+part at all. An id longer than 64 characters raises
+`TOO_LARGE_STRING_SIZE`, as it always did - loud, never a silent match. To
+look at the unverified-token bucket deliberately, read
+`launchpad_trades_by_token` directly; it is not a screen.
+
+`tx_id` comes back as the raw transaction bytes - `hex(tx_id)` to print
+it.
 
 Every screen below reads a trust-filtered view; the `*_all_v` twins
 (§3.2) are the exploration tool, and only the launch feed ships one as a

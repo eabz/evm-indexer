@@ -314,9 +314,23 @@ p)), 32)`: a constant expression ClickHouse folds BEFORE it reads a part, so
 the "one query per screen" promise holds - every one of these is still a
 primary key range read (asserted with `EXPLAIN indexes = 1` in the
 integration tests). `leftPad()` reads better but is *not* folded into a key
-condition on 25.12, which is why the `if` / `concat` form is used. Anything
-other than 40 or 64 hex characters is a caller error and can only fail to
-match. Queries against the plain `prediction_markets_v` take ids that are 32
+condition on 25.12, which is why the `if` / `concat` form is used.
+
+**Anything that is not 40 or 64 hex characters matches nothing**, which is
+enforced rather than assumed. `unhex('')` is the empty string and
+`toFixedString('', 32)` is 32 ZERO BYTES - a real, populated value in these
+tables (the unknown collateral, an unset `parent_collection_id`, the zero
+counterparty) - so an empty id parameter did not fail to match: it silently
+selected the zero bucket, which is exactly what a UI sends when its field
+is unset. A truncated 39 or 63 character id padded the same way. Every
+parameterized view therefore carries `AND length({id:String}) IN (40, 64)`
+once, in the filter that gates its output; the conjunct names no column, so
+a valid id keeps its primary key range read untouched and a wrong one makes
+the WHERE constant false, reading no part. An id longer than 64 characters
+raises `TOO_LARGE_STRING_SIZE` from `toFixedString`, as it always did -
+loud, never a silent match.
+
+Queries against the plain `prediction_markets_v` take ids that are 32
 bytes on every chain (`market_id`, `event_id`), so they just `unhex()` the
 same hex string.
 

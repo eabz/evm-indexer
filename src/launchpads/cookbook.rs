@@ -18,11 +18,20 @@
 //! a UI holding a 20 byte EVM address passes its 40 characters unchanged
 //! and the parameterized views left pad them with 12 zero bytes
 //! themselves (the padding is a constant expression, so the primary key
-//! range read survives it). Anything else can only fail to match, except
-//! an EMPTY string, which pads to the 32 zero bytes - in this module a
-//! real bucket, the trades whose token leg stayed unverified. `{now}` /
-//! `{since}` are unix seconds, and `tx_id` comes back as the raw
-//! transaction bytes (`hex(tx_id)` to print it).
+//! range read survives it).
+//!
+//! **Anything that is not 40 or 64 hex characters matches nothing.** That
+//! is enforced, not hoped for: `unhex('')` is the empty string and
+//! `toFixedString('', 32)` is 32 zero bytes, which in this module is a
+//! real bucket (the trades whose token leg stayed unverified), so an
+//! empty parameter used to return that bucket - a UI with an unset field
+//! got rows. Every parameterized view now carries
+//! `AND length({id:String}) IN (40, 64)`, folded at analysis time, so a
+//! valid id keeps its primary key range read and an empty or truncated
+//! one reads no part at all.
+//!
+//! `{now}` / `{since}` are unix seconds, and `tx_id` comes back as the
+//! raw transaction bytes (`hex(tx_id)` to print it).
 //!
 //! # Trust, and the `_all_v` twins
 //!

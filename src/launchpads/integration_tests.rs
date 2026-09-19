@@ -1295,6 +1295,139 @@ async fn a_forged_launch_moves_no_creator_page_number() {
     db.drop_database().await;
 }
 
+/// Review round 3, item 3. An id parameter is hex WITHOUT `0x`, and the
+/// views pad a 40 character one. An EMPTY string went through the same
+/// path: `unhex('')` is the empty string and `toFixedString('', 32)` is 32
+/// ZERO BYTES, which in this module is a real, populated bucket - the
+/// trades whose token leg stayed unverified. So an empty token parameter,
+/// which is exactly what a UI sends when its field is unset, returned that
+/// bucket instead of nothing. A truncated 39 or 63 character id padded the
+/// same way.
+///
+/// Every parameterized view now carries `AND length({id}) IN (40, 64)`, so
+/// a wrong length matches NOTHING while a valid one is untouched.
+#[tokio::test]
+#[ignore]
+async fn an_empty_or_wrong_length_id_parameter_matches_nothing() {
+    let db = TestDb::create("emptyid").await;
+    db.store(&rows_of(fixtures::ALL, 1, 0)).await;
+    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0)).await;
+    db.trust_the_real_venues().await;
+
+    // A curve trade whose token leg stayed unverified and whose family
+    // does not name the token: it lands under the 32 zero bytes (0030),
+    // which is what an empty parameter used to return. The real fixtures
+    // have none, so one is planted - without it this test proves nothing.
+    db.execute(&format!(
+        "INSERT INTO launchpad_trades (chain, block_number, timestamp, tx_id, \
+         tx_index, ordinal, family, emitter, token, token_verified, \
+         quote_token, quote_verified, side, trader, caller, token_amount, \
+         quote_amount, fee_amount, tax_amount, progress_wad, graduating, \
+         sole_unverified_quote, tx_from, tx_to, tx_value, epoch, _version, \
+         is_deleted) VALUES ({CHAIN}, 66679600, toDateTime(1789780500), \
+         unhex('aa'), 0, 0, 'flap_portal', {emitter}, toFixedString('', 32), 0, \
+         toFixedString('', 32), 0, 'buy', {trader}, toFixedString('', 32), 1, 1, \
+         0, 0, 0, 0, 0, {trader}, toFixedString('', 32), 0, 0, 3, 0)",
+        emitter = id_literal(FLAP_RH),
+        trader = id_literal(BUNDLER),
+    ))
+    .await;
+
+    // The premise: the 32 zero bytes really are a populated bucket here,
+    // so "matches nothing" is a filter doing work, not an empty table.
+    assert!(
+        db.count(&format!(
+            "SELECT count() FROM launchpad_trades_by_token FINAL WHERE \
+             chain = {CHAIN} AND token = toFixedString('', 32) \
+             AND is_deleted = 0"
+        ))
+        .await
+            > 0,
+        "the unverified-token bucket is empty: this test proves nothing"
+    );
+
+    let token = id_hex(TOKEN);
+    let creator = id_hex(CREATOR);
+
+    // Every parameterized view, with the id parameter it scopes on.
+    let token_views: Vec<&str> = vec![
+        "SELECT count() FROM launchpad_candles_1m_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT count() FROM launchpad_candles_1h_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT count() FROM launchpad_token_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT count() FROM launchpad_token_all_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT count() FROM launchpad_token_trades_v(chain = {chain:UInt64}, \
+         token = {token:String}, from_block = {from_block:UInt64})",
+        "SELECT count() FROM launchpad_token_trades_all_v(\
+         chain = {chain:UInt64}, token = {token:String}, \
+         from_block = {from_block:UInt64})",
+        "SELECT count() FROM launchpad_token_holders_v(chain = {chain:UInt64}, \
+         token = {token:String}, as_of_block = {as_of_block:UInt64})",
+        "SELECT count() FROM launchpad_token_holders_all_v(\
+         chain = {chain:UInt64}, token = {token:String}, \
+         as_of_block = {as_of_block:UInt64})",
+        "SELECT count() FROM launchpad_snipers_v(chain = {chain:UInt64}, \
+         token = {token:String}, blocks = {blocks:UInt64})",
+        "SELECT count() FROM launchpad_snipers_all_v(chain = {chain:UInt64}, \
+         token = {token:String}, blocks = {blocks:UInt64})",
+    ];
+    let creator_views: Vec<&str> = vec![
+        "SELECT count() FROM launchpad_creator_v(chain = {chain:UInt64}, \
+         creator = {creator:String}, as_of = {now:UInt32}, \
+         dead_after = {dead_after:UInt32})",
+        "SELECT count() FROM launchpad_creator_all_v(chain = {chain:UInt64}, \
+         creator = {creator:String}, as_of = {now:UInt32}, \
+         dead_after = {dead_after:UInt32})",
+        "SELECT count() FROM launchpad_creator_tokens_v(\
+         chain = {chain:UInt64}, creator = {creator:String}, \
+         as_of = {now:UInt32}, dead_after = {dead_after:UInt32})",
+        "SELECT count() FROM launchpad_creator_tokens_all_v(\
+         chain = {chain:UInt64}, creator = {creator:String}, \
+         as_of = {now:UInt32}, dead_after = {dead_after:UInt32})",
+    ];
+
+    // A real id still answers: the guard must not have broken the screens.
+    db.set(&cookbook_parameters(&token, &creator));
+    for sql in token_views.iter().chain(&creator_views) {
+        assert!(db.count(sql).await > 0, "a valid id returned nothing: {sql}");
+    }
+
+    // ... and every wrong length answers with nothing at all.
+    for bad in [
+        "",                  // the empty field of a UI
+        &token[..39],        // one character short of an address
+        &token[..63],        // one short of a 32 byte id
+        "00",                // a stray byte
+    ] {
+        db.set(&cookbook_parameters(bad, bad));
+        for sql in token_views.iter().chain(&creator_views) {
+            assert_eq!(
+                db.count(sql).await,
+                0,
+                "id {bad:?} matched rows: {sql}"
+            );
+        }
+    }
+
+    // The empty case, spelled out: it used to return the zero bucket.
+    db.set(&cookbook_parameters("", ""));
+    assert_eq!(
+        db.count(
+            "SELECT count() FROM launchpad_token_trades_all_v(\
+             chain = {chain:UInt64}, token = {token:String}, \
+             from_block = {from_block:UInt64})"
+        )
+        .await,
+        0,
+        "an empty token parameter still returns the unverified bucket"
+    );
+
+    db.drop_database().await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn hostile_amounts_do_not_wrap() {

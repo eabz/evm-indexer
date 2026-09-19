@@ -55,12 +55,30 @@
 -- with 12 zero bytes themselves. The padding is a constant expression
 -- ClickHouse folds before it reads a part, so the primary key range read
 -- survives it (the if / concat form is used because leftPad() is not
--- folded - same as 0022). Anything other than 40 or 64 hex characters is a
--- caller error that can only fail to match, with ONE exception worth
--- knowing: an EMPTY string pads to the 32 zero bytes, which in this module
--- is a real bucket - the trades whose token leg stayed unverified and
--- whose family does not name the token (see 0030). An empty token
--- parameter therefore returns that bucket rather than nothing.
+-- folded - same as 0022).
+--
+-- A WRONG LENGTH MATCHES NOTHING. It used not to, and in THIS module that
+-- was the sharpest version of the bug: unhex('') is the empty string,
+-- toFixedString('', 32) is 32 zero bytes, and 32 zero bytes is a real
+-- populated bucket here - the trades whose token leg stayed unverified
+-- and whose family does not name the token (see 0030). An empty token
+-- parameter therefore returned that bucket, as if a UI with an unset
+-- field had asked for it. A truncated 39 or 63 character id pads the same
+-- way.
+--
+-- Every parameterized view below therefore carries
+--
+--   AND length({<id>:String}) IN (40, 64)
+--
+-- exactly once, in the filter that gates its output. The conjunct names
+-- no column, so ClickHouse folds it while it analyses the query: a valid
+-- length leaves the primary key range read exactly as it was (verified
+-- with EXPLAIN indexes = 1 - the key condition still names the id column
+-- and reads one granule), a wrong one makes the WHERE constant false and
+-- no part is read. An id longer than 64 characters still raises
+-- TOO_LARGE_STRING_SIZE from toFixedString, as it always did: loud, never
+-- a silent match. To look at the unverified-token bucket on purpose, read
+-- launchpad_trades_by_token directly - it is not a screen.
 --
 -- Ids are 32 bytes (docs/design.md section 13) and NOTHING here assumes
 -- the top 12 bytes are zero. Print one with the family of its chain, using
@@ -148,6 +166,7 @@ GROUP BY chain, token, emitter, bucket;
 CREATE VIEW IF NOT EXISTS launchpad_candles_1m_v AS
 SELECT * FROM launchpad_candles_1m_all_v
 WHERE chain = {chain:UInt64}
+  AND length({token:String}) IN (40, 64)
   AND token = toFixedString(unhex(if(length({token:String}) = 40,
   concat('000000000000000000000000', {token:String}), {token:String})), 32)
   AND emitter IN (
@@ -157,6 +176,7 @@ WHERE chain = {chain:UInt64}
 CREATE VIEW IF NOT EXISTS launchpad_candles_1h_v AS
 SELECT * FROM launchpad_candles_1h_all_v
 WHERE chain = {chain:UInt64}
+  AND length({token:String}) IN (40, 64)
   AND token = toFixedString(unhex(if(length({token:String}) = 40,
   concat('000000000000000000000000', {token:String}), {token:String})), 32)
   AND emitter IN (
@@ -321,6 +341,7 @@ FROM
   FROM launchpad_tokens FINAL
   WHERE chain = {chain:UInt64} AND token = token_id
     AND is_deleted = 0
+    AND length({token:String}) IN (40, 64)
   GROUP BY chain, token
 ) AS l
 CROSS JOIN
@@ -417,6 +438,7 @@ FROM
   FROM launchpad_tokens FINAL
   WHERE chain = {chain:UInt64} AND token = token_id
     AND is_deleted = 0
+    AND length({token:String}) IN (40, 64)
     AND emitter IN (
       SELECT curve FROM launchpad_trusted_curves_v
       WHERE chain = {chain:UInt64})
@@ -484,6 +506,7 @@ FROM launchpad_trades_by_token FINAL
 WHERE chain = {chain:UInt64} AND token = toFixedString(unhex(if(length({token:String}) = 40,
   concat('000000000000000000000000', {token:String}), {token:String})), 32)
   AND is_deleted = 0 AND block_number >= {from_block:UInt64}
+  AND length({token:String}) IN (40, 64)
 ORDER BY block_number DESC, tx_index DESC, ordinal DESC;
 
 CREATE VIEW IF NOT EXISTS launchpad_token_trades_v AS
@@ -555,7 +578,7 @@ FROM
     AND is_deleted = 0
 )
 GROUP BY account
-HAVING balance_raw > 0
+HAVING balance_raw > 0 AND length({token:String}) IN (40, 64)
 ORDER BY balance_raw DESC;
 
 CREATE VIEW IF NOT EXISTS launchpad_token_holders_v AS
@@ -604,7 +627,7 @@ FROM
     AND is_deleted = 0
 )
 GROUP BY account
-HAVING balance_raw > 0
+HAVING balance_raw > 0 AND length({token:String}) IN (40, 64)
 ORDER BY balance_raw DESC;
 
 -- ------------------------------------------------ screen: graduations
@@ -726,6 +749,7 @@ LEFT JOIN
 ) AS t ON t.t_chain = l.chain AND t.t_token = l.token
 WHERE l.chain = {chain:UInt64} AND l.creator = creator_id
   AND l.is_deleted = 0
+  AND length({creator:String}) IN (40, 64)
 ORDER BY l.timestamp DESC;
 
 -- THE screen. Same shape, every source restricted to the trusted curves,
@@ -777,6 +801,7 @@ LEFT JOIN
 ) AS t ON t.t_chain = l.chain AND t.t_token = l.token
 WHERE l.chain = {chain:UInt64} AND l.creator = creator_id
   AND l.is_deleted = 0
+  AND length({creator:String}) IN (40, 64)
   AND l.emitter IN (
     SELECT curve FROM launchpad_trusted_curves_v
     WHERE chain = {chain:UInt64})
@@ -818,7 +843,8 @@ CROSS JOIN
   FROM launchpad_creator_fees FINAL
   WHERE chain = {chain:UInt64} AND is_deleted = 0
     AND recipient = creator_id AND kind = 'creator'
-) AS f;
+) AS f
+WHERE length({creator:String}) IN (40, 64);
 
 -- THE screen. Every launch counted, every graduation, every trade and
 -- every fee row comes from a trusted curve, so a forger can neither add
@@ -859,7 +885,8 @@ CROSS JOIN
     AND emitter IN (
       SELECT curve FROM launchpad_trusted_curves_v
       WHERE chain = {chain:UInt64})
-) AS f;
+) AS f
+WHERE length({creator:String}) IN (40, 64);
 
 -- -------------------------------------------------- screen: sniper view
 --
@@ -906,6 +933,7 @@ FROM
     FROM launchpad_trades_by_token FINAL
     WHERE chain = {chain:UInt64} AND token = token_id
       AND is_deleted = 0 AND side = 'buy'
+      AND length({token:String}) IN (40, 64)
       AND block_number <= (
         SELECT min(block_number) + {blocks:UInt64}
         FROM launchpad_tokens FINAL
@@ -958,6 +986,7 @@ FROM
     FROM launchpad_trades_by_token FINAL
     WHERE chain = {chain:UInt64} AND token = token_id
       AND is_deleted = 0 AND side = 'buy'
+      AND length({token:String}) IN (40, 64)
       AND emitter IN (
         SELECT curve FROM launchpad_trusted_curves_v
         WHERE chain = {chain:UInt64})
