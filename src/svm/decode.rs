@@ -306,6 +306,18 @@ pub struct Diagnostics {
     pub decoder_disagreed: u64,
     /// A native SOL leg was needed but could not be attributed unambiguously.
     pub ambiguous_native: u64,
+    /// Swaps per venue, indexed by [`Venue::index`].
+    pub swaps_by_venue: [u64; Venue::ALL.len()],
+    /// Of those, how many the venue's own event CONFIRMED.
+    pub confirmed_by_venue: [u64; Venue::ALL.len()],
+    /// And how many it CONTRADICTED. `confirmed / (confirmed + disagreed)`
+    /// is the agreement rate between the two layers, per venue - the number
+    /// that says whether an event layout is right.
+    pub disagreed_by_venue: [u64; Venue::ALL.len()],
+    /// A venue instruction whose discriminator says "swap" but whose token
+    /// movement says otherwise, or the reverse. The two classifications are
+    /// independent, so a divergence is worth counting on its own.
+    pub kind_disagreed: u64,
 }
 
 impl Diagnostics {
@@ -315,6 +327,23 @@ impl Diagnostics {
         self.unclassified += other.unclassified;
         self.decoder_disagreed += other.decoder_disagreed;
         self.ambiguous_native += other.ambiguous_native;
+        self.kind_disagreed += other.kind_disagreed;
+        for index in 0..Venue::ALL.len() {
+            self.swaps_by_venue[index] += other.swaps_by_venue[index];
+            self.confirmed_by_venue[index] +=
+                other.confirmed_by_venue[index];
+            self.disagreed_by_venue[index] +=
+                other.disagreed_by_venue[index];
+        }
+    }
+
+    /// Agreement between the movement layer and the venue's own event,
+    /// over the swaps where an event was found at all.
+    pub fn agreement_rate(&self, venue: Venue) -> Option<f64> {
+        let confirmed = self.confirmed_by_venue[venue.index()];
+        let disagreed = self.disagreed_by_venue[venue.index()];
+        let judged = confirmed + disagreed;
+        (judged > 0).then(|| confirmed as f64 / judged as f64)
     }
 }
 
@@ -674,9 +703,12 @@ pub fn decode_transaction_with(
                     &mut row,
                     0,
                 );
-                if enriched == crate::svm::events::Enrichment::Disagreed {
-                    outcome.diagnostics.decoder_disagreed += 1;
-                }
+                record(
+                    &mut outcome.diagnostics,
+                    venue,
+                    enriched,
+                    instruction,
+                );
                 outcome.swaps.push(row);
             }
             // The movement layer proposed both sides of a symmetric
@@ -686,6 +718,7 @@ pub fn decode_transaction_with(
             Classified::NativeCandidates(proposals) => {
                 let only_one = proposals.len() == 1;
                 let mut accepted = None;
+                let mut verdict = crate::svm::events::Enrichment::None;
                 for swap in &proposals {
                     let mut row =
                         build_row(chain, timestamp, tx, &movements, swap);
@@ -698,6 +731,8 @@ pub fn decode_transaction_with(
                         0,
                     ) {
                         crate::svm::events::Enrichment::Applied => {
+                            verdict =
+                                crate::svm::events::Enrichment::Applied;
                             accepted = Some(row);
                             break;
                         }
@@ -708,15 +743,33 @@ pub fn decode_transaction_with(
                         {
                             accepted = Some(row);
                         }
-                        _ => {}
+                        other => verdict = other,
                     }
                 }
                 match accepted {
-                    Some(row) => outcome.swaps.push(row),
+                    Some(row) => {
+                        record(
+                            &mut outcome.diagnostics,
+                            venue,
+                            verdict,
+                            instruction,
+                        );
+                        outcome.swaps.push(row);
+                    }
                     None => outcome.diagnostics.ambiguous_native += 1,
                 }
             }
-            Classified::Liquidity => outcome.diagnostics.liquidity += 1,
+            Classified::Liquidity => {
+                outcome.diagnostics.liquidity += 1;
+                // The two classifications are independent. The movement
+                // layer says "both mints moved the same way"; the
+                // discriminator should say `Liquidity` too.
+                if venue.instruction_kind(&instruction.data)
+                    == crate::svm::programs::IxKind::Swap
+                {
+                    outcome.diagnostics.kind_disagreed += 1;
+                }
+            }
             Classified::Unclassified => {
                 outcome.diagnostics.unclassified += 1
             }
@@ -729,6 +782,40 @@ pub fn decode_transaction_with(
 
     outcome.swaps.sort_by_key(|swap| swap.ordinal);
     outcome
+}
+
+/// Books one swap against its venue, and cross-checks the venue's own
+/// discriminator against the shape of the token movement.
+///
+/// The discriminator check is genuinely independent evidence: the movement
+/// layer concluded "one mint in, a different one out" from validator
+/// metadata, and the discriminator is the program's own statement of what
+/// the instruction was. A swap by movement that the registry calls
+/// `Liquidity` means one of the two is wrong, and it is worth a counter
+/// rather than a silent row.
+fn record(
+    diagnostics: &mut Diagnostics,
+    venue: Venue,
+    enrichment: crate::svm::events::Enrichment,
+    instruction: &SvmInstruction,
+) {
+    use crate::svm::{events::Enrichment, programs::IxKind};
+
+    diagnostics.swaps_by_venue[venue.index()] += 1;
+    match enrichment {
+        Enrichment::Applied => {
+            diagnostics.confirmed_by_venue[venue.index()] += 1
+        }
+        Enrichment::Disagreed => {
+            diagnostics.disagreed_by_venue[venue.index()] += 1;
+            diagnostics.decoder_disagreed += 1;
+        }
+        Enrichment::None => {}
+    }
+
+    if venue.instruction_kind(&instruction.data) == IxKind::Liquidity {
+        diagnostics.kind_disagreed += 1;
+    }
 }
 
 enum Classified {

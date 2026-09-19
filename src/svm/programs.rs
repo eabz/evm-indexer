@@ -101,6 +101,23 @@ impl Venue {
         Venue::BisonFi,
     ];
 
+    /// Position in [`Venue::ALL`], so per-venue counters can be a fixed
+    /// array rather than a map - which keeps `Diagnostics` `Copy` and
+    /// cheap to merge across threads.
+    pub const fn index(&self) -> usize {
+        match self {
+            Venue::PumpSwap => 0,
+            Venue::PumpFun => 1,
+            Venue::RaydiumAmmV4 => 2,
+            Venue::RaydiumCpmm => 3,
+            Venue::RaydiumClmm => 4,
+            Venue::OrcaWhirlpool => 5,
+            Venue::MeteoraDlmm => 6,
+            Venue::MeteoraDammV2 => 7,
+            Venue::BisonFi => 8,
+        }
+    }
+
     /// Value of the `protocol` column.
     pub const fn as_str(&self) -> &'static str {
         match self {

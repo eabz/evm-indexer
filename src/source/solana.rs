@@ -32,13 +32,14 @@ use hypersync_client_solana::{
 };
 use hypersync_solana_net_types::{
     field_selection::{
-        AccountActivityField, BlockField, InstructionField,
+        AccountActivityField, BlockField, InstructionField, LogField,
         SolanaFieldSelection, TransactionField,
     },
     query::{
-        AccountActivitySelection, InstructionSelection, SolanaQuery,
-        TransactionSelection,
+        AccountActivitySelection, InstructionSelection, LogSelection,
+        SolanaQuery, TransactionSelection,
     },
+    types::LogKind,
     Address,
 };
 use log::info;
@@ -46,7 +47,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 
 use crate::svm::{
-    decode::{SvmAccountActivity, SvmInstruction, SvmTransaction},
+    decode::{
+        SvmAccountActivity, SvmInstruction, SvmLog, SvmTransaction,
+    },
     models::{Pubkey, SigBytes},
     programs::{
         registry, Venue, IX_SYSTEM_TRANSFER, IX_TRANSFER,
@@ -58,10 +61,57 @@ use crate::svm::{
 /// Public endpoint.
 pub const DEFAULT_URL: &str = "https://solana.hypersync.xyz";
 
-/// Without this a response stops after ~700 rows (one or two slots). The
-/// measured cost of a generous value is fine: one request returned 107
-/// slots and 33,886 instruction rows in 2.7 s.
-const MAX_NUM_INSTRUCTIONS: usize = 200_000;
+/// Row cap put on EVERY table of a response.
+///
+/// # Why every table, and not just the instructions
+///
+/// `SolanaQuery` has FIVE independent `max_num_*` caps - blocks,
+/// transactions, instructions, logs and account activity - and each one
+/// stops the whole response when it is hit. Raising one of them raises
+/// nothing: the lowest UNSET cap simply binds first.
+///
+/// That is not a theoretical point. Measured on the production query shape
+/// (docs/solana-research.md section 11.1.1): with only
+/// `max_num_instructions` raised, a request returned **one slot**. With all
+/// five raised, the same request returned **40 slots**. At 30 queries a
+/// minute, one slot per query is 0.5 slots/s against a chain that produces
+/// 3.76 - the pipeline could not have followed the head at all.
+///
+/// With the caps out of the way the binding limit becomes the server's own
+/// ~5 s query execution budget, which lands at 30-40 slots. That number is
+/// NOT a constant to rely on: the client follows `next_slot` and never its
+/// own arithmetic.
+const MAX_RESPONSE_ROWS: usize = 1_000_000;
+
+/// Raises every response cap. See [`MAX_RESPONSE_ROWS`].
+///
+/// Written as a function over the whole query, rather than as five literals
+/// at each call site, so that a cap added by a future version of the crate
+/// is missed in exactly one place - which is what
+/// `every_response_cap_is_raised` then catches.
+fn raise_response_caps(query: &mut SolanaQuery) {
+    query.max_num_blocks = Some(MAX_RESPONSE_ROWS);
+    query.max_num_transactions = Some(MAX_RESPONSE_ROWS);
+    query.max_num_instructions = Some(MAX_RESPONSE_ROWS);
+    query.max_num_logs = Some(MAX_RESPONSE_ROWS);
+    query.max_num_account_activity = Some(MAX_RESPONSE_ROWS);
+}
+
+/// The same trap, one layer down in the client.
+///
+/// `StreamConfig` auto-tunes `batch_size` to keep a response between
+/// `response_bytes_floor` and `response_bytes_ceiling`, and its defaults are
+/// 250 KB and 500 KB. Measured Arrow density on this query shape is ~0.5 MB
+/// PER SLOT, so the auto-tuner converges on a batch of one slot and quietly
+/// recreates the one-slot-per-query problem after the query caps are fixed.
+/// Both thresholds are therefore raised to tens of megabytes.
+fn stream_config() -> StreamConfig {
+    StreamConfig {
+        response_bytes_ceiling: 64 * 1024 * 1024,
+        response_bytes_floor: 16 * 1024 * 1024,
+        ..Default::default()
+    }
+}
 
 // Field selection (docs/design.md section 8): exactly what a column stores
 // or a decoder reads, nothing else.
@@ -119,12 +169,33 @@ const ACCOUNT_ACTIVITY_FIELDS: [AccountActivityField; 12] = [
     AccountActivityField::IsFeePayer,
 ];
 
+/// Raydium's and Orca's swap events are `Program data:` / `ray_log:` LOG
+/// lines, so this table is not optional for them.
+///
+/// `InstructionAddress` is the important one: it names the instruction that
+/// wrote the line, which is what lets a log be attributed to exactly one
+/// instruction subtree, the same way an instruction is. Without it a log
+/// could only be attributed to a transaction, and a transaction holding two
+/// swaps on one pool is precisely the case this module exists to get right.
+/// `Kind` is what separates a `Program data:` line (an Anchor `emit!`
+/// event, base64) from a `Program log:` one (free text, which is where
+/// Raydium v4's `ray_log:` lives). The server stores both with the prefix
+/// stripped, so without the kind the two are indistinguishable.
+const LOG_FIELDS: [LogField; 6] = [
+    LogField::Slot,
+    LogField::TransactionIndex,
+    LogField::InstructionAddress,
+    LogField::ProgramId,
+    LogField::Kind,
+    LogField::Message,
+];
+
 fn field_selection() -> SolanaFieldSelection {
     SolanaFieldSelection {
         block: BLOCK_FIELDS.to_vec(),
         transaction: TRANSACTION_FIELDS.to_vec(),
         instruction_call: INSTRUCTION_FIELDS.to_vec(),
-        log: Vec::new(),
+        log: LOG_FIELDS.to_vec(),
         account_activity: ACCOUNT_ACTIVITY_FIELDS.to_vec(),
         reward: Vec::new(),
     }
@@ -184,7 +255,7 @@ pub fn instruction_selections(
 
 /// The query for `[from_slot, to_slot)`.
 pub fn build_query(from_slot: u64, to_slot: u64) -> SolanaQuery {
-    SolanaQuery {
+    let mut query = SolanaQuery {
         from_slot,
         to_slot: Some(to_slot),
         instruction_calls: instruction_selections(&VENUES),
@@ -192,18 +263,34 @@ pub fn build_query(from_slot: u64, to_slot: u64) -> SolanaQuery {
         // wants: owners, mints, decimals and the native side for every
         // account of a matched transaction.
         account_activity: vec![AccountActivitySelection::default()],
+        // Likewise match-all, and for a reason phase 1 did not have: half
+        // the phase 2 venues publish their swap event as a LOG LINE rather
+        // than a self-CPI instruction. Raydium's three programs and Orca
+        // use Anchor's `emit!` (or a bare `msg!`), so without this table
+        // their exact fees and pool state are simply unreachable.
+        //
+        // It has to be match-all rather than filtered to those four
+        // programs: selections in DIFFERENT arrays are INTERSECTED, so a
+        // `program_id` filter here would restrict the response to
+        // transactions that ALSO carry one of those logs, dropping every
+        // PumpSwap and pump.fun transaction on the chain.
+        logs: vec![LogSelection::default()],
         // Slots with no match still need their header: it is the commit
         // marker and it carries the parent_slot chain.
         include_all_blocks: true,
         field_selection: field_selection(),
-        max_num_instructions: Some(MAX_NUM_INSTRUCTIONS),
         ..Default::default()
-    }
+    };
+    raise_response_caps(&mut query);
+    query
 }
 
-/// Headers only, for the fork-point search.
+/// Headers only, for the fork-point search and the contiguity sweep.
+///
+/// Measured ~300x cheaper per slot than the data query - one request
+/// returned 10,000 slots - because nothing but the block table is touched.
 pub fn build_header_query(from_slot: u64, to_slot: u64) -> SolanaQuery {
-    SolanaQuery {
+    let mut query = SolanaQuery {
         from_slot,
         to_slot: Some(to_slot),
         include_all_blocks: true,
@@ -212,7 +299,9 @@ pub fn build_header_query(from_slot: u64, to_slot: u64) -> SolanaQuery {
             ..Default::default()
         },
         ..Default::default()
-    }
+    };
+    raise_response_caps(&mut query);
+    query
 }
 
 /// One slot header, for the `parent_slot` continuity check.
@@ -363,10 +452,8 @@ impl SolanaSource {
         let (tx, rx) = mpsc::channel(1);
 
         tokio::spawn(async move {
-            let mut responses = client.stream_arrow(
-                build_query(from, to),
-                StreamConfig::default(),
-            );
+            let mut responses =
+                client.stream_arrow(build_query(from, to), stream_config());
 
             while let Some(response) = responses.recv().await {
                 let message = match response {
@@ -521,6 +608,31 @@ pub fn to_batch(response: SolanaResponse) -> SolanaBatch {
         });
     }
 
+    for row in &response.logs {
+        let (Some(slot), Some(tx_index)) =
+            (row.slot, row.transaction_index)
+        else {
+            continue;
+        };
+        let Some(entry) = transactions.get_mut(&(slot, tx_index)) else {
+            continue;
+        };
+        // Only the two kinds that can carry an event. `invoke` / `success` /
+        // `consumed` are runtime chatter, and dropping them here keeps the
+        // decoder's own scan short.
+        let is_data = match row.kind {
+            Some(LogKind::Data) => true,
+            Some(LogKind::Log) => false,
+            _ => continue,
+        };
+        entry.logs.push(SvmLog {
+            path: row.instruction_address.clone().unwrap_or_default(),
+            program: row.program_id.map(|key| key.0).unwrap_or_default(),
+            is_data,
+            message: row.message.clone().unwrap_or_default(),
+        });
+    }
+
     let mut by_slot: HashMap<u64, Vec<SvmTransaction>> = HashMap::new();
     for ((slot, _), mut tx) in transactions {
         tx.instructions.sort_by(|a, b| a.path.cmp(&b.path));
@@ -602,7 +714,7 @@ pub fn build_transaction_query(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(SolanaQuery {
+    let mut query = SolanaQuery {
         from_slot,
         to_slot: Some(to_slot),
         transactions: vec![TransactionSelection {
@@ -611,11 +723,13 @@ pub fn build_transaction_query(
         }],
         instruction_calls: vec![InstructionSelection::default()],
         account_activity: vec![AccountActivitySelection::default()],
+        logs: vec![LogSelection::default()],
         include_all_blocks: true,
         field_selection: field_selection(),
-        max_num_instructions: Some(MAX_NUM_INSTRUCTIONS),
         ..Default::default()
-    })
+    };
+    raise_response_caps(&mut query);
+    Ok(query)
 }
 
 #[cfg(test)]
@@ -651,14 +765,122 @@ mod tests {
         assert_eq!(query.instruction_calls.len(), VENUES.len() + 5);
     }
 
-    /// Without this the server stops after roughly 700 rows, i.e. one or
-    /// two slots, and the stream would crawl.
+    /// EVERY response cap must be raised, on every query this module builds.
+    ///
+    /// Raising one and leaving the others unset is not a partial fix, it is
+    /// no fix at all: the lowest unset cap binds and stops the response.
+    /// Measured on the production query shape, that was the difference
+    /// between **1 slot** and **40 slots** per request
+    /// (docs/solana-research.md section 11.1.1).
     #[test]
-    fn the_row_cap_is_always_raised() {
+    fn every_response_cap_is_raised() {
+        for (name, query) in [
+            ("data", build_query(0, 1)),
+            ("header", build_header_query(0, 1)),
+            (
+                "transaction",
+                build_transaction_query(
+                    448_258_071,
+                    448_258_096,
+                    &["Qxpfmre4JbRctxg1JKJ7vk5Rze6XGpX36bqkm34dgRe5vvCWt4mkRhDe6Zu999TomKnJ14DetevDDURGsgPLaMb"],
+                )
+                .expect("valid signature"),
+            ),
+        ] {
+            for (cap, value) in [
+                ("max_num_blocks", query.max_num_blocks),
+                ("max_num_transactions", query.max_num_transactions),
+                ("max_num_instructions", query.max_num_instructions),
+                ("max_num_logs", query.max_num_logs),
+                (
+                    "max_num_account_activity",
+                    query.max_num_account_activity,
+                ),
+            ] {
+                assert_eq!(
+                    value,
+                    Some(MAX_RESPONSE_ROWS),
+                    "the {name} query leaves {cap} unset, which caps the \
+                     whole response no matter what the others say"
+                );
+            }
+        }
+    }
+
+    /// And a cap the crate adds LATER must not slip through unnoticed.
+    ///
+    /// `SolanaQuery`'s `max_num_*` fields are plain `Option`s with no
+    /// `skip_serializing_if`, so serialising a query lists every one of
+    /// them, including any this file has never heard of. If the crate grows
+    /// a sixth cap, this fails with its name rather than silently throttling
+    /// the stream back to one slot a query.
+    #[test]
+    fn a_response_cap_added_by_a_future_crate_version_is_caught() {
+        let value = serde_json::to_value(build_query(0, 1))
+            .expect("the query serialises");
+        let object = value.as_object().expect("a JSON object");
+
+        let caps: Vec<&String> = object
+            .keys()
+            .filter(|key| key.starts_with("max_num_"))
+            .collect();
         assert_eq!(
-            build_query(0, 1).max_num_instructions,
-            Some(MAX_NUM_INSTRUCTIONS)
+            caps.len(),
+            5,
+            "hypersync-solana-net-types now has {} response caps, not 5: \
+             {caps:?}. Add the new one to raise_response_caps.",
+            caps.len()
         );
+        for cap in caps {
+            assert!(
+                !object[cap].is_null(),
+                "{cap} is unset and will cap the whole response"
+            );
+        }
+    }
+
+    /// The client's own auto-tuner is the same trap one layer down: its
+    /// default ceiling is 500 KB against a measured ~0.5 MB PER SLOT, so it
+    /// converges on a batch of one slot and undoes the fix above.
+    #[test]
+    fn the_stream_byte_thresholds_clear_a_single_slot() {
+        /// Measured Arrow bytes for one slot of the production query shape.
+        const BYTES_PER_SLOT: u64 = 500_000;
+
+        let config = stream_config();
+        let default = StreamConfig::default();
+        assert!(
+            config.response_bytes_ceiling > default.response_bytes_ceiling,
+            "the default ceiling is one slot's worth of Arrow"
+        );
+        assert!(
+            config.response_bytes_floor >= 16 * BYTES_PER_SLOT,
+            "a floor below ~16 slots lets the auto-tuner shrink the batch \
+             back towards one slot"
+        );
+        assert!(config.response_bytes_ceiling > config.response_bytes_floor);
+    }
+
+    /// Raydium and Orca publish their swap events as LOG LINES and nothing
+    /// else, so the log table is not optional. Phase 1 selected no log
+    /// fields at all, which put half the phase 2 volume out of reach.
+    #[test]
+    fn the_log_table_is_selected_with_its_instruction_address() {
+        let query = build_query(0, 1);
+        assert_eq!(query.logs.len(), 1);
+        assert!(
+            query.logs[0].is_empty(),
+            "the log selection must be match-all: selections in different \
+             arrays are INTERSECTED, so filtering logs by program would \
+             drop every transaction that has no such log"
+        );
+        assert!(query
+            .field_selection
+            .log
+            .contains(&LogField::InstructionAddress));
+        assert!(query.field_selection.log.contains(&LogField::Kind));
+        assert!(query.field_selection.log.contains(&LogField::Message));
+        assert!(query.field_selection.log.contains(&LogField::ProgramId));
     }
 
     #[test]

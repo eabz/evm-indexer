@@ -33,7 +33,7 @@ use crate::{
     svm::{
         self,
         models::{Pubkey, SOLANA_CHAIN},
-        programs::{to_base58, Venue},
+        programs::{to_base58, Venue, VENUES},
     },
 };
 
@@ -53,31 +53,181 @@ fn token() -> Option<String> {
     std::env::var("ENVIO_API_TOKEN").ok().filter(|t| !t.trim().is_empty())
 }
 
-/// Streams `SLOTS` slots below the head and decodes them.
-async fn stream_and_decode(token: &str) -> (svm::SvmRows, u64, u64) {
+/// What one live run measured, beyond the rows themselves.
+#[derive(Debug, Default, Clone, Copy)]
+struct RunCost {
+    queries: u32,
+    slots: u64,
+    /// Seconds spent waiting for the server.
+    fetch_seconds: f64,
+    /// Seconds spent in the pure decoder.
+    decode_seconds: f64,
+    transactions: usize,
+}
+
+/// Streams `SLOTS` slots below the head and decodes them, timing the two
+/// halves separately.
+///
+/// The split matters more than any single hot spot: phase 1 reported ~4.5
+/// minutes for 150 slots and treated it as decode cost, but the decoder and
+/// the network are not remotely comparable here and only a measurement says
+/// which one to fix.
+async fn stream_and_decode(
+    token: &str,
+) -> (svm::SvmRows, u64, u64, RunCost) {
+    use std::time::Instant;
+
     let source = SolanaSource::new(None, token).expect("build source");
     let head = source.head().await.expect("head");
     let from = head - HEAD_MARGIN - SLOTS;
     let to = from + SLOTS;
 
     let mut rows = svm::SvmRows::default();
+    let mut cost = RunCost::default();
     let mut cursor = from;
 
     // Follow the server's truncation cursor to the end of the range, the
     // way the pipeline's own loop will have to.
     while cursor < to {
+        let started = Instant::now();
         let batch = source.fetch(cursor, to).await.expect("fetch");
+        cost.fetch_seconds += started.elapsed().as_secs_f64();
+        cost.queries += 1;
+        cost.slots += batch.batches.len() as u64;
+        cost.transactions += batch
+            .batches
+            .iter()
+            .map(|slot| slot.transactions.len())
+            .sum::<usize>();
+
         assert!(
             batch.next_slot > cursor,
             "the server made no progress at {cursor}: a resume loop must \
              treat this as a stop condition, never spin"
         );
+
+        let started = Instant::now();
         let mut decoded = svm::decode(SOLANA_CHAIN, &batch.batches);
+        cost.decode_seconds += started.elapsed().as_secs_f64();
+
         rows.append(&mut decoded);
         cursor = batch.next_slot;
     }
 
-    (rows, from, to)
+    (rows, from, to, cost)
+}
+
+fn report_cost(cost: &RunCost) {
+    println!("\n=== cost of this run ===");
+    println!(
+        "  {} queries for {} slots = {:.1} slots/query",
+        cost.queries,
+        cost.slots,
+        cost.slots as f64 / f64::from(cost.queries.max(1))
+    );
+    println!(
+        "  fetch  {:>8.2} s  ({:.0}%)",
+        cost.fetch_seconds,
+        100.0 * cost.fetch_seconds
+            / (cost.fetch_seconds + cost.decode_seconds).max(f64::EPSILON)
+    );
+    println!(
+        "  decode {:>8.2} s  ({:.0}%)   {:.0} us/transaction",
+        cost.decode_seconds,
+        100.0 * cost.decode_seconds
+            / (cost.fetch_seconds + cost.decode_seconds).max(f64::EPSILON),
+        cost.decode_seconds * 1e6 / cost.transactions.max(1) as f64
+    );
+    // Solana produces ~324,538 slots a day (research section 11.2).
+    let per_day = 324_538.0;
+    println!(
+        "  projected to a full day: {:.0} queries ({:.1}/minute against a \
+         free budget of 30) and {:.1} minutes of decode",
+        per_day / (cost.slots as f64 / f64::from(cost.queries.max(1))).max(1.0),
+        per_day
+            / (cost.slots as f64 / f64::from(cost.queries.max(1))).max(1.0)
+            / 1440.0,
+        per_day / cost.slots.max(1) as f64 * cost.decode_seconds / 60.0
+    );
+}
+
+/// The fix the plan analyst found: raising ONE response cap raises nothing.
+///
+/// This is the whole reason phase 1 could not keep up. `max_num_instructions`
+/// was set and the other four caps were not, so whichever of them was lowest
+/// stopped the response - at ONE slot. It is measured here rather than
+/// asserted from a document, and it costs two queries.
+#[tokio::test]
+#[ignore]
+async fn live_response_caps_decide_slots_per_query() {
+    use hypersync_client_solana::{config::ClientConfig, Client};
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+    let from = head - HEAD_MARGIN - 200;
+    let to = from + 200;
+
+    let client = Client::new(ClientConfig {
+        url: crate::source::solana::DEFAULT_URL.to_owned(),
+        bearer_token: Some(token.clone()),
+        ..Default::default()
+    })
+    .expect("client");
+
+    // What phase 1 sent: one cap raised, the rest left unset.
+    let mut crippled = crate::source::solana::build_query(from, to);
+    crippled.max_num_blocks = None;
+    crippled.max_num_transactions = None;
+    crippled.max_num_logs = None;
+    crippled.max_num_account_activity = None;
+    let before = client.get(&crippled).await.expect("crippled query");
+
+    // What this module sends now.
+    let after = client
+        .get(&crate::source::solana::build_query(from, to))
+        .await
+        .expect("full query");
+
+    println!("\n=== response caps, measured ===");
+    println!(
+        "  only max_num_instructions raised : {:>4} slots, {:>7} \
+         instruction rows",
+        before.blocks.len(),
+        before.instruction_calls.len()
+    );
+    println!(
+        "  every cap raised                 : {:>4} slots, {:>7} \
+         instruction rows, {} log rows",
+        after.blocks.len(),
+        after.instruction_calls.len(),
+        after.logs.len()
+    );
+    println!(
+        "  -> {:.0}x more slots per query",
+        after.blocks.len() as f64 / before.blocks.len().max(1) as f64
+    );
+
+    assert!(
+        after.blocks.len() > before.blocks.len(),
+        "raising every cap must return more slots than raising one"
+    );
+    assert!(
+        after.blocks.len() >= 10,
+        "only {} slots came back with every cap raised; the pipeline needs \
+         ~9,300 queries a day at 35 slots each to follow the head",
+        after.blocks.len()
+    );
+    // The log table is the phase 2 prerequisite: Raydium and Orca publish
+    // their swap events there and nowhere else.
+    assert!(
+        !after.logs.is_empty(),
+        "no log rows came back, so no Raydium or Orca event can ever decode"
+    );
 }
 
 /// (i) What the stream contains and how much of it the decoders cover.
@@ -89,7 +239,7 @@ async fn live_coverage_per_venue() {
         return;
     };
 
-    let (rows, from, to) = stream_and_decode(&token).await;
+    let (rows, from, to, cost) = stream_and_decode(&token).await;
 
     let mut per_venue: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for swap in &rows.swaps {
@@ -109,15 +259,71 @@ async fn live_coverage_per_venue() {
     println!("matched transactions    {}", rows.transactions.len());
     println!("swaps decoded           {total}");
     println!("mints with decimals     {}", rows.tokens.len());
-    println!("\nper venue (swaps, of which cross-checked by an event):");
-    for (venue, (count, decoded)) in &per_venue {
-        let share = 100.0 * *count as f64 / total.max(1) as f64;
+    report_cost(&cost);
+
+    println!(
+        "\nper venue: swaps, share, how many the venue's own event \
+         CONFIRMED, and the AGREEMENT RATE between the two layers over the \
+         swaps where an event was found at all"
+    );
+    for venue in Venue::ALL {
+        let swaps = rows.diagnostics.swaps_by_venue[venue.index()];
+        if swaps == 0 {
+            continue;
+        }
+        let confirmed = rows.diagnostics.confirmed_by_venue[venue.index()];
+        let disagreed = rows.diagnostics.disagreed_by_venue[venue.index()];
+        let agreement = rows
+            .diagnostics
+            .agreement_rate(venue)
+            .map(|rate| format!("{:.2}%", 100.0 * rate))
+            .unwrap_or_else(|| "n/a".to_owned());
         println!(
-            "  {venue:<14} {count:>6}  {share:>5.1}%   event-decoded \
-             {decoded:>6} ({:.1}%)",
-            100.0 * *decoded as f64 / (*count).max(1) as f64
+            "  {:<16} {swaps:>6} ({:>5.1}%)  confirmed {confirmed:>6} \
+             ({:>5.1}%)  disagreed {disagreed:>4}  agreement {agreement:>7} \
+             [{}]",
+            venue.as_str(),
+            100.0 * swaps as f64 / total.max(1) as f64,
+            100.0 * confirmed as f64 / swaps as f64,
+            match venue.event_source() {
+                crate::svm::programs::EventSource::SelfCpi => "self-CPI",
+                crate::svm::programs::EventSource::Log => "log line",
+                crate::svm::programs::EventSource::None => "no event",
+            }
         );
     }
+    println!(
+        "\ndiscriminator vs movement disagreements: {} (the venue's own \
+         instruction name said one thing and the token flow another)",
+        rows.diagnostics.kind_disagreed
+    );
+
+    // Every venue with a decoder must actually be decoding something. A
+    // venue that streams swaps but confirms none of them is a decoder that
+    // silently does nothing - which is exactly what a wrong event offset
+    // or an unselected log table looks like.
+    for venue in VENUES {
+        let swaps = rows.diagnostics.swaps_by_venue[venue.index()];
+        if swaps < 20 || !venue.has_decoder() {
+            continue;
+        }
+        let confirmed = rows.diagnostics.confirmed_by_venue[venue.index()];
+        assert!(
+            confirmed > 0,
+            "{} produced {swaps} swaps and its decoder confirmed NONE of \
+             them",
+            venue.as_str()
+        );
+        if let Some(rate) = rows.diagnostics.agreement_rate(venue) {
+            assert!(
+                rate > 0.95,
+                "{} agreement between the two layers is only {:.1}%",
+                venue.as_str(),
+                100.0 * rate
+            );
+        }
+    }
+    let _ = &per_venue;
     println!(
         "\ngeneric movement layer covered 100% of the {total} rows \
          (it is what creates them); the per-program layer confirmed \
@@ -259,7 +465,7 @@ async fn live_swaps_match_the_public_rpc() {
         return;
     };
 
-    let (rows, _, _) = stream_and_decode(&token).await;
+    let (rows, _, _, _cost) = stream_and_decode(&token).await;
 
     // Transactions holding exactly one swap.
     let mut once: BTreeMap<(u64, u32), usize> = BTreeMap::new();
