@@ -3,6 +3,7 @@ pub mod db;
 pub mod dex;
 pub mod metrics;
 pub mod pipeline;
+pub mod reorg;
 pub mod source;
 pub mod tokens;
 pub mod utils;
