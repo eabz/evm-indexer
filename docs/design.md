@@ -235,6 +235,28 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
      sees the REPLACED value; and `SELECT * REPLACE` with `LIMIT` silently returns no
      rows. Generated tombstones use positional column lists for this reason.
 
+**Changes from hardening round 2 (implemented, binding):**
+   - The validity rule is now BOUNDED: a contribution with epoch `e` in bucket `b` counts
+     iff `e >= max(r.epoch)` over the chain's `reorgs` rows with `r.from_ts <= b AND
+     b < r.to_ts` (`to_ts` = start of the day after the newest purged row). A repair
+     covers exactly `[from_ts, to_ts)`. `epoch_floor_v` is a per-day step function with
+     explicit segment ends, so every consumer's `ASOF LEFT JOIN ... WHERE a.epoch >=
+     ifNull(f.epoch_floor, 0)` stays byte-identical (measured: 0.28 s on 10k reorgs x 1M
+     aggregate rows; the array formulation needed 59 GiB). This supersedes accepted
+     trade-off (2) above. `ReorgStore`: `min_timestamp` -> `timestamp_span` (both ends,
+     no `FINAL`); `rebuild_derived` gains `to_ts`; `DerivedTable::rebuild_slice`.
+   - A flush spanning more than 90 monthly partitions is split by month, oldest part
+     first, each part complete in itself (`blocks` last, own dedup tokens, own checkpoint).
+   - `checkpoints` are compacted (insert-only cover + tombstones, lease-fenced, bounded).
+   - Every module's rebuild SQL excludes the purged block range itself
+     (`{purge_from}`/`{purge_to}`): a rebuild never depends on seeing tombstones.
+   - Test harnesses must re-issue tombstones until a count says 0 and re-read after an
+     insert: ClickHouse 25.12 misses ~3% of reads issued right after an acknowledged INSERT.
+   - OPEN: the sink's queue of flush spans that raced another process's purge is in memory
+     only; a crash there leaves those aggregate contributions hidden (rows are stored, so
+     no gap query asks again; only `indexer verify` finds it). Fix: persist the span or
+     verify the days covered by the newest `reorgs` rows on the first pass after a start.
+
 **No read-your-writes (ClickHouse 25.12, observed on the macOS build).** Right after an
 `INSERT` returns, the next query can miss the new part for a few milliseconds when
 several writers are active (44-137 misses per 3,200 in the schema engineer's repro; it
