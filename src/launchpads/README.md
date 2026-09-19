@@ -315,6 +315,26 @@ every one of those screens is byte for byte identical before and after the
 forged rows exist, including the earlier-launch case, and that every
 `_all_v` twin does show them.
 
+**Picking a CREATOR is not a trust decision either**, and there the victim
+is a wallet that did nothing at all. A launch names its creator in the
+event, so a forger can emit a `TokenLaunched` naming any address as
+`creator`: unfiltered, that launch lands on the stranger's page, never
+graduates, and so raises `launches`, raises `died` and drags
+`graduation_rate` down - manufacturing precisely the serial-rugger signal
+the creator page exists to report. The other three sources are open the
+same way: a forged `CurveBuy` on one of those tokens moves `trades`,
+`volume_quote_raw` and `last_trade_time` (and through it `died`), a forged
+graduation flips `graduated`, and a forged fee sweep naming the wallet as
+`recipient` inflates `realised_creator_fees_raw`. So
+`launchpad_creator_tokens_v` and `launchpad_creator_v` restrict all four
+sources to `launchpad_trusted_curves_v`, and
+`launchpad_creator_tokens_all_v` / `launchpad_creator_all_v` are the
+exploration twins (the `_all_v` header also carries `trusted_launches`, how
+many of the counted launches came from a trusted curve).
+`integration_tests::a_forged_launch_moves_no_creator_page_number` asserts
+the two creator screens are byte identical before and after the forged
+rows and that both twins move.
+
 **Why trusted-by-default-off is the right default.** The alternative -
 counting everything and hoping the corroboration filters it - fails against
 the cheapest attack there is: deploy a token, deploy a fake curve, move
@@ -397,10 +417,25 @@ crate) and NEVER pasted into its text - which is why no placeholder is
 inside quotes. Ids are plain hex without `0x`: 64 characters for a 32 byte
 id, or the 40 of an EVM address, which the parameterized views left pad
 themselves (a constant expression, so the primary key range read
-survives). Anything else can only fail to match, with one exception worth
-knowing: an EMPTY string pads to the 32 zero bytes, which here is the real
-bucket holding the trades whose token leg stayed unverified. `tx_id` comes
-back as the raw transaction bytes - `hex(tx_id)` to print it.
+survives).
+
+**Anything that is not 40 or 64 hex characters matches nothing**, and that
+is enforced rather than assumed. `unhex('')` is the empty string and
+`toFixedString('', 32)` is 32 zero bytes, which here is a *real* bucket -
+the trades whose token leg stayed unverified - so an empty parameter used
+to return that bucket, which is what a UI sends when its field is unset.
+Every parameterized view now carries `AND length({id:String}) IN (40, 64)`
+exactly once, in the filter that gates its output. The conjunct names no
+column, so ClickHouse folds it while analysing the query: a valid id keeps
+its primary key range read (`EXPLAIN indexes = 1` still shows the key
+condition on the id and one granule), an empty or truncated one reads no
+part at all. An id longer than 64 characters raises
+`TOO_LARGE_STRING_SIZE`, as it always did - loud, never a silent match. To
+look at the unverified-token bucket deliberately, read
+`launchpad_trades_by_token` directly; it is not a screen.
+
+`tx_id` comes back as the raw transaction bytes - `hex(tx_id)` to print
+it.
 
 Every screen below reads a trust-filtered view; the `*_all_v` twins
 (§3.2) are the exploration tool, and only the launch feed ships one as a
@@ -531,6 +566,13 @@ for `dead_after` seconds. `realised_creator_fees_raw` counts only fee rows
 whose recipient the fee ESCROW named (`kind = 'creator'`), so it is money
 that provably moved, not a fee policy read over RPC.
 
+All four sources are restricted to `launchpad_trusted_curves_v` (§3.2):
+without that, anyone could name this wallet as the `creator` of a launch
+that never graduates, or as the `recipient` of a fee sweep, and both
+numbers are exactly the ones a reader judges the wallet by. The
+exploration twin is `launchpad_creator_all_v`, which counts every emitter
+and adds `trusted_launches`.
+
 ### Creator launches
 
 ```sql
@@ -540,6 +582,10 @@ FROM launchpad_creator_tokens_v(chain = {chain:UInt64}, creator = {creator:Strin
                                 as_of = {now:UInt32}, dead_after = {dead_after:UInt32})
 LIMIT 200
 ```
+
+One row per launch of the wallet, newest first, launches / graduations /
+trades all taken from trusted curves. `launchpad_creator_tokens_all_v` is
+the unfiltered twin and carries `trusted` per row.
 
 ### Sniper view
 

@@ -27,8 +27,43 @@
 -- The padding is a constant expression ClickHouse folds before it reads a
 -- part, so each of these views is still a primary key range read (checked
 -- with EXPLAIN indexes = 1. leftPad() is NOT folded, hence the
--- if / concat form below). Anything other than 40 or 64 hex characters is
--- a caller error: it can only fail to match.
+-- if / concat form below).
+--
+-- A WRONG LENGTH MATCHES NOTHING, and that needs saying out loud because
+-- the obvious reading is wrong. unhex('') is the empty string and
+-- toFixedString('', 32) is 32 ZERO BYTES - a real, populated value in
+-- these tables (the unknown / unset collateral, parent_collection_id, the
+-- zero counterparty). So an empty id parameter did not "fail to match":
+-- it silently selected the zero bucket and returned rows the caller never
+-- asked for. A truncated 39 or 63 character id pads the same way.
+--
+-- Every parameterized view below therefore carries
+--
+--   AND length({<id>:String}) IN (40, 64)
+--
+-- exactly once, in the filter that gates its output. The conjunct has no
+-- column in it, so ClickHouse folds it to 0 or 1 while it analyses the
+-- query: a valid length keeps the primary key range read untouched
+-- (verified with EXPLAIN indexes = 1 - the key condition still names the
+-- id column and reads one granule), and a wrong one makes the whole WHERE
+-- constant false, so no part is read at all. An id longer than 64
+-- characters still raises TOO_LARGE_STRING_SIZE from toFixedString, as it
+-- did before: loud, and never a silent match.
+--
+-- THE 20 vs 32 BYTE SEAM (the dex_token_info_v rule of migration 0012).
+-- Identity columns here - collateral_token among them - are the chain
+-- neutral FixedString(32) of docs/design.md section 13, while the core
+-- `tokens` table is EVM only and keys on a FixedString(20) address. Where
+-- the two meet, PAD `tokens.address` up to 32 bytes:
+--
+--   toFixedString(concat(toFixedString('', 12), tk.address), 32)
+--
+-- NEVER truncate the 32 byte side with substring(collateral_token, 13, 20).
+-- Truncating maps EVERY 32 byte id onto some EVM address - a Solana pubkey
+-- whose last 20 bytes happen to equal a real token's address would pick up
+-- that token's decimals and silently rescale its amounts by 10^decimals.
+-- Padding just finds no row, which is the honest answer: the amount stays
+-- raw and the decimals-adjusted column stays NULL.
 --
 -- Amounts: *_raw columns are the on chain integers as Float64, the others
 -- are divided by 10^decimals of the collateral token (shares of a CTF
@@ -42,8 +77,9 @@ toFixedString(unhex(if(length({registry:String}) = 40,
   concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
 (
   SELECT any(toNullable(decimals)) FROM tokens FINAL
-  WHERE chain = {chain:UInt64} AND address IN (
-    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+  WHERE chain = {chain:UInt64}
+    AND toFixedString(concat(toFixedString('', 12), address), 32) IN (
+    SELECT collateral_token
     FROM prediction_outcome_tokens FINAL
     WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
@@ -61,6 +97,7 @@ SELECT
 FROM prediction_candles_1m AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
+  AND length({registry:String}) IN (40, 64)
   AND a.epoch >= ifNull(f.epoch_floor, 0)
   AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
@@ -71,8 +108,9 @@ toFixedString(unhex(if(length({registry:String}) = 40,
   concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
 (
   SELECT any(toNullable(decimals)) FROM tokens FINAL
-  WHERE chain = {chain:UInt64} AND address IN (
-    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+  WHERE chain = {chain:UInt64}
+    AND toFixedString(concat(toFixedString('', 12), address), 32) IN (
+    SELECT collateral_token
     FROM prediction_outcome_tokens FINAL
     WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
@@ -90,6 +128,7 @@ SELECT
 FROM prediction_candles_1h AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
+  AND length({registry:String}) IN (40, 64)
   AND a.epoch >= ifNull(f.epoch_floor, 0)
   AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
@@ -100,8 +139,9 @@ toFixedString(unhex(if(length({registry:String}) = 40,
   concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
 (
   SELECT any(toNullable(decimals)) FROM tokens FINAL
-  WHERE chain = {chain:UInt64} AND address IN (
-    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+  WHERE chain = {chain:UInt64}
+    AND toFixedString(concat(toFixedString('', 12), address), 32) IN (
+    SELECT collateral_token
     FROM prediction_outcome_tokens FINAL
     WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
@@ -119,6 +159,7 @@ SELECT
 FROM prediction_candles_1d AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
+  AND length({registry:String}) IN (40, 64)
   AND a.epoch >= ifNull(f.epoch_floor, 0)
   AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
@@ -300,8 +341,8 @@ collaterals AS (
     toFixedString(concat(toFixedString('', 12), tk.address), 32) AS address,
     tk.symbol AS symbol, tk.decimals AS decimals, toUInt8(1) AS known
   FROM tokens AS tk FINAL
-  WHERE (tk.chain, tk.address) IN (
-    SELECT chain, toFixedString(substring(collateral_token, 13, 20), 20)
+  WHERE (tk.chain, toFixedString(concat(toFixedString('', 12), tk.address), 32)) IN (
+    SELECT chain, collateral_token
     FROM primary_collateral)
 ),
 enriched AS (
@@ -422,6 +463,7 @@ mapping AS (
   SELECT registry, outcome_token_id, outcome_index
   FROM prediction_outcome_tokens_by_market FINAL
   WHERE chain = {chain:UInt64} AND market_id = market_key
+    AND length({market_id:String}) IN (40, 64)
     AND (registry, collateral_token) IN (
       SELECT registry, collateral_token FROM prediction_market_list
       WHERE chain = {chain:UInt64} AND market_id = market_key)
@@ -499,6 +541,7 @@ SELECT
     WHERE chain = {chain:UInt64}) AS trusted
 FROM prediction_trades_by_token AS s FINAL
 WHERE s.chain = {chain:UInt64}
+  AND length({market_id:String}) IN (40, 64)
   AND (s.registry, s.outcome_token_id) IN (
     SELECT registry, outcome_token_id FROM prediction_outcome_tokens_by_market FINAL
     WHERE chain = {chain:UInt64} AND market_id = market_key)
@@ -515,6 +558,7 @@ mapping AS (
   SELECT registry, outcome_token_id, outcome_index
   FROM prediction_outcome_tokens_by_market FINAL
   WHERE chain = {chain:UInt64} AND market_id = market_key
+    AND length({market_id:String}) IN (40, 64)
     AND (registry, collateral_token) IN (
       SELECT registry, collateral_token FROM prediction_market_list
       WHERE chain = {chain:UInt64} AND market_id = market_key)
@@ -592,6 +636,7 @@ ledger AS (
     max(timestamp) AS last_activity_at
   FROM prediction_ledger_by_holder FINAL
   WHERE chain = {chain:UInt64} AND holder = holder_id
+    AND length({holder:String}) IN (40, 64)
     AND registry IN (
       SELECT registry FROM prediction_trusted_registries_v
       WHERE chain = {chain:UInt64})
@@ -656,6 +701,7 @@ ledger AS (
   SELECT *
   FROM prediction_ledger_by_holder FINAL
   WHERE chain = {chain:UInt64} AND holder = holder_id
+    AND length({holder:String}) IN (40, 64)
     AND reason != 'trade'
     AND registry IN (
       SELECT registry FROM prediction_trusted_registries_v
@@ -777,8 +823,8 @@ decimals AS (
     tk.decimals AS decimals, toUInt8(1) AS known
   FROM tokens AS tk FINAL
   WHERE tk.chain = {chain:UInt64} AND (
-    tk.address IN (SELECT toFixedString(substring(collateral_token, 13, 20), 20) FROM venues)
-    OR tk.address IN (SELECT toFixedString(substring(collateral_token, 13, 20), 20) FROM funding))
+    toFixedString(concat(toFixedString('', 12), tk.address), 32) IN (SELECT collateral_token FROM venues)
+    OR toFixedString(concat(toFixedString('', 12), tk.address), 32) IN (SELECT collateral_token FROM funding))
 ),
 labelled AS (
   SELECT address FROM prediction_venue_labels FINAL WHERE chain = {chain:UInt64}

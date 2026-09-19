@@ -1053,6 +1053,382 @@ async fn a_forged_curve_moves_no_token_page_number() {
     db.drop_database().await;
 }
 
+/// Review round 3, item 1: the creator page had the forgery hole the token
+/// page just had fixed, and its victim is a wallet that did nothing at
+/// all. A launch names its creator in the event, so anyone can emit a
+/// `TokenLaunched` naming a stranger: unfiltered it lands on that
+/// stranger's page, never graduates, and so inflates `launches`, inflates
+/// `died` and tanks `graduation_rate` - the serial-rugger signal the
+/// screen exists to report. A forged `CurveBuy` on the same token moves
+/// `trades` / `volume_quote_raw` / `last_trade_time`, and a forged fee
+/// sweep naming the wallet as `recipient` inflates
+/// `realised_creator_fees_raw`.
+///
+/// Both creator screens must therefore read byte for byte the same before
+/// and after those rows exist, and both `_all_v` twins must show them.
+#[tokio::test]
+#[ignore]
+async fn a_forged_launch_moves_no_creator_page_number() {
+    let db = TestDb::create("creatorpage").await;
+    db.store(&rows_of(fixtures::ALL, 1, 0)).await;
+    db.trust_the_real_venues().await;
+
+    let token = id_hex(TOKEN);
+    let creator = id_hex(CREATOR);
+    db.set(&cookbook_parameters(&token, &creator));
+
+    // The two creator screens, whole rows, before the forgery.
+    let screens: Vec<&str> = vec![
+        "SELECT * FROM launchpad_creator_v(chain = {chain:UInt64}, \
+         creator = {creator:String}, as_of = {now:UInt32}, \
+         dead_after = {dead_after:UInt32})",
+        "SELECT * FROM launchpad_creator_tokens_v(chain = {chain:UInt64}, \
+         creator = {creator:String}, as_of = {now:UInt32}, \
+         dead_after = {dead_after:UInt32})",
+    ];
+    let mut before = Vec::new();
+    for screen in &screens {
+        let rows = db.snapshot(screen).await;
+        assert!(!rows.is_empty(), "nothing to protect: {screen}");
+        before.push(rows);
+    }
+
+    // The exploration twins, which MUST move.
+    let twins: Vec<&str> = vec![
+        "SELECT * FROM launchpad_creator_all_v(chain = {chain:UInt64}, \
+         creator = {creator:String}, as_of = {now:UInt32}, \
+         dead_after = {dead_after:UInt32})",
+        "SELECT * FROM launchpad_creator_tokens_all_v(\
+         chain = {chain:UInt64}, creator = {creator:String}, \
+         as_of = {now:UInt32}, dead_after = {dead_after:UInt32})",
+    ];
+    let mut twins_before = Vec::new();
+    for twin in &twins {
+        twins_before.push(db.snapshot(twin).await);
+    }
+
+    let header = |view: &str, column: &str| {
+        format!(
+            "SELECT ifNull(toString({column}), '') FROM {view}(\
+             chain = {{chain:UInt64}}, creator = {{creator:String}}, \
+             as_of = {{now:UInt32}}, dead_after = {{dead_after:UInt32}})"
+        )
+    };
+    let honest_launches =
+        db.text(&header("launchpad_creator_v", "launches")).await;
+    let honest_rate =
+        db.text(&header("launchpad_creator_v", "graduation_rate")).await;
+    let honest_fees = db
+        .text(&header("launchpad_creator_v", "realised_creator_fees_raw"))
+        .await;
+    assert_eq!(honest_launches, "1");
+    assert_eq!(honest_rate, "1", "the real launch graduated");
+
+    // ---- the forgery, all of it naming the REAL creator.
+    let real_creator = address(CREATOR);
+    let forger = Address::repeat_byte(0x55);
+    let fake_token = Address::repeat_byte(0x56);
+    let fake_curve = Address::repeat_byte(0x57);
+    let fake_factory = Address::repeat_byte(0x58);
+    let huge = U256::from(10u64).pow(U256::from(30u64));
+    let place = |log_index: u32| Place {
+        chain: CHAIN,
+        block_number: 66_679_570,
+        log_index,
+        timestamp: 1_789_780_400,
+        transaction_hash: B256::repeat_byte(0x55),
+    };
+
+    let logs = vec![
+        // A launch of a token the forger controls, crediting the REAL
+        // creator. It never graduates, so unfiltered it is a second
+        // launch, a `died` and a halved graduation_rate on their page.
+        fixtures::constructed_launch(
+            place(0),
+            fake_factory,
+            fake_token,
+            fake_curve,
+            real_creator,
+            huge,
+        ),
+        // A corroborated trade on it: trades and volume_quote_raw.
+        fixtures::constructed_transfer(
+            place(1),
+            fake_token,
+            fake_curve,
+            forger,
+            huge,
+        ),
+        fixtures::constructed_buy(
+            place(2),
+            fake_curve,
+            forger,
+            forger,
+            huge,
+            huge,
+            U256::ZERO,
+            U256::ZERO,
+        ),
+    ];
+
+    let mut forged = decode(CHAIN, &logs);
+    assert_eq!(forged.tokens.len(), 1);
+    assert_eq!(forged.trades.len(), 1);
+    assert_eq!(
+        forged.tokens[0].creator, real_creator,
+        "the launch names the real creator"
+    );
+    forged.set_version(2);
+    db.store(&forged).await;
+
+    // ... and a fee sweep from the forger's curve paying the real
+    // creator, which is what realised_creator_fees_raw sums. No fixture
+    // constructor emits one, so it goes in as the row a decoder would
+    // have written.
+    db.execute(&format!(
+        "INSERT INTO launchpad_creator_fees (chain, block_number, timestamp, \
+         tx_id, tx_index, ordinal, component, family, emitter, token, pool_id, \
+         phase, kind, recipient, recipient_known, quote_token, amount, tx_from, \
+         epoch, _version, is_deleted) VALUES ({CHAIN}, 66679570, \
+         toDateTime(1789780400), unhex('55'), 0, 3, 0, 'pons_v2', {emitter}, \
+         {token_id}, toFixedString('', 32), 'curve', 'creator', {recipient}, 1, \
+         toFixedString('', 32), toUInt256('{huge}'), {recipient}, 0, 2, 0)",
+        emitter = id_literal(&format!("{fake_curve:?}")),
+        token_id = id_literal(&format!("{fake_token:?}")),
+        recipient = id_literal(CREATOR),
+    ))
+    .await;
+
+    // THE ASSERTION: neither screen moved.
+    for (screen, expected) in screens.iter().zip(&before) {
+        assert_eq!(&db.snapshot(screen).await, expected, "{screen}");
+    }
+
+    // Both twins see all of it - that is what they are for.
+    let mut moved = 0;
+    for (twin, was) in twins.iter().zip(&twins_before) {
+        if &db.snapshot(twin).await != was {
+            moved += 1;
+        }
+    }
+    assert_eq!(moved, twins.len(), "an _all_v twin hid the forgery");
+
+    // The specific lies, spelled out against the trusted header ...
+    assert_eq!(
+        db.text(&header("launchpad_creator_v", "launches")).await,
+        honest_launches
+    );
+    assert_eq!(
+        db.text(&header("launchpad_creator_v", "graduation_rate")).await,
+        honest_rate
+    );
+    assert_eq!(db.text(&header("launchpad_creator_v", "died")).await, "0");
+    assert_eq!(
+        db.text(&header(
+            "launchpad_creator_v",
+            "realised_creator_fees_raw"
+        ))
+        .await,
+        honest_fees,
+        "a forged fee sweep reached the creator's realised fees"
+    );
+    assert_eq!(
+        db.count(
+            "SELECT count() FROM launchpad_creator_tokens_v(\
+             chain = {chain:UInt64}, creator = {creator:String}, \
+             as_of = {now:UInt32}, dead_after = {dead_after:UInt32})"
+        )
+        .await,
+        1
+    );
+
+    // ... and the untrusted twin showing every one of them instead.
+    assert_eq!(
+        db.text(&header("launchpad_creator_all_v", "launches")).await,
+        "2"
+    );
+    assert_eq!(
+        db.text(&header("launchpad_creator_all_v", "graduation_rate"))
+            .await,
+        "0.5",
+        "the forged launch halved the rate in the twin"
+    );
+    assert_eq!(
+        db.text(&header("launchpad_creator_all_v", "died")).await,
+        "1"
+    );
+    assert_eq!(
+        db.text(&header("launchpad_creator_all_v", "trusted_launches"))
+            .await,
+        "1"
+    );
+    assert!(
+        db.number(
+            "SELECT toFloat64(realised_creator_fees_raw) FROM \
+             launchpad_creator_all_v(chain = {chain:UInt64}, \
+             creator = {creator:String}, as_of = {now:UInt32}, \
+             dead_after = {dead_after:UInt32})"
+        )
+        .await
+            > db.number(
+                "SELECT toFloat64(realised_creator_fees_raw) FROM \
+                 launchpad_creator_v(chain = {chain:UInt64}, \
+                 creator = {creator:String}, as_of = {now:UInt32}, \
+                 dead_after = {dead_after:UInt32})"
+            )
+            .await,
+        "the twin did not show the forged fee sweep"
+    );
+    assert_eq!(
+        db.count(
+            "SELECT count() FROM launchpad_creator_tokens_all_v(\
+             chain = {chain:UInt64}, creator = {creator:String}, \
+             as_of = {now:UInt32}, dead_after = {dead_after:UInt32}) \
+             WHERE trusted = 0"
+        )
+        .await,
+        1
+    );
+
+    db.drop_database().await;
+}
+
+/// Review round 3, item 3. An id parameter is hex WITHOUT `0x`, and the
+/// views pad a 40 character one. An EMPTY string went through the same
+/// path: `unhex('')` is the empty string and `toFixedString('', 32)` is 32
+/// ZERO BYTES, which in this module is a real, populated bucket - the
+/// trades whose token leg stayed unverified. So an empty token parameter,
+/// which is exactly what a UI sends when its field is unset, returned that
+/// bucket instead of nothing. A truncated 39 or 63 character id padded the
+/// same way.
+///
+/// Every parameterized view now carries `AND length({id}) IN (40, 64)`, so
+/// a wrong length matches NOTHING while a valid one is untouched.
+#[tokio::test]
+#[ignore]
+async fn an_empty_or_wrong_length_id_parameter_matches_nothing() {
+    let db = TestDb::create("emptyid").await;
+    db.store(&rows_of(fixtures::ALL, 1, 0)).await;
+    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0)).await;
+    db.trust_the_real_venues().await;
+
+    // A curve trade whose token leg stayed unverified and whose family
+    // does not name the token: it lands under the 32 zero bytes (0030),
+    // which is what an empty parameter used to return. The real fixtures
+    // have none, so one is planted - without it this test proves nothing.
+    db.execute(&format!(
+        "INSERT INTO launchpad_trades (chain, block_number, timestamp, tx_id, \
+         tx_index, ordinal, family, emitter, token, token_verified, \
+         quote_token, quote_verified, side, trader, caller, token_amount, \
+         quote_amount, fee_amount, tax_amount, progress_wad, graduating, \
+         sole_unverified_quote, tx_from, tx_to, tx_value, epoch, _version, \
+         is_deleted) VALUES ({CHAIN}, 66679600, toDateTime(1789780500), \
+         unhex('aa'), 0, 0, 'flap_portal', {emitter}, toFixedString('', 32), 0, \
+         toFixedString('', 32), 0, 'buy', {trader}, toFixedString('', 32), 1, 1, \
+         0, 0, 0, 0, 0, {trader}, toFixedString('', 32), 0, 0, 3, 0)",
+        emitter = id_literal(FLAP_RH),
+        trader = id_literal(BUNDLER),
+    ))
+    .await;
+
+    // The premise: the 32 zero bytes really are a populated bucket here,
+    // so "matches nothing" is a filter doing work, not an empty table.
+    assert!(
+        db.count(&format!(
+            "SELECT count() FROM launchpad_trades_by_token FINAL WHERE \
+             chain = {CHAIN} AND token = toFixedString('', 32) \
+             AND is_deleted = 0"
+        ))
+        .await
+            > 0,
+        "the unverified-token bucket is empty: this test proves nothing"
+    );
+
+    let token = id_hex(TOKEN);
+    let creator = id_hex(CREATOR);
+
+    // Every parameterized view, with the id parameter it scopes on.
+    let token_views: Vec<&str> = vec![
+        "SELECT count() FROM launchpad_candles_1m_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT count() FROM launchpad_candles_1h_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT count() FROM launchpad_token_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT count() FROM launchpad_token_all_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT count() FROM launchpad_token_trades_v(chain = {chain:UInt64}, \
+         token = {token:String}, from_block = {from_block:UInt64})",
+        "SELECT count() FROM launchpad_token_trades_all_v(\
+         chain = {chain:UInt64}, token = {token:String}, \
+         from_block = {from_block:UInt64})",
+        "SELECT count() FROM launchpad_token_holders_v(chain = {chain:UInt64}, \
+         token = {token:String}, as_of_block = {as_of_block:UInt64})",
+        "SELECT count() FROM launchpad_token_holders_all_v(\
+         chain = {chain:UInt64}, token = {token:String}, \
+         as_of_block = {as_of_block:UInt64})",
+        "SELECT count() FROM launchpad_snipers_v(chain = {chain:UInt64}, \
+         token = {token:String}, blocks = {blocks:UInt64})",
+        "SELECT count() FROM launchpad_snipers_all_v(chain = {chain:UInt64}, \
+         token = {token:String}, blocks = {blocks:UInt64})",
+    ];
+    let creator_views: Vec<&str> = vec![
+        "SELECT count() FROM launchpad_creator_v(chain = {chain:UInt64}, \
+         creator = {creator:String}, as_of = {now:UInt32}, \
+         dead_after = {dead_after:UInt32})",
+        "SELECT count() FROM launchpad_creator_all_v(chain = {chain:UInt64}, \
+         creator = {creator:String}, as_of = {now:UInt32}, \
+         dead_after = {dead_after:UInt32})",
+        "SELECT count() FROM launchpad_creator_tokens_v(\
+         chain = {chain:UInt64}, creator = {creator:String}, \
+         as_of = {now:UInt32}, dead_after = {dead_after:UInt32})",
+        "SELECT count() FROM launchpad_creator_tokens_all_v(\
+         chain = {chain:UInt64}, creator = {creator:String}, \
+         as_of = {now:UInt32}, dead_after = {dead_after:UInt32})",
+    ];
+
+    // A real id still answers: the guard must not have broken the screens.
+    db.set(&cookbook_parameters(&token, &creator));
+    for sql in token_views.iter().chain(&creator_views) {
+        assert!(
+            db.count(sql).await > 0,
+            "a valid id returned nothing: {sql}"
+        );
+    }
+
+    // ... and every wrong length answers with nothing at all.
+    for bad in [
+        "",           // the empty field of a UI
+        &token[..39], // one character short of an address
+        &token[..63], // one short of a 32 byte id
+        "00",         // a stray byte
+    ] {
+        db.set(&cookbook_parameters(bad, bad));
+        for sql in token_views.iter().chain(&creator_views) {
+            assert_eq!(
+                db.count(sql).await,
+                0,
+                "id {bad:?} matched rows: {sql}"
+            );
+        }
+    }
+
+    // The empty case, spelled out: it used to return the zero bucket.
+    db.set(&cookbook_parameters("", ""));
+    assert_eq!(
+        db.count(
+            "SELECT count() FROM launchpad_token_trades_all_v(\
+             chain = {chain:UInt64}, token = {token:String}, \
+             from_block = {from_block:UInt64})"
+        )
+        .await,
+        0,
+        "an empty token parameter still returns the unverified bucket"
+    );
+
+    db.drop_database().await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn hostile_amounts_do_not_wrap() {

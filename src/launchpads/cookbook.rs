@@ -18,11 +18,20 @@
 //! a UI holding a 20 byte EVM address passes its 40 characters unchanged
 //! and the parameterized views left pad them with 12 zero bytes
 //! themselves (the padding is a constant expression, so the primary key
-//! range read survives it). Anything else can only fail to match, except
-//! an EMPTY string, which pads to the 32 zero bytes - in this module a
-//! real bucket, the trades whose token leg stayed unverified. `{now}` /
-//! `{since}` are unix seconds, and `tx_id` comes back as the raw
-//! transaction bytes (`hex(tx_id)` to print it).
+//! range read survives it).
+//!
+//! **Anything that is not 40 or 64 hex characters matches nothing.** That
+//! is enforced, not hoped for: `unhex('')` is the empty string and
+//! `toFixedString('', 32)` is 32 zero bytes, which in this module is a
+//! real bucket (the trades whose token leg stayed unverified), so an
+//! empty parameter used to return that bucket - a UI with an unset field
+//! got rows. Every parameterized view now carries
+//! `AND length({id:String}) IN (40, 64)`, folded at analysis time, so a
+//! valid id keeps its primary key range read and an empty or truncated
+//! one reads no part at all.
+//!
+//! `{now}` / `{since}` are unix seconds, and `tx_id` comes back as the
+//! raw transaction bytes (`hex(tx_id)` to print it).
 //!
 //! # Trust, and the `_all_v` twins
 //!
@@ -31,9 +40,19 @@
 //! `launchpad_trusted_emitters`. **Picking a token is not a trust
 //! decision**: a forged curve can name a real token, and a forged launch
 //! emitted earlier than the real one can claim it, so the token page, the
-//! chart, the tape, the snipers and the holders are filtered too. Each
-//! has an `*_all_v` twin that counts everything - that is the tool for
-//! deciding what to trust, never the screen.
+//! chart, the tape, the snipers and the holders are filtered too.
+//!
+//! **Picking a creator is not a trust decision either.** A launch names
+//! its creator in the event, so a forger can hang a launch that never
+//! graduates on any wallet it likes - inflating that wallet's launch
+//! count, tanking its graduation rate and manufacturing the very
+//! serial-rugger signal the creator page reports - and a forged fee sweep
+//! can name it as the recipient of fees it never earned. The creator
+//! screens therefore take their launches, graduations, trades and fees
+//! from trusted curves only.
+//!
+//! Each filtered screen has an `*_all_v` twin that counts everything -
+//! that is the tool for deciding what to trust, never the screen.
 //!
 //! # The text these queries return is HOSTILE
 //!
