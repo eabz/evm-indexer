@@ -5,7 +5,7 @@
 //! # Why this is a second store and not a `Scope` of `pipeline::store`
 //!
 //! `ClickhouseReorgStore` names `blocks` in eight places and enumerates
-//! `db::BASE_TABLES` + `ALL_MODULES`. On Solana the commit marker is
+//! `core::BASE_TABLES` + `ALL_MODULES`. On Solana the commit marker is
 //! `sol_slots`, the children are `svm::BASE_TABLES`, and none of the EVM
 //! tables exist for the chain. Teaching the EVM store a family switch would
 //! touch every one of those methods; implementing the SAME trait a second
@@ -1085,7 +1085,7 @@ mod tests {
     /// and this test fails instead of a chart silently zeroing.
     #[test]
     fn every_aggregate_the_solana_flush_feeds_is_repaired() {
-        use crate::{db::derived::CORE_DERIVED, dex, predictions};
+        use crate::{core::CORE_DERIVED, dex, predictions};
 
         let written: Vec<&str> = child_tables();
         let repaired: Vec<&str> =

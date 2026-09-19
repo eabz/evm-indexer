@@ -18,7 +18,7 @@ use super::*;
 use crate::{
     configs::Command,
     core::events::TRANSFER_EVENT_SIGNATURE,
-    db::{self, migrate, next_version, DatabaseParams, FlushKey},
+    db::{migrate, next_version, DatabaseParams, FlushKey},
     dex, launchpads,
     pipeline::{backfill, modules::ALL_MODULES, verify},
     reorg::ReorgStore,
@@ -770,8 +770,8 @@ impl Scenario {
     /// Everything a reader can see, as strings: every base and side table
     /// (FINAL, without the per-flush stamps) and every aggregate view.
     async fn snapshot(&self) -> BTreeMap<String, Vec<String>> {
-        let mut tables: Vec<&str> = db::BASE_TABLES.to_vec();
-        tables.extend_from_slice(db::SIDE_TABLES);
+        let mut tables: Vec<&str> = crate::core::BASE_TABLES.to_vec();
+        tables.extend_from_slice(crate::core::SIDE_TABLES);
         tables.push("seen_tokens");
         for spec in ALL_MODULES {
             tables.extend_from_slice(spec.base_tables);
@@ -1874,7 +1874,8 @@ async fn debris_of_a_finished_purge_is_not_healed_again() {
 async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
     /// Every read-path side table the core and the modules declare.
     fn side_tables() -> Vec<&'static str> {
-        let mut tables: Vec<&'static str> = db::SIDE_TABLES.to_vec();
+        let mut tables: Vec<&'static str> =
+            crate::core::SIDE_TABLES.to_vec();
         for spec in ALL_MODULES {
             tables.extend_from_slice(spec.side_tables);
         }
@@ -1947,7 +1948,9 @@ async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
 
     assert!(injected > 0, "nothing was resurrected");
     // No base row explains a single one of them.
-    for table in db::BASE_TABLES.iter().filter(|t| **t != "blocks") {
+    for table in
+        crate::core::BASE_TABLES.iter().filter(|t| **t != "blocks")
+    {
         assert_eq!(
             scenario
                 .count(&format!(

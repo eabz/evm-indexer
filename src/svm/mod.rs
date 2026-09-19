@@ -49,7 +49,7 @@ use registry::ProgramNames;
 
 /// Block scoped `sol_*` tables, in the order a purge must tombstone them:
 /// children first, the commit marker LAST. Same rule as
-/// `db::BASE_TABLES` - while the old `sol_slots` row is alive a crashed
+/// `core::BASE_TABLES` - while the old `sol_slots` row is alive a crashed
 /// purge is re-detected and re-run, which is harmless.
 ///
 /// `sol_tokens` is NOT here: a mint's decimals are chain state, not part of

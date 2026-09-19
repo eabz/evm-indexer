@@ -790,7 +790,7 @@ pub const ALL_MODULES: &[&ModuleSpec] = &[&DEX, &PREDICTIONS, &LAUNCHPADS];
 /// Every table a process writes versioned rows of a chain into: what
 /// `Database::seed_version` looks at.
 pub fn versioned_tables() -> Vec<&'static str> {
-    let mut tables: Vec<&'static str> = db::BASE_TABLES.to_vec();
+    let mut tables: Vec<&'static str> = crate::core::BASE_TABLES.to_vec();
     tables.push("checkpoints");
     for spec in ALL_MODULES {
         tables.extend_from_slice(spec.base_tables);
@@ -983,7 +983,7 @@ mod tests {
     fn every_aggregate_of_every_module_can_be_bounded() {
         let mut checked = 0;
 
-        for table in db::derived::CORE_DERIVED {
+        for table in crate::core::CORE_DERIVED {
             assert!(
                 table.rebuild_sql.contains("{to_ts}"),
                 "{}",

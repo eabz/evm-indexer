@@ -8,7 +8,6 @@ pub mod schema;
 
 pub use schema::{
     block_number_column, tables_with_block_number, tombstone_sql,
-    BASE_TABLES, SIDE_TABLES,
 };
 
 use crate::{

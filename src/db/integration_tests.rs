@@ -14,12 +14,11 @@
 
 use super::{
     block_number_column,
-    derived::{repair_start, CORE_DERIVED},
+    derived::repair_start,
     next_version,
     ranges::BlockRange,
     schema::{live_rows_sql, min_timestamp_sql},
-    tombstone_sql, Database, DatabaseParams, RowBatch, BASE_TABLES,
-    SIDE_TABLES,
+    tombstone_sql, Database, DatabaseParams, RowBatch,
 };
 use crate::{
     core::events::{
@@ -31,6 +30,7 @@ use crate::{
         erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
         transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
     },
+    core::{BASE_TABLES, CORE_DERIVED, SIDE_TABLES},
     pipeline::transform::{transform, ResponseRows},
     tokens::models::DatabaseToken,
 };
