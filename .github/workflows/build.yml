@@ -52,6 +52,16 @@ jobs:
     services:
       clickhouse:
         # Keep in step with docker-compose.yml.
+        #
+        # `db::migrate::integration` needs a server with a WRITABLE access
+        # storage: `least_privilege_user_starts_only_when_nothing_is_pending`
+        # runs `CREATE USER ... GRANT SELECT, INSERT` to prove that a
+        # least-privilege user can start once the migrations are applied.
+        # This image ships a `<user_directories>` with a `<local_directory>`
+        # (/var/lib/clickhouse/access/), which is what makes that possible;
+        # a server configured with `users_xml` alone refuses with "there are
+        # no writable access storages". CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+        # then gives CLICKHOUSE_USER the right to use it.
         image: clickhouse/clickhouse-server:25.8
         env:
           CLICKHOUSE_USER: indexer

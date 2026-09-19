@@ -2336,3 +2336,79 @@ async fn record_phase2_fixtures() {
     .expect("write fixtures");
     println!("\nwrote {} fixtures to {path}", out.len());
 }
+
+// --- review round 4: the two transactions the addendum names --------------
+
+/// The ADDENDUM of docs/review-round-4.md cites two real mainnet
+/// transactions by signature. Recording them by SLOT and signature - rather
+/// than scanning for a shape - is what makes those findings reproducible
+/// from the same bytes the reviewer read.
+const WANTED_ROUND4: &[(&str, u64, &str, &str)] = &[
+    (
+        "raydium_v4_and_pumpswap",
+        448_414_771,
+        "3ZZw4CfNzTMgPnnJRhKk28bteiip6zDimArpQSNURYfLn94J4UTPmYfBqTU2SfJ3pbwodZV3rGsUz7Qfyh8MVPJP",
+        "findings B3 and M4. Raydium AMM v4's two vaults are owned by the \
+         ONE program-wide authority 5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1, \
+         so storing that owner as pool_id collapses every Raydium v4 pair \
+         into one candle series. The same transaction's PumpSwap sell pays \
+         the taker into an account opened and closed inside it, so a \
+         decoder that SKIPS an unreadable destination and takes the next \
+         one stores a fee recipient's delta as amount_out",
+    ),
+    (
+        "launchlab_sell",
+        448_416_320,
+        "3J4T72bwybz5h8qjgoj2M1LPyexmKzL4WCYoMZyrck5Wf2nJXL3FV4mcRksTrivR1K52J1bgUkJSt8Y4xh4Yg97c",
+        "finding M4, second case, and a real 1% Token-2022 transfer fee. A \
+         Raydium LaunchLab sell whose taker receive account is unreadable: \
+         amount_out must fall back to what the pool SENT rather than take \
+         the next movement's delta. LaunchLab's vault authority is \
+         program-wide too, which is finding B3 on a second venue",
+    ),
+];
+
+/// Records the round 4 fixtures, by slot and signature.
+///
+/// `cargo test --release svm::live_tests::record_round4 -- --ignored
+/// --nocapture`
+#[tokio::test]
+#[ignore]
+async fn record_round4_fixtures() {
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
+    for (name, slot_number, signature, why) in WANTED_ROUND4 {
+        let batch = source
+            .fetch(*slot_number, slot_number + 1)
+            .await
+            .expect("fetch");
+        let mut hit = false;
+        for slot in &batch.batches {
+            for tx in &slot.transactions {
+                if bs58::encode(tx.signature).into_string() != *signature {
+                    continue;
+                }
+                out.push(fixture_json(name, why, slot, tx));
+                hit = true;
+            }
+        }
+        println!(
+            "  {name} @ {slot_number}: {}",
+            if hit { "found" } else { "MISSING" }
+        );
+    }
+
+    let path = "src/svm/fixtures/round4.json";
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&out).expect("serialise"),
+    )
+    .expect("write fixtures");
+    println!("\nwrote {} fixtures to {path}", out.len());
+}

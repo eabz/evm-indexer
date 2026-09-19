@@ -37,6 +37,15 @@
 -- sum() over Int256 wraps silently and a spam mint emits amounts near
 -- 2^256. The exact amounts stay in `sol_dex_swaps`.
 --
+-- A row with NO pool key - 32 zero bytes - is excluded from every view
+-- below. Five of the ten streamed venues own every pool's vaults with one
+-- program-wide account, so a fill of theirs that no event and no account
+-- meta could tie to a pool has no series to belong to; keying it on the
+-- shared authority would merge every pair of that venue into ONE candle,
+-- mixing USDC/SOL with memecoin prices and summing amounts of unrelated
+-- mints. The trade stays in `sol_dex_swaps`, where its price and size are
+-- exact; it is only the pool-keyed aggregate it stays out of.
+--
 -- Never read the tables below directly: only their *_v views apply the
 -- validity rule, and only they are correct.
 
@@ -87,7 +96,7 @@ SELECT
   count() AS swaps,
   uniqState(trader) AS traders
 FROM sol_dex_swaps
-WHERE is_deleted = 0
+WHERE is_deleted = 0 AND pool_id != toFixedString('', 32)
 GROUP BY chain, pool_id, venue_program, bucket, epoch;
 
 CREATE TABLE IF NOT EXISTS sol_dex_candles_1h (
@@ -137,7 +146,7 @@ SELECT
   count() AS swaps,
   uniqState(trader) AS traders
 FROM sol_dex_swaps
-WHERE is_deleted = 0
+WHERE is_deleted = 0 AND pool_id != toFixedString('', 32)
 GROUP BY chain, pool_id, venue_program, bucket, epoch;
 
 CREATE TABLE IF NOT EXISTS sol_dex_candles_1d (
@@ -187,7 +196,7 @@ SELECT
   count() AS swaps,
   uniqState(trader) AS traders
 FROM sol_dex_swaps
-WHERE is_deleted = 0
+WHERE is_deleted = 0 AND pool_id != toFixedString('', 32)
 GROUP BY chain, pool_id, venue_program, bucket, epoch;
 
 -- Reader views. They apply the validity rule of docs/design.md §2 BEFORE

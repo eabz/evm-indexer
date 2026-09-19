@@ -631,6 +631,15 @@ TEST_DATABASE_URL=http://indexer:indexer@localhost:8123/indexer_test \
   db::integration_tests:: db::migrate::integration:: dex::integration_tests::
 ```
 
+`db::migrate::integration` needs a server whose **access storage is writable**: one of its tests runs `CREATE USER ... GRANT SELECT, INSERT` to prove that a least-privilege user can start once the migrations are applied. The `clickhouse/clickhouse-server` image used by `docker-compose.yml` and by CI has one out of the box (a `<user_directories>` with a `<local_directory>` at `/var/lib/clickhouse/access/`), and `CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1` lets the configured user use it. A ClickHouse started by hand from a config with `users_xml` alone refuses with *"there are no writable access storages"*, so give it:
+
+```xml
+<user_directories>
+  <users_xml><path>users.xml</path></users_xml>
+  <local_directory><path>/var/lib/clickhouse/access/</path></local_directory>
+</user_directories>
+```
+
 CI runs the same set against a ClickHouse service container, plus the Redis cache round trip (`redis_round_trip_and_restart`, `TOKEN_CACHE_TEST_REDIS_URL`). The remaining ignored tests (`live_*`) need internet access and are meant to be run by hand.
 
 Schema changes are new files in `migrations/` (`NNNN_name.sql`; `0001`-`0009` core, `0010`-`0019` DEX, `0020`-`0029` prediction markets). Never edit a migration that has been released: its checksum is verified at startup.

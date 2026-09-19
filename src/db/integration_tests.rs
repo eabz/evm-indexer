@@ -16,7 +16,7 @@ use super::{
     block_number_column,
     derived::repair_start,
     next_version,
-    ranges::BlockRange,
+    ranges::{BlockRange, DatabaseCheckpoint},
     schema::{live_rows_sql, min_timestamp_sql},
     tombstone_sql, Database, DatabaseParams,
 };
@@ -2180,4 +2180,146 @@ async fn missing_ranges_are_computed_in_clickhouse() {
         missing.ranges,
         vec![BlockRange::new(50, 60), BlockRange::new(90, 100)]
     );
+}
+
+/// A flush that landed while ANOTHER process's purge was rebuilding the
+/// same days carries an epoch the validity rule now hides, and nothing
+/// else will ever ask for those blocks again: their rows ARE stored, so no
+/// gap query reports them. The running indexer queues them in memory; this
+/// is the same question asked of the database, so a restart does not lose
+/// them (docs/review-round-4.md, MAJOR 3).
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart()
+{
+    const CHAIN: u64 = 990_013;
+
+    let database = database(CHAIN).await;
+
+    // Nothing has ever been purged: nothing to look for.
+    assert!(database.stale_flush_ranges().await.unwrap().is_empty());
+
+    core::store(&database, &rows_at(CHAIN, 0, 8, FULL, 0)).await.unwrap();
+
+    // Another process purges and rebuilds every bucket of both days
+    // under epoch 1; `tombstone_version` is what it stamped BEFORE the
+    // rebuild read its input.
+    let tombstoned = next_version();
+    execute(
+        &database,
+        &format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+               fork_block, to_block, old_head, depth, rows_tombstoned, \
+               reason, tombstone_version, completed) \
+             VALUES ({CHAIN}, 1, {DAY_1}, {}, 0, 4, 0, 0, 0, \
+               'redecode', {tombstoned}, 1)",
+            DAY_2 + 86_400
+        ),
+    )
+    .await;
+
+    // Still nothing: every stored block was written BEFORE the rebuild.
+    assert!(database.stale_flush_ranges().await.unwrap().is_empty());
+
+    // Now the flush that raced it: written after the rebuild, still
+    // stamped with the old epoch.
+    core::store(&database, &rows_at(CHAIN, 8, 12, FULL, 0)).await.unwrap();
+
+    assert_eq!(
+        database.stale_flush_ranges().await.unwrap(),
+        vec![BlockRange::new(8, 12)],
+        "the blocks flushed under the superseded epoch have to be \
+         purged and indexed again"
+    );
+
+    // Written again under the epoch in force: the question answers
+    // itself, so a restart loop is impossible.
+    core::store(&database, &rows_at(CHAIN, 8, 12, FULL, 1)).await.unwrap();
+
+    assert!(
+        database.stale_flush_ranges().await.unwrap().is_empty(),
+        "a range re-indexed under the epoch in force is not stale"
+    );
+}
+
+/// Checkpoint compaction reads a bounded page, so successive passes have
+/// to SWEEP the table. Always reading the lowest rows meant that a chain
+/// with more non-contiguous live ranges than one page holds (a partial
+/// backfill: holes everywhere, nothing to merge down there) never reached
+/// the head's fast growing contiguous run, and the table grew without
+/// bound (docs/review-round-4.md, MINOR 15).
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn checkpoint_compaction_sweeps_past_a_page_of_holes() {
+    use super::ranges::MAX_CHECKPOINTS_PER_COMPACTION;
+
+    const CHAIN: u64 = 990_014;
+    const HEAD: u64 = 10_000_000;
+    const RUN: u64 = 400;
+
+    let database = database(CHAIN).await;
+
+    // A full page of live ranges with a hole between each pair: nothing
+    // to merge, and reading them again changes nothing.
+    let holes = MAX_CHECKPOINTS_PER_COMPACTION as u64 + 10;
+    let mut rows: Vec<DatabaseCheckpoint> = (0..holes)
+        .map(|i| DatabaseCheckpoint {
+            chain: CHAIN,
+            from_block: i * 10,
+            to_block: i * 10 + 1,
+            epoch: 0,
+            _version: next_version(),
+        })
+        .collect();
+
+    // The head: one contiguous run, one row per flush.
+    rows.extend((0..RUN).map(|i| DatabaseCheckpoint {
+        chain: CHAIN,
+        from_block: HEAD + i,
+        to_block: HEAD + i + 1,
+        epoch: 0,
+        _version: next_version(),
+    }));
+
+    for page in rows.chunks(500) {
+        database.insert_rows("checkpoints", page).await.unwrap();
+    }
+
+    let covered = format!(
+        "SELECT toUInt64(count()) FROM checkpoints FINAL WHERE chain = \
+         {CHAIN} AND is_deleted = 0 AND from_block = {HEAD} AND \
+         to_block = {}",
+        HEAD + RUN
+    );
+
+    // A handful of passes is enough to sweep past the page of holes and
+    // collapse the head's run into one covering row.
+    let mut swept = false;
+    for _ in 0..6 {
+        database.compact_checkpoints().await.unwrap();
+        if database.db.query(&covered).fetch_one::<u64>().await.unwrap()
+            > 0
+        {
+            swept = true;
+            break;
+        }
+    }
+
+    assert!(
+        swept,
+        "the head's contiguous run was never reached: the compaction \
+         keeps re-reading the lowest rows"
+    );
+
+    // The holes are untouched: the union of the live ranges never changes.
+    let live_holes: u64 = database
+        .db
+        .query(&format!(
+            "SELECT toUInt64(count()) FROM checkpoints FINAL WHERE chain \
+             = {CHAIN} AND is_deleted = 0 AND from_block < {HEAD}"
+        ))
+        .fetch_one()
+        .await
+        .unwrap();
+    assert_eq!(live_holes, holes);
 }

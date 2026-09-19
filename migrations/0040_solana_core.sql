@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS sol_slots (
   parent_slot UInt64 CODEC(Delta, ZSTD),
   parent_blockhash FixedString(32),
   block_height UInt64 CODEC(Delta, ZSTD),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32 DEFAULT 0,
   _version UInt64,
   is_deleted UInt8 DEFAULT 0
@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS sol_transactions (
   -- self-CPI events this module uses are instructions and are never
   -- dropped.
   dropped_logs Bool DEFAULT false,
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32 DEFAULT 0,
   _version UInt64,
   is_deleted UInt8 DEFAULT 0

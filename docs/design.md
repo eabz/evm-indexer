@@ -42,7 +42,10 @@ Deferred (NOT in scope): F1 Arrow passthrough.
 - Every block-scoped table: `ENGINE = ReplacingMergeTree(_version, is_deleted)`,
   `_version UInt64` (strictly increasing per process, unix-ms based), `is_deleted UInt8
   DEFAULT 0`, plus `epoch UInt32` (§2). **Target scale is 50+ chains in one database**, so
-  base tables are `PARTITION BY toYYYYMM(timestamp)` — never by chain (50 chains x 120
+  base tables are `PARTITION BY toYYYYMM(timestamp)` with `timestamp DateTime('UTC')` —
+  the timezone is part of the rule, because `toYYYYMM` of a plain `DateTime` takes the
+  month in the SERVER's timezone while the writer splits a flush into whole UTC months —
+  never by chain (50 chains x 120
   months would be ~6,000 partitions per table); `chain` is the first sorting-key column,
   which is what prunes reads. Lookup/side tables are `PARTITION BY chain` (hash/address
   lookups must not fan out per month). `SETTINGS do_not_merge_across_partitions_select_final = 1`
@@ -209,7 +212,19 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    - **Epochs and the validity rule are per CHAIN, not per module.** Anything that writes
      a `reorgs` row - including `indexer backfill --module X` - must rebuild EVERY derived
      table of every module for the affected buckets, or it silently zeroes the others.
-     Two indexer processes on the same chain are unsupported (refuse at startup).
+     Two indexer processes on the same chain are unsupported (refuse at startup), and so
+     are two `indexer backfill` runs of the same module: the lease has a ROLE and only
+     excludes processes of the same role, so a backfill is refused by another backfill
+     while still being allowed next to a live `indexer run`.
+   - A MODULE purge settles only its OWN tables. Its repair window is the timestamp span
+     of the module's rows, which can be far narrower than its block range, so
+     `has_orphan_children` must not treat a completed `reason = 'redecode'` row as having
+     settled anybody else's tombstones.
+   - `timestamp_span` reports the smallest timestamp ABOVE ZERO. A `timestamp` of 0 is a
+     MISSING block time, not a block time of 1970; taking it as the start of the repair
+     window arms the validity rule on every day since the epoch and hides a whole chain's
+     aggregates until a rebuild of fifty years finishes. `Purger` clamps a 0 it still
+     gets to the last day of the range, loudly.
 
 **Changes from the hardening round (implemented, binding):**
    - Purge order is now: checkpoints, children, `reorgs` row (armed), rebuild, `blocks`,
@@ -228,7 +243,11 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
      process whose heartbeats lapsed stops for ANY other live instance.
    - `indexer backfill` re-reads the chain's epoch before each chunk and stops loudly if
      the live indexer purged meanwhile. `indexer verify` cross-checks aggregates against
-     base tables per complete UTC day (a doubled aggregate is INCONSISTENT).
+     base tables per complete UTC day (a doubled aggregate is INCONSISTENT), over the
+     complete days of the GAP-FREE PARTS of the range so that a backfill in progress does
+     not switch the check off; a pending gap heal is INCONSISTENT too (the aggregates
+     still count rows that the next start removes), and a range where no complete day
+     could be compared reads "CONSISTENT, NOT FULLY CHECKED", never plain CONSISTENT.
    - Checkpoints are an index, deliberately NOT the resume cursor: resuming from them
      would skip the one inspection that finds orphan children below the cursor.
    - ClickHouse 25.12 landmines: in `SELECT * REPLACE (x AS c) ... WHERE c = ..` the WHERE
@@ -252,10 +271,15 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
      (`{purge_from}`/`{purge_to}`): a rebuild never depends on seeing tombstones.
    - Test harnesses must re-issue tombstones until a count says 0 and re-read after an
      insert: ClickHouse 25.12 misses ~3% of reads issued right after an acknowledged INSERT.
-   - OPEN: the sink's queue of flush spans that raced another process's purge is in memory
-     only; a crash there leaves those aggregate contributions hidden (rows are stored, so
-     no gap query asks again; only `indexer verify` finds it). Fix: persist the span or
-     verify the days covered by the newest `reorgs` rows on the first pass after a start.
+   - The sink's queue of flush spans that raced another process's purge is drained
+     NON-DESTRUCTIVELY: a span leaves it only after its purge succeeded, so a transient
+     error does not lose it (nothing else asks for those blocks again - their rows are
+     stored, so no gap query reports them). It no longer has to survive in memory either:
+     every start re-derives the same spans from the database (`stale_flush_ranges`) as
+     the live base rows inside a purge's `[from_ts, to_ts)` whose `epoch` is below that
+     purge's and whose `_version` is above its `tombstone_version`, i.e. rows written
+     after the rebuild had read its input. Conservative and self-terminating: the rows
+     come back stamped with the newest epoch, which no `reorgs` row is above.
 
 **No read-your-writes (ClickHouse 25.12, observed on the macOS build).** Right after an
 `INSERT` returns, the next query can miss the new part for a few milliseconds when
@@ -550,6 +574,21 @@ wallet history, no chain-wide transfers, and the schema/README must say so.
   per-program decoders for venues with a public format (fees, pool state). SPL/Token-2022
   transfer instructions must be selected in the same query (a matched instruction does
   not return its children). Aggregators/routers are attribution, never venue volume.
+- The pool key is the venue's own pool account and NEVER the owner of its vaults: five
+  of the ten streamed venues (Raydium AMM v4 and CPMM, Meteora DAMM v2 and DBC, Raydium
+  LaunchLab) own every pool's vaults with one program-wide PDA, which is also what the
+  movement layer finds as "the common counterparty". A fill whose pool cannot be named
+  from the venue's event or from the instruction's account metas is written with a zero
+  `pool_id` and excluded from the pool-keyed aggregates, never keyed on the authority.
+- `trader` is the account the venue's own event names, and the transaction's fee payer
+  only where no event names one - on Solana the fee payer is very often a relayer or a
+  bot, and the candle `traders` series counts distinct traders.
+- One instruction can execute SEVERAL fills (Orca `two_hop_swap`, Raydium CLMM
+  `swap_router_base_in`). Each is its own row, told apart by a hop sub-index in the low
+  bits of `ordinal`.
+- A transaction whose logs the validator truncated (`has_dropped_log_messages`) is never
+  enriched from those logs: for the venues whose event exists only as a log line the row
+  keeps `movement` confidence and the case is counted.
 - Chain id for Solana: 1399811149 (no standard exists; recorded in `chains`).
 - Resume on Solana is the CHECKPOINT TILING and not a gap query over the commit marker
   (a slot with no row is usually a skipped slot, not a gap), but section 2's rule still

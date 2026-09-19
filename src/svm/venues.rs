@@ -202,6 +202,9 @@ pub struct RaydiumCpmmSwap {
     pub output_mint: Pubkey,
     pub trade_fee: u64,
     pub creator_fee: u64,
+    /// Which LEG the creator fee came off. The two fees are in different
+    /// mints when this is false, and they can then not be added together.
+    pub creator_fee_on_input: bool,
 }
 
 impl RaydiumCpmmSwap {
@@ -235,6 +238,7 @@ impl RaydiumCpmmSwap {
             output_mint: pubkey_at(data, LOG_BODY + 113)?,
             trade_fee: u64_at(data, LOG_BODY + 145)?,
             creator_fee: u64_at(data, LOG_BODY + 153)?,
+            creator_fee_on_input: bool_at(data, LOG_BODY + 161)?,
         })
     }
 
@@ -756,7 +760,14 @@ pub fn enrich_raydium_v4(
         U256::from(event.pool_pc),
     );
 
-    let Some(pool) = instruction.account(1) else {
+    // Index 1 in all four swap variants (tags 9, 11, 16, 17), and the one
+    // place in this module where an account index is used. It is the same
+    // constant `build_row` uses when no event turns up, so the two can
+    // never name different accounts.
+    let Some(pool) = Venue::RaydiumAmmV4
+        .pool_account_index()
+        .and_then(|index| instruction.account(index))
+    else {
         return Enrichment::None;
     };
     row.mark_decoded(pool);
@@ -809,7 +820,19 @@ pub fn enrich_raydium_cpmm(
         event.output_mint,
         U256::from(event.output_vault_before),
     );
-    row.fee_amount = U256::from(event.total_fee());
+    // The trade fee is taken off the INPUT leg; the creator fee is taken
+    // off whichever leg `creator_fee_on_input` names. Only one mint's
+    // worth is storable, so the input side is reported and the creator fee
+    // joins it only when it is on that side - adding a fee in the output
+    // mint to one in the input mint would be a number in no unit at all.
+    row.set_fee(
+        event.trade_fee.saturating_add(if event.creator_fee_on_input {
+            event.creator_fee
+        } else {
+            0
+        }),
+        event.input_mint,
+    );
     row.mark_decoded(event.pool_id);
     Enrichment::Applied
 }
@@ -855,7 +878,20 @@ pub fn enrich_raydium_clmm(
     }
 
     row.sender = event.sender;
-    row.fee_amount = U256::from(event.total_fee());
+    // `trade_fee_0` / `trade_fee_1` are fees in token 0 and in token 1
+    // respectively - two different mints - and CLMM takes its fee off the
+    // leg the swap came in on. `zero_for_one` says which that is.
+    let (fee_in, fee_out) = if event.zero_for_one {
+        (event.trade_fee_0, event.trade_fee_1)
+    } else {
+        (event.trade_fee_1, event.trade_fee_0)
+    };
+    if fee_in > 0 || fee_out == 0 {
+        row.set_fee(fee_in, swap.mint_in);
+    } else {
+        row.set_fee(fee_out, swap.mint_out);
+    }
+    row.mark_trader(event.sender);
     row.mark_decoded(event.pool_state);
     Enrichment::Applied
 }
@@ -895,7 +931,8 @@ pub fn enrich_orca(
         return Enrichment::Disagreed;
     }
 
-    row.fee_amount = U256::from(event.total_fee());
+    // Whirlpools takes both its fees off the INPUT leg.
+    row.set_fee(event.total_fee(), swap.mint_in);
     row.mark_decoded(event.whirlpool);
     Enrichment::Applied
 }
@@ -956,7 +993,17 @@ pub fn enrich_meteora_dlmm(
         return Enrichment::Disagreed;
     }
 
-    row.fee_amount = U256::from(fee);
+    // `fees_on_input` is exactly the field that says which mint the fee is
+    // in; without it the two cases are indistinguishable.
+    row.set_fee(
+        fee,
+        if fees_on_input { swap.mint_in } else { swap.mint_out },
+    );
+    if let Some(one) = &first {
+        row.mark_trader(one.from);
+    } else if let Some(two) = &second {
+        row.mark_trader(two.from);
+    }
     row.mark_decoded(pool);
     Enrichment::Applied
 }
@@ -1004,7 +1051,10 @@ pub fn enrich_meteora_damm2(
         mint_b,
         U256::from(event.reserve_b_amount),
     );
-    row.fee_amount = U256::from(event.total_fee());
+    // DAMM v2 deducts its trading fee from what the pool pays OUT, which
+    // is why `included_transfer_fee_amount_out` and the excluded one are
+    // both reported.
+    row.set_fee(event.total_fee(), swap.mint_out);
     row.mark_decoded(event.pool);
     Enrichment::Applied
 }
@@ -1052,7 +1102,15 @@ impl DbcSwap2 {
     pub const LEN: usize = CPI_BODY + 179;
 
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() != Self::LEN {
+        // The discriminator is checked here as well as by
+        // `cpi_event_of`'s (program, discriminator) gate: every sibling
+        // parser does it, and a parser that trusts its caller to have
+        // checked is one refactor away from reading another event's bytes
+        // at these offsets.
+        if data.get(..8)? != EVENT_CPI_PREFIX
+            || data.get(8..16)? != DISC_DBC_SWAP2
+            || data.len() != Self::LEN
+        {
             return None;
         }
         Some(Self {
@@ -1138,7 +1196,8 @@ pub fn enrich_meteora_dbc(
         quote_mint,
         U256::from(event.quote_reserve_amount),
     );
-    row.fee_amount = U256::from(event.total_fee());
+    // Every DBC fee is taken on the QUOTE side.
+    row.set_fee(event.total_fee(), quote_mint);
     row.mark_decoded(event.pool);
     Enrichment::Applied
 }
@@ -1187,7 +1246,13 @@ impl LaunchlabTrade {
     pub const DIRECTION_BUY: u8 = 0;
 
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() != Self::LEN {
+        // Checked here too, not only by `cpi_event_of`'s program gate:
+        // this discriminator is pump.fun's as well, and the length is the
+        // only other thing keeping the two apart.
+        if data.get(..8)? != EVENT_CPI_PREFIX
+            || data.get(8..16)? != DISC_LAUNCHLAB_TRADE
+            || data.len() != Self::LEN
+        {
             return None;
         }
         Some(Self {
@@ -1299,7 +1364,8 @@ pub fn enrich_raydium_launchlab(
         quote_mint,
         U256::from(event.real_quote_after),
     );
-    row.fee_amount = U256::from(event.total_fee());
+    // Protocol, platform, creator and share fees are all quote-side.
+    row.set_fee(event.total_fee(), quote_mint);
     row.mark_decoded(event.pool_state);
     Enrichment::Applied
 }

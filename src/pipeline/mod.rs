@@ -481,7 +481,36 @@ pub async fn run_with<S: BlockSource>(
     let discovery = workers.discovery();
 
     let last_flush = LastFlush::default();
-    let stale = Arc::new(Mutex::new(Vec::new()));
+
+    // The queue of flushes that raced another process's purge lives in
+    // memory, so a restart would lose whatever was still in it. Nothing
+    // else would ever ask for those blocks again (their rows ARE stored),
+    // so the same question is asked of the database once per start.
+    let stale = Arc::new(Mutex::new(
+        db.stale_flush_ranges()
+            .await
+            .context("look for flushes that raced another purge")?,
+    ));
+
+    {
+        let queued = stale.lock().unwrap();
+        if !queued.is_empty() {
+            warn!(
+                "Chain {}: {} block range(s) were flushed under an epoch \
+                 another process had already superseded ({}). Their \
+                 aggregate contributions are hidden, so they are purged \
+                 and indexed again before anything else.",
+                config.chain_id,
+                queued.len(),
+                queued
+                    .iter()
+                    .take(8)
+                    .map(|range| range.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
 
     let fence = lease.fence();
 
@@ -1063,13 +1092,24 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
     }
 
     /// See [`ClickhouseSink::stale`]. Returns the lowest purged block.
+    ///
+    /// The queue is the ONLY record that these blocks have to be indexed
+    /// again: their rows are stored, so no gap query ever asks for them.
+    /// So an entry is taken out only after its purge succeeded - a
+    /// transient ClickHouse error, a lost lease or `TombstonesNotConverging`
+    /// leaves it (and everything after it) in the queue and the next pass
+    /// tries again (docs/review-round-4.md, MAJOR 3). Draining the whole
+    /// `Vec` into a local one and returning `Err` half way through it
+    /// dropped the rest for ever.
     async fn purge_stale_flushes(&mut self) -> Result<Option<u64>> {
-        let stale: Vec<BlockRange> =
-            std::mem::take(&mut *self.stale.lock().unwrap());
-
         let mut lowest = None;
 
-        for range in stale {
+        loop {
+            let Some(range) = self.stale.lock().unwrap().first().copied()
+            else {
+                return Ok(lowest);
+            };
+
             self.purger
                 .purge_range(
                     self.settings.chain_id,
@@ -1078,13 +1118,17 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
                     PurgeReason::GapHeal,
                 )
                 .await?;
+
+            // Only now is the span repaired. The sink pushes into the
+            // same queue from the writer task, so the entry is looked up
+            // again instead of being popped by index.
+            self.stale.lock().unwrap().retain(|queued| *queued != range);
+
             self.forget_committed(range.from, Some(range.to));
             lowest = Some(
                 lowest.map_or(range.from, |low: u64| low.min(range.from)),
             );
         }
-
-        Ok(lowest)
     }
 }
 

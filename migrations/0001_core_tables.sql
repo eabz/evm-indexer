@@ -25,6 +25,16 @@
 -- first sorting key column, that is what prunes reads. A tombstone copies
 -- the timestamp of its row, so it always lands in the partition of the row.
 --
+-- `timestamp` is DateTime('UTC'), never a plain DateTime: `toYYYYMM` of a
+-- plain DateTime takes the month in the SERVER's timezone, while the
+-- writer splits a flush into whole UTC months so that no insert touches
+-- more partitions than ClickHouse allows (`db::flush_windows`). On a
+-- server that was not on UTC a 90-UTC-month slice could therefore land in
+-- 91 partitions (docs/review-round-4.md, MINOR 18). The stored value is
+-- unix seconds either way, so nothing else changes - the aggregates
+-- already declare their bucket columns DateTime('UTC') for the same
+-- reason.
+--
 -- The database comes from the connection, never from the DDL.
 
 CREATE TABLE IF NOT EXISTS blocks (
@@ -32,7 +42,7 @@ CREATE TABLE IF NOT EXISTS blocks (
   number UInt64 CODEC(Delta, ZSTD),
   hash FixedString(32),
   parent_hash FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   miner FixedString(20),
   -- NULL before London. Zero is a real base fee on some chains.
   base_fee_per_gas Nullable(UInt256),
@@ -69,7 +79,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   transaction_index UInt32 CODEC(Delta, ZSTD),
   hash FixedString(32),
   block_hash FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   `from` FixedString(20),
   -- NULL for contract creations (the zero address is a real recipient).
   `to` Nullable(FixedString(20)),
@@ -110,7 +120,7 @@ CREATE TABLE IF NOT EXISTS logs (
   log_index UInt32 CODEC(Delta, ZSTD),
   transaction_index UInt32 CODEC(Delta, ZSTD),
   transaction_hash FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   address FixedString(20),
   -- Number of topics (0-4): tells an absent topic from an all zero one.
   topic_count UInt8,
@@ -135,7 +145,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   validator_index UInt64,
   address FixedString(20),
   amount UInt256,
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32 DEFAULT 0,
   _version UInt64 CODEC(Delta, ZSTD),
   is_deleted UInt8 DEFAULT 0
@@ -151,7 +161,7 @@ CREATE TABLE IF NOT EXISTS erc20_transfers (
   log_index UInt32 CODEC(Delta, ZSTD),
   transaction_index UInt32 CODEC(Delta, ZSTD),
   transaction_hash FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   token_address FixedString(20),
   `from` FixedString(20),
   `to` FixedString(20),
@@ -171,7 +181,7 @@ CREATE TABLE IF NOT EXISTS erc721_transfers (
   log_index UInt32 CODEC(Delta, ZSTD),
   transaction_index UInt32 CODEC(Delta, ZSTD),
   transaction_hash FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   token_address FixedString(20),
   `from` FixedString(20),
   `to` FixedString(20),
@@ -191,7 +201,7 @@ CREATE TABLE IF NOT EXISTS erc1155_transfers (
   log_index UInt32 CODEC(Delta, ZSTD),
   transaction_index UInt32 CODEC(Delta, ZSTD),
   transaction_hash FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   token_address FixedString(20),
   operator FixedString(20),
   `from` FixedString(20),

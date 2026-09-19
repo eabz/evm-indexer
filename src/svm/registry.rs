@@ -119,20 +119,44 @@ pub struct SolDexProgram {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProgramNames {
     names: HashMap<Pubkey, String>,
+    kinds: HashMap<Pubkey, ProgramKind>,
 }
 
 impl ProgramNames {
     pub fn new(rows: impl IntoIterator<Item = SolDexProgram>) -> Self {
         let mut names = HashMap::new();
+        let mut kinds = HashMap::new();
         for row in rows {
             // A row with no name would blank the `protocol` column, which
             // is strictly worse than the built-in default.
             if row.name.trim().is_empty() {
                 continue;
             }
+            if let Some(kind) = ProgramKind::parse(&row.kind) {
+                kinds.insert(row.program_id, kind);
+            }
             names.insert(row.program_id, row.name);
         }
-        Self { names }
+        Self { names, kinds }
+    }
+
+    /// What the operator said this program IS, when they said anything.
+    pub fn kind(&self, program: &Pubkey) -> Option<ProgramKind> {
+        self.kinds.get(program).copied()
+    }
+
+    /// Does a swap of `program` count as venue volume?
+    ///
+    /// An operator's row can say "router" or "frontend" about a program
+    /// this module STREAMS, and the honest answer to that is a loud
+    /// contradiction rather than a silent subtraction: which programs are
+    /// streamed as venues is a code-level decision
+    /// ([`crate::svm::programs::VENUES`]), and a row in a table must not be
+    /// able to make a venue's volume vanish without anyone noticing. So
+    /// this answers the question and [`contradictions`] is what reports
+    /// the disagreement; nothing filters rows on it.
+    pub fn counts_as_volume(&self, program: &Pubkey) -> bool {
+        self.kind(program).map(|kind| kind.is_volume()).unwrap_or(true)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -176,6 +200,28 @@ pub fn undescribed(names: &ProgramNames) -> Vec<&'static str> {
         .collect()
 }
 
+/// Streamed venues an operator has marked as something whose swaps are NOT
+/// venue volume - a router or a front end.
+///
+/// The two statements cannot both be right: the program is in
+/// [`crate::svm::programs::VENUES`], so every swap of it is already being
+/// written as venue volume, and the row says it should not be. This is the
+/// list a reviewer works through, exactly like [`undescribed`]; the
+/// decoder does not act on it, because a table row must not be able to
+/// delete a venue's volume silently. Resolving it is either an edit to the
+/// row or an edit to `VENUES`, and both are decisions a person makes.
+pub fn contradictions(names: &ProgramNames) -> Vec<&'static str> {
+    crate::svm::programs::VENUES
+        .iter()
+        .filter(|venue| {
+            !names.counts_as_volume(&crate::svm::programs::pubkey(
+                venue.program_b58(),
+            ))
+        })
+        .map(|venue| venue.as_str())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +254,49 @@ mod tests {
         assert!(ProgramKind::PropAmm.is_volume());
         assert!(!ProgramKind::Router.is_volume());
         assert!(!ProgramKind::Frontend.is_volume());
+    }
+
+    /// The `kind` column was read out of the table and then thrown away:
+    /// nothing anywhere consulted it, so a program an operator called a
+    /// router got a nicer `protocol` string and its swaps were counted
+    /// just the same, with nothing saying so.
+    ///
+    /// It is kept now, and the one case where it contradicts the code -
+    /// a STREAMED venue an operator says is not a market - is reported.
+    /// It is deliberately not acted on: `VENUES` is a code-level decision
+    /// and a table row must not be able to make a venue's volume vanish
+    /// silently.
+    #[test]
+    fn an_operator_calling_a_streamed_venue_a_router_is_reported() {
+        let names = ProgramNames::new([
+            row(
+                Venue::PumpSwap.program_b58(),
+                "pumpswap",
+                ProgramKind::Router,
+            ),
+            row(
+                Venue::OrcaWhirlpool.program_b58(),
+                "orca",
+                ProgramKind::Venue,
+            ),
+        ]);
+
+        assert_eq!(
+            names.kind(&pubkey(Venue::PumpSwap.program_b58())),
+            Some(ProgramKind::Router)
+        );
+        assert!(!names
+            .counts_as_volume(&pubkey(Venue::PumpSwap.program_b58())));
+        assert!(names.counts_as_volume(&pubkey(
+            Venue::OrcaWhirlpool.program_b58()
+        )));
+        // An unlisted program is a market until somebody says otherwise.
+        assert!(names
+            .counts_as_volume(&pubkey(Venue::RaydiumAmmV4.program_b58())));
+
+        assert_eq!(contradictions(&names), vec!["pumpswap"]);
+        // A fresh database contradicts nothing.
+        assert!(contradictions(&ProgramNames::default()).is_empty());
     }
 
     /// An empty registry - the default, and what a fresh database has -
