@@ -600,7 +600,7 @@ async fn a_canned_range_with_skipped_slots_is_indexed_end_to_end() {
     let resume = crate::pipeline::solana_store::SolanaReorgStore::new(
         scenario.db.clone(),
     )
-    .checkpoint_tiling(CHAIN, FIRST_SLOT, 10_000)
+    .checkpoint_tiling(CHAIN, FIRST_SLOT, None)
     .await
     .unwrap();
     assert_eq!(
@@ -713,10 +713,10 @@ async fn a_flush_killed_before_the_commit_marker_is_healed_on_restart() {
     let orphaned_swaps = rows.swaps.len() as u64;
     assert!(orphaned_swaps > 0, "the crash must leave real rows behind");
 
-    let batch = SvmBatch {
+    let batch = SvmBatch::new(
         rows,
-        windows: vec![BlockRange::new(middle, chain.slot_at(30))],
-    };
+        vec![BlockRange::new(middle, chain.slot_at(30))],
+    );
     store_children(&scenario.db, &batch).await.unwrap();
 
     // The orphans are really there and really have no slot.
@@ -846,10 +846,10 @@ async fn the_holder_projection_is_re_observed_after_a_heal() {
     rows.set_epoch(0);
     store_children(
         &scenario.db,
-        &SvmBatch {
+        &SvmBatch::new(
             rows,
-            windows: vec![BlockRange::new(middle, chain.slot_at(30))],
-        },
+            vec![BlockRange::new(middle, chain.slot_at(30))],
+        ),
     )
     .await
     .unwrap();
@@ -912,7 +912,7 @@ async fn a_retried_flush_counts_once() {
     let slots = rows.slots.len() as u64;
     assert!(swaps > 0 && slots > 0);
 
-    let batch = SvmBatch { rows, windows: vec![window] };
+    let batch = SvmBatch::new(rows, vec![window]);
 
     // The whole commit protocol, twice.
     crate::pipeline::solana_writer::store_batch(&scenario.db, &batch)
@@ -987,7 +987,7 @@ async fn a_retried_flush_counts_once() {
     again.set_epoch(0);
     crate::pipeline::solana_writer::store_batch(
         &scenario.db,
-        &SvmBatch { rows: again, windows: vec![window] },
+        &SvmBatch::new(again, vec![window]),
     )
     .await
     .unwrap();
@@ -1154,7 +1154,7 @@ async fn verify_tells_a_consistent_index_from_an_inconsistent_one() {
     // check would have been screaming about the skipped slots all along
     // instead.
     let tiling = SolanaReorgStore::new(scenario.db.clone())
-        .checkpoint_tiling(CHAIN, FIRST_SLOT, 10_000)
+        .checkpoint_tiling(CHAIN, FIRST_SLOT, None)
         .await
         .unwrap();
     assert!(!tiling.is_empty(), "{tiling:?}");

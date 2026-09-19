@@ -32,10 +32,7 @@
 
 use crate::{
     configs::Config,
-    db::{
-        ranges::{contiguous_until, BlockRange},
-        Database,
-    },
+    db::{ranges::BlockRange, Database},
     metrics::{self, Metrics, SolanaStats},
     pipeline::{
         lease::{Fence, Lease, LeaseOptions},
@@ -128,12 +125,20 @@ const MAX_PASS_BACKOFF: Duration = Duration::from_secs(60);
 /// `/readyz`: not ready when nothing happened for this long.
 const READY_STALENESS: Duration = Duration::from_secs(120);
 
-/// Checkpoints read per resume. Far more than a head follower ever has;
-/// a long backfill that exceeds it simply re-inspects from further back.
-const MAX_CHECKPOINTS: usize = 100_000;
-
-/// Gap ranges a single pass streams.
+/// Gap ranges a single pass streams. A listing cut off here does NOT let
+/// the cursor past the holes above it - see [`MissingSlots::covered_until`].
 const MAX_GAPS_PER_PASS: usize = 1_000;
+
+/// How often the contiguous runs of `checkpoints` are collapsed into one
+/// covering row each. Same value and same reason as the EVM loop: without
+/// it the table grows by one row per flush for ever (~25k rows a day at the
+/// Solana head), and every resume reads all of them.
+const COMPACT_CHECKPOINTS_EVERY: Duration = Duration::from_secs(300);
+
+/// How often the operator's `sol_dex_programs` overlay is read again, so a
+/// registry change does not need a restart. It only ever ADDS knowledge, so
+/// a failed reload keeps the previous answer and is never fatal.
+const RELOAD_PROGRAM_NAMES_EVERY: Duration = Duration::from_secs(300);
 
 /// How long [`SvmWriterGate::quiesce`] waits for the last flush to become
 /// readable (ClickHouse has no read-your-writes; normally a few ms).
@@ -630,39 +635,70 @@ async fn load_program_names(
     Ok(svm::registry::ProgramNames::new(rows))
 }
 
-/// Polls until the `sol_slots` row of the last flush is readable.
+/// Polls until EVERYTHING the last flush wrote is readable: its
+/// `sol_slots` row and its `checkpoints` row.
+///
+/// Both, and not just the marker. A flush writes the marker and the
+/// checkpoints as two separate inserts, and a window whose slots were all
+/// skipped writes no marker row at all - so a gate that only proves the
+/// marker lets a purge start while the newest checkpoint is still
+/// invisible. The purge then tombstones the checkpoints it can see, the
+/// invisible one survives, the tiling shows no hole where the slots were
+/// removed, and those slots are never streamed again.
 async fn wait_until_visible(db: Database, last: LastFlush) -> Result<()> {
-    let Some((slot, version)) = *last.lock().unwrap() else {
+    let Some(mark) = *last.lock().unwrap() else {
         return Ok(());
     };
 
-    // No FINAL: the exact row version this process wrote.
-    let sql = format!(
-        "SELECT toUInt64(count()) FROM `{COMMIT_MARKER}` \
-         WHERE chain = {} AND block_number = {slot} AND _version = {version}",
+    let (from, to) = mark.checkpoint;
+    let version = mark.version;
+
+    // No FINAL anywhere: the exact row versions this process wrote.
+    let mut sql = vec![format!(
+        "SELECT toUInt64(count()) FROM checkpoints \
+         WHERE chain = {} AND from_block = {from} AND to_block = {to} \
+         AND _version = {version} AND is_deleted = 0",
         db.chain_id
-    );
+    )];
 
-    for _ in 0..VISIBILITY_ATTEMPTS {
-        let rows: u64 = db
-            .db
-            .query(&sql)
-            .fetch_one()
-            .await
-            .context("read back the last Solana flush")?;
-
-        if rows > 0 {
-            return Ok(());
-        }
-
-        tokio::time::sleep(VISIBILITY_DELAY).await;
+    if let Some(slot) = mark.slot {
+        sql.push(format!(
+            "SELECT toUInt64(count()) FROM `{COMMIT_MARKER}` \
+             WHERE chain = {} AND block_number = {slot} \
+             AND _version = {version}",
+            db.chain_id
+        ));
     }
 
-    bail!(
-        "slot {slot} of the last flush (version {version}) can not be read \
-         back after {:?}",
-        VISIBILITY_DELAY * VISIBILITY_ATTEMPTS
-    )
+    for statement in sql {
+        let mut readable = false;
+
+        for _ in 0..VISIBILITY_ATTEMPTS {
+            let rows: u64 = db
+                .db
+                .query(&statement)
+                .fetch_one()
+                .await
+                .context("read back the last Solana flush")?;
+
+            if rows > 0 {
+                readable = true;
+                break;
+            }
+
+            tokio::time::sleep(VISIBILITY_DELAY).await;
+        }
+
+        if !readable {
+            bail!(
+                "the last Solana flush (version {version}, slots \
+                 [{from}, {to})) can not be read back after {:?}: {statement}",
+                VISIBILITY_DELAY * VISIBILITY_ATTEMPTS
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Solana has no block-keyed discovery caches: there is no token worker on
@@ -689,21 +725,39 @@ struct SolanaSettings {
 struct SolanaIndexer<S: SlotSource> {
     settings: SolanaSettings,
     source: S,
+    db: Database,
     store: SolanaReorgStore,
     purger: Purger,
     writer: SvmWriter,
     budget: Arc<Budget>,
     metrics: Metrics,
+    /// The chain's lease. Housekeeping that rewrites rows another process
+    /// could be splitting (the checkpoint compaction) asks it first.
+    fence: Fence,
     /// Windows this process committed (and did not purge since). A
     /// checkpoint listing that misses one is a stale read, not a gap.
     committed: Vec<BlockRange>,
     stale: Arc<Mutex<Vec<BlockRange>>>,
     /// Gap heals are only looked for on the first inspection of a range.
     healed_until: u64,
-    /// The operator's `sol_dex_programs` overlay, read once at startup.
-    /// It can only ADD knowledge: an unlisted program keeps its built-in
-    /// venue name, so an empty table decodes exactly as before.
+    /// Where the last `stream_range` stopped, with the continuity of the
+    /// last block it served: `(next slot to serve, its predecessor)`.
+    ///
+    /// This is the anchor of the NEXT pass whenever that pass starts
+    /// exactly here, and it is exact - unlike re-reading it from
+    /// `checkpoints FINAL`, which at the head means reading back the row
+    /// the previous pass wrote a moment ago and losing the only fork check
+    /// this chain has whenever that read is stale.
+    last_continuity: Option<(u64, Continuity)>,
+    /// The operator's `sol_dex_programs` overlay. It can only ADD
+    /// knowledge: an unlisted program keeps its built-in venue name, so an
+    /// empty table decodes exactly as before. Re-read every
+    /// [`RELOAD_PROGRAM_NAMES_EVERY`], so a registry change does not need a
+    /// restart.
     program_names: Arc<svm::registry::ProgramNames>,
+    reloaded_names: Option<tokio::time::Instant>,
+    /// When the checkpoints were last compacted.
+    compacted: Option<tokio::time::Instant>,
     /// Counters for the Solana-only metric series.
     swaps_stored: Arc<AtomicU64>,
     launchpad_rows: Arc<AtomicU64>,
@@ -865,15 +919,20 @@ pub async fn run_with<S: SlotSource>(
             launchpads: config.launchpads,
         },
         source: runtime.source,
+        db: db.clone(),
         store,
         purger,
         writer,
         budget: budget.clone(),
         metrics: metrics.clone(),
+        fence: lease.fence(),
         committed: Vec::new(),
         stale,
         healed_until: 0,
+        last_continuity: None,
         program_names: Arc::new(program_names),
+        reloaded_names: None,
+        compacted: None,
         swaps_stored: Arc::new(AtomicU64::new(0)),
         launchpad_rows: Arc::new(AtomicU64::new(0)),
         skipped_slots: Arc::new(AtomicU64::new(0)),
@@ -1006,6 +1065,8 @@ impl<S: SlotSource> SolanaIndexer<S> {
                         self.metrics.set_ready(true);
                         last_tip_commit =
                             Some(tokio::time::Instant::now());
+                        self.compact_checkpoints().await;
+                        self.reload_program_names().await;
                     }
                     Ok(PassOutcome::Restart(from)) => {
                         failures = 0;
@@ -1057,16 +1118,9 @@ impl<S: SlotSource> SolanaIndexer<S> {
     /// Witness 1: the slot up to which the live checkpoints tile
     /// `[start_slot, ..)` with no hole.
     async fn resume_point(&self) -> Result<u64> {
-        let tiling = self
-            .store
-            .checkpoint_tiling(
-                self.settings.chain,
-                self.settings.start_slot,
-                MAX_CHECKPOINTS,
-            )
-            .await?;
-
-        Ok(contiguous_until(self.settings.start_slot, tiling))
+        self.store
+            .resume_point(self.settings.chain, self.settings.start_slot)
+            .await
     }
 
     /// The holes of the checkpoint tiling inside `range`.
@@ -1077,17 +1131,91 @@ impl<S: SlotSource> SolanaIndexer<S> {
     async fn missing_ranges(
         &self,
         range: BlockRange,
-    ) -> Result<Vec<BlockRange>> {
+    ) -> Result<MissingSlots> {
         let tiling = self
             .store
             .checkpoint_tiling(
                 self.settings.chain,
                 range.from,
-                MAX_CHECKPOINTS,
+                Some(range.to),
             )
             .await?;
 
         Ok(holes(range, &tiling, MAX_GAPS_PER_PASS))
+    }
+
+    /// Housekeeping after a committed pass: collapse the runs of
+    /// contiguous `checkpoints` this process keeps adding to (one row per
+    /// flush, ~25k a day at the Solana head) into one covering row each.
+    ///
+    /// Never fatal: it changes no answer, only how many rows hold it. And
+    /// never without the lease - a purge of another process may be
+    /// splitting the very rows this would merge. Exactly the EVM loop's
+    /// `Indexer::compact_checkpoints`.
+    async fn compact_checkpoints(&mut self) {
+        let now = tokio::time::Instant::now();
+
+        if self
+            .compacted
+            .is_some_and(|last| now - last < COMPACT_CHECKPOINTS_EVERY)
+        {
+            return;
+        }
+
+        if let Err(e) = self.fence.check() {
+            debug!("Not compacting the checkpoints: {e:#}");
+            return;
+        }
+
+        self.compacted = Some(now);
+
+        if let Err(e) = self.store.compact_checkpoints().await {
+            warn!(
+                "Chain {}: could not compact the checkpoints: {e:#}. \
+                 Nothing is wrong with what is stored; the next pass \
+                 tries again.",
+                self.settings.chain
+            );
+        }
+    }
+
+    /// Re-reads the operator's `sol_dex_programs` overlay, so adding a
+    /// program to the registry takes effect without a restart.
+    ///
+    /// Never fatal: the registry only ADDS names, so keeping the previous
+    /// answer for another interval loses nothing.
+    async fn reload_program_names(&mut self) {
+        let now = tokio::time::Instant::now();
+
+        if self
+            .reloaded_names
+            .is_some_and(|last| now - last < RELOAD_PROGRAM_NAMES_EVERY)
+        {
+            return;
+        }
+
+        self.reloaded_names = Some(now);
+
+        match load_program_names(&self.db).await {
+            Ok(names) => {
+                if names.len() != self.program_names.len() {
+                    info!(
+                        "Chain {}: the `sol_dex_programs` registry now has \
+                         {} operator row(s) (was {}).",
+                        self.settings.chain,
+                        names.len(),
+                        self.program_names.len()
+                    );
+                }
+                self.program_names = Arc::new(names);
+            }
+            Err(e) => warn!(
+                "Chain {}: could not re-read the `sol_dex_programs` \
+                 registry: {e:#}. Keeping the {} row(s) read before.",
+                self.settings.chain,
+                self.program_names.len()
+            ),
+        }
     }
 
     fn saw_head(&self, head: u64) {
@@ -1099,21 +1227,29 @@ impl<S: SlotSource> SolanaIndexer<S> {
             return Ok(PassOutcome::Restart(from));
         }
 
-        let mut missing = self.missing_ranges(range).await?;
+        let MissingSlots { mut ranges, covered_until } =
+            self.missing_ranges(range).await?;
 
         // No read-your-writes: what this process committed is not a gap,
         // whatever a lagging read says.
-        missing =
-            crate::db::ranges::subtract_ranges(&missing, &self.committed);
+        ranges =
+            crate::db::ranges::subtract_ranges(&ranges, &self.committed);
 
         // Gap healing, on the FIRST inspection of a range only: a flush
         // that died between its children and its `sol_slots` insert left
         // orphans there, and streaming on top of them would make the
         // candles count both.
-        self.heal_gaps(&missing, range.to).await?;
+        //
+        // `covered_until`, NOT `range.to`: when the hole listing hit
+        // `MAX_GAPS_PER_PASS` it only accounts for the slots below the last
+        // hole it returned, and marking the rest inspected would leave
+        // those holes unexamined for the life of the process.
+        self.heal_gaps(&ranges, covered_until).await?;
+
+        let missing = ranges;
 
         if missing.is_empty() {
-            return Ok(PassOutcome::Covered(range.to));
+            return Ok(PassOutcome::Covered(covered_until));
         }
 
         let slots: u64 = missing.iter().map(BlockRange::len).sum();
@@ -1158,10 +1294,34 @@ impl<S: SlotSource> SolanaIndexer<S> {
 
         streamed?;
 
-        Ok(PassOutcome::Covered(range.to))
+        Ok(PassOutcome::Covered(covered_until))
     }
 
-    /// Purges the gap ranges that hold orphan children, once per range.
+    /// Purges the gap ranges that still hold rows, once per range.
+    ///
+    /// A hole in the checkpoint tiling is about to be streamed again, so
+    /// EVERY row already stored inside it would be counted twice by the
+    /// materialized views (the base tables still read right under `FINAL`;
+    /// the candles and the launchpad aggregates are
+    /// `SimpleAggregateFunction(sum, ..)` and can not take a contribution
+    /// back). There are two ways a hole can hold rows, and both have to be
+    /// purged:
+    ///
+    /// * **orphan children** - a flush that died between its children and
+    ///   its `sol_slots` insert. This is the EVM invariant, checked through
+    ///   the same trait.
+    /// * **live commit markers** - a flush whose marker landed and whose
+    ///   CHECKPOINT did not (the checkpoint is a separate insert after the
+    ///   marker: its retries can be exhausted, or the writer aborted
+    ///   between the two awaits). `has_orphan_children` is false for those
+    ///   slots, precisely because their marker is alive, so without this
+    ///   second test the range would be re-streamed on top of live data.
+    ///   Design §2 says so in one line: `checkpoints` is an index, not the
+    ///   resume oracle - the DATA decides.
+    ///
+    /// A purge of a range that holds nothing is not free, so the cheap
+    /// count comes first and only a hole that really holds something is
+    /// purged. The purge itself is idempotent.
     async fn heal_gaps(
         &mut self,
         gaps: &[BlockRange],
@@ -1174,27 +1334,39 @@ impl<S: SlotSource> SolanaIndexer<S> {
                 continue;
             }
 
-            // The same invariant the EVM path checks, through the same
-            // trait: children at a slot with no live commit marker, not
-            // already settled by a purge that finished.
-            if !self
-                .store
-                .has_orphan_children(
-                    self.settings.chain,
-                    gap.from,
-                    Some(gap.to),
-                )
-                .await?
+            let stored =
+                self.store.stored_slots(self.settings.chain, *gap).await?;
+
+            if stored == 0
+                && !self
+                    .store
+                    .has_orphan_children(
+                        self.settings.chain,
+                        gap.from,
+                        Some(gap.to),
+                    )
+                    .await?
             {
                 continue;
             }
 
-            warn!(
-                "Chain {}: slots {gap} hold rows of a flush that died \
-                 before its `{COMMIT_MARKER}` insert. Purging them before \
-                 the range is streamed again.",
-                self.settings.chain
-            );
+            if stored > 0 {
+                warn!(
+                    "Chain {}: slots {gap} are not claimed by any \
+                     checkpoint but still hold {stored} live \
+                     `{COMMIT_MARKER}` row(s) - the checkpoint of that \
+                     flush never landed. Purging them before the range is \
+                     streamed again, so the candles do not count it twice.",
+                    self.settings.chain
+                );
+            } else {
+                warn!(
+                    "Chain {}: slots {gap} hold rows of a flush that died \
+                     before its `{COMMIT_MARKER}` insert. Purging them \
+                     before the range is streamed again.",
+                    self.settings.chain
+                );
+            }
 
             self.purger
                 .purge_range(
@@ -1326,12 +1498,19 @@ impl<S: SlotSource> SolanaIndexer<S> {
                 Ordering::Relaxed,
             );
 
-            self.writer
-                .send(SvmBatch { rows, windows: vec![served] })
-                .await?;
+            self.writer.send(SvmBatch::new(rows, vec![served])).await?;
 
             cursor = page.next_slot;
             *reached = cursor;
+
+            // Carry the anchor to the next pass in memory. At the head the
+            // next pass starts exactly here, and this is the value it
+            // needs: re-reading it from `checkpoints FINAL` would mean
+            // reading back the row this pass is about to write, which is
+            // the one read ClickHouse is allowed to answer stale.
+            if let Some(previous) = previous {
+                self.last_continuity = Some((cursor, previous));
+            }
         }
 
         Ok(())
@@ -1339,34 +1518,66 @@ impl<S: SlotSource> SolanaIndexer<S> {
 
     /// The stored slot the first block of `from` must build on, or `None`
     /// when nothing below `from` is known to be adjacent.
+    ///
+    /// Three sources, in order of trust:
+    ///
+    /// 1. **The anchor this process carried over from the last pass.** At
+    ///    the head this is the normal case and it is exact.
+    /// 2. **The database**, when a live checkpoint ends exactly at `from`:
+    ///    then every slot between the stored predecessor and `from` was
+    ///    asked for and skipped, so the height chain must close over the
+    ///    boundary.
+    /// 3. **Nothing** - and then the first served block of the range is
+    ///    not checked, which is why case 2 failing where an anchor was
+    ///    expected is a `warn!` and not silence. The measured ~3%
+    ///    no-read-your-writes rate used to switch the only fork check this
+    ///    chain has off at about one head boundary in 33, with no log line.
     async fn anchor_for(&self, from: u64) -> Result<Option<Continuity>> {
-        // Adjacent means: a live checkpoint ends exactly here. Then every
-        // slot between the stored predecessor and `from` was asked for and
-        // skipped, so the height chain must close over the boundary.
-        let tiling = self
-            .store
-            .checkpoint_tiling(
-                self.settings.chain,
-                from.saturating_sub(1),
-                MAX_CHECKPOINTS,
-            )
-            .await?;
-
-        if !tiling.iter().any(|(_, to)| *to == from) {
-            return Ok(None);
+        if let Some(carried) = carried_anchor(self.last_continuity, from) {
+            return Ok(Some(carried));
         }
 
-        Ok(self
-            .store
-            .anchor_below(self.settings.chain, from)
-            .await?
-            .map(Continuity::from))
+        if self.store.checkpoint_ends_at(self.settings.chain, from).await?
+        {
+            return Ok(self
+                .store
+                .anchor_below(self.settings.chain, from)
+                .await?
+                .map(Continuity::from));
+        }
+
+        // Not adjacent. Nothing stored below means this is simply the
+        // bottom of the index; a stored predecessor means the checkpoint
+        // that should claim it is missing or was not readable.
+        if let Some(below) =
+            self.store.anchor_below(self.settings.chain, from).await?
+        {
+            warn!(
+                "Chain {}: no live checkpoint ends at slot {from}, though \
+                 slot {} is stored below it. The continuity of the first \
+                 block served for this range can not be checked. This is \
+                 expected right after a purge of the range below; if it \
+                 repeats at the head, the `checkpoints` read is lagging \
+                 behind the writes.",
+                self.settings.chain, below.block_number
+            );
+        }
+
+        Ok(None)
     }
 
     fn forget_committed(&mut self, from: u64, to: Option<u64>) {
         let purged = BlockRange::new(from, to.unwrap_or(u64::MAX));
         self.committed =
             crate::db::ranges::subtract_ranges(&self.committed, &[purged]);
+
+        // The carried anchor described a block that may no longer be
+        // stored: a purge is exactly when it must be read from the
+        // database again rather than believed.
+        if self.last_continuity.is_some_and(|(reached, _)| reached > from)
+        {
+            self.last_continuity = None;
+        }
     }
 
     /// Windows flushed under an epoch a purge superseded meanwhile.
@@ -1432,17 +1643,37 @@ pub fn target_slot(head: u64, end_slot: u64) -> u64 {
     }
 }
 
+/// The holes of a checkpoint tiling inside a range, and how far the
+/// listing accounts for.
+///
+/// The second field is what stops a truncated listing from advancing the
+/// cursor past holes nobody looked at: the EVM path calls it
+/// `MissingRanges::covered_until` and this is the same idea.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSlots {
+    /// Ascending, non overlapping, at most `limit` of them.
+    pub ranges: Vec<BlockRange>,
+    /// Every slot of the inspected range below this one is either claimed
+    /// by the tiling or listed in `ranges`. Equals the end of the
+    /// inspected range unless the listing was truncated at `limit`.
+    pub covered_until: u64,
+}
+
 /// The holes of a checkpoint tiling inside `range`, ascending.
 ///
 /// `tiling` may overlap and need not be sorted. At most `limit` holes are
-/// returned; the rest are picked up by the next pass.
+/// returned; the rest are picked up by a later pass, which is what
+/// [`MissingSlots::covered_until`] keeps honest.
 pub fn holes(
     range: BlockRange,
     tiling: &[(u64, u64)],
     limit: usize,
-) -> Vec<BlockRange> {
+) -> MissingSlots {
     if range.is_empty() {
-        return Vec::new();
+        return MissingSlots {
+            ranges: Vec::new(),
+            covered_until: range.to,
+        };
     }
 
     let mut covered: Vec<(u64, u64)> = tiling
@@ -1454,14 +1685,18 @@ pub fn holes(
         .collect();
     covered.sort_unstable();
 
-    let mut holes = Vec::new();
+    let mut holes: Vec<BlockRange> = Vec::new();
     let mut cursor = range.from;
 
     for (from, to) in covered {
         if from > cursor {
             holes.push(BlockRange::new(cursor, from));
             if holes.len() >= limit {
-                return holes;
+                // Cut off: nothing above the last hole was looked at, so
+                // the caller must not treat it as covered.
+                let covered_until =
+                    holes.last().map(|hole| hole.to).unwrap_or(range.from);
+                return MissingSlots { ranges: holes, covered_until };
             }
         }
         cursor = cursor.max(to);
@@ -1471,7 +1706,22 @@ pub fn holes(
         holes.push(BlockRange::new(cursor, range.to));
     }
 
-    holes
+    MissingSlots { ranges: holes, covered_until: range.to }
+}
+
+/// The anchor carried over from the last pass, when it applies to a range
+/// starting at `from`.
+///
+/// It applies only when the last pass stopped EXACTLY there. One slot of
+/// distance means slots in between were never served by this process, so
+/// nothing says the next produced block is the stored one's successor and
+/// the anchor has to come from the database (or from nowhere).
+pub fn carried_anchor(
+    last: Option<(u64, Continuity)>,
+    from: u64,
+) -> Option<Continuity> {
+    last.filter(|(reached, _)| *reached == from)
+        .map(|(_, continuity)| continuity)
 }
 
 fn pass_backoff(failures: u32) -> Duration {
@@ -1517,3 +1767,107 @@ fn remember(committed: &mut Vec<BlockRange>, range: BlockRange) {
 /// `indexer verify --chain solana`, so `bin/indexer.rs` has one door per
 /// family and nothing else to know.
 pub use solana_verify::verify;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(from: u64, to: u64) -> BlockRange {
+        BlockRange::new(from, to)
+    }
+
+    #[test]
+    fn a_complete_tiling_has_no_hole_and_covers_the_whole_range() {
+        let missing = holes(range(100, 200), &[(90, 150), (150, 260)], 10);
+
+        assert!(missing.ranges.is_empty());
+        assert_eq!(missing.covered_until, 200);
+    }
+
+    #[test]
+    fn the_holes_of_a_tiling_are_ascending_and_the_range_is_covered() {
+        let missing =
+            holes(range(100, 200), &[(100, 120), (140, 160)], 10);
+
+        assert_eq!(missing.ranges, vec![range(120, 140), range(160, 200)]);
+        assert_eq!(missing.covered_until, 200);
+    }
+
+    /// A hole listing cut off at `limit` must NOT report the range as
+    /// covered up to its end.
+    ///
+    /// `pass()` returns `covered_until` as the new cursor and `heal_gaps`
+    /// marks everything below it inspected. With `range.to` there, the
+    /// holes above the cut fall below both for the life of the process:
+    /// they are never streamed, never healed, and `/readyz` still says
+    /// ready. Only a restart would find them.
+    #[test]
+    fn a_truncated_hole_listing_does_not_claim_the_slots_above_the_cut() {
+        // Ten one-slot holes between eleven one-slot checkpoints.
+        let tiling: Vec<(u64, u64)> =
+            (0..11).map(|i| (100 + i * 2, 101 + i * 2)).collect();
+
+        let missing = holes(range(100, 200), &tiling, 3);
+
+        assert_eq!(
+            missing.ranges,
+            vec![range(101, 102), range(103, 104), range(105, 106)]
+        );
+        // The end of the LAST listed hole, not 200: nothing above it was
+        // looked at.
+        assert_eq!(missing.covered_until, 106);
+
+        // ... and the untruncated listing of the same tiling really does
+        // hold more, so the test is not passing by accident.
+        let all = holes(range(100, 200), &tiling, 1_000);
+        assert!(all.ranges.len() > 3);
+        assert_eq!(all.covered_until, 200);
+    }
+
+    #[test]
+    fn an_empty_range_has_no_holes() {
+        let missing = holes(range(100, 100), &[], 10);
+        assert!(missing.ranges.is_empty());
+        assert_eq!(missing.covered_until, 100);
+    }
+
+    // ------------------------------------------------- the carried anchor
+
+    fn continuity(slot: u64) -> Continuity {
+        Continuity { slot, blockhash: [7u8; 32], block_height: 900_000 }
+    }
+
+    /// The anchor the last pass left behind is the next pass's predecessor
+    /// when - and only when - the two are adjacent.
+    ///
+    /// At the head every pass starts exactly where the previous one
+    /// stopped, and re-reading that boundary from `checkpoints FINAL`
+    /// means reading back the row the previous pass has just written: the
+    /// one read ClickHouse is allowed to answer stale (~3% measured). When
+    /// it does, the only fork check this chain has is skipped for the
+    /// first served block, with no log line.
+    #[test]
+    fn the_carried_anchor_is_used_only_when_it_is_adjacent() {
+        let last = Some((500, continuity(498)));
+
+        assert_eq!(carried_anchor(last, 500), Some(continuity(498)));
+
+        // One slot away is not adjacent: slots in between were never
+        // served by this process, so nothing says the next produced block
+        // is the stored one's successor.
+        assert_eq!(carried_anchor(last, 501), None);
+        assert_eq!(carried_anchor(last, 499), None);
+        assert_eq!(carried_anchor(None, 500), None);
+    }
+
+    #[test]
+    fn committed_ranges_merge_and_empty_ones_are_dropped() {
+        let mut committed = Vec::new();
+        remember(&mut committed, range(100, 110));
+        remember(&mut committed, range(120, 130));
+        remember(&mut committed, range(110, 120));
+        remember(&mut committed, range(200, 200));
+
+        assert_eq!(committed, vec![range(100, 130)]);
+    }
+}
