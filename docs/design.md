@@ -165,6 +165,14 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    4. Bucket repair for every `DerivedTable` at `new_epoch`.
    5. Tombstone `blocks`, then overlapping `checkpoints`; adopt `new_epoch` in the writer;
       evict cached discoveries from the range.
+   Two subtleties (found by the schema engineer):
+   - `from_ts` is computed over ALL row versions, **without `FINAL`** (tombstoned rows
+     included): after a crash mid-purge the early part of the range is already dead, and
+     a minimum over live rows would move forward and leave the first bucket stale forever.
+   - Because `blocks` is tombstoned last, the rebuild of any aggregate sourced from
+     `blocks` still sees the orphaned blocks. Such `rebuild_sql` takes
+     `{purge_from}`/`{purge_to}` and excludes that block range; child-sourced aggregates
+     (transactions, transfers, swaps, trades) do not need it.
    A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
    the abandoned partial epoch invisible.
 
