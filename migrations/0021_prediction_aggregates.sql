@@ -37,6 +37,30 @@
 -- same side (mint / merge), once more in the maker's token at
 -- maker_collateral_amount / share_amount. A print above 1 collateral per
 -- share is not a probability (forged events) and is left out.
+--
+-- THE DUST FLOOR (>= 1000 raw units on BOTH sides of the ratio, the same
+-- number the DEX and launchpad candles use - src/dex/derived.rs,
+-- DUST_FLOOR_RAW). A price here is bounded to [0, 1] by the line above,
+-- which makes it look safer than a DEX price and is exactly why it is not:
+-- the two ENDPOINTS are what a probability chart is read for, and one raw
+-- unit of collateral against one raw unit of shares prints 1.0 - certainty
+-- - while zero against one prints 0.0. Both are settable for a millionth
+-- of a cent.
+--
+-- Why the same 1000 as the DEX candles, and why on both sides: unlike a
+-- DEX price these two numbers are amounts of the SAME unit (a share is
+-- redeemable one for one against the collateral, which is what makes
+-- collateral <= shares meaningful), so "below 1000 raw units" means the
+-- same thing on both - a trade of less than a thousandth of a cent at six
+-- decimals. It bounds the low end of the chart at 1000 / share_amount,
+-- i.e. 1e-5 for a hundred-share order: below any real long shot.
+--
+-- Why in the WHERE and not in an `argMinIf` the way the DEX candles do it:
+-- this family already drops a print it cannot price - the <= bound right
+-- above - so `trades` here has always been "prints that made a price",
+-- and `volume` is the collateral of those prints, in the very units the
+-- floor is measured in. A print under the floor adds nothing to either.
+-- (Review F, NEW-3.)
 --   volume: collateral of the prints (raw units, Float64)
 --   trades: prints in this token
 --   fills:  taker side prints only - adds up to fills per market
@@ -87,7 +111,7 @@ FROM
   FROM prediction_trades
   WHERE is_deleted = 0 AND verified = 1 AND share_amount != 0
 )
-WHERE tupleElement(print, 2) <= share_amount
+WHERE tupleElement(print, 2) <= share_amount AND abs(toFloat64(tupleElement(print, 2))) >= 1000 AND abs(toFloat64(share_amount)) >= 1000
 GROUP BY chain, registry, outcome_token_id, bucket, epoch;
 
 CREATE TABLE IF NOT EXISTS prediction_candles_1h (
@@ -136,7 +160,7 @@ FROM
   FROM prediction_trades
   WHERE is_deleted = 0 AND verified = 1 AND share_amount != 0
 )
-WHERE tupleElement(print, 2) <= share_amount
+WHERE tupleElement(print, 2) <= share_amount AND abs(toFloat64(tupleElement(print, 2))) >= 1000 AND abs(toFloat64(share_amount)) >= 1000
 GROUP BY chain, registry, outcome_token_id, bucket, epoch;
 
 CREATE TABLE IF NOT EXISTS prediction_candles_1d (
@@ -185,7 +209,7 @@ FROM
   FROM prediction_trades
   WHERE is_deleted = 0 AND verified = 1 AND share_amount != 0
 )
-WHERE tupleElement(print, 2) <= share_amount
+WHERE tupleElement(print, 2) <= share_amount AND abs(toFloat64(tupleElement(print, 2))) >= 1000 AND abs(toFloat64(share_amount)) >= 1000
 GROUP BY chain, registry, outcome_token_id, bucket, epoch;
 
 -- Collateral locked in a market per day. Registry level events only

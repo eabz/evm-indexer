@@ -56,16 +56,21 @@ pub const REBUILD_EPOCH: &str = "toUInt32({epoch}) AS epoch";
 /// below any real trade of a token with decimals and far above the dust a
 /// prank costs.
 ///
-/// It is NOT applied to volumes or trade counts: a dust trade happened and
-/// is counted, it just does not get to say what the price was.
+/// On the three DEX-shaped families it is NOT applied to volumes or trade
+/// counts: a dust trade happened and is counted, it just does not get to
+/// say what the price was. The prediction candles put it in the `WHERE`
+/// instead, because that family already drops a print it cannot price -
+/// migration 0021 gives the reasoning.
 ///
-/// The threshold lives in SQL text in four places - the EVM DEX candles
+/// The threshold lives in SQL text in four families - the EVM DEX candles
 /// (`migrations/0011`), the Solana DEX candles (`0042`), the launchpad
-/// candles (`0031`) and each of their `rebuild_sql` twins - because a
-/// migration cannot read a Rust constant.
-/// [`every_candle_family_uses_the_same_dust_floor`] is what keeps the four
-/// from drifting: it reads the embedded migrations and every
-/// `DerivedTable` of every family.
+/// candles (`0031`), the prediction candles (`0021`) - and in each of
+/// their `rebuild_sql` twins, because a migration cannot read a Rust
+/// constant. [`every_candle_family_uses_the_same_dust_floor`] is what
+/// keeps them from drifting: it reads the embedded migrations and every
+/// `DerivedTable` of every family, and it knows how many candles there
+/// are, so a family that stops matching its filter fails rather than
+/// disappears.
 pub const DUST_FLOOR_RAW: u64 = 1000;
 
 macro_rules! candles {
@@ -371,16 +376,18 @@ mod tests {
         }
     }
 
-    /// Every candle family - EVM DEX, Solana DEX, launchpads - takes its
-    /// price from a trade only when BOTH legs reach [`DUST_FLOOR_RAW`].
+    /// Every candle family - EVM DEX, Solana DEX, launchpads, prediction
+    /// markets - takes its price from a trade only when BOTH sides of the
+    /// ratio reach [`DUST_FLOOR_RAW`].
     ///
     /// The threshold has to be repeated in SQL text (a migration cannot
     /// read a Rust constant), and repeated text drifts: the Solana and
     /// launchpad candles were written from the EVM ones and silently left
-    /// the floor out (review round 4, MAJOR 13). This test reads the
-    /// embedded migrations and every family's `rebuild_sql`, so a new
-    /// candle without the floor - or a floor changed in one place only -
-    /// fails here.
+    /// the floor out (review round 4, MAJOR 13), and the prediction
+    /// candles were then left out of the fix (review F, NEW-3). This test
+    /// reads the embedded migrations and every family's `rebuild_sql`, so
+    /// a new candle without the floor - or a floor changed in one place
+    /// only - fails here.
     #[test]
     fn every_candle_family_uses_the_same_dust_floor() {
         let floor = DUST_FLOOR_RAW;
@@ -402,6 +409,15 @@ mod tests {
             crate::launchpads::LAUNCHPADS_DERIVED,
             crate::launchpads::sql::AGGREGATES_SQL,
         );
+        // A prediction price is `collateral / shares`, both raw amounts
+        // of the SAME unit, and the ratio is bounded to [0, 1] - which is
+        // why the floor matters here: 1 raw unit against 1 raw unit
+        // prints 1.0, certainty, on a probability chart.
+        let predictions = (
+            ["tupleElement(print, 2)", "share_amount"],
+            crate::predictions::derived::PREDICTIONS_DERIVED,
+            crate::predictions::sql::AGGREGATES_SQL,
+        );
 
         let guard = |columns: [&str; 2]| {
             format!(
@@ -413,13 +429,18 @@ mod tests {
 
         // An aggregate that never divides one leg by the other has no
         // price to protect (`dex_pool_volume_1h`, the launchpad 1d
-        // counters): what marks a candle is the price alias.
+        // counters, the prediction flow and trader tables): what marks a
+        // candle is the price alias.
         let prices = |sql: &str| {
-            sql.contains("AS trade_price") || sql.contains("AS price,")
+            sql.contains("AS trade_price")
+                || sql.contains("AS price,")
+                || sql.contains("AS price ")
         };
 
         let mut checked = 0;
-        for (columns, tables, migration) in [evm, solana, launchpads] {
+        for (columns, tables, migration) in
+            [evm, solana, launchpads, predictions]
+        {
             let guard = guard(columns);
             let migration = normalize(migration);
 
@@ -453,9 +474,10 @@ mod tests {
             }
         }
 
-        // Three EVM candles, three Solana candles, two launchpad ones: a
-        // filter that stopped matching would otherwise pass silently.
-        assert_eq!(checked, 8);
+        // Three EVM candles, three Solana candles, two launchpad ones and
+        // three prediction ones: a filter that stopped matching would
+        // otherwise pass silently.
+        assert_eq!(checked, 11);
     }
 
     #[test]
