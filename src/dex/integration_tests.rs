@@ -86,8 +86,11 @@ impl TestDb {
             std::sync::atomic::AtomicU32::new(0);
         let sequence =
             SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Unique per process, per call and per instant, and ending in
+        // `_test` (the convention of the combined gate, which runs every
+        // module's integration tests in parallel on one server).
         let name =
-            format!("dex_it_{}_{nanos}_{sequence}", std::process::id());
+            format!("dex_{}_{nanos}_{sequence}_test", std::process::id());
 
         let admin = Client::default()
             .with_url(&params.endpoint)
