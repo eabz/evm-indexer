@@ -76,5 +76,5 @@ usage thresholds below.
 
 Fable only for the lead and the pipeline engineer (or something that truly needs it);
 everything else on Opus. The lead checks plan usage every time it is active. **Urgent
-threshold: weekly Fable >= 92% or 5-hour >= 88%** -> stop all agents, update this file,
+threshold: weekly Fable >= 97% or 5-hour >= 90% (owner, checked every 5 minutes)** -> stop all agents, update this file,
 commit and push it, and stop.
