@@ -865,7 +865,38 @@ pub async fn run_with<S: SlotSource>(
 
     let store = SolanaReorgStore::new(db.clone());
     let last_flush = LastFlush::default();
-    let stale = Arc::new(Mutex::new(Vec::new()));
+
+    // The queue of flushes that raced another process's purge lives in
+    // memory, so a restart would lose whatever was still in it. Nothing
+    // else would ever ask for those slots again (their rows ARE stored,
+    // so no gap query reports them), so the same question is asked of the
+    // database once per start - the EVM rule, over Solana's commit marker
+    // (docs/review-round-4.md, MAJOR 3).
+    let stale = Arc::new(Mutex::new(
+        db.stale_flush_ranges_in(COMMIT_MARKER, "block_number")
+            .await
+            .context("look for flushes that raced another purge")?,
+    ));
+
+    {
+        let queued = stale.lock().unwrap();
+        if !queued.is_empty() {
+            warn!(
+                "Chain {chain}: {} slot range(s) were flushed under an \
+                 epoch another process had already superseded ({}). Their \
+                 aggregate contributions are hidden, so they are purged \
+                 and indexed again before anything else.",
+                queued.len(),
+                queued
+                    .iter()
+                    .take(8)
+                    .map(|range| range.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
     let fence = lease.fence();
 
     let writer = SvmWriter::spawn(
@@ -1584,28 +1615,36 @@ impl<S: SlotSource> SolanaIndexer<S> {
     }
 
     /// Windows flushed under an epoch a purge superseded meanwhile.
+    ///
+    /// The queue is the ONLY record that those slots have to be indexed
+    /// again - their rows are stored, so no gap query reports them - so a
+    /// span leaves it only after its purge succeeded. That rule, and the
+    /// loop that applies it, are [`Purger::purge_queued`], shared with the
+    /// EVM pipeline (docs/review-round-4.md, MAJOR 3); this used to take
+    /// the whole `Vec` and lose the failed span and every span after it
+    /// on the first transient error.
     async fn purge_stale_flushes(&mut self) -> Result<Option<u64>> {
-        let stale: Vec<BlockRange> =
-            std::mem::take(&mut *self.stale.lock().unwrap());
+        let purger = self.purger.clone();
+        let stale = self.stale.clone();
+        let mut forgotten: Vec<BlockRange> = Vec::new();
 
-        let mut lowest = None;
+        let lowest = purger
+            .purge_queued(
+                self.settings.chain,
+                &stale,
+                PurgeReason::GapHeal,
+                |range| forgotten.push(range),
+            )
+            .await;
 
-        for range in stale {
-            self.purger
-                .purge_range(
-                    self.settings.chain,
-                    range.from,
-                    Some(range.to),
-                    PurgeReason::GapHeal,
-                )
-                .await?;
+        // Also after a failure part way through: what WAS purged must not
+        // stay in `committed`, or the next pass would take those slots for
+        // stored and never stream them again.
+        for range in forgotten {
             self.forget_committed(range.from, Some(range.to));
-            lowest = Some(
-                lowest.map_or(range.from, |low: u64| low.min(range.from)),
-            );
         }
 
-        Ok(lowest)
+        Ok(lowest?)
     }
 
     /// The Solana-only metric series. `lag_blocks` and `lag_seconds` come

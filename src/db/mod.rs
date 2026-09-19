@@ -612,6 +612,19 @@ impl Database {
     /// cost is work. It converges - the rows come back stamped with the
     /// newest epoch, which no `reorgs` row is above.
     pub async fn stale_flush_ranges(&self) -> Result<Vec<BlockRange>> {
+        self.stale_flush_ranges_in("blocks", "number").await
+    }
+
+    /// [`Self::stale_flush_ranges`] over a family's commit marker:
+    /// `blocks` on EVM, `sol_slots` on Solana. Both carry `chain`,
+    /// `timestamp`, `epoch`, `_version` and `is_deleted`; only the name of
+    /// the block column differs, so the rule itself is shared rather than
+    /// written twice.
+    pub async fn stale_flush_ranges_in(
+        &self,
+        marker: &str,
+        block_column: &str,
+    ) -> Result<Vec<BlockRange>> {
         #[derive(Row, serde::Deserialize)]
         struct PurgeWindow {
             epoch: u32,
@@ -657,14 +670,15 @@ impl Database {
         let hulls: Vec<(u64, u64)> = self
             .db
             .query(&format!(
-                "SELECT toUInt64(min(number)), toUInt64(max(number)) \
-                 FROM blocks FINAL WHERE chain = {} AND is_deleted = 0 \
+                "SELECT toUInt64(min(`{block_column}`)), \
+                 toUInt64(max(`{block_column}`)) \
+                 FROM `{marker}` FINAL WHERE chain = {} AND is_deleted = 0 \
                  AND timestamp >= toDateTime({low}) \
                  AND timestamp < toDateTime({high}) \
                  AND arrayExists(w -> toUInt32(timestamp) >= w.1 \
                  AND toUInt32(timestamp) < w.2 AND epoch < w.3 \
                  AND `_version` > w.4, [{}]) \
-                 GROUP BY epoch ORDER BY min(number) ASC",
+                 GROUP BY epoch ORDER BY min(`{block_column}`) ASC",
                 self.chain_id,
                 windows.join(", ")
             ))

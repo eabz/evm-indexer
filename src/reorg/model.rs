@@ -499,6 +499,10 @@ struct StoreState {
     /// were flushed a moment ago and can not be read yet.
     miss_children_once: bool,
     miss_lowest_timestamp_once: bool,
+    /// The next `live_children` read is answered from before the write it
+    /// is meant to verify: 0 although rows are alive. This is the shape of
+    /// the no-read-your-writes miss that used to end the tombstone loop.
+    stale_children_count_once: bool,
     lagged_last: bool,
     lagged_reads: u64,
     /// State of each chain before its most recent writes, oldest first.
@@ -594,6 +598,12 @@ impl FakeStore {
 
     pub fn children_never_die(&self) {
         self.state.lock().unwrap().children_never_die = true;
+    }
+
+    /// The next `live_children` read answers 0 although rows are alive: a
+    /// count served from just before the tombstone insert it verifies.
+    pub fn stale_children_count_once(&self) {
+        self.state.lock().unwrap().stale_children_count_once = true;
     }
 
     /// The next `times` tombstone statements land in their base table
@@ -1226,6 +1236,9 @@ impl ReorgStore for FakeStore {
             Self::enter(&mut state, chain, PurgeStep::Verify)?;
             if state.children_never_die {
                 return Ok(1);
+            }
+            if std::mem::take(&mut state.stale_children_count_once) {
+                return Ok(0);
             }
             let view = state.view(chain);
             Ok(view

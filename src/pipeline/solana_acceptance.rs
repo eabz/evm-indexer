@@ -32,7 +32,7 @@ use crate::{
             run_with, SlotPage, SlotSource, SolanaRuntime, Tripwire,
             FIRST_SERVED_SLOT,
         },
-        solana_store::SolanaReorgStore,
+        solana_store::{SolanaReorgStore, COMMIT_MARKER},
         solana_verify,
         solana_writer::{store_children, SvmBatch},
     },
@@ -98,6 +98,12 @@ struct TestChain {
     slots: Arc<Vec<SvmSlotBatch>>,
     /// Exclusive: the head the fake `/height` reports.
     head: u64,
+    /// `(head, calls)`: the first `calls` reads of `/height` report this
+    /// lower head instead, so ONE process makes two passes with the
+    /// boundary exactly there - which is what a head follower does every
+    /// few seconds, and the only situation the carried anchor is about.
+    staged_head: Option<(u64, u64)>,
+    head_calls: Arc<AtomicU64>,
     /// Metered queries served, so a scenario can assert the loop is not
     /// spinning.
     queries: Arc<AtomicU64>,
@@ -188,6 +194,8 @@ fn chain(count: u64) -> TestChain {
     TestChain {
         slots: Arc::new(slots),
         head,
+        staged_head: None,
+        head_calls: Arc::new(AtomicU64::new(0)),
         queries: Arc::new(AtomicU64::new(0)),
     }
 }
@@ -212,6 +220,18 @@ impl TestChain {
         Self { slots: Arc::new(slots), ..self.clone() }
     }
 
+    /// The same chain whose `/height` reports `staged` for the first
+    /// `calls` reads: the process then indexes up to `staged`, asks again,
+    /// and makes a SECOND pass that starts exactly where the first
+    /// stopped.
+    fn with_staged_head(&self, staged: u64, calls: u64) -> Self {
+        Self {
+            staged_head: Some((staged, calls)),
+            head_calls: Arc::new(AtomicU64::new(0)),
+            ..self.clone()
+        }
+    }
+
     fn slot_at(&self, index: usize) -> u64 {
         self.slots[index].slot
     }
@@ -223,6 +243,12 @@ impl TestChain {
 
 impl SlotSource for TestChain {
     async fn head(&self) -> Result<u64> {
+        if let Some((staged, calls)) = self.staged_head {
+            if self.head_calls.fetch_add(1, Ordering::Relaxed) < calls {
+                return Ok(staged);
+            }
+        }
+
         Ok(self.head)
     }
 
@@ -1277,6 +1303,87 @@ async fn a_parent_hash_break_trips_the_tripwire_too() {
     assert_eq!(above, 0);
 }
 
+/// The tripwire at a PASS BOUNDARY, with the database read that used to
+/// supply the predecessor answering stale (docs/review-round-4.md,
+/// MAJOR 9).
+///
+/// At the head every pass starts exactly where the previous one stopped,
+/// and `anchor_for` used to ask `checkpoints FINAL` whether a checkpoint
+/// ends there - a read of the row the previous pass had just written,
+/// i.e. the one read ClickHouse is allowed to answer stale (~3%
+/// measured). When it did, the first block of the new pass was not
+/// checked at all and the only fork check this chain has was off, with no
+/// log line.
+///
+/// This forces that stale answer and puts a forked block exactly at the
+/// boundary. It passes only because the loop carries the last
+/// `Continuity` in memory: delete `SolanaIndexer::last_continuity` and
+/// the run finishes happily with a different block stored, which is the
+/// whole point - the pure-function test of `carried_anchor` would still
+/// pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_carried_anchor_checks_a_fork_a_stale_checkpoint_read_misses()
+{
+    use crate::pipeline::solana_store::stale;
+
+    let scenario = Scenario::new("d_stale_anchor").await;
+
+    // The block at index 25 does not build on the one below it. The head
+    // stops just under it for the first two `/height` reads, so the first
+    // pass ends exactly at the boundary and the second pass begins with
+    // the forked block.
+    let broken = chain(40).with_parent_hash_break(25);
+    let boundary = broken.slot_at(25);
+    let broken = broken.with_staged_head(boundary, 2);
+
+    // Every checkpoint-adjacency read of this run is answered stale, so
+    // the database can supply no anchor at all.
+    stale::arm_checkpoint_reads(64);
+
+    let error = scenario
+        .index_until(&broken, broken.head)
+        .await
+        .expect_err("the fork at the pass boundary must be fatal");
+
+    assert!(
+        Tripwire::is_cause_of(&error),
+        "the first block of the second pass was not checked against the \
+         last block of the first: {error:#}"
+    );
+    let text = format!("{error:#}");
+    assert!(text.contains("parent_blockhash"), "{text}");
+    assert!(text.contains(&boundary.to_string()), "{text}");
+
+    // The forked block reached no table.
+    let above = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM `{COMMIT_MARKER}` FINAL \
+             WHERE chain = {CHAIN} AND block_number >= {boundary}"
+        ))
+        .await;
+    assert_eq!(above, 0);
+
+    // ... and the run really did go through two passes, with the slots
+    // below the boundary stored by the first one.
+    let below = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM `{COMMIT_MARKER}` FINAL \
+             WHERE chain = {CHAIN} AND block_number < {boundary}"
+        ))
+        .await;
+    assert_eq!(below, 25, "the first pass stored 25 produced slots");
+
+    // The anchor came from memory, not from the database: had the loop
+    // asked, it would have been told "no checkpoint ends here" and would
+    // have skipped the check.
+    assert!(
+        stale::checkpoint_reads_taken() > 0,
+        "the loop never even asked the database - arm the knob against \
+         the read that is actually taken"
+    );
+}
+
 // ------------------------------------------------------------------- (e)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1834,4 +1941,208 @@ async fn the_program_registry_is_read_again_not_only_at_startup() {
     }
 
     panic!("the registry read never saw the operator's new row");
+}
+
+/// A flush that landed while ANOTHER process's purge was rebuilding the
+/// same days carries an epoch the validity rule now hides, and nothing
+/// else will ever ask for those slots again: their rows ARE stored, so no
+/// hole appears in the tiling and no gap query reports them. The running
+/// indexer queues them in memory; a restart used to lose the queue, and
+/// the Solana loop never asked the database the same question the way the
+/// EVM one does (docs/review-round-4.md, MAJOR 3).
+///
+/// Here the queue is EMPTY at the start of the run and everything comes
+/// from what is stored: the loop finds the span by itself, purges it
+/// before anything else, and streams it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart()
+{
+    let chain = chain(40);
+    let clean = clean_index("i_clean", &chain, chain.head).await;
+    let scenario = Scenario::new("i_raced_purge").await;
+
+    // Index the first part normally, then stop (the process ends).
+    scenario.index_until(&chain, chain.slot_at(31)).await.unwrap();
+
+    // Another process purged and rebuilt every bucket of the third UTC
+    // day of this chain under epoch 1. `tombstone_version` is what it
+    // stamped BEFORE its rebuild read its input.
+    let tombstoned = next_version();
+    let day = BASE_TIMESTAMP + 2 * 86_400;
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+               fork_block, to_block, old_head, depth, rows_tombstoned, \
+               reason, tombstone_version, completed) \
+             VALUES ({CHAIN}, 1, {day}, {}, {}, {}, 0, 0, 0, \
+               'redecode', {tombstoned}, 1)",
+            day + 86_400,
+            chain.slot_at(24),
+            chain.slot_at(31),
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // ... and this is the flush that raced it: the very same three slots,
+    // written again AFTER that rebuild had read its input and still
+    // stamped with the epoch in force when the flush started. Identical
+    // content, so only the stamps differ - which is the whole point: no
+    // hole, no orphan, nothing else to notice them by.
+    let (from, to) = (chain.slot_at(25), chain.slot_at(27) + 1);
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO `{COMMIT_MARKER}` (chain, block_number, \
+               blockhash, parent_slot, parent_blockhash, block_height, \
+               timestamp, epoch, _version, is_deleted) \
+             SELECT chain, block_number, blockhash, parent_slot, \
+               parent_blockhash, block_height, timestamp, 0 AS epoch, \
+               {} AS `_version`, 0 AS is_deleted \
+             FROM `{COMMIT_MARKER}` FINAL WHERE chain = {CHAIN} \
+               AND block_number >= {from} AND block_number < {to}",
+            next_version()
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // No read-your-writes: wait until the question really answers itself
+    // before restarting, so a pass cannot succeed for the wrong reason.
+    let mut found = Vec::new();
+    for _ in 0..200 {
+        found = scenario
+            .db
+            .stale_flush_ranges_in(COMMIT_MARKER, "block_number")
+            .await
+            .unwrap();
+        if !found.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        found,
+        vec![BlockRange::new(from, to)],
+        "the slots flushed under the superseded epoch have to be purged \
+         and indexed again"
+    );
+
+    // The restart: a brand new process, an empty in-memory queue.
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    // It purged exactly that span before streaming anything ...
+    let healed: u64 = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM reorgs WHERE chain = {CHAIN} \
+             AND reason = 'gap_heal' AND fork_block = {from} \
+             AND to_block = {to} AND completed = 1"
+        ))
+        .await;
+    assert_eq!(
+        healed, 1,
+        "the restart did not purge the span that raced the other \
+         process's purge"
+    );
+
+    // ... and what is stored is a clean index again: the span came back
+    // under an epoch the validity rule counts, and nothing is doubled.
+    assert_eq!(scenario.rows(COMMIT_MARKER).await, chain.produced_slots());
+    scenario.assert_consistent().await;
+    assert_same(
+        "after a restart that found the raced flush",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+}
+
+/// One slot whose `blockTime` the node did not report is stored with
+/// `timestamp` 0 (`src/source/solana.rs` maps `None` to the default), and
+/// 0 is NOT a block time. Taking it as the start of a repair window arms
+/// the validity rule from 1970 on: `epoch_floor_v` raises the floor on
+/// ~20,700 days at once and every aggregate of the chain reads as zero
+/// until a rebuild that slices fifty years into monthly INSERTs per
+/// aggregate finishes (docs/review-round-4.md, MAJOR 6).
+///
+/// The store therefore reports the oldest REAL timestamp of the range, as
+/// the EVM store now does. The shared clamp in `src/reorg` stays as the
+/// last line of defence; this is the line that keeps it from firing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_slot_without_a_block_time_does_not_start_the_repair_window() {
+    let scenario = Scenario::new("h_missing_block_time").await;
+    let store = SolanaReorgStore::new(scenario.db.clone());
+    let version = next_version();
+
+    // Three produced slots: the middle one lost its block time.
+    let rows = [
+        (FIRST_SLOT, BASE_TIMESTAMP),
+        (FIRST_SLOT + 1, 0),
+        (FIRST_SLOT + 2, BASE_TIMESTAMP + SECONDS_PER_SLOT),
+    ]
+    .iter()
+    .map(|(slot, timestamp)| {
+        format!(
+            "({CHAIN}, {slot}, toFixedString('', 32), {}, \
+             toFixedString('', 32), {}, toDateTime({timestamp}), 0, \
+             {version}, 0)",
+            slot - 1,
+            900_000 + slot - FIRST_SLOT
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(", ");
+
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO `{COMMIT_MARKER}` (chain, block_number, \
+             blockhash, parent_slot, parent_blockhash, block_height, \
+             timestamp, epoch, _version, is_deleted) VALUES {rows}"
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // No read-your-writes: wait for the rows rather than race them.
+    for _ in 0..200 {
+        let stored = store
+            .stored_slots(
+                CHAIN,
+                BlockRange::new(FIRST_SLOT, FIRST_SLOT + 3),
+            )
+            .await
+            .unwrap();
+        if stored == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let span = store
+        .timestamp_span(CHAIN, FIRST_SLOT, Some(FIRST_SLOT + 3))
+        .await
+        .unwrap()
+        .expect("three stored slots are a span");
+
+    assert_eq!(
+        span,
+        (BASE_TIMESTAMP, BASE_TIMESTAMP + SECONDS_PER_SLOT),
+        "the repair window starts at the oldest REAL block time, not at \
+         the missing one"
+    );
+
+    // A range in which NOTHING has a real block time is a different case:
+    // day 0 really is the only bucket those rows contributed to, so the
+    // span is reported rather than hidden.
+    let only_zero = store
+        .timestamp_span(CHAIN, FIRST_SLOT + 1, Some(FIRST_SLOT + 2))
+        .await
+        .unwrap();
+    assert_eq!(only_zero, Some((0, 0)));
 }
