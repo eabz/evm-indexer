@@ -32,9 +32,13 @@ the fleet process's own flags and environment; the panel shows them as
 "set" or "not set" and can change none of them. Before the security review
 it could, and that was enough to send the owner's Envio token to any host
 on the internet (`configs::fleet::CHAIN_SETTINGS` has the whole story).
-The start block, the end block and `--new-blocks-only` are out for the
-other reason: they decide the coverage floor, which design section 16 fixes
-on a chain's first start.
+The start block, the start DATE, the end block and `--new-blocks-only`
+are out for the other reason: they decide the coverage floor, which design
+section 16 fixes on a chain's first start. The panel shows that floor - the
+same "gap-free from ... to ..." sentence `indexer verify` prints, once per
+chain card - and shows it read-only. Moving it earlier is
+`indexer backfill`; moving it later is refused everywhere, because data is
+never dropped.
 
 What IS editable: how far behind the head to stay, how deep a rollback may
 go, how big and how frequent the writes are, and which decoders run.
@@ -74,7 +78,7 @@ reaches the chain supervisors.
 | Threat | Answer |
 |---|---|
 | the password in `ps`, in a shell history, in `docker inspect` | `ADMIN_PASSWORD` is read from the environment only. It is not a clap argument, so it cannot reach a `--help` text or a `Debug` print either |
-| a password short enough to guess | under 12 characters and the panel does not start; the log says why |
+| a password short enough to guess | under 12 characters, one character repeated, or on a small built-in denylist, and the panel does not start. The log says why and prints `openssl rand -base64 18` |
 | a memory dump hands out the password | only a salted SHA-256 of it is kept |
 | timing says how much of a guess was right | the PASSWORD comparison is constant time (`subtle`) over two 32-byte digests. The session lookup is an ordinary hash-map probe, which is safe for a different reason: its key is a SHA-256 of the token, so a timing signal reveals nothing invertible |
 | a guessable session token | 256 bits from the operating system's CSPRNG (`getrandom`) |

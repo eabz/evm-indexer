@@ -19,9 +19,10 @@
 //! | Limit | The attack it answers |
 //! |---|---|
 //! | [`Limits::max_connections`] | opening more sockets than the process can afford. A connection with no permit is closed at once, so the cost of a flood is bounded by the cap and not by the attacker's patience |
+//! | [`Limits::max_per_address`] | one address taking every slot of that cap and leaving none for the owner (security re-check residual 1) |
 //! | [`Limits::header_read`] | a request line that never ends (slowloris). hyper's own `header_read_timeout`, which is the only thing that can see a header that never arrives |
-//! | [`Limits::request`] | a complete request whose body dribbles in, or a handler that hangs. Wraps the WHOLE connection |
-//! | [`Limits::idle`] | a finished keep-alive connection held open for nothing |
+//! | [`Limits::request`] | a complete request whose body dribbles in, or a handler that hangs. Applied to ONE request, by a layer inside the router (`admin::router`) so that its 408 still carries the security headers |
+//! | [`Limits::idle`] | the whole connection, which for a finished keep-alive connection is the time it may be held open for nothing |
 //!
 //! A connection also runs in its own task, so a panic anywhere in a handler
 //! unwinds into that task and never reaches the supervisor.
@@ -35,10 +36,15 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use log::{debug, warn};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tower::Service;
 
@@ -48,13 +54,29 @@ pub struct Limits {
     /// Connections served at once. Further ones are closed immediately.
     /// The panel has ONE user; this is generous already.
     pub max_connections: usize,
+    /// Of those, how many one source address may hold.
+    ///
+    /// Without it the global cap is itself a way to lock the owner out:
+    /// the re-check held 80 sockets from one address, and the owner's
+    /// `GET /` got no answer at all until the header timeout cleared them
+    /// (re-check residual 1). The indexing was never at risk - that is
+    /// what the global cap fixed - but the panel was unreachable for as
+    /// long as the attacker cared to keep re-opening.
+    pub max_per_address: usize,
     /// Time to finish sending the request head. This is the slowloris
     /// answer: only hyper can enforce it, because only hyper knows the
     /// head is still incomplete.
     pub header_read: Duration,
-    /// Cap on a whole connection, head, body, handler and response.
+    /// Cap on ONE request: head done, body read, handler, response.
+    ///
+    /// Enforced by a layer inside the router, not here. It used to be
+    /// `max(request, idle)` around the whole connection, which is to say
+    /// it was never the limit that applied and a dribbling body got the
+    /// idle value instead (re-check residual 2).
     pub request: Duration,
-    /// A keep-alive connection with nothing in flight is closed after this.
+    /// Cap on a whole connection, however many requests it carries. For a
+    /// keep-alive connection with nothing in flight this is how long it
+    /// may be held open for nothing.
     pub idle: Duration,
 }
 
@@ -62,10 +84,85 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_connections: 64,
+            max_per_address: 8,
             header_read: Duration::from_secs(10),
             request: Duration::from_secs(30),
             idle: Duration::from_secs(60),
         }
+    }
+}
+
+/// The connection budget: a global cap with a per-address share inside it.
+///
+/// Both halves matter and neither replaces the other. The global cap is
+/// what keeps a flood from costing the *indexer* its file descriptors; the
+/// per-address share is what keeps one flooding address from costing the
+/// *owner* the panel.
+struct Slots {
+    /// The global cap. An owned permit travels with the connection task,
+    /// so it comes back however the task ends - including by panic.
+    permits: Arc<Semaphore>,
+    per_address: usize,
+    /// How many connections each address is holding right now. An address
+    /// is removed as soon as it drops to zero, so this map is never larger
+    /// than the global cap.
+    held: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+/// One connection's place in the budget, given back on drop.
+struct Slot {
+    _permit: OwnedSemaphorePermit,
+    address: IpAddr,
+    held: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut held = lock(&self.held);
+        if let Some(count) = held.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.address);
+            }
+        }
+    }
+}
+
+/// A poisoned lock here means some other connection task panicked while
+/// holding it. The map is a counter, not an invariant, so carrying on with
+/// it is right: refusing every connection because one task fell over would
+/// be the outage this whole module exists to prevent.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Slots {
+    fn new(limits: Limits) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(
+                limits.max_connections.max(1),
+            )),
+            per_address: limits.max_per_address.max(1),
+            held: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A place for a connection from `address`, or `None` when either cap
+    /// is full. The global permit is taken first and dropped again if the
+    /// address is over its share, so a refusal costs nothing.
+    fn take(&self, address: IpAddr) -> Option<Slot> {
+        let permit = self.permits.clone().try_acquire_owned().ok()?;
+
+        {
+            let mut held = lock(&self.held);
+            let count = held.entry(address).or_insert(0);
+            if *count >= self.per_address {
+                return None;
+            }
+            *count += 1;
+        }
+
+        Some(Slot { _permit: permit, address, held: self.held.clone() })
     }
 }
 
@@ -79,10 +176,7 @@ pub async fn serve(
     limits: Limits,
     shutdown: BoxFuture<'static, ()>,
 ) {
-    // One permit per connection we are willing to hold. `acquire_owned`
-    // moves the permit into the connection task, so it is returned when the
-    // task ends however it ends - including by panic.
-    let permits = Arc::new(Semaphore::new(limits.max_connections.max(1)));
+    let slots = Slots::new(limits);
 
     let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
     tokio::pin!(shutdown);
@@ -104,10 +198,10 @@ pub async fn serve(
             }
         };
 
-        // Full: close this one NOW instead of queueing it. Dropping the
-        // stream sends the FIN, so the attacker's socket does not stay
-        // charged to this process.
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
+        // Full - globally, or for this address on its own. Close this one
+        // NOW instead of queueing it: dropping the stream sends the FIN,
+        // so the attacker's socket does not stay charged to this process.
+        let Some(slot) = slots.take(peer.ip()) else {
             debug!("Control panel is at its connection limit, dropping {peer}");
             drop(stream);
             continue;
@@ -126,7 +220,7 @@ pub async fn serve(
         // Its own task: a panic in a handler unwinds here and the chain
         // supervisors never see it.
         tokio::spawn(async move {
-            let _permit = permit;
+            let _slot = slot;
             connection(stream, service, limits).await;
         });
     }
@@ -165,11 +259,13 @@ where
         TowerToHyperService::new(service),
     );
 
-    // And a hard cap on the whole thing, so a body that dribbles in one
-    // byte at a time, or a handler that hangs, still ends.
-    match tokio::time::timeout(limits.request.max(limits.idle), served)
-        .await
-    {
+    // And a hard cap on the whole connection, so a keep-alive socket that
+    // is held open for nothing still ends. A single slow REQUEST is bounded
+    // separately and much sooner by `Limits::request`, which is a layer
+    // inside the router: this used to be `max(request, idle)`, i.e. the
+    // idle value always won and the request limit never applied to anything
+    // (re-check residual 2).
+    match tokio::time::timeout(limits.idle, served).await {
         Ok(Ok(())) => {}
         // A client that hangs up mid-request is ordinary, not a fault.
         Ok(Err(e)) => debug!("Control panel connection ended: {e}"),
@@ -196,8 +292,99 @@ mod tests {
         let limits = Limits::default();
 
         assert!(limits.max_connections > 0);
+        assert!(limits.max_per_address > 0);
+        assert!(limits.max_per_address < limits.max_connections);
         assert!(limits.header_read <= Duration::from_secs(30));
         assert!(limits.request >= limits.header_read);
         assert!(limits.idle <= Duration::from_secs(300));
+    }
+
+    fn budget(max_connections: usize, max_per_address: usize) -> Slots {
+        Slots::new(Limits {
+            max_connections,
+            max_per_address,
+            ..Limits::default()
+        })
+    }
+
+    fn address(last: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, last])
+    }
+
+    /// Re-check residual 1: with a global cap alone, one address could hold
+    /// every slot and the owner's own request never got answered.
+    #[test]
+    fn one_address_can_not_take_every_slot() {
+        let slots = budget(16, 4);
+
+        let mut flood = Vec::new();
+        for _ in 0..4 {
+            flood.push(
+                slots
+                    .take(address(1))
+                    .expect("under its own share of the cap"),
+            );
+        }
+
+        assert!(
+            slots.take(address(1)).is_none(),
+            "one address went past its share of the connection cap"
+        );
+        assert!(
+            slots.take(address(2)).is_some(),
+            "the owner was starved out by another address"
+        );
+    }
+
+    #[test]
+    fn the_global_cap_still_applies_across_addresses() {
+        let slots = budget(4, 4);
+
+        let mut held = Vec::new();
+        for last in 1..=4 {
+            held.push(slots.take(address(last)).expect("under the cap"));
+        }
+
+        assert!(
+            slots.take(address(5)).is_none(),
+            "the global cap was exceeded"
+        );
+    }
+
+    #[test]
+    fn a_closed_connection_gives_its_slot_back() {
+        let slots = budget(16, 2);
+
+        let first = slots.take(address(1)).expect("under the cap");
+        let second = slots.take(address(1)).expect("under the cap");
+        assert!(slots.take(address(1)).is_none());
+
+        drop(first);
+        let third = slots.take(address(1)).expect("a slot came free");
+
+        drop(second);
+        drop(third);
+        assert!(
+            lock(&slots.held).is_empty(),
+            "an address stayed in the table after its last connection went"
+        );
+    }
+
+    /// A refused connection must not hold a global permit either, or an
+    /// address over its share would eat the whole cap on the way out.
+    #[test]
+    fn a_refused_connection_costs_nothing() {
+        let slots = budget(4, 1);
+
+        let held = slots.take(address(1)).expect("under the cap");
+        for _ in 0..50 {
+            assert!(slots.take(address(1)).is_none());
+        }
+
+        assert!(
+            slots.take(address(2)).is_some(),
+            "refusals leaked permits out of the global cap"
+        );
+        drop(held);
     }
 }

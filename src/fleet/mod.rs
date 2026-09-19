@@ -238,6 +238,8 @@ impl ChainRunner for PipelineRunner {
                 .await
                 .context("set up the RPC endpoints (--rpc)")?;
 
+                let history_source = source.clone();
+
                 let runtime = Runtime {
                     canonical: Arc::new(source.clone()),
                     source,
@@ -247,6 +249,7 @@ impl ChainRunner for PipelineRunner {
                     shutdown,
                     metrics: Some(metrics),
                     status,
+                    history: Some(Arc::new(history_source)),
                 };
 
                 pipeline::run_with(config, runtime).await
@@ -278,6 +281,13 @@ impl DesiredStore for ClickhouseStore {
         Box::pin(async move {
             chains::foreign(&self.db, self.lease_ttl_ms, &mine).await
         })
+    }
+
+    fn coverage(
+        &self,
+    ) -> BoxFuture<'_, Result<std::collections::BTreeMap<u64, String>>>
+    {
+        Box::pin(chains::coverage(&self.db))
     }
 }
 

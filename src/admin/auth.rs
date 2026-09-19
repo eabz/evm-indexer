@@ -16,8 +16,9 @@
 //! | a sibling subdomain shadows the cookie | `__Host-` prefix behind TLS, and a duplicated cookie name is refused rather than resolved |
 //! | the cookie travels in clear text | `Secure` when the panel is behind TLS |
 //! | brute force over the network | 5 attempts a minute per address, then a lock-out that decays and is capped at one minute unless the address is hammering ([`RateLimiter`]) |
-//! | a guessable password | shorter than [`MIN_PASSWORD_CHARS`] and the panel does not start at all |
+//! | a guessable password | shorter than [`MIN_PASSWORD_CHARS`], one character repeated, or on a small denylist, and the panel does not start at all ([`check_strength`], which also prints [`PASSWORD_HINT`]) |
 //! | an attacker fills memory with addresses or sessions | both maps are capped and pruned |
+//! | one address holds every connection and the owner cannot reach the panel | a per-address share of the connection cap (`server::Limits::max_per_address`) |
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -78,15 +79,68 @@ pub const DECAY_AFTER: Duration = Duration::from_secs(5 * 60);
 /// enough to walk a PIN or a short word (review MAJOR 5).
 pub const MIN_PASSWORD_CHARS: usize = 12;
 
-/// Is this password long enough to run a control plane behind? The message
+/// The one command that ends this whole conversation. Printed with every
+/// refusal, because "your password is bad" without "here is a good one" is
+/// how an operator ends up typing `passwordpassword`.
+pub const PASSWORD_HINT: &str = "openssl rand -base64 18";
+
+/// Passwords the panel refuses by name.
+///
+/// Deliberately TINY. A real dictionary belongs in a password manager, not
+/// in an indexer, and length plus [`RateLimiter`] is the actual defence.
+/// This list only catches the handful an operator types when they mean "I
+/// will change it later" - which are also an attacker's first guesses, and
+/// which the length rule alone waves through (re-check residual 3).
+/// Compared lower-cased and trimmed.
+const DENYLIST: &[&str] = &[
+    "123456789012",
+    "adminadmin",
+    "administrator",
+    "changeme",
+    "changemeplease",
+    "clickhouse",
+    "correcthorsebatterystaple",
+    "evm-indexer",
+    "evmindexer",
+    "iloveyou1234",
+    "letmeinplease",
+    "password1234",
+    "passwordpassword",
+    "qwertyuiop12",
+    "secretsecret",
+];
+
+/// Is this password fit to run a control plane behind? The message
 /// completes the sentence "`ADMIN_PASSWORD` ...".
+///
+/// Three rules, in the order an operator meets them. Length is the one that
+/// matters; the other two exist because twelve characters of nothing is
+/// still nothing - `aaaaaaaaaaaa` is one guess, not twelve, and a phrase
+/// off the top of the list is a handful.
 pub fn check_strength(password: &str) -> Result<(), String> {
     let length = password.chars().count();
 
     if length < MIN_PASSWORD_CHARS {
         return Err(format!(
             "is {length} characters long and the minimum is \
-             {MIN_PASSWORD_CHARS}."
+             {MIN_PASSWORD_CHARS}. Generate one with `{PASSWORD_HINT}`."
+        ));
+    }
+
+    let mut characters = password.chars();
+    let first = characters.next().unwrap_or('\0');
+    if characters.all(|character| character == first) {
+        return Err(format!(
+            "is the same character {length} times over, which is one guess \
+             and not {length}. Generate one with `{PASSWORD_HINT}`."
+        ));
+    }
+
+    let folded = password.trim().to_lowercase();
+    if DENYLIST.contains(&folded.as_str()) {
+        return Err(format!(
+            "is one of the passwords a guesser tries first. Generate one \
+             with `{PASSWORD_HINT}`."
         ));
     }
 
@@ -179,7 +233,7 @@ impl Password {
                 "The control panel is OFF: {name} {why} The panel can \
                  start and stop the indexing of every chain in this \
                  process, so it will not run behind a password that can be \
-                 guessed. Set a longer one and start the process again."
+                 guessed. Set a better one and start the process again."
             );
             return Ok(None);
         }
@@ -658,12 +712,65 @@ mod tests {
         for good in [
             "a-very-good-password",
             "correct horse battery staple",
-            "123456789012",
+            "Tr0ubador&3xile",
         ] {
             check_strength(good).unwrap_or_else(|why| {
                 panic!("{good:?} was refused: {why}")
             });
         }
+    }
+
+    /// Re-check residual 3: the rule was length only, so twelve of the
+    /// same character counted as a twelve-character password. It is one
+    /// guess.
+    #[test]
+    fn a_password_of_one_repeated_character_is_refused() {
+        for weak in [
+            "aaaaaaaaaaaa",
+            "000000000000",
+            "....................",
+            // Twelve identical non-ASCII characters counted too, because
+            // the length rule counts CHARACTERS and so does this one.
+            "ñññññññññññññ",
+        ] {
+            let why = check_strength(weak)
+                .expect_err("{weak:?} was accepted as a password");
+            assert!(why.contains("same character"), "{why}");
+        }
+
+        // One different character is enough to leave this rule behind;
+        // it is not a "variety" score, just a floor.
+        check_strength("aaaaaaaaaaab").expect("not all the same");
+    }
+
+    #[test]
+    fn a_password_off_the_denylist_is_refused() {
+        for weak in [
+            "passwordpassword",
+            "PasswordPassword",
+            "  changeme  ",
+            "correcthorsebatterystaple",
+        ] {
+            assert!(
+                check_strength(weak).is_err(),
+                "{weak:?} was accepted as a password"
+            );
+        }
+    }
+
+    /// Every refusal has to end with something the owner can paste.
+    #[test]
+    fn the_refusal_says_how_to_make_a_good_password() {
+        for weak in ["short", "aaaaaaaaaaaa", "changeme    ", "changeme"] {
+            let why = check_strength(weak)
+                .expect_err("{weak:?} was accepted as a password");
+            assert!(
+                why.contains(PASSWORD_HINT),
+                "no way out offered: {why}"
+            );
+        }
+
+        assert_eq!(PASSWORD_HINT, "openssl rand -base64 18");
     }
 
     #[test]

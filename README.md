@@ -18,6 +18,7 @@ An indexer that streams blockchain data from [Envio HyperSync](https://docs.envi
 - [Quick start](#quick-start)
 - [Commands and schema migrations](#commands-and-schema-migrations)
 - [Configuration](#configuration)
+- [What this indexer covers: the coverage floor](#what-this-indexer-covers-the-coverage-floor)
 - [Token metadata and RPC endpoints](#token-metadata-and-rpc-endpoints)
 - [Database schema](#database-schema)
 - [Querying the data](#querying-the-data)
@@ -156,8 +157,9 @@ cargo build --release
 |---------|--------------|
 | `indexer run [OPTIONS]` | Index a chain. Applies pending schema migrations first (unless `--no-migrate`). `indexer [OPTIONS]` without a subcommand is the same thing |
 | `indexer migrate --database <url> [--dry-run]` | Create the database if it is missing, apply pending migrations and exit. `--dry-run` only lists what is pending and creates nothing |
-| `indexer verify --database <url> [--chain N] [--start-block A] [--end-block B]` | Read-only consistency check of what is stored for a chain: missing blocks (gaps), rows without their block (left by an interrupted write; the next `indexer run` purges them), and checkpoints that claim missing blocks. Prints a report; exit status `0` = consistent, `1` = problems found |
+| `indexer verify --database <url> [--chain N] [--start-block A] [--end-block B]` | Read-only consistency check of what is stored for a chain. Its first line is the promise — `gap-free from 2024-09-19 (block 20779400) to 2025-09-19 (block 23400512)` — and the rest is the detail: missing blocks (gaps), rows without their block (left by an interrupted write; the next `indexer run` purges them), and checkpoints that claim missing blocks. Exit status `0` = consistent, `1` = problems found |
 | `indexer fleet --database <url> --hypersync-token <token> [--chain N]...` | Index MANY chains in one process, with a web control panel. Applies pending migrations once, at start. See [Fleet mode and the control panel](#fleet-mode-and-the-control-panel) |
+| `indexer backfill --module predictions --registry-only --database <url> [--chain A]` | Fetch what a prediction market created BELOW the coverage floor needs to be describable: its metadata, its question, its outcomes and the split / merge / redeem events its open interest is made of. **No trade below the floor is stored.** `indexer run` does this by itself, once, in the background; this is the on-demand version. See [the coverage floor](#what-this-indexer-covers-the-coverage-floor) |
 | `indexer backfill --module dex\|predictions --database <url> [--chain A] [--from-block A] [--to-block B]` | Decode a module's rows again **from the stored `logs`** (no re-sync, no HyperSync traffic), e.g. after a decoder fix or a new event family. Compares first and writes nothing when the stored rows already match; otherwise the module's rows of the affected block range are replaced and every aggregate of the chain is rebuilt under a new epoch, so nothing is counted twice. Safe to run while `indexer run` is live on the same chain |
 
 The schema lives in `migrations/NNNN_name.sql` and is **compiled into the binary**; the container image needs no SQL files and ClickHouse needs no init scripts.
@@ -183,9 +185,10 @@ Options of `indexer run`:
 | `--hypersync-token` | `ENVIO_API_TOKEN` | *required* | [Envio API token](https://docs.envio.dev/docs/HyperSync/api-tokens) |
 | `--rpc` | `RPC_URL` | `auto` | Comma-separated JSON-RPC endpoints for token / pool metadata `eth_call`s. `auto` = discover public endpoints, `none` = disable. See [Token metadata and RPC endpoints](#token-metadata-and-rpc-endpoints) |
 | `--redis` | `REDIS_URL` | *none* | Redis or Dragonfly URL for the token metadata cache. Without it an in-memory cache is used |
-| `--start-block` | `START_BLOCK` | `0` | Block number to start syncing from |
+| `--start-block` | `START_BLOCK` | one year ago | Block number to start syncing from. **Read only on a chain's FIRST start**: it sets the [coverage floor](#what-this-indexer-covers-the-coverage-floor), which is fixed from then on |
+| `--start-date` | `START_DATE` | one year ago | The same thing as a date, `YYYY-MM-DD` in UTC, resolved to a block by a binary search over block timestamps (about 25 requests, once). Mutually exclusive with `--start-block` |
 | `--end-block` | `END_BLOCK` | `0` | Block to stop at, **exclusive**: blocks `--start-block` up to `--end-block - 1` are indexed and the process exits. `0` = follow the chain head |
-| `--new-blocks-only` | `NEW_BLOCKS_ONLY` | `false` | Start from the current chain height instead of `--start-block` (skip the historical sync) |
+| `--new-blocks-only` | `NEW_BLOCKS_ONLY` | `false` | Start from the current chain height instead of `--start-block` (skip the historical sync). The coverage floor is then the head |
 | `--confirmations` | `CONFIRMATIONS` | `0` | Stay this many blocks behind the chain head. Optional: reorgs are repaired either way, see [Reorgs](#reorgs) |
 | `--max-reorg-depth` | `MAX_REORG_DEPTH` | `512` | Deepest rollback the indexer performs on its own. A deeper fork stops the process with an error |
 | `--no-dex` | `NO_DEX` | `false` | Turn [DEX analytics](#dex-analytics) off |
@@ -222,6 +225,86 @@ Options of `indexer fleet`. Everything here is the same for every chain in the p
 `indexer migrate` takes `--database`, `--dry-run` and `--debug`; `indexer verify` and `indexer backfill` take the options shown in the first table (plus `--debug`). See [`.env.example`](.env.example) for a commented template; for Docker Compose it additionally contains the ClickHouse container credentials (`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DB`) and `METRICS_PORT`.
 
 Any network available on HyperSync can be indexed: see the [list of supported networks](https://docs.envio.dev/docs/HyperSync/hypersync-supported-networks). The HyperSync endpoint is derived from `--chain`; use `--hypersync-url` to point to a different endpoint.
+
+## What this indexer covers: the coverage floor
+
+The promise this indexer makes is **gap-free and consistent from a known
+date to now, everything kept** — not "all of history". That known date is
+the chain's **coverage floor**.
+
+### Where it comes from
+
+The first time a chain is indexed, and only then:
+
+| What you gave it | The floor |
+|---|---|
+| nothing | **a year back**, resolved to a block |
+| nothing, but the database already holds older blocks | the oldest block it holds (see below) |
+| `--start-block N` | block `N` |
+| `--start-date 2024-03-01` | the first block at or after midnight UTC of that day |
+| `--new-blocks-only` | the head |
+| nothing, on Solana | the head (see [Solana](#solana)) |
+
+A year is the default because it is what makes "all-time", "last 12 months"
+and every year-on-year comparison a real answer rather than an accident of
+the day you happened to start the indexer. It is measured from the newest
+block the source **has**, or from now, whichever is earlier: a year is a
+promise about the data, and an archive that is behind would otherwise
+quietly give you less than a year.
+
+**Upgrading an existing deployment changes nothing.** A database that was
+already indexing before coverage floors existed keeps what it has: its
+floor is its oldest stored block, not a year back, so nothing stops being
+indexed and nothing stops being healed. The log says so on the first start
+after the upgrade.
+
+### It does not move
+
+From then on the floor is a fact about your data, not a setting:
+
+- a restart keeps it;
+- a different `--start-block` or `--start-date` keeps it, and the log says
+  so and tells you what to run instead;
+- the control panel cannot touch it — it shows the line, read-only;
+- moving it **later** is refused everywhere, because data is never dropped
+  and a higher floor would be a claim your stored rows contradict;
+- moving it **earlier** is `indexer backfill --start-block N` (or
+  `--start-date D`), which lowers the floor **after checking** that every
+  block between `N` and the old floor really is stored and gap-free. If it
+  is not, the floor stays where it was and the command says how many blocks
+  are missing. (`indexer backfill` re-decodes logs this database already
+  has; it does not fetch new ones, so this moves the floor over blocks you
+  already indexed — with an older version, or with an explicit
+  `--start-block` — not over blocks nobody has ever asked for.)
+
+To see it:
+
+```sh
+indexer verify --chain 8453 --database http://default@localhost:8123/indexer
+# Coverage: gap-free from 2024-09-19 (block 20779400) to 2025-09-19 (block 23400512).
+```
+
+or `SELECT * FROM coverage_v`, which gives every chain's floor and the
+gap-free head it has reached.
+
+### What "all-time" means to whoever reads the data
+
+**Since the floor.** Every total, every "all-time volume", every
+leaderboard covers the window that chain actually has, and `coverage_v` is
+where a dashboard should read the window from. Two consequences are worth
+telling your users:
+
+- **A launchpad token launched before the floor** keeps its DEX data but has
+  no launch attribution: the launch event is below the window. Documented,
+  not fixed.
+- **A prediction market created before the floor** would have no question
+  and no outcomes, and its open interest could go negative. That one *is*
+  fixed: `indexer run` reads the market metadata and the
+  split / merge / redeem events from below the floor once, in the
+  background, from the addresses in your own `prediction_trusted` — and
+  stores no trade from down there, so volume means the same thing on both
+  sides of the floor. See
+  [`src/predictions/README.md`](src/predictions/README.md).
 
 ## Token metadata and RPC endpoints
 
@@ -383,7 +466,7 @@ ORDER BY bucket;
 ## Resume and gap healing
 
 - On every flush, `blocks` rows are written **last**, after the transactions, logs, transfers and other rows of the same batch. A row in `blocks` is the commit marker for that block: if it is there, the rest of the block's data is too. After `blocks`, the flush records the committed range in `checkpoints`, which is what a restart resumes from.
-- The first sync pass after a start also runs a gap-detection query over `blocks` for the configured range, from `--start-block` (inclusive) to `--end-block` (**exclusive**), or to the chain head minus `--confirmations` when `--end-block` is `0`, and streams only what is missing.
+- The first sync pass after a start also runs a gap-detection query over `blocks` for the configured range, from the [coverage floor](#what-this-indexer-covers-the-coverage-floor) (inclusive) to `--end-block` (**exclusive**), or to the chain head minus `--confirmations` when `--end-block` is `0`, and streams only what is missing.
 - If the process died in the middle of a flush, the affected heights have transactions or logs but no `blocks` row. Before such a gap is streamed again, its leftovers are removed with the same rollback primitive that repairs reorgs (recorded in `reorgs` with `reason = 'gap_heal'`). Nothing is ever inserted twice, which is what keeps the incremental aggregates exact.
 - With `--end-block 0` the indexer keeps following the chain head after the backfill is complete. With `--end-block N` it exits with status `0` once every block below `N` is stored (`N` itself is not indexed). With `--new-blocks-only` the historical backfill is skipped.
 
@@ -551,6 +634,8 @@ In compose, it is one more service in the `x-indexer` block:
 | `--confirmations` | **refused** unless 0. Envio serves Solana at (just behind) `finalized`, so staying further back costs freshness twice and protects against nothing |
 | `--no-dex` | **refused**: with the DEX decoder off this pipeline would store empty slot headers and nothing else |
 | `--start-block` | a slot, and at least 391,000,000 |
+| `--start-date` | **refused**. A slot carries no timestamp, so there is nothing to resolve a date against, and this indexer will not guess one into a coverage floor it can never move later. Use `--start-block <slot>` |
+| the default start | the **head**, not a year of history: Envio serves Solana from 2026-01-03 and the free tier is slow, so going back is an explicit choice |
 | `--rpc`, `--redis` | ignored, with one log line. Token decimals arrive free on every `account_activity` row, so nothing here makes an RPC call |
 | `--max-reorg-depth` | ignored: there is no fork-point search on this chain (see below) |
 | `--no-predictions`, `--no-launchpads` | ignored: those decoders have no Solana front end yet |

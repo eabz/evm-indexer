@@ -68,6 +68,7 @@ pub mod cookbook;
 pub mod decode;
 pub mod derived;
 pub mod events;
+pub mod history;
 pub mod ids;
 pub mod models;
 pub mod resolve;

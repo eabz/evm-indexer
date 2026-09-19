@@ -49,6 +49,7 @@ mod solana_acceptance;
 use crate::{
     configs::Config,
     core::{self, convert::hash_to_b256, RowBatch},
+    coverage,
     db::{
         ranges::{subtract_ranges, BlockRange, MissingRanges},
         Database,
@@ -358,6 +359,10 @@ pub struct Runtime<S: BlockSource> {
     pub metrics: Option<Metrics>,
     /// Where the chain reports what it is doing. Off for `indexer run`.
     pub status: StatusSink,
+    /// Where the registry-only prediction history pass reads its logs
+    /// (docs/design.md section 16). `None` switches the pass off, which is
+    /// what the acceptance tests that have no log source do.
+    pub history: Option<Arc<dyn crate::predictions::history::LogSource>>,
 }
 
 /// Runs the indexer. Returns `Ok` when `--end-block` was reached or a
@@ -386,6 +391,8 @@ pub async fn run(config: Config) -> Result<()> {
     .await
     .context("set up the RPC endpoints (--rpc)")?;
 
+    let history_source = source.clone();
+
     let runtime = Runtime {
         canonical: Arc::new(source.clone()),
         source,
@@ -395,6 +402,7 @@ pub async fn run(config: Config) -> Result<()> {
         shutdown: Box::pin(shutdown_signal()),
         metrics: None,
         status: StatusSink::off(),
+        history: Some(Arc::new(history_source)),
     };
 
     run_with(config, runtime).await
@@ -402,7 +410,7 @@ pub async fn run(config: Config) -> Result<()> {
 
 /// [`run`] over explicit backends.
 pub async fn run_with<S: BlockSource>(
-    config: Config,
+    mut config: Config,
     runtime: Runtime<S>,
 ) -> Result<()> {
     // The fleet hands its own handle in, already labelled with this chain,
@@ -466,6 +474,37 @@ pub async fn run_with<S: BlockSource>(
         // MODULE: one placeholder and one arm in the line above.
     );
 
+    // The coverage floor (docs/design.md section 16). Decided once, on
+    // this chain's first start, and from then on a fact about the data:
+    // this is where `--start-block` / `--start-date` stop being settings
+    // and start being history. After the lease on purpose - one process
+    // per chain is what makes "the first writer wins" a statement about
+    // two starts rather than about two threads - and before anything reads
+    // `config.start_block`, which it overwrites.
+    //
+    // `--new-blocks-only` keeps its own meaning further down (the cursor
+    // starts at the head); the floor it sets is the head too, so the two
+    // agree about what this database promises.
+    let floor = coverage::establish(
+        &db,
+        &lease.fence(),
+        &*runtime.canonical,
+        runtime.source.head().await.context(
+            "ask the source for the chain head to place the coverage floor",
+        )?,
+        coverage::date::now(),
+        coverage::Wanted::of(
+            config.start_block,
+            config.start_date,
+            config.new_blocks_only,
+            coverage::Family::Evm,
+        ),
+    )
+    .await
+    .context("establish the chain's coverage floor")?;
+
+    config.start_block = floor.block;
+
     // Checkpoints say where a previous run got to; `blocks` stays the
     // truth: the first pass verifies the whole range with the gap query.
     //
@@ -495,6 +534,22 @@ pub async fn run_with<S: BlockSource>(
 
     // The epoch of a chain survives restarts in `reorgs`.
     db.set_epoch(db.current_epoch().await?);
+
+    // Prediction markets are the one dataset that needs data from BELOW the
+    // floor to be right: a market created down there has no question and
+    // its open interest can go negative (docs/design.md section 16). The
+    // pass that fixes that runs in the background, once, and never delays
+    // the live window - a market's name arriving a minute later is not
+    // worth a minute of lag.
+    if let Some(history) = runtime.history.clone() {
+        crate::predictions::history::spawn(
+            db.clone(),
+            lease.fence(),
+            history,
+            enabled,
+            floor.block,
+        );
+    }
 
     let workers = Workers::spawn(
         &db,

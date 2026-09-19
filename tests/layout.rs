@@ -142,6 +142,37 @@ fn fleet_mode_and_the_control_panel_are_their_own_modules() {
     );
 }
 
+/// `src/coverage/` (docs/design.md section 16). Like `src/reorg/` it is a
+/// CONCEPT module: it owns one registry table and no chain data, so the
+/// data-module file set does not apply - but it documents itself, and it
+/// must not grow row models of chain data, which is what would turn it into
+/// a dataset behind everyone's back.
+#[test]
+fn the_coverage_floor_is_its_own_concept_module() {
+    let directory = src("coverage");
+
+    assert!(
+        directory.is_dir(),
+        "src/coverage/ is missing: section 16 lists it"
+    );
+
+    for file in
+        ["mod.rs", "date.rs", "resolve.rs", "store.rs", "README.md"]
+    {
+        assert!(
+            directory.join(file).is_file(),
+            "src/coverage/{file} is missing"
+        );
+    }
+
+    assert!(
+        !directory.join("models.rs").exists()
+            && !directory.join("models").exists(),
+        "src/coverage owns no table of chain data; a row model there means \
+         the coverage floor grew a dataset"
+    );
+}
+
 #[test]
 fn every_source_is_one_file_per_chain_family() {
     for file in ["mod.rs", "evm.rs", "solana.rs"] {

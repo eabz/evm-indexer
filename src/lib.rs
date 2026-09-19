@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod configs;
 pub mod core;
+pub mod coverage;
 pub mod db;
 pub mod dex;
 pub mod fleet;

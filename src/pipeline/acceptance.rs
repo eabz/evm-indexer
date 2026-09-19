@@ -741,6 +741,9 @@ impl Scenario {
             workers: fast_workers(),
             lease: fast_lease(),
             shutdown: Box::pin(shutdown),
+            // The in-memory chain of these tests serves no log filter; the
+            // registry-only history pass has its own tests.
+            history: None,
         };
 
         tokio::time::timeout(
@@ -759,7 +762,20 @@ impl Scenario {
         flags: &[&str],
     ) {
         let end = end.to_string();
-        let mut all = vec!["--end-block", end.as_str(), "--rpc", "none"];
+        // The whole fake chain, whatever dates its blocks claim. Without
+        // this the coverage floor (docs/design.md section 16) would apply
+        // its default - one year back from the newest block - and the two
+        // tests whose chain spans eleven years would index only the last
+        // year of it. `--start-date` and not `--start-block 0`, because 0
+        // IS the default and says nothing.
+        let mut all = vec![
+            "--end-block",
+            end.as_str(),
+            "--rpc",
+            "none",
+            "--start-date",
+            "1970-01-01",
+        ];
         all.extend_from_slice(flags);
 
         self.run(self.config(&all), chain, &FakeRpc::new(), |_| async {
@@ -2150,6 +2166,64 @@ async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
 /// every aggregate. ClickHouse refuses ONE insert over that many (code
 /// 252), which would wedge the chain for ever (the purge fails at the
 /// rebuild on every restart): the rebuilds are one INSERT per month.
+/// docs/design.md section 16, the UPGRADE case. A deployment that has been
+/// indexing since before there were coverage floors already holds years of
+/// blocks. Giving it the default floor - one year back - would make it
+/// promise less than it holds AND stop the gap heal from ever looking
+/// below that line again, which is a silent regression of the worst kind.
+///
+/// So a database that already has rows keeps what it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_database_that_already_has_old_blocks_keeps_them_as_its_floor() {
+    use crate::coverage::{self, store};
+
+    let scenario = Scenario::new("upgrade").await;
+
+    // What an older version of this indexer left behind: blocks far below
+    // anything a "one year ago" default would choose.
+    for number in [1_000u64, 1_001, 1_002] {
+        scenario
+            .db
+            .db
+            .query(&format!(
+                "INSERT INTO blocks (chain, number, timestamp, _version) \
+                 SELECT {CHAIN}, {number}, toDateTime({}), 1",
+                BASE_TIMESTAMP + number as u32
+            ))
+            .execute()
+            .await
+            .unwrap();
+    }
+
+    // No floor is stored yet, and the flags ask for the default.
+    assert!(store::stored(&scenario.db).await.unwrap().is_none());
+
+    let chain = TestChain::new(5_000);
+    let floor = coverage::establish(
+        &scenario.db,
+        &crate::pipeline::lease::Fence::open(),
+        &chain,
+        5_000,
+        // "Now" is years after the fake chain's newest block, which is
+        // exactly when the default would otherwise collapse to the head.
+        i64::from(BASE_TIMESTAMP) + 10 * 365 * 86_400,
+        coverage::Wanted::of(0, None, false, coverage::Family::Evm),
+    )
+    .await
+    .expect("the coverage floor");
+
+    assert_eq!(
+        floor.block, 1_000,
+        "the floor moved above blocks this database already holds"
+    );
+    assert_eq!(floor.reason, store::Reason::Existing);
+
+    // And it is written down, so the next start does not decide again.
+    let stored = store::stored(&scenario.db).await.unwrap().unwrap();
+    assert_eq!(stored, floor);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs TEST_DATABASE_URL"]
 async fn a_purge_eleven_years_deep_can_finish() {
