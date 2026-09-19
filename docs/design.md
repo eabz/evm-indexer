@@ -286,8 +286,10 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
 several writers are active (44-137 misses per 3,200 in the schema engineer's repro; it
 heals on the next try). So: (1) before purging, make sure the last flush is visible;
 (2) a tombstone `INSERT .. SELECT` can miss freshly flushed rows: re-issue
-`tombstone_sql` until `live_rows_sql` returns 0 (idempotent, lock-free), bounded, fatal
-if it never converges; (3) a rebuild never depends on seeing tombstones (it excludes the
+`tombstone_sql` until `live_rows_sql` returns 0 TWICE IN A ROW, the second read taken
+after the retry delay (one zero can be the answer from before this loop's own insert,
+which is exactly the case where stopping is wrong; a miss heals on the next try, so two
+cannot both be stale) - idempotent, lock-free, bounded, fatal if it never converges; (3) a rebuild never depends on seeing tombstones (it excludes the
 purged range itself). The same caution applies to any read that decides what to write.
 
 **Disk hygiene (operator note).** Tombstones and the rows they hide stay on disk until

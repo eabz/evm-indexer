@@ -182,6 +182,17 @@ pub struct Purger {
     epochs: Arc<Mutex<HashMap<u64, u32>>>,
 }
 
+/// How many counts in a row have to say "no live row left" before
+/// [`Purger::tombstone_until_gone`] believes them.
+///
+/// Two, because a lagging read heals on the next try (docs/design.md §2:
+/// the misses are transient, 44-137 per 3,200 in the measured repro). Two
+/// reads separated by the retry delay therefore cannot both be the answer
+/// from before this loop's insert - and every extra read costs one cheap
+/// `count()` per purge step, which is the right price for the only
+/// verification a purge has.
+const ZERO_READS_REQUIRED: u32 = 2;
+
 /// Which tombstone statement [`Purger::tombstone_until_gone`] drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -551,10 +562,20 @@ impl Purger {
         })
     }
 
-    /// Issues a tombstone statement until a count of the live rows says 0.
-    /// The statement is an `INSERT .. SELECT .. FINAL`: it can miss rows
-    /// that were written a moment ago, and repeating it is free (rows that
-    /// are already dead are not selected again).
+    /// Issues a tombstone statement until a count of the live rows says 0
+    /// [`ZERO_READS_REQUIRED`] times in a row. The statement is an
+    /// `INSERT .. SELECT .. FINAL`: it can miss rows that were written a
+    /// moment ago, and repeating it is free (rows that are already dead
+    /// are not selected again).
+    ///
+    /// The count can miss them too, which is the whole point of the
+    /// repetition (docs/design.md §2, "No read-your-writes"). One zero is
+    /// therefore not proof that the range is empty: it is either the
+    /// truth, or a read served from just before this loop's own insert -
+    /// and that is exactly the case where stopping is wrong
+    /// (docs/review-round-4.md, MAJOR 7). A zero has to be confirmed by a
+    /// second read, taken after the retry delay, so that the two cannot
+    /// be the same lagging answer.
     async fn tombstone_until_gone(
         &self,
         target: Target,
@@ -576,6 +597,24 @@ impl Purger {
             Target::SideTables => PurgeStep::TombstoneSideTables,
         };
 
+        let count = || async {
+            match target {
+                Target::Checkpoints => {
+                    store.live_checkpoints(chain, from, to)
+                }
+                Target::Children => store.live_children(chain, from, to),
+                Target::Blocks => store.live_blocks(chain, from, to),
+                Target::SideTables => {
+                    store.live_side_rows(chain, from, to)
+                }
+            }
+            .await
+            .map_err(|source| ReorgError::Step {
+                step: PurgeStep::Verify,
+                source,
+            })
+        };
+
         for attempt in 1..=attempts {
             tombstoned += match target {
                 Target::Checkpoints => {
@@ -594,23 +633,22 @@ impl Purger {
             .await
             .map_err(|source| ReorgError::Step { step, source })?;
 
-            live = match target {
-                Target::Checkpoints => {
-                    store.live_checkpoints(chain, from, to)
-                }
-                Target::Children => store.live_children(chain, from, to),
-                Target::Blocks => store.live_blocks(chain, from, to),
-                Target::SideTables => {
-                    store.live_side_rows(chain, from, to)
-                }
-            }
-            .await
-            .map_err(|source| ReorgError::Step {
-                step: PurgeStep::Verify,
-                source,
-            })?;
+            live = count().await?;
 
-            if live == 0 {
+            // A zero, confirmed. Every confirming read is taken after the
+            // delay, so it cannot be the same lagging answer; the first
+            // one that is not zero ends the confirmation and the loop
+            // issues the statement again.
+            let mut zeros = u32::from(live == 0);
+            while zeros > 0 && zeros < ZERO_READS_REQUIRED {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                live = count().await?;
+                zeros = if live == 0 { zeros + 1 } else { 0 };
+            }
+
+            if zeros >= ZERO_READS_REQUIRED {
                 return Ok(tombstoned);
             }
 

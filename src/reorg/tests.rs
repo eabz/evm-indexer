@@ -377,6 +377,9 @@ async fn purge_steps_run_in_the_documented_order() {
         .filter(|step| *step != PurgeStep::FindForkPoint)
         .collect();
 
+    // Every tombstone statement is followed by TWO counts: one zero is
+    // not proof that a range is empty when a read may be served from
+    // before the insert it verifies (MAJOR 7).
     assert_eq!(
         journal,
         vec![
@@ -384,7 +387,9 @@ async fn purge_steps_run_in_the_documented_order() {
             PurgeStep::MinTimestamp,
             PurgeStep::TombstoneCheckpoints,
             PurgeStep::Verify,
+            PurgeStep::Verify,
             PurgeStep::TombstoneChildren,
+            PurgeStep::Verify,
             PurgeStep::Verify,
             // Second look at `from_ts`, after the tombstones converged.
             PurgeStep::MinTimestamp,
@@ -393,9 +398,11 @@ async fn purge_steps_run_in_the_documented_order() {
             // The commit marker is the last write of the base tables.
             PurgeStep::TombstoneBlocks,
             PurgeStep::Verify,
+            PurgeStep::Verify,
             // After it, so the mirror of `blocks` is covered too. Writes
             // nothing when the materialized views did their job.
             PurgeStep::TombstoneSideTables,
+            PurgeStep::Verify,
             PurgeStep::Verify,
             // Everything is durable: the `reorgs` row is written again,
             // completed. Its absence is what marks a purge that died.
@@ -1030,6 +1037,66 @@ async fn a_module_purge_repairs_only_its_own_side_tables() {
 
 // ---------------------------------------------------------- re-decoding
 
+/// ClickHouse gives no read-your-writes (docs/design.md §2): right after
+/// an INSERT the next query can miss the new part, measured at ~3%. The
+/// tombstone loop stopped on the FIRST attempt whose live count was 0, so
+/// ONE stale read ended it with rows still alive: the purge reported
+/// success, the aggregates of those days kept counting the rows it was
+/// supposed to remove, and nothing ever looked again
+/// (docs/review-round-4.md, MAJOR 7). A zero is now only proof when a
+/// second, independent read confirms it - the model's own rule for a
+/// lagging read ("never two in a row, it heals on the next try").
+#[tokio::test]
+async fn a_single_stale_zero_does_not_end_the_tombstone_loop() {
+    let node = indexed(40, NodeOptions::new(CHAIN)).await;
+
+    let purger = Purger::new(
+        node.store.clone(),
+        node.writer.clone(),
+        node.recorder.clone(),
+        node.recorder.clone(),
+    )
+    .with_options(PurgeOptions {
+        tombstone_attempts: 4,
+        retry_delay: Duration::ZERO,
+    });
+
+    // The first children tombstone misses the upper half of the range -
+    // rows flushed a moment ago that its `SELECT` could not see yet ...
+    node.store.miss_children_once();
+    // ... and the count that follows it is served from before the write,
+    // so it says the range is clean while half of it is not.
+    node.store.stale_children_count_once();
+
+    purger
+        .purge_range(CHAIN, 10, Some(20), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+
+    let data = node.data();
+    let alive: usize = (0..2)
+        .map(|table| {
+            data.live_children(table)
+                .keys()
+                .filter(|(number, _)| (10..20).contains(number))
+                .count()
+        })
+        .sum();
+
+    assert_eq!(
+        alive, 0,
+        "a purge that saw one stale zero left rows alive and called \
+         itself finished"
+    );
+
+    // The test would pass by accident if the range had held nothing:
+    // outside it, the same blocks are still there.
+    assert!(data
+        .live_children(0)
+        .keys()
+        .any(|(number, _)| (20..40).contains(number)));
+}
+
 /// A [`ReorgStore`] scoped to one module (child table 1), the way the
 /// pipeline builds one for `indexer backfill --module dex`.
 struct ModuleStore {
@@ -1548,9 +1615,10 @@ async fn a_missing_block_time_does_not_repair_from_1970() {
     assert!(from_ts > 0);
     assert!(to_ts > from_ts);
 
-    // A store that does (the Solana one still takes `min(timestamp)`
-    // straight, and a node that omits `blockTime` stores 0): the window
-    // is clamped to the last day instead of arming the rule from 1970.
+    // A store that does: neither real store reports a bare 0 any more,
+    // so this is the last line of defence rather than the first. The
+    // window is clamped to the last day instead of arming the rule from
+    // 1970.
     let (clamped_from, clamped_to) =
         purge(FakeStore::with_min_ts_zero()).await;
     assert_eq!(clamped_to, to_ts, "the end of the window is unchanged");
