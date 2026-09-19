@@ -66,6 +66,20 @@ pub fn next_version() -> u64 {
     }
 }
 
+/// Never hand out a `_version` at or below `stored` again.
+///
+/// `next_version` is only monotonic INSIDE a process. After a restart on a
+/// host whose wall clock moved back (NTP step, VM snapshot, skewed
+/// container host) it would hand out versions BELOW the stored ones: the
+/// tombstones of a purge (version V) would then beat the canonical rows
+/// streamed afterwards (version V' < V), and the range would stay
+/// invisible until the clock passes V. So every process that writes seeds
+/// the counter with the highest version the chain has stored
+/// ([`Database::seed_version`]).
+pub fn seed_version(stored: u64) {
+    LAST_VERSION.fetch_max(stored, Ordering::Relaxed);
+}
+
 /// Attempts per table insert before the flush is reported as failed.
 const INSERT_ATTEMPTS: u32 = 6;
 const INSERT_BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -368,6 +382,21 @@ impl Database {
         Ok(database)
     }
 
+    /// A handle that was never connected, for the unit tests of the code
+    /// that only BUILDS statements (the purge's table lists and
+    /// predicates). Every query on it fails.
+    #[cfg(test)]
+    pub(crate) fn offline(chain_id: u64) -> Self {
+        let db = Client::default().with_url("http://127.0.0.1:1");
+        Self {
+            chain_id,
+            small: db.clone(),
+            db,
+            metrics: Metrics::disabled(),
+            epoch: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
     /// Same database, reporting rows / retries to `metrics`.
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = metrics;
@@ -382,6 +411,67 @@ impl Database {
     /// Adopts `epoch` (after a purge). Shared by every clone.
     pub fn set_epoch(&self, epoch: u32) {
         self.epoch.store(epoch, Ordering::SeqCst);
+    }
+
+    /// Seeds [`next_version`] from the highest `_version` stored for the
+    /// chain over `tables` (every table this process may write a newer
+    /// version of a row into). Read a few times: ClickHouse has no
+    /// read-your-writes, and the newest part is exactly what matters.
+    ///
+    /// Cost: one column per table, and `_version` compresses to almost
+    /// nothing (it is constant per flush). Once per process start.
+    pub async fn seed_version(&self, tables: &[&str]) -> Result<u64> {
+        const READS: u32 = 3;
+
+        let selects: Vec<String> = tables
+            .iter()
+            .map(|table| {
+                format!(
+                    "SELECT max(_version) AS v FROM `{table}` \
+                     WHERE chain = {}",
+                    self.chain_id
+                )
+            })
+            .collect();
+
+        let sql = format!(
+            "SELECT toUInt64(max(v)) FROM ({})",
+            selects.join(" UNION ALL ")
+        );
+
+        let mut stored = 0u64;
+        for read in 0..READS {
+            if read > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let seen: u64 = self
+                .db
+                .query(&sql)
+                .fetch_one()
+                .await
+                .context("query the highest stored _version")?;
+            stored = stored.max(seen);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+
+        if stored > now {
+            warn!(
+                "Chain {}: the newest stored row version is {} ms AHEAD of \
+                 this host's clock (the clock stepped back, or another \
+                 host's clock is ahead). New rows continue from the stored \
+                 version, so nothing is hidden.",
+                self.chain_id,
+                stored - now
+            );
+        }
+
+        seed_version(stored);
+
+        Ok(stored)
     }
 
     /// The chain's current purge generation: `max(epoch)` of its `reorgs`
@@ -891,6 +981,20 @@ mod tests {
             key.token("logs"),
             FlushKey { version: 1_235, ..key }.token("logs")
         );
+    }
+
+    #[test]
+    fn a_seed_from_the_future_is_never_undercut() {
+        let ahead = next_version() + 86_400_000;
+
+        seed_version(ahead);
+        let next = next_version();
+        assert!(next > ahead, "{next} <= {ahead}");
+        assert!(next_version() > next);
+
+        // A lower seed changes nothing.
+        seed_version(1);
+        assert!(next_version() > next);
     }
 
     #[test]

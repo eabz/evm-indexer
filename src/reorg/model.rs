@@ -254,6 +254,40 @@ impl CanonicalChain for FakeChain {
 /// partition.
 pub const PARTITION_SECONDS: u32 = 30 * 86_400;
 
+/// The `_version` clock of one process: `db::next_version()` with a wall
+/// clock that can be set BACK (NTP step, VM snapshot, skewed container
+/// host) and the seed a process reads from the database at startup.
+#[derive(Debug)]
+pub struct ModelClock {
+    /// How far behind the real clock this process' wall clock is.
+    behind: u64,
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl ModelClock {
+    pub fn new(behind: u64, seed: u64) -> Arc<Self> {
+        Arc::new(Self {
+            behind,
+            last: std::sync::atomic::AtomicU64::new(seed),
+        })
+    }
+
+    /// Strictly increasing within the process, never below the seed.
+    pub fn next(&self) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let wall = next_version().saturating_sub(self.behind);
+        let mut last = self.last.load(SeqCst);
+        loop {
+            let next = wall.max(last + 1);
+            match self.last.compare_exchange(last, next, SeqCst, SeqCst) {
+                Ok(_) => return next,
+                Err(current) => last = current,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row<T> {
     pub version: u64,
@@ -264,13 +298,15 @@ pub struct Row<T> {
 }
 
 /// `SELECT .. FINAL`: per partition the newest version, unless it is a
-/// tombstone.
+/// tombstone. With EQUAL versions ClickHouse keeps the row inserted LAST
+/// (measured on 25.12: tombstone last -> gone, canonical last -> alive,
+/// also after `OPTIMIZE FINAL`); `versions` is in insertion order.
 pub fn live<T>(versions: &[Row<T>]) -> Vec<&Row<T>> {
     let mut newest: BTreeMap<u32, &Row<T>> = BTreeMap::new();
     for row in versions {
         let partition = row.timestamp / PARTITION_SECONDS;
         match newest.get(&partition) {
-            Some(current) if current.version >= row.version => {}
+            Some(current) if current.version > row.version => {}
             _ => {
                 newest.insert(partition, row);
             }
@@ -316,6 +352,15 @@ pub type ChildRows = BTreeMap<(u64, u32), Vec<Row<u64>>>;
 pub struct ChainData {
     pub blocks: BTreeMap<u64, Vec<Row<B256>>>,
     pub children: [ChildRows; CHILD_TABLES],
+    /// READ-PATH SIDE TABLES: one mirror per child table, plus one fed
+    /// from `blocks` (the model's `block_lookup`). Written ONLY by the
+    /// materialized view of their base table - which passes `_version`
+    /// and `is_deleted` through, so a tombstone in the base table
+    /// normally kills the mirror row for free. A push that gets LOST
+    /// leaves an orphan nothing else can ever remove, which is what
+    /// [`ReorgStore::tombstone_side_rows`] repairs.
+    pub side_children: [ChildRows; CHILD_TABLES],
+    pub side_blocks: BTreeMap<u64, Vec<Row<B256>>>,
     pub checkpoints: BTreeMap<(u64, u64), Vec<Row<()>>>,
     pub reorgs: Vec<ReorgRecord>,
     /// `(aggregate, bucket, epoch)` -> `(count, sum)`.
@@ -323,6 +368,21 @@ pub struct ChainData {
 }
 
 impl ChainData {
+    /// `max(_version)` over every block scoped table and the checkpoints:
+    /// what a starting process seeds its version clock with.
+    pub fn max_version(&self) -> u64 {
+        let blocks = self.blocks.values().flatten().map(|r| r.version);
+        let children = self
+            .children
+            .iter()
+            .flat_map(|table| table.values().flatten())
+            .map(|r| r.version);
+        let checkpoints =
+            self.checkpoints.values().flatten().map(|r| r.version);
+
+        blocks.chain(children).chain(checkpoints).max().unwrap_or(0)
+    }
+
     fn add(&mut self, agg: Agg, ts: u32, epoch: u32, value: u64) {
         let entry =
             self.aggs.entry((agg, agg.bucket(ts), epoch)).or_default();
@@ -372,6 +432,27 @@ impl ChainData {
             .collect()
     }
 
+    pub fn live_side_children(
+        &self,
+        table: usize,
+    ) -> BTreeMap<(u64, u32), Vec<u64>> {
+        self.side_children[table]
+            .iter()
+            .map(|(k, v)| (*k, live(v).iter().map(|r| r.data).collect()))
+            .filter(|(_, values): &((u64, u32), Vec<u64>)| {
+                !values.is_empty()
+            })
+            .collect()
+    }
+
+    pub fn live_side_blocks(&self) -> BTreeMap<u64, Vec<B256>> {
+        self.side_blocks
+            .iter()
+            .map(|(n, v)| (*n, live(v).iter().map(|r| r.data).collect()))
+            .filter(|(_, hashes): &(u64, Vec<B256>)| !hashes.is_empty())
+            .collect()
+    }
+
     pub fn live_checkpoints(&self) -> Vec<(u64, u64)> {
         self.checkpoints
             .iter()
@@ -403,6 +484,9 @@ struct StoreState {
     lag: Option<Rng>,
     /// The next `current_epoch` read misses the newest `reorgs` row.
     stale_epoch_once: bool,
+    /// The next tombstone of a base table does NOT reach its side table:
+    /// the base part landed and the materialized view push did not.
+    lose_side_push: u32,
     /// `live_children` never reaches 0 (somebody else keeps writing).
     children_never_die: bool,
     /// The next children tombstone statement misses the upper half of the
@@ -462,9 +546,12 @@ impl StoreState {
 pub struct FakeStore {
     state: Mutex<StoreState>,
     /// NEGATIVE CONTROLS, to show the subtleties matter: compute `from_ts`
-    /// over live rows only / look for live orphans only.
+    /// over live rows only / look for live orphans only / trust the
+    /// materialized views instead of verifying the side tables (what the
+    /// purge did before this step existed).
     min_ts_live_only: bool,
     orphans_live_only: bool,
+    trust_the_views: bool,
 }
 
 fn in_range(number: u64, from: u64, to: Option<u64>) -> bool {
@@ -499,6 +586,12 @@ impl FakeStore {
         self.state.lock().unwrap().children_never_die = true;
     }
 
+    /// The next `times` tombstone statements land in their base table
+    /// WITHOUT reaching the side tables.
+    pub fn lose_side_push(&self, times: u32) {
+        self.state.lock().unwrap().lose_side_push = times;
+    }
+
     pub fn lagged_reads(&self) -> u64 {
         self.state.lock().unwrap().lagged_reads
     }
@@ -516,6 +609,13 @@ impl FakeStore {
     /// NEGATIVE CONTROL: only live rows count as orphans.
     pub fn with_orphans_live_only() -> Arc<Self> {
         Arc::new(Self { orphans_live_only: true, ..Self::default() })
+    }
+
+    /// NEGATIVE CONTROL: the purge trusts the materialized views and never
+    /// looks at the side tables (`live_side_rows` says 0,
+    /// `tombstone_side_rows` writes nothing).
+    pub fn with_trusted_views() -> Arc<Self> {
+        Arc::new(Self { trust_the_views: true, ..Self::default() })
     }
 
     /// The next time `chain` reaches `step`, fail (once).
@@ -556,6 +656,7 @@ impl FakeStore {
                 | PurgeStep::InsertReorg
                 | PurgeStep::RebuildDerived
                 | PurgeStep::TombstoneBlocks
+                | PurgeStep::TombstoneSideTables
         );
         state.journal.entry(chain).or_default().push(step);
         match state.faults.get(&chain).copied() {
@@ -578,7 +679,11 @@ impl FakeStore {
         let mut state = self.state.lock().unwrap();
         let data = state.write(chain);
         data.blocks.retain(|number, _| !in_range(*number, from, Some(to)));
-        for table in data.children.iter_mut() {
+        data.side_blocks
+            .retain(|number, _| !in_range(*number, from, Some(to)));
+        for table in
+            data.children.iter_mut().chain(data.side_children.iter_mut())
+        {
             table.retain(|(number, _), _| {
                 !in_range(*number, from, Some(to))
             });
@@ -599,6 +704,8 @@ impl FakeStore {
         let step = PurgeStep::TombstoneChildren;
         let partial = Self::enter(&mut state, chain, step)?;
         let missing = std::mem::take(&mut state.miss_children_once);
+        let lose_push = state.lose_side_push > 0;
+        state.lose_side_push = state.lose_side_push.saturating_sub(1);
         let view = state.view(chain);
         let data = state.write(chain);
 
@@ -611,6 +718,10 @@ impl FakeStore {
             .collect();
         let middle =
             affected.iter().nth(affected.len() / 2).copied().unwrap_or(0);
+
+        // The materialized view of a base table sees the tombstone insert
+        // and pushes it on - unless this push is the one that gets lost.
+        let pushes = if lose_push { None } else { Some(()) };
 
         let mut count = 0;
         for (index, table) in view.children.iter().enumerate() {
@@ -626,6 +737,12 @@ impl FakeStore {
                 }
                 let dead = dead_copies(versions, version);
                 count += dead.len() as u64;
+                if pushes.is_some() {
+                    data.side_children[index]
+                        .entry(*key)
+                        .or_default()
+                        .extend(dead.clone());
+                }
                 data.children[index].entry(*key).or_default().extend(dead);
             }
         }
@@ -634,6 +751,44 @@ impl FakeStore {
             return Err(injected(step));
         }
         Ok(count)
+    }
+
+    /// `tombstone_side_rows`, restricted to some child mirrors (a module
+    /// scoped store only owns its own read path).
+    pub fn tombstone_side_rows_of(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+        tables: &[usize],
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        let tables = tables.to_vec();
+        async move {
+            let mut state = self.state.lock().unwrap();
+            let step = PurgeStep::TombstoneSideTables;
+            Self::enter(&mut state, chain, step)?;
+            let view = state.view(chain);
+            let data = state.write(chain);
+            let mut count = 0;
+
+            for index in tables {
+                for (key, versions) in &view.side_children[index] {
+                    if !in_range(key.0, from, to) {
+                        continue;
+                    }
+                    let dead = dead_copies(versions, version);
+                    count += dead.len() as u64;
+                    data.side_children[index]
+                        .entry(*key)
+                        .or_default()
+                        .extend(dead);
+                }
+            }
+
+            Ok(count)
+        }
+        .boxed()
     }
 
     /// `rebuild_derived`; the aggregates in `keep_range_for` count the
@@ -739,16 +894,21 @@ impl FakeStore {
             let timestamp = block.header.timestamp;
             for (table, values) in block.children.iter().enumerate() {
                 for (index, value) in values.iter().enumerate() {
+                    let row = Row {
+                        version,
+                        deleted: false,
+                        epoch,
+                        timestamp,
+                        data: *value,
+                    };
                     data.children[table]
                         .entry((block.header.number, index as u32))
                         .or_default()
-                        .push(Row {
-                            version,
-                            deleted: false,
-                            epoch,
-                            timestamp,
-                            data: *value,
-                        });
+                        .push(row.clone());
+                    data.side_children[table]
+                        .entry((block.header.number, index as u32))
+                        .or_default()
+                        .push(row);
                     data.add(Agg::child(table), timestamp, epoch, *value);
                 }
             }
@@ -770,16 +930,21 @@ impl FakeStore {
             let timestamp = block.header.timestamp;
             for (index, value) in block.children[table].iter().enumerate()
             {
+                let row = Row {
+                    version,
+                    deleted: false,
+                    epoch,
+                    timestamp,
+                    data: *value,
+                };
                 data.children[table]
                     .entry((block.header.number, index as u32))
                     .or_default()
-                    .push(Row {
-                        version,
-                        deleted: false,
-                        epoch,
-                        timestamp,
-                        data: *value,
-                    });
+                    .push(row.clone());
+                data.side_children[table]
+                    .entry((block.header.number, index as u32))
+                    .or_default()
+                    .push(row);
                 data.add(Agg::child(table), timestamp, epoch, *value);
             }
         }
@@ -796,13 +961,18 @@ impl FakeStore {
         let data = state.write(chain);
         for block in blocks {
             let header = block.header;
-            data.blocks.entry(header.number).or_default().push(Row {
+            let row = Row {
                 version,
                 deleted: false,
                 epoch,
                 timestamp: header.timestamp,
                 data: header.hash,
-            });
+            };
+            data.blocks
+                .entry(header.number)
+                .or_default()
+                .push(row.clone());
+            data.side_blocks.entry(header.number).or_default().push(row);
             data.add(
                 Agg::BlocksDaily,
                 header.timestamp,
@@ -1023,6 +1193,88 @@ impl ReorgStore for FakeStore {
         .boxed()
     }
 
+    fn live_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        async move {
+            let mut state = self.state.lock().unwrap();
+            Self::enter(&mut state, chain, PurgeStep::Verify)?;
+            if self.trust_the_views {
+                return Ok(0);
+            }
+            let view = state.view(chain);
+            let children: u64 = view
+                .side_children
+                .iter()
+                .flat_map(|table| table.iter())
+                .filter(|((number, _), _)| in_range(*number, from, to))
+                .map(|(_, versions)| live(versions).len() as u64)
+                .sum();
+            let blocks: u64 = view
+                .side_blocks
+                .iter()
+                .filter(|(number, _)| in_range(**number, from, to))
+                .map(|(_, versions)| live(versions).len() as u64)
+                .sum();
+            Ok(children + blocks)
+        }
+        .boxed()
+    }
+
+    fn tombstone_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        async move {
+            let mut state = self.state.lock().unwrap();
+            let step = PurgeStep::TombstoneSideTables;
+            // Partial: only the child mirrors, not the `blocks` mirror.
+            let partial = Self::enter(&mut state, chain, step)?;
+            if self.trust_the_views {
+                return Ok(0);
+            }
+            let view = state.view(chain);
+            let data = state.write(chain);
+            let mut count = 0;
+
+            for (index, table) in view.side_children.iter().enumerate() {
+                for (key, versions) in table {
+                    if !in_range(key.0, from, to) {
+                        continue;
+                    }
+                    let dead = dead_copies(versions, version);
+                    count += dead.len() as u64;
+                    data.side_children[index]
+                        .entry(*key)
+                        .or_default()
+                        .extend(dead);
+                }
+            }
+
+            if partial {
+                return Err(injected(step));
+            }
+
+            for (number, versions) in &view.side_blocks {
+                if !in_range(*number, from, to) {
+                    continue;
+                }
+                let dead = dead_copies(versions, version);
+                count += dead.len() as u64;
+                data.side_blocks.entry(*number).or_default().extend(dead);
+            }
+
+            Ok(count)
+        }
+        .boxed()
+    }
+
     fn live_checkpoints(
         &self,
         chain: u64,
@@ -1169,6 +1421,8 @@ impl ReorgStore for FakeStore {
             let step = PurgeStep::TombstoneBlocks;
             // Partial: every other block dies.
             let partial = Self::enter(&mut state, chain, step)?;
+            let lose_push = state.lose_side_push > 0;
+            state.lose_side_push = state.lose_side_push.saturating_sub(1);
             let view = state.view(chain);
             let data = state.write(chain);
 
@@ -1182,6 +1436,12 @@ impl ReorgStore for FakeStore {
                 }
                 let dead = dead_copies(versions, version);
                 count += dead.len() as u64;
+                if !lose_push {
+                    data.side_blocks
+                        .entry(*number)
+                        .or_default()
+                        .extend(dead.clone());
+                }
                 data.blocks.entry(*number).or_default().extend(dead);
             }
 
@@ -1227,6 +1487,7 @@ struct WriterState {
 pub struct FakeWriter {
     chain: u64,
     store: Arc<FakeStore>,
+    clock: Arc<ModelClock>,
     /// `quiesce` drops the buffer instead of flushing it.
     discard_on_quiesce: bool,
     /// `quiesce` returns without making sure its flush can be read back
@@ -1239,12 +1500,14 @@ impl FakeWriter {
     pub fn new(
         chain: u64,
         store: Arc<FakeStore>,
+        clock: Arc<ModelClock>,
         discard_on_quiesce: bool,
         sloppy: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             chain,
             store,
+            clock,
             discard_on_quiesce,
             sloppy,
             state: Mutex::new(WriterState {
@@ -1298,7 +1561,7 @@ impl FakeWriter {
 
         assert_ne!(epoch, u32::MAX, "the writer never adopted an epoch");
 
-        let version = next_version();
+        let version = self.clock.next();
         self.store.insert_children(self.chain, &blocks, epoch, version);
 
         let written: Vec<FakeBlock> = match fault {
@@ -1411,6 +1674,9 @@ pub struct NodeOptions {
     pub stream_guards: bool,
     pub check_tip: bool,
     pub sloppy_writer: bool,
+    /// A starting process seeds its `_version` clock from the store
+    /// (`false` = the bug of review round 2, for the negative control).
+    pub seed_versions: bool,
 }
 
 impl NodeOptions {
@@ -1427,6 +1693,7 @@ impl NodeOptions {
             stream_guards: true,
             check_tip: false,
             sloppy_writer: false,
+            seed_versions: true,
         }
     }
 }
@@ -1448,6 +1715,9 @@ pub struct Node {
     pub writer: Arc<FakeWriter>,
     pub recorder: Arc<Recorder>,
     pub guard: ReorgGuard,
+    /// How far behind the real clock the wall clock of the CURRENT process
+    /// is (grows with every `restart_with_clock_step_back`).
+    clock_behind: u64,
     cursor: u64,
     started: bool,
     pub rollbacks: Vec<super::Rollback>,
@@ -1461,7 +1731,7 @@ impl Node {
     ) -> Self {
         let recorder = Arc::new(Recorder::default());
         let (writer, guard) =
-            Self::boot(&options, &chain, &store, &recorder);
+            Self::boot(&options, &chain, &store, &recorder, 0);
         Self {
             options,
             chain,
@@ -1469,6 +1739,7 @@ impl Node {
             writer,
             recorder,
             guard,
+            clock_behind: 0,
             cursor: options.start_block,
             started: false,
             rollbacks: Vec::new(),
@@ -1480,10 +1751,20 @@ impl Node {
         chain: &Arc<FakeChain>,
         store: &Arc<FakeStore>,
         recorder: &Arc<Recorder>,
+        clock_behind: u64,
     ) -> (Arc<FakeWriter>, ReorgGuard) {
+        // What `Database::seed_version` does at startup.
+        let seed = if options.seed_versions {
+            store.snapshot(options.chain_id).max_version()
+        } else {
+            0
+        };
+        let clock = ModelClock::new(clock_behind, seed);
+
         let writer = FakeWriter::new(
             options.chain_id,
             store.clone(),
+            clock.clone(),
             options.discard_on_quiesce,
             options.sloppy_writer,
         );
@@ -1493,6 +1774,7 @@ impl Node {
             recorder.clone(),
             recorder.clone(),
         )
+        .with_version_source(Arc::new(move || clock.next()))
         .with_options(PurgeOptions {
             tombstone_attempts: 6,
             retry_delay: Duration::ZERO,
@@ -1506,6 +1788,13 @@ impl Node {
         (writer.clone(), ReorgGuard::new(config, chain.clone(), purger))
     }
 
+    /// The process died, and the wall clock of the host it comes back on
+    /// is `step_back` version units (ms) behind where it was.
+    pub fn restart_with_clock_step_back(&mut self, step_back: u64) {
+        self.clock_behind = self.clock_behind.saturating_add(step_back);
+        self.restart();
+    }
+
     /// The process died: buffered rows and every in-memory state are gone.
     pub fn restart(&mut self) {
         let (writer, guard) = Self::boot(
@@ -1513,6 +1802,7 @@ impl Node {
             &self.chain,
             &self.store,
             &self.recorder,
+            self.clock_behind,
         );
         self.writer = writer;
         self.guard = guard;
@@ -1738,6 +2028,21 @@ pub fn check_clean(node: &Node) -> Result<(), String> {
         if data.live_children(table) != clean.live_children(table) {
             return Err(format!("child table {table} differs"));
         }
+        // A side table is a mirror: an orphan there is invisible in every
+        // base table and permanent (nothing rewrites it).
+        if data.live_side_children(table) != clean.live_children(table) {
+            return Err(format!(
+                "side table of child {table} differs from the canonical \
+                 chain (a materialized view push was lost and never \
+                 repaired)"
+            ));
+        }
+    }
+    if data.live_side_blocks() != clean.live_blocks() {
+        return Err(
+            "the `blocks` side table differs from the canonical chain"
+                .to_string(),
+        );
     }
     if data.aggregates() != clean.aggregates() {
         return Err(format!(

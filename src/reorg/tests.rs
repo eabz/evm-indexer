@@ -8,12 +8,12 @@
 use super::{
     find_fork_point,
     model::{
-        assert_checkpoints_honest, assert_clean, check_clean, Agg,
+        assert_checkpoints_honest, assert_clean, check_clean, live, Agg,
         FakeChain, FakeStore, FlushFault, Node, NodeOptions, PassOutcome,
-        Rng,
+        Rng, Row,
     },
-    BlockHeader, CanonicalChain, PurgeReason, PurgeStep, ReorgConfig,
-    ReorgError, ReorgStore, StreamGuard, Verdict,
+    BlockHeader, CanonicalChain, PurgeOptions, PurgeReason, PurgeStep,
+    Purger, ReorgConfig, ReorgError, ReorgStore, StreamGuard, Verdict,
 };
 use alloy::primitives::B256;
 use futures::{future::BoxFuture, FutureExt};
@@ -390,8 +390,12 @@ async fn purge_steps_run_in_the_documented_order() {
             PurgeStep::MinTimestamp,
             PurgeStep::InsertReorg,
             PurgeStep::RebuildDerived,
-            // The commit marker is the last write.
+            // The commit marker is the last write of the base tables.
             PurgeStep::TombstoneBlocks,
+            PurgeStep::Verify,
+            // After it, so the mirror of `blocks` is covered too. Writes
+            // nothing when the materialized views did their job.
+            PurgeStep::TombstoneSideTables,
             PurgeStep::Verify,
         ]
     );
@@ -781,6 +785,139 @@ async fn a_guard_purge_that_reads_nothing_is_not_reported_as_done() {
     assert!(node.data().reorgs.is_empty());
 }
 
+// --------------------------------------------------- side table orphans
+
+/// A side table is written ONLY by the materialized view of its base
+/// table. If the base part lands and the push into one of its views does
+/// not (a failure between the parts, a process killed mid insert), the
+/// base row is dead and the mirror row stays alive FOR EVER: nothing else
+/// ever rewrites it, and every reader of that access path keeps seeing a
+/// transaction / swap of an abandoned fork.
+///
+/// So the purge verifies the side tables after the base tables and repairs
+/// them by tombstoning them directly.
+#[tokio::test]
+async fn a_lost_materialized_view_push_is_repaired_by_the_purge() {
+    let mut node = indexed(60, NodeOptions::new(CHAIN)).await;
+
+    // Every tombstone statement of the coming purge lands in its base
+    // table without reaching the mirrors.
+    node.store.lose_side_push(20);
+    node.chain.reorg(5, 6);
+
+    node.settle(false).await.unwrap();
+
+    // The base tables alone would look perfect.
+    let data = node.data();
+    let clean = super::model::clean_index(&node.chain, 0, node.target());
+    assert_eq!(data.live_blocks(), clean.live_blocks());
+
+    // And the mirrors are clean too, because the purge repaired them.
+    assert_clean(&node, "after a lost view push");
+}
+
+/// NEGATIVE CONTROL: a purge that trusts its materialized views (what this
+/// one did before the repair step existed) leaves the orphans behind, and
+/// no later pass ever notices.
+#[tokio::test]
+async fn trusting_the_views_leaves_permanent_orphans() {
+    let chain = FakeChain::new(CHAIN + 7, 20_000);
+    chain.extend(59);
+    let mut node = Node::new(
+        NodeOptions::new(CHAIN),
+        chain,
+        FakeStore::with_trusted_views(),
+    );
+    node.settle(false).await.unwrap();
+    assert_clean(&node, "initial index");
+
+    node.store.lose_side_push(20);
+    node.chain.reorg(5, 6);
+    node.settle(false).await.unwrap();
+
+    let problem = check_clean(&node)
+        .expect_err("the orphaned mirror rows must be visible");
+    assert!(problem.contains("side table"), "{problem}");
+
+    // Running for ever does not help: nothing rewrites a mirror row.
+    node.settle(false).await.unwrap();
+    assert!(check_clean(&node).is_err());
+}
+
+/// The repair is part of the purge, so a crash inside it is healed like
+/// any other step: the range is purged again and converges.
+#[tokio::test]
+async fn a_crash_inside_the_side_table_repair_converges() {
+    for partial in [false, true] {
+        let mut node = indexed(60, NodeOptions::new(CHAIN)).await;
+
+        node.store.lose_side_push(20);
+        node.store.fail_at(CHAIN, PurgeStep::TombstoneSideTables, partial);
+        node.chain.reorg(4, 5);
+
+        node.settle(true).await.unwrap();
+
+        assert!(
+            !node.store.fault_pending(CHAIN),
+            "partial = {partial}: the fault never fired"
+        );
+        assert_clean(&node, &format!("partial = {partial}"));
+    }
+}
+
+/// A module scoped purge (`indexer backfill --module ...`) repairs the
+/// module's OWN read path and touches nobody else's.
+#[tokio::test]
+async fn a_module_purge_repairs_only_its_own_side_tables() {
+    let node = indexed(40, NodeOptions::new(CHAIN)).await;
+    node.store.lose_side_push(20);
+
+    let store = Arc::new(ModuleStore {
+        inner: node.store.clone(),
+        rebuild_like_a_rollback: false,
+    });
+    let purger = Purger::new(
+        store,
+        node.writer.clone(),
+        node.recorder.clone(),
+        node.recorder.clone(),
+    )
+    .with_options(PurgeOptions {
+        tombstone_attempts: 4,
+        retry_delay: Duration::ZERO,
+    });
+
+    let report = purger
+        .purge_range(CHAIN, 10, Some(20), PurgeReason::Redecode)
+        .await
+        .unwrap();
+
+    let data = node.data();
+    let in_range = |(number, _): &&(u64, u32)| (10..20).contains(number);
+
+    // The module's own mirror follows its (tombstoned) base rows ...
+    assert!(report.children_tombstoned > 0);
+    assert_eq!(
+        data.live_side_children(1).keys().filter(in_range).count(),
+        0
+    );
+    // ... and the other module's mirror is untouched, because its base
+    // rows are untouched.
+    assert_eq!(
+        data.live_side_children(0).keys().filter(in_range).count(),
+        data.live_children(0).keys().filter(in_range).count()
+    );
+    assert!(data.live_children(0).keys().any(|key| in_range(&key)));
+
+    // `blocks` and its mirror are never touched by a module purge.
+    assert_eq!(data.live_side_blocks(), data.live_blocks());
+
+    // Outside the purged range the module's mirror still matches its base
+    // table exactly: the repair is scoped to the range, like everything
+    // else in a purge.
+    assert_eq!(data.live_side_children(1), data.live_children(1));
+}
+
 // ---------------------------------------------------------- re-decoding
 
 /// A [`ReorgStore`] scoped to one module (child table 1), the way the
@@ -849,6 +986,35 @@ impl ReorgStore for ModuleStore {
                 .count() as u64)
         }
         .boxed()
+    }
+
+    /// The module's own side tables. `FakeStore` mirrors child table 1
+    /// in `side_children[1]`, which is exactly the module's read path.
+    fn live_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        async move {
+            let data = self.inner.snapshot(chain);
+            Ok(data
+                .live_side_children(1)
+                .keys()
+                .filter(|(n, _)| *n >= from && to.is_none_or(|to| *n < to))
+                .count() as u64)
+        }
+        .boxed()
+    }
+
+    fn tombstone_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        self.inner.tombstone_side_rows_of(chain, from, to, version, &[1])
     }
 
     fn live_blocks(
@@ -1268,6 +1434,73 @@ async fn orphans_above_a_chain_that_got_shorter_are_healed() {
     assert_clean(&node, "orphans above the head");
 }
 
+/// A host whose wall clock stepped back (NTP, VM snapshot): the process
+/// that starts on it must not hand out `_version`s below the stored ones,
+/// or the tombstones of its purge (version V) would beat the canonical
+/// rows streamed afterwards (version V' < V) and the range would stay
+/// invisible until the clock catches up.
+#[tokio::test]
+async fn a_clock_that_stepped_back_never_writes_below_the_stored_versions()
+{
+    let mut node = indexed(30, NodeOptions::new(CHAIN)).await;
+    let stored = node.data().max_version();
+
+    node.restart_with_clock_step_back(3_600_000);
+    node.chain.reorg(4, 6);
+    node.settle(false).await.unwrap();
+
+    assert_clean(&node, "after a rollback on a host with a late clock");
+    assert!(node.data().reorgs[0].epoch == 1);
+
+    // Every row written since is newer than everything stored before.
+    let data = node.data();
+    let newest_block = data.live_blocks().into_keys().max().unwrap();
+    assert!(data.blocks[&newest_block]
+        .iter()
+        .all(|row| row.version > stored));
+}
+
+/// Negative control: without the seed the same history ends with rows a
+/// reader can not see.
+#[tokio::test]
+async fn without_the_version_seed_a_late_clock_hides_the_new_fork() {
+    let options =
+        NodeOptions { seed_versions: false, ..NodeOptions::new(CHAIN) };
+    let mut node = indexed(30, options).await;
+
+    // First a rollback with the healthy clock: tombstones at "now".
+    node.chain.reorg(4, 6);
+    node.settle(false).await.unwrap();
+    assert_clean(&node, "healthy clock");
+
+    // Then the clock steps back and the same heights are rolled back
+    // again: the re-streamed rows are older than the first tombstones.
+    node.restart_with_clock_step_back(3_600_000);
+    node.chain.reorg(4, 6);
+    let _ = node.settle(false).await;
+
+    assert!(
+        check_clean(&node).is_err(),
+        "the model no longer reproduces the version regression"
+    );
+}
+
+/// Equal versions: ClickHouse keeps the row inserted LAST.
+#[test]
+fn final_keeps_the_last_inserted_row_of_equal_versions() {
+    let row = |deleted| Row {
+        version: 7,
+        deleted,
+        epoch: 0,
+        timestamp: 0,
+        data: 1u64,
+    };
+
+    // Tombstone last: gone. Canonical last: alive.
+    assert!(live(&[row(false), row(true)]).is_empty());
+    assert_eq!(live(&[row(true), row(false)]).len(), 1);
+}
+
 #[tokio::test]
 async fn the_epoch_survives_restarts_and_failed_purges() {
     let mut node = indexed(40, NodeOptions::new(CHAIN)).await;
@@ -1301,6 +1534,7 @@ struct Tally {
     gap_heals: u64,
     faults_hit: u64,
     lagged_reads: u64,
+    clock_regressions: u64,
 }
 
 fn random_options(rng: &mut Rng, chain_id: u64) -> NodeOptions {
@@ -1316,6 +1550,7 @@ fn random_options(rng: &mut Rng, chain_id: u64) -> NodeOptions {
         stream_guards: rng.chance(50),
         check_tip: rng.chance(50),
         sloppy_writer: rng.chance(50),
+        seed_versions: true,
     }
 }
 
@@ -1368,7 +1603,19 @@ async fn random_operation(
             node.chain
                 .reorg_after_calls(rng.between(1, 6), rng.between(1, 4));
         }
-        _ => node.restart(),
+        _ => {
+            // Half of the restarts come back on a host whose clock is
+            // behind (up to an hour): without the version seed the new
+            // process would write BELOW the stored versions.
+            if rng.chance(50) {
+                node.restart_with_clock_step_back(
+                    rng.between(1, 3_600_000),
+                );
+                tally.clock_regressions += 1;
+            } else {
+                node.restart();
+            }
+        }
     }
 
     let faulty = node.store.fault_pending(chain_id);
@@ -1434,6 +1681,7 @@ async fn random_histories_always_settle_to_a_clean_index() {
         gap_heals: 0,
         faults_hit: 0,
         lagged_reads: 0,
+        clock_regressions: 0,
     };
 
     for seed in 1..=400u64 {
@@ -1472,6 +1720,7 @@ async fn random_histories_always_settle_to_a_clean_index() {
 
     // The generator must actually exercise what it claims to.
     assert!(tally.lagged_reads > 1_000);
+    assert!(tally.clock_regressions > 100);
     assert!(tally.rollbacks > 400);
     assert!(tally.gap_heals > 100);
     assert!(tally.faults_hit > 100);
@@ -1487,6 +1736,7 @@ async fn chains_sharing_a_store_never_affect_each_other() {
         gap_heals: 0,
         faults_hit: 0,
         lagged_reads: 0,
+        clock_regressions: 0,
     };
 
     for seed in 1..=60u64 {

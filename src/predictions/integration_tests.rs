@@ -31,7 +31,7 @@ use crate::{
     predictions::{
         cookbook::{self, Recipe},
         decode,
-        derived::render_rebuild,
+        derived::rebuild_statements,
         fixtures::{self, address, hash, Place, RawTx},
         models::{PredictionVenue, Protocol, RowSource, VERSION_RPC},
         PredictionRows, BASE_TABLES, PREDICTIONS_DERIVED,
@@ -66,6 +66,12 @@ struct TestDb {
     admin: Client,
     client: Client,
     name: String,
+    /// Request parameters of the cookbook queries, BOUND (sent beside the
+    /// statement as `param_x=`), never spliced into its text - that is
+    /// what the cookbook promises and what these tests have to exercise.
+    /// ClickHouse ignores a parameter a query does not use, so one set
+    /// covers every screen.
+    params: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl TestDb {
@@ -101,12 +107,32 @@ impl TestDb {
         migrate::run(target.as_str()).await.unwrap();
 
         let client = admin.clone().with_database(&name);
-        Self { admin, client, name }
+        Self {
+            admin,
+            client,
+            name,
+            params: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Replaces the bound parameters used by every following query.
+    fn set(&self, params: &[(&str, &str)]) {
+        *self.params.lock().unwrap() = params
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+    }
+
+    fn query(&self, sql: &str) -> clickhouse::query::Query {
+        let mut query = self.client.query(&sql.replace('?', "??"));
+        for (name, value) in self.params.lock().unwrap().iter() {
+            query = query.param(name, value.as_str());
+        }
+        query
     }
 
     async fn execute(&self, sql: &str) {
-        self.client
-            .query(&sql.replace('?', "??"))
+        self.query(sql)
             .execute()
             .await
             .unwrap_or_else(|error| panic!("{error}\n{sql}"));
@@ -116,8 +142,7 @@ impl TestDb {
     where
         T: clickhouse::RowOwned + clickhouse::RowRead,
     {
-        self.client
-            .query(&sql.replace('?', "??"))
+        self.query(sql)
             .fetch_all::<T>()
             .await
             .unwrap_or_else(|error| panic!("{error}\n{sql}"))
@@ -180,6 +205,44 @@ impl TestDb {
         .await;
     }
 
+    /// What the OPERATOR populates: the contracts it believes. The
+    /// indexer ships no address list, and the headline views count
+    /// nothing else - an empty `prediction_trusted` means empty screens
+    /// (README, "Trusted emitters"), which is why every test that reads a
+    /// headline view has to do this first.
+    async fn trust(&self, registry: &str, exchanges: &[&str]) {
+        self.execute(&format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) \
+             VALUES ({CHAIN}, 'registry', unhex('{0}'), unhex('{0}'))",
+            id32_hex(registry)
+        ))
+        .await;
+
+        for exchange in exchanges {
+            self.execute(&format!(
+                "INSERT INTO prediction_trusted (chain, kind, address, registry) \
+                 VALUES ({CHAIN}, 'exchange', unhex('{}'), unhex('{}'))",
+                id32_hex(exchange),
+                id32_hex(registry)
+            ))
+            .await;
+        }
+    }
+
+    /// The adapters that acted for a user on `registry`, as an operator
+    /// would add them after reading `prediction_position_events`. They are
+    /// the funding side of the leaderboard.
+    async fn trust_adapters(&self, registry: &str) {
+        self.execute(&format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) \
+             SELECT DISTINCT chain, 'adapter', emitter, unhex('{}') \
+             FROM prediction_position_events FINAL \
+             WHERE chain = {CHAIN} AND is_deleted = 0",
+            id32_hex(registry)
+        ))
+        .await;
+    }
+
     /// What the venue worker would have stored.
     async fn venue(&self, exchange: &str, collateral: &str) {
         self.write(
@@ -202,8 +265,14 @@ impl TestDb {
     async fn refresh_markets(&self) {
         let started =
             self.count("SELECT toUInt64(toUnixTimestamp(now()))").await;
+        // The list holds the TRUSTED markets only (0020), so that is what
+        // a finished refresh has to contain.
         let markets = self
-            .count("SELECT count() FROM prediction_markets_live_v")
+            .count(
+                "SELECT count() FROM prediction_markets_live_v \
+                 WHERE (chain, registry) IN ( \
+                 SELECT chain, registry FROM prediction_trusted_registries_v)",
+            )
             .await;
 
         self.execute("SYSTEM REFRESH VIEW prediction_market_list").await;
@@ -250,15 +319,19 @@ impl TestDb {
         ))
         .await;
 
+        // Month chunked, like the pipeline must run it: one INSERT over
+        // more than 100 monthly partitions is refused by ClickHouse.
         for table in PREDICTIONS_DERIVED {
-            self.execute(&render_rebuild(
+            for sql in rebuild_statements(
                 table,
                 CHAIN,
                 day,
+                now() + 86_400,
                 epoch,
                 (from_block, None),
-            ))
-            .await;
+            ) {
+                self.execute(&sql).await;
+            }
         }
     }
 
@@ -277,6 +350,13 @@ fn now() -> u32 {
 
 fn bare(hex: &str) -> String {
     hex.trim_start_matches("0x").to_lowercase()
+}
+
+/// The 32 byte id of an EVM address as hex, for the columns that store one
+/// (docs/design.md §13). Never hand rolled: `format::id32` is the one
+/// padding helper.
+fn id32_hex(address: &str) -> String {
+    hex::encode(crate::utils::format::id32(fixtures::address(address)))
 }
 
 /// `tx` decoded as if it had been mined in `block` at `timestamp`.
@@ -423,6 +503,7 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     database.token(PUSD, "pUSD", 6).await;
     database.venue(NEG_RISK_EXCHANGE, USDC_E).await;
     database.venue(V2_EXCHANGE, PUSD).await;
+    database.trust(CTF, &[NEG_RISK_EXCHANGE, V2_EXCHANGE]).await;
 
     // Titles first (as on chain), then the trades, a few hours ago.
     let real: [(&RawTx, u64, u32); 12] = [
@@ -446,6 +527,8 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         database.insert(&rows).await;
         expected.append(&mut rows);
     }
+    // The adapters exist only once their events are in.
+    database.trust_adapters(CTF).await;
 
     // Every table round trips through RowBinary.
     for (table, rows) in [
@@ -479,9 +562,32 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
 
     let chain = CHAIN.to_string();
     let m1_hex = hex::encode(m1());
+    let event_id = hex::encode(
+        decode(CHAIN, &fixtures::NEG_RISK_QUESTION_PREPARED.logs())
+            .questions[0]
+            .event_id,
+    );
+    let token = U256::from_be_bytes(hash(M1_NO).0).to_string();
+    let from_day = "2020-01-01";
+
+    // Everything the cookbook screens ask for, BOUND: the recipes carry
+    // `{name:Type}` and the value travels beside the statement, so a
+    // search box full of quotes is data, never SQL.
+    let parameters: [(&str, &str); 9] = [
+        ("chain", &chain),
+        ("market_id", &m1_hex),
+        ("event_id", &event_id),
+        ("registry", &bare(CTF)),
+        ("token", &token),
+        ("holder", &bare(TAKER)),
+        ("text", "golden state"),
+        ("from_day", from_day),
+        ("to_day", "2100-01-01"),
+    ];
+    database.set(&parameters);
 
     // ------------------------------------------------------- market list
-    let list = cookbook::MARKET_LIST.render(&[("chain", &chain)]);
+    let list = cookbook::MARKET_LIST.sql;
     let markets: Vec<MarketLine> = database
         .rows(&format!(
             "SELECT {MARKET_PROJECTION} FROM (SELECT * FROM prediction_markets_v \
@@ -518,8 +624,7 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     assert_eq!(second.traders, 2);
 
     // Titles, outcome labels and the event grouping come from the chain.
-    let search = cookbook::MARKET_SEARCH
-        .render(&[("chain", &chain), ("text", "golden state")]);
+    let search = cookbook::MARKET_SEARCH.sql;
     let found: Vec<MarketLine> = database
         .rows(&format!(
             "SELECT {MARKET_PROJECTION} FROM (SELECT * FROM prediction_markets_v \
@@ -545,21 +650,14 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     assert_eq!(uma.len(), 1);
     assert_eq!(uma[0].outcomes, vec!["Over", "Under"]);
 
-    let event_id = hex::encode(
-        decode(CHAIN, &fixtures::NEG_RISK_QUESTION_PREPARED.logs())
-            .questions[0]
-            .event_id,
-    );
-    let event = cookbook::EVENT_MARKETS
-        .render(&[("chain", &chain), ("event_id", &event_id)]);
+    let event = cookbook::EVENT_MARKETS.sql;
     assert_eq!(
         database.count(&format!("SELECT count() FROM ({event})")).await,
         1
     );
 
     // ------------------------------------------------------------ header
-    let header = cookbook::MARKET_HEADER
-        .render(&[("chain", &chain), ("market_id", &m1_hex)]);
+    let header = cookbook::MARKET_HEADER.sql;
     assert_eq!(
         database.count(&format!("SELECT count() FROM ({header})")).await,
         1
@@ -585,12 +683,7 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         trades: u64,
         traders: u64,
     }
-    let token = U256::from_be_bytes(hash(M1_NO).0).to_string();
-    let chart = cookbook::PRICE_CHART.render(&[
-        ("chain", &chain),
-        ("registry", &bare(CTF)),
-        ("token", &token),
-    ]);
+    let chart = cookbook::PRICE_CHART.sql;
     let candles: Vec<Candle> = database
         .rows(&format!(
             "SELECT open, high, low, close, ifNull(volume, -1.) AS volume, \
@@ -617,13 +710,12 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         collateral: f64,
         trader: String,
     }
-    let tape = cookbook::TRADES_TAPE
-        .render(&[("chain", &chain), ("market_id", &m1_hex)]);
+    let tape = cookbook::TRADES_TAPE.sql;
     let prints: Vec<Print> = database
         .rows(&format!(
             "SELECT outcome_index, side, price, ifNull(shares, -1.) AS shares, \
              ifNull(collateral, -1.) AS collateral, \
-             concat('0x', lower(hex(trader))) AS trader FROM ({tape})"
+             concat('0x', lower(hex(substring(trader, 13)))) AS trader FROM ({tape})"
         ))
         .await;
     assert_eq!(prints.len(), 6);
@@ -645,11 +737,10 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         shares: f64,
         avg_entry_price: f64,
     }
-    let holders = cookbook::HOLDERS
-        .render(&[("chain", &chain), ("market_id", &m1_hex)]);
+    let holders = cookbook::HOLDERS.sql;
     let holders: Vec<Holder> = database
         .rows(&format!(
-            "SELECT outcome_index, concat('0x', lower(hex(holder))) AS holder, \
+            "SELECT outcome_index, concat('0x', lower(hex(substring(holder, 13)))) AS holder, \
              ifNull(shares, -1.) AS shares, \
              ifNull(avg_entry_price, -1.) AS avg_entry_price FROM ({holders})"
         ))
@@ -666,13 +757,26 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     assert!(holders.iter().all(|line| line.shares > 0.0));
 
     // --------------------------------------------------------- portfolio
-    let portfolio = |holder: &str| {
-        let sql = cookbook::PORTFOLIO
-            .render(&[("chain", &chain), ("holder", &bare(holder))]);
-        format!("SELECT {POSITION_PROJECTION} FROM ({sql})")
-    };
+    let portfolio = format!(
+        "SELECT {POSITION_PROJECTION} FROM ({})",
+        cookbook::PORTFOLIO.sql
+    );
+    // Only the bound `holder` changes between wallets - the statement is
+    // the same bytes every time.
+    fn for_holder<'a>(
+        parameters: &[(&'a str, &'a str); 9],
+        holder: &'a str,
+    ) -> [(&'a str, &'a str); 9] {
+        let mut bound = *parameters;
+        bound[5] = ("holder", holder);
+        bound
+    }
+    let taker = bare(TAKER);
+    let v2_taker = bare(V2_TAKER);
+    let maker = bare(MAKER);
 
-    let open: Vec<PositionLine> = database.rows(&portfolio(TAKER)).await;
+    database.set(&for_holder(&parameters, &taker));
+    let open: Vec<PositionLine> = database.rows(&portfolio).await;
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].status, "open");
     assert!(close(open[0].shares, 1_346.42), "{open:?}");
@@ -684,7 +788,8 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     assert!(open[0].redeemable.abs() < 1e-9, "{open:?}");
 
     // The V2 taker paid 63.35 + 2.05887 fee for 181 shares.
-    let v2: Vec<PositionLine> = database.rows(&portfolio(V2_TAKER)).await;
+    database.set(&for_holder(&parameters, &v2_taker));
+    let v2: Vec<PositionLine> = database.rows(&portfolio).await;
     assert_eq!(v2.len(), 1, "{v2:?}");
     assert!(close(v2[0].shares, 181.0), "{v2:?}");
     assert!(close(v2[0].avg_entry_price, 65.408_87 / 181.0), "{v2:?}");
@@ -704,13 +809,15 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     database.insert(&resolution).await;
     database.refresh_markets().await;
 
-    let won: Vec<PositionLine> = database.rows(&portfolio(TAKER)).await;
+    database.set(&for_holder(&parameters, &taker));
+    let won: Vec<PositionLine> = database.rows(&portfolio).await;
     assert_eq!(won[0].status, "resolved");
     assert!(close(won[0].value, 1_346.42), "{won:?}");
     assert!(close(won[0].unrealized_pnl, 79.438_78), "{won:?}");
     assert!(close(won[0].redeemable, 1_346.42), "{won:?}");
 
-    let lost: Vec<PositionLine> = database.rows(&portfolio(MAKER)).await;
+    database.set(&for_holder(&parameters, &maker));
+    let lost: Vec<PositionLine> = database.rows(&portfolio).await;
     assert_eq!(lost.len(), 1, "{lost:?}");
     assert!(close(lost[0].shares, 500.0), "{lost:?}");
     assert!(close(lost[0].unrealized_pnl, -29.5), "{lost:?}");
@@ -722,18 +829,18 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     database.insert(&redemption).await;
     database.refresh_markets().await;
 
-    let done: Vec<PositionLine> = database.rows(&portfolio(TAKER)).await;
+    database.set(&for_holder(&parameters, &taker));
+    let done: Vec<PositionLine> = database.rows(&portfolio).await;
     assert_eq!(done.len(), 1, "{done:?}");
     assert!(done[0].shares.abs() < 1e-9, "{done:?}");
     assert!(close(done[0].realized_pnl, 79.438_78), "{done:?}");
     assert!(done[0].redeemable.abs() < 1e-9, "{done:?}");
     assert_eq!(
         database
-            .rows::<String>(&format!(
+            .rows::<String>(
                 "SELECT toString(balance) FROM prediction_positions_v(\
-                 chain = {CHAIN}, holder = unhex('{}'))",
-                bare(TAKER)
-            ))
+                 chain = {chain:UInt64}, holder = {holder:String})"
+            )
             .await,
         vec!["0"]
     );
@@ -773,8 +880,7 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         #[allow(dead_code)]
         shares: f64,
     }
-    let history = cookbook::WALLET_TRADES
-        .render(&[("chain", &chain), ("holder", &bare(TAKER))]);
+    let history = cookbook::WALLET_TRADES.sql;
     let history: Vec<Activity> = database
         .rows(&format!(
             "SELECT action, role, ifNull(price, -1.) AS price, \
@@ -794,30 +900,51 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     #[derive(Debug, Row, Deserialize)]
     struct Leader {
         trader: String,
+        collateral: String,
         volume: f64,
         net_cash_flow: f64,
         trades: u64,
     }
-    let from_day = "2020-01-01";
-    let leaders = cookbook::LEADERBOARD.render(&[
-        ("chain", &chain),
-        ("from_day", from_day),
-        ("to_day", "2100-01-01"),
-    ]);
+    let leaders = cookbook::LEADERBOARD.sql;
     let leaders: Vec<Leader> = database
         .rows(&format!(
-            "SELECT concat('0x', lower(hex(trader))) AS trader, volume, \
-             net_cash_flow, trades FROM ({leaders}) ORDER BY volume DESC"
+            "SELECT concat('0x', lower(hex(substring(trader, 13)))) AS trader, \
+             concat('0x', lower(hex(substring(collateral_token, 13)))) AS collateral, \
+             ifNull(volume, -1.) AS volume, ifNull(net_cash_flow, -999.) AS net_cash_flow, \
+             trades FROM ({leaders}) ORDER BY volume DESC"
         ))
         .await;
-    // The taker: 1266.98122 paid in six fills, 1346.42 redeemed.
-    assert_eq!(leaders[0].trader, TAKER);
-    assert!(close(leaders[0].volume, 1_266.981_22), "{leaders:?}");
-    assert!(close(leaders[0].net_cash_flow, 79.438_78), "{leaders:?}");
-    assert_eq!(leaders[0].trades, 6);
+    let line = |trader: &str, collateral: &str| {
+        leaders
+            .iter()
+            .find(|line| {
+                line.trader == trader.to_lowercase()
+                    && line.collateral == collateral.to_lowercase()
+            })
+            .unwrap_or_else(|| {
+                panic!("{trader} / {collateral}: {leaders:#?}")
+            })
+    };
+
+    // ONE ROW PER COLLATERAL TOKEN, never one number over both: the
+    // taker's six fills are priced in the exchange's USDC.e ...
+    let traded = line(TAKER, USDC_E);
+    assert!(close(traded.volume, 1_266.981_22), "{traded:?}");
+    assert!(close(traded.net_cash_flow, -1_266.981_22), "{traded:?}");
+    assert_eq!(traded.trades, 6);
+
+    // ... and the redemption it paid for is in the market's wrapped
+    // collateral. 1346.42 - 1266.98122 = 79.43878 is the trader's profit
+    // ONLY if the two tokens are worth the same, which this module has no
+    // price feed to know - so it never adds them up.
+    let redeemed = line(TAKER, WRAPPED_COLLATERAL);
+    assert!(close(redeemed.volume, -1.0), "{redeemed:?}");
+    assert!(close(redeemed.net_cash_flow, 1_346.42), "{redeemed:?}");
+    assert_eq!(redeemed.trades, 0);
+
     // Volume is counted once per party: the taker's equals the makers'
     // counterpart legs of M1 plus nothing else.
-    let v2 = leaders.iter().find(|line| line.trader == V2_TAKER).unwrap();
+    let v2 = line(V2_TAKER, PUSD);
     assert!(close(v2.volume, 63.35), "{v2:?}");
     assert!(close(v2.net_cash_flow, -65.408_87), "{v2:?}");
 
@@ -826,8 +953,8 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         .execute(&format!(
             "INSERT INTO prediction_venue_labels (chain, address, venue) VALUES \
              ({CHAIN}, unhex('{}'), 'polymarket'), ({CHAIN}, unhex('{}'), 'polymarket')",
-            bare(CTF),
-            bare(NEG_RISK_EXCHANGE)
+            id32_hex(CTF),
+            id32_hex(NEG_RISK_EXCHANGE)
         ))
         .await;
     database.refresh_markets().await;
@@ -861,28 +988,12 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     );
 
     // ---------------------------------------------------------- latency
-    let parameters: [(&str, &str); 9] = [
-        ("chain", &chain),
-        ("market_id", &m1_hex),
-        ("event_id", &event_id),
-        ("registry", &bare(CTF)),
-        ("token", &token),
-        ("holder", &bare(TAKER)),
-        ("text", "golden state"),
-        ("from_day", from_day),
-        ("to_day", "2100-01-01"),
-    ];
+    database.set(&parameters);
     println!("screen -> median latency over 9 runs (fixture sized data)");
-    for Recipe { screen, .. } in cookbook::COOKBOOK {
-        let recipe = cookbook::COOKBOOK
-            .iter()
-            .find(|recipe| recipe.screen == *screen)
-            .unwrap();
-        let sql = recipe.render(&parameters);
-        assert!(!sql.contains('{'), "{sql}");
+    for Recipe { screen, sql } in cookbook::COOKBOOK {
         println!(
             "  {screen:24} {:7.2} ms",
-            latency(&database, &sql, 9).await
+            latency(&database, sql, 9).await
         );
     }
 
@@ -909,16 +1020,17 @@ async fn everything(database: &TestDb) -> Vec<(String, Vec<String>)> {
         ("from_day", "2020-01-01"),
         ("to_day", "2100-01-01"),
     ];
+    database.set(&parameters);
 
     let mut seen = Vec::new();
 
     for recipe in cookbook::COOKBOOK {
-        let sql = recipe.render(&parameters);
+        let sql = recipe.sql;
         // computed_at is the wall clock of the refresh.
         let sql = if sql.starts_with("SELECT *") {
             sql.replacen("SELECT *", "SELECT * EXCEPT (computed_at)", 1)
         } else {
-            sql
+            sql.to_owned()
         };
         seen.push((
             recipe.screen.to_owned(),
@@ -931,14 +1043,14 @@ async fn everything(database: &TestDb) -> Vec<(String, Vec<String>)> {
         (
             "portfolio of the V1 taker",
             format!(
-                "SELECT * FROM prediction_positions_v(chain = {CHAIN}, holder = unhex('{}'))",
+                "SELECT * FROM prediction_positions_v(chain = {CHAIN}, holder = '{}')",
                 bare(TAKER)
             ),
         ),
         (
             "tape of M1",
             format!(
-                "SELECT * FROM prediction_trades_v(chain = {CHAIN}, market_id = unhex('{}'))",
+                "SELECT * FROM prediction_trades_v(chain = {CHAIN}, market_id = '{}')",
                 hex::encode(m1())
             ),
         ),
@@ -984,6 +1096,7 @@ async fn a_reorg_leaves_every_view_equal_to_a_clean_index() {
         database.token(PUSD, "pUSD", 6).await;
         database.venue(NEG_RISK_EXCHANGE, USDC_E).await;
         database.venue(V2_EXCHANGE, PUSD).await;
+        database.trust(CTF, &[NEG_RISK_EXCHANGE, V2_EXCHANGE]).await;
         // Before the fork: untouched by the purge.
         database
             .insert(&decoded(
@@ -1097,32 +1210,44 @@ async fn hostile_amounts_do_not_wrap_aggregates() {
     let exchange = Address::repeat_byte(0xe1);
     let registry = Address::repeat_byte(0xc7);
     let taker = Address::repeat_byte(0x7a);
-    let token = U256::from(77u8);
-    let place = |log_index| Place {
+    // One outcome token per maker: the shares bound of `verify_shares` is
+    // per (registry, token), and a registry cannot move more than
+    // 2^256-1 of ONE token however many transfers it emits.
+    let tokens = [U256::from(77u8), U256::from(78u8)];
+    let place = |transaction: u8, log_index| Place {
         chain: CHAIN,
         block_number: 10,
         log_index,
         timestamp: now - 60,
-        transaction_hash: B256::repeat_byte(1),
+        transaction_hash: B256::repeat_byte(transaction),
     };
 
-    // CONSTRUCTED: two maker orders selling 2^256-1 shares for 2^256-1
-    // collateral each, a registry moving 2^256-1 shares twice.
-    let mut logs = vec![fixtures::constructed_transfer(
-        place(0),
-        registry,
-        exchange,
-        Address::repeat_byte(0xa1),
-        taker,
-        token,
-        U256::MAX,
-    )];
-    for (index, maker) in [0xa1u8, 0xa2].into_iter().enumerate() {
-        logs.push(fixtures::constructed_v2_fill(
-            place(1 + index as u32),
+    // CONSTRUCTED: TWO transactions, each one maker order selling 2^256-1
+    // shares for 2^256-1 collateral of its own outcome token, and each
+    // preceded by the registry really moving 2^256-1 of it. Two
+    // transactions because the shares bound of `verify_shares` is per
+    // transaction and per (registry, token): a registry cannot move more
+    // than 2^256-1 of one token in one transaction however many transfers
+    // it emits, which is exactly the property under test elsewhere.
+    let mut logs = Vec::new();
+    for (index, token) in tokens.into_iter().enumerate() {
+        let tx = 1 + index as u8;
+        let maker = Address::repeat_byte(0xa1 + index as u8);
+
+        logs.push(fixtures::constructed_transfer(
+            place(tx, 0),
+            registry,
             exchange,
-            B256::repeat_byte(maker),
-            Address::repeat_byte(maker),
+            maker,
+            taker,
+            token,
+            U256::MAX,
+        ));
+        logs.push(fixtures::constructed_v2_fill(
+            place(tx, 1),
+            exchange,
+            B256::repeat_byte(0xa1 + index as u8),
+            maker,
             taker,
             true,
             token,
@@ -1130,24 +1255,37 @@ async fn hostile_amounts_do_not_wrap_aggregates() {
             U256::MAX,
             U256::ZERO,
         ));
+        logs.push(fixtures::constructed_v2_fill(
+            place(tx, 2),
+            exchange,
+            B256::repeat_byte(0x7a),
+            taker,
+            exchange,
+            false,
+            token,
+            U256::MAX,
+            U256::MAX,
+            U256::ZERO,
+        ));
     }
-    logs.push(fixtures::constructed_v2_fill(
-        place(3),
-        exchange,
-        B256::repeat_byte(0x7a),
-        taker,
-        exchange,
-        false,
-        token,
-        U256::MAX,
-        U256::MAX,
-        U256::ZERO,
-    ));
 
     let mut rows = decode(CHAIN, &logs);
     assert_eq!(rows.trades.len(), 2);
+    // 2^256-1 shares really were moved for each, so both fills are proven
+    // and DO reach the aggregates: this test is about the arithmetic, not
+    // about the proof.
+    assert!(rows.trades.iter().all(|trade| trade.verified == 1));
     rows.set_version(crate::db::next_version());
     database.insert(&rows).await;
+    database
+        .execute(&format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) \
+             VALUES ({CHAIN}, 'registry', unhex('{0}'), unhex('{0}')), \
+             ({CHAIN}, 'exchange', unhex('{1}'), unhex('{0}'))",
+            hex::encode(crate::utils::format::id32(registry)),
+            hex::encode(crate::utils::format::id32(exchange))
+        ))
+        .await;
 
     // The exact values survive the round trip ...
     assert_eq!(
@@ -1186,18 +1324,30 @@ async fn hostile_amounts_do_not_wrap_aggregates() {
     // A print above 1 collateral per share is not a probability: forged
     // prices never reach a chart.
     let forged = fixtures::constructed_v2_fill(
-        place(9),
+        place(9, 9),
         exchange,
         B256::repeat_byte(0xa3),
         Address::repeat_byte(0xa3),
         taker,
         true,
-        token,
+        tokens[0],
         U256::from(10u8),
         U256::from(1_000u64),
         U256::ZERO,
     );
-    let mut rows = decode(CHAIN, &[forged]);
+    // The shares ARE proven (the registry moves exactly ten), so what
+    // keeps this print off the chart is the price bound alone.
+    let moved = fixtures::constructed_transfer(
+        place(9, 8),
+        registry,
+        exchange,
+        Address::repeat_byte(0xa3),
+        taker,
+        tokens[0],
+        U256::from(10u8),
+    );
+    let mut rows = decode(CHAIN, &[moved, forged]);
+    assert_eq!(rows.trades[0].verified, 1);
     rows.set_version(crate::db::next_version());
     database.insert(&rows).await;
     assert_eq!(
@@ -1213,10 +1363,628 @@ async fn hostile_amounts_do_not_wrap_aggregates() {
     database.refresh_markets().await;
     let _ = database
         .snapshot(&format!(
-            "SELECT * FROM prediction_positions_v(chain = {CHAIN}, holder = unhex('{}'))",
+            "SELECT * FROM prediction_positions_v(chain = {CHAIN}, holder = '{}')",
             hex::encode(taker)
         ))
         .await;
+
+    database.drop().await;
+}
+
+// ---------------------------------------------------------- chain neutral
+
+/// A chain that is not EVM: the reserved Solana id (docs/design.md §14).
+const SVM_CHAIN: u64 = 1_399_811_149;
+
+/// 32 byte ids that are NOT left padded EVM addresses - every one has
+/// non-zero bytes in the 12 byte prefix an EVM address leaves empty, so any
+/// code still assuming "the last 20 bytes are the address" mangles them
+/// visibly.
+const SVM_REGISTRY: &str =
+    "b3f1a90c5d2e7481aa6fc03d94e5178b2c6d0f43a97e15bc8d2043fe6719ac85";
+const SVM_EXCHANGE: &str =
+    "7c2d5e8a41f0b96d3ae7c184fb5029d6e3a8710c45bd92fe6018a3c7d54b09ef";
+const SVM_TAKER: &str =
+    "e41a7b0396d5c82f14ae6d093b7c52801faa36d9c4e0b71852fd6a3c09e7b418";
+const SVM_MAKER: &str =
+    "2d90fa4c7b18e635a0cd472e918bf3067ac54d21e8b0937fca6d152048e3b7c9";
+const SVM_COLLATERAL: &str =
+    "5a8c3f19d02b47e6ba71cd8340f29e5b16d7a04c93e281fb60ac57d9138e4b2f";
+const SVM_ORACLE: &str =
+    "cd47e0a8153b96f27ea40d1c85b3097fe2461da05c8bf37962a0e4d81753cb6a";
+const SVM_CREATOR: &str =
+    "81f350ce9a274db6083fac51e7d29b640a5c8371fe4092bd6ac1573e8b04d9f2";
+const SVM_MARKET: &str =
+    "3fa07c15e9b8246d0cf37a5be1948d02c76ba31d905e8437b26cfa0d5187e93a";
+/// A Solana signature is 64 bytes: `tx_id` is a String, never a hash column.
+const SVM_TX: &str = concat!(
+    "9a4c0f71e3b58d26ac190fe74b3d0825c6a1fb39d07e42b85cf1360ad9e274bb",
+    "1f83e0d94a26cb705e3df182ac9460b7d5301fe8ba27c46d90f3581ea7b02d4c",
+);
+
+/// Every `prediction_*` table, materialized view, aggregate, parameterized
+/// view and cookbook query carries a 32 byte NON-EVM id and a 64 byte
+/// transaction id through unmangled (docs/design.md §13).
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn a_non_evm_32_byte_id_round_trips_through_every_table_and_query() {
+    let database = TestDb::create().await;
+    let traded_at = now() - 3_600;
+    let version = crate::db::next_version();
+    // The ERC-1155 style token id is a UInt256 on every chain.
+    let token_id = (U256::MAX - U256::from(1u8)).to_string();
+
+    // A non-EVM front end writes these columns from its own row type: the
+    // EVM decoder's models are `Address` based on purpose (§13), the TABLES
+    // are not. So this test inserts the way that front end would.
+    for sql in [
+        format!(
+            "INSERT INTO prediction_markets (chain, market_id, registry, protocol, \
+             oracle, question_id, outcome_count, block_number, timestamp, tx_id, \
+             tx_index, ordinal, tx_from, source, epoch, _version) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_MARKET}'), unhex('{SVM_REGISTRY}'), 'ctf', \
+             unhex('{SVM_ORACLE}'), unhex('{SVM_MARKET}'), 2, 10, {traded_at}, \
+             unhex('{SVM_TX}'), 3, 77, unhex('{SVM_CREATOR}'), 'event', 0, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_questions (chain, question_id, emitter, kind, \
+             protocol, event_id, question_index, title, description, outcomes, data, \
+             creator, oracle, reward_token, reward, proposal_bond, fee_bips, \
+             block_number, timestamp, tx_id, tx_index, ordinal, epoch, _version) \
+             VALUES ({SVM_CHAIN}, unhex('{SVM_MARKET}'), unhex('{SVM_ORACLE}'), \
+             'uma_question', 'uma', unhex('{SVM_MARKET}'), 0, 'A non-EVM market', '', \
+             ['Yes', 'No'], '', unhex('{SVM_CREATOR}'), unhex('{SVM_ORACLE}'), \
+             unhex('{SVM_COLLATERAL}'), 0, 0, 0, 10, {traded_at}, unhex('{SVM_TX}'), \
+             3, 78, 0, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_outcome_tokens (chain, registry, \
+             outcome_token_id, market_id, outcome_index, collateral_token, \
+             first_seen_block, first_seen_timestamp, _version) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_REGISTRY}'), toUInt256('{token_id}'), \
+             unhex('{SVM_MARKET}'), 0, unhex('{SVM_COLLATERAL}'), 10, {traded_at}, \
+             {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_position_events (chain, block_number, timestamp, \
+             tx_id, tx_index, ordinal, protocol, emitter, kind, stakeholder, \
+             market_id, collateral_token, parent_collection_id, index_sets, amount, \
+             tx_from, epoch, _version) VALUES \
+             ({SVM_CHAIN}, 10, {traded_at}, unhex('{SVM_TX}'), 3, 79, 'ctf', \
+             unhex('{SVM_REGISTRY}'), 'split', unhex('{SVM_MAKER}'), \
+             unhex('{SVM_MARKET}'), unhex('{SVM_COLLATERAL}'), toFixedString('', 32), \
+             [1, 2], 1000000, unhex('{SVM_CREATOR}'), 0, {version})"
+        ),
+        // The split mints a full set to the maker ...
+        format!(
+            "INSERT INTO prediction_transfers (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, batch_index, registry, operator, `from`, `to`, \
+             outcome_token_id, amount, from_reason, to_reason, priced_collateral, \
+             epoch, _version) VALUES \
+             ({SVM_CHAIN}, 10, {traded_at}, unhex('{SVM_TX}'), 3, 80, 0, \
+             unhex('{SVM_REGISTRY}'), unhex('{SVM_REGISTRY}'), toFixedString('', 32), \
+             unhex('{SVM_MAKER}'), toUInt256('{token_id}'), 1000000, 'split', 'split', \
+             500000, 0, {version})"
+        ),
+        // ... and the maker sells 400000 of one outcome to the taker at 0.6.
+        format!(
+            "INSERT INTO prediction_transfers (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, batch_index, registry, operator, `from`, `to`, \
+             outcome_token_id, amount, from_reason, to_reason, priced_collateral, \
+             epoch, _version) VALUES \
+             ({SVM_CHAIN}, 11, {traded_at}, unhex('{SVM_TX}'), 4, 12, 0, \
+             unhex('{SVM_REGISTRY}'), unhex('{SVM_EXCHANGE}'), unhex('{SVM_MAKER}'), \
+             unhex('{SVM_TAKER}'), toUInt256('{token_id}'), 400000, 'trade', 'trade', \
+             0, 0, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_trades (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, protocol, exchange, registry, order_hash, maker, \
+             taker, tx_from, tx_to, outcome_token_id, side, share_amount, \
+             collateral_amount, match_type, verified, maker_outcome_token_id, maker_side, \
+             maker_collateral_amount, maker_fee_amount, maker_fee_unit, \
+             taker_fee_amount, taker_fee_unit, epoch, _version) VALUES \
+             ({SVM_CHAIN}, 11, {traded_at}, unhex('{SVM_TX}'), 4, 13, 'ctf_exchange', \
+             unhex('{SVM_EXCHANGE}'), unhex('{SVM_REGISTRY}'), unhex('{SVM_MARKET}'), \
+             unhex('{SVM_MAKER}'), unhex('{SVM_TAKER}'), unhex('{SVM_CREATOR}'), \
+             unhex('{SVM_EXCHANGE}'), toUInt256('{token_id}'), 'buy', 400000, 240000, \
+             'complementary', 1, toUInt256('{token_id}'), 'sell', 240000, 0, \
+             'collateral', 0, 'collateral', 0, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_venues (chain, exchange, protocol, \
+             collateral_token, registry, source, _version) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_EXCHANGE}'), 'ctf_exchange', \
+             unhex('{SVM_COLLATERAL}'), unhex('{SVM_REGISTRY}'), 'rpc', {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_venue_labels (chain, address, venue) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_EXCHANGE}'), 'a non-evm venue')"
+        ),
+        // The operator trusts this chain's registry, exchange and the
+        // registry as its own adapter (it emitted the split).
+        format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) VALUES \
+             ({SVM_CHAIN}, 'registry', unhex('{SVM_REGISTRY}'), unhex('{SVM_REGISTRY}')), \
+             ({SVM_CHAIN}, 'exchange', unhex('{SVM_EXCHANGE}'), unhex('{SVM_REGISTRY}')), \
+             ({SVM_CHAIN}, 'adapter', unhex('{SVM_REGISTRY}'), unhex('{SVM_REGISTRY}'))"
+        ),
+        format!(
+            "INSERT INTO prediction_market_metadata (chain, market_id, title, source) \
+             VALUES ({SVM_CHAIN}, unhex('{SVM_MARKET}'), 'A non-EVM market', 'gamma')"
+        ),
+    ] {
+        database.execute(&sql).await;
+    }
+
+    // ------------------------------- every stored id comes back unmangled
+    for (table, column, expected) in [
+        ("prediction_markets", "registry", SVM_REGISTRY),
+        ("prediction_markets", "oracle", SVM_ORACLE),
+        ("prediction_markets", "tx_from", SVM_CREATOR),
+        ("prediction_questions", "emitter", SVM_ORACLE),
+        ("prediction_questions", "creator", SVM_CREATOR),
+        ("prediction_questions", "reward_token", SVM_COLLATERAL),
+        ("prediction_outcome_tokens", "registry", SVM_REGISTRY),
+        ("prediction_outcome_tokens", "collateral_token", SVM_COLLATERAL),
+        ("prediction_outcome_tokens_by_market", "registry", SVM_REGISTRY),
+        (
+            "prediction_outcome_tokens_by_market",
+            "collateral_token",
+            SVM_COLLATERAL,
+        ),
+        ("prediction_position_events", "emitter", SVM_REGISTRY),
+        ("prediction_position_events", "stakeholder", SVM_MAKER),
+        ("prediction_position_events", "collateral_token", SVM_COLLATERAL),
+        ("prediction_transfers", "registry", SVM_REGISTRY),
+        ("prediction_trades", "exchange", SVM_EXCHANGE),
+        ("prediction_trades", "maker", SVM_MAKER),
+        ("prediction_trades", "taker", SVM_TAKER),
+        ("prediction_trades", "tx_to", SVM_EXCHANGE),
+        ("prediction_trades_by_token", "registry", SVM_REGISTRY),
+        ("prediction_trades_by_token", "taker", SVM_TAKER),
+        ("prediction_ledger_by_holder", "registry", SVM_REGISTRY),
+        ("prediction_ledger_by_token", "registry", SVM_REGISTRY),
+        ("prediction_venues", "exchange", SVM_EXCHANGE),
+        ("prediction_venue_labels", "address", SVM_EXCHANGE),
+        ("prediction_candles_1m", "registry", SVM_REGISTRY),
+        ("prediction_candles_1d", "registry", SVM_REGISTRY),
+        ("prediction_market_flows_1d", "registry", SVM_REGISTRY),
+        ("prediction_trader_trades_1d", "exchange", SVM_EXCHANGE),
+        ("prediction_trader_flows_1d", "collateral_token", SVM_COLLATERAL),
+    ] {
+        assert_eq!(
+            database
+                .rows::<String>(&format!(
+                    "SELECT DISTINCT lower(hex({column})) FROM {table} \
+                     WHERE chain = {SVM_CHAIN}"
+                ))
+                .await,
+            vec![expected.to_owned()],
+            "{table}.{column}"
+        );
+    }
+
+    // Both parties of the fill and both legs of the mint kept their ids.
+    let mut both = vec![SVM_MAKER.to_owned(), SVM_TAKER.to_owned()];
+    both.sort();
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT DISTINCT lower(hex(holder)) FROM prediction_ledger_by_token \
+                 WHERE chain = {SVM_CHAIN} ORDER BY 1"
+            ))
+            .await,
+        both
+    );
+
+    // A 64 byte transaction id is not truncated to 32 anywhere.
+    assert_eq!(SVM_TX.len(), 128);
+    for table in [
+        "prediction_markets",
+        "prediction_questions",
+        "prediction_position_events",
+        "prediction_transfers",
+        "prediction_trades",
+        "prediction_trades_by_token",
+        "prediction_ledger_by_holder",
+        "prediction_ledger_by_token",
+    ] {
+        assert_eq!(
+            database
+                .rows::<String>(&format!(
+                    "SELECT DISTINCT lower(hex(tx_id)) FROM {table} \
+                     WHERE chain = {SVM_CHAIN}"
+                ))
+                .await,
+            vec![SVM_TX.to_owned()],
+            "{table}.tx_id"
+        );
+    }
+
+    // The 256 bit token id survives too (it is not an identity column).
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT DISTINCT toString(outcome_token_id) FROM prediction_trades \
+                 WHERE chain = {SVM_CHAIN}"
+            ))
+            .await,
+        vec![token_id.clone()]
+    );
+
+    // ---------------------------------------------- every cookbook query
+    database.refresh_markets().await;
+
+    let chain = SVM_CHAIN.to_string();
+    let parameters: [(&str, &str); 9] = [
+        ("chain", &chain),
+        ("market_id", SVM_MARKET),
+        ("event_id", SVM_MARKET),
+        ("registry", SVM_REGISTRY),
+        ("token", &token_id),
+        ("holder", SVM_TAKER),
+        ("text", "non-EVM"),
+        ("from_day", "2020-01-01"),
+        ("to_day", "2100-01-01"),
+    ];
+    database.set(&parameters);
+    for recipe in cookbook::COOKBOOK {
+        let sql = recipe.sql;
+        assert!(
+            database.count(&format!("SELECT count() FROM ({sql})")).await
+                >= 1,
+            "{}: no row",
+            recipe.screen
+        );
+    }
+
+    // ... and the ids the screens PRINT are the stored bytes.
+    let header = cookbook::MARKET_HEADER.sql;
+    assert_eq!(
+        database
+            .rows::<(String, String)>(&format!(
+                "SELECT lower(hex(registry)), lower(hex(market_id)) FROM ({header})"
+            ))
+            .await,
+        vec![(SVM_REGISTRY.to_owned(), SVM_MARKET.to_owned())]
+    );
+
+    let tape = cookbook::TRADES_TAPE.sql;
+    assert_eq!(
+        database
+            .rows::<(String, String)>(&format!(
+                "SELECT lower(hex(trader)), lower(hex(tx_id)) FROM ({tape})"
+            ))
+            .await,
+        vec![(SVM_TAKER.to_owned(), SVM_TX.to_owned())]
+    );
+
+    let holders = cookbook::HOLDERS.sql;
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT lower(hex(holder)) FROM ({holders}) ORDER BY 1"
+            ))
+            .await,
+        both
+    );
+
+    // The portfolio balance is exact even though the collateral has no
+    // decimals: `tokens` is the EVM-only core table, so the Float64 columns
+    // stay NULL rather than guessing (README, chain-neutral section).
+    assert_eq!(
+        database
+            .rows::<(String, String)>(&format!(
+                "SELECT lower(hex(market_id)), toString(balance) FROM \
+                 (SELECT * FROM prediction_positions_v(chain = {SVM_CHAIN}, \
+                 holder = '{SVM_TAKER}'))"
+            ))
+            .await,
+        vec![(SVM_MARKET.to_owned(), "400000".to_owned())]
+    );
+
+    let leaders = cookbook::LEADERBOARD.sql;
+    // The labelled exchange is not a trader, both parties of the fill are.
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT lower(hex(trader)) FROM ({leaders}) ORDER BY 1"
+            ))
+            .await,
+        both
+    );
+
+    // The padding of a 40 character parameter is a real distinction: the
+    // last 20 bytes of a Solana id are NOT that id.
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM prediction_positions_v(chain = {SVM_CHAIN}, \
+                 holder = '{}')",
+                &SVM_TAKER[24..]
+            ))
+            .await,
+        0
+    );
+
+    database.drop().await;
+}
+
+/// A contract nobody trusts, emitting the same events the real one does.
+const FORGER: &str = "0xF0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0";
+/// A worthless ERC-20 the forger splits one unit of.
+const JUNK_COLLATERAL: &str = "0xBAdBAdbaDbaDbAdbaDBadBadBADbadBadbADBAd0";
+
+/// Everything a UI screen can see, as text. `computed_at` is the wall
+/// clock of the last refresh, so it is left out.
+async fn headline(database: &TestDb) -> Vec<(String, Vec<String>)> {
+    database.refresh_markets().await;
+
+    let mut seen = Vec::new();
+    for recipe in cookbook::COOKBOOK {
+        let sql = if recipe.sql.starts_with("SELECT *") {
+            recipe.sql.replacen(
+                "SELECT *",
+                "SELECT * EXCEPT (computed_at)",
+                1,
+            )
+        } else {
+            recipe.sql.to_owned()
+        };
+
+        // The leaderboard is per COLLATERAL TOKEN, and anyone may really
+        // split a worthless ERC-20 at a trusted registry - that is a true
+        // fact about a real contract, reported under that token and
+        // nowhere near the tokens a UI ranks by. So the screens are
+        // compared for the collaterals that carry the market, and the
+        // junk line is asserted separately below.
+        let sql = if recipe.screen == "Leaderboard" {
+            format!(
+                "SELECT * FROM ({sql}) \
+                 WHERE lower(hex(collateral_token)) != '{}'",
+                id32_hex(JUNK_COLLATERAL)
+            )
+        } else {
+            sql
+        };
+
+        seen.push((
+            recipe.screen.to_owned(),
+            database.snapshot(&sql).await,
+        ));
+    }
+
+    // The aggregates the screens are built on, directly - for the
+    // registries a screen can reach. A candle row of an UNTRUSTED
+    // registry exists (the materialized view cannot know a trust table
+    // the operator may populate later), and no view reads it: every
+    // prediction_candles_*_v guards on prediction_trusted_registries_v.
+    for table in ["prediction_candles_1m", "prediction_candles_1d"] {
+        seen.push((
+            table.to_owned(),
+            database
+                .snapshot(&format!(
+                    "SELECT chain, lower(hex(registry)) AS registry, \
+                     toString(outcome_token_id) AS token, bucket, \
+                     toFloat64(sum(volume)) AS volume, \
+                     toFloat64(sum(shares)) AS shares, \
+                     toUInt64(sum(trades)) AS trades, \
+                     argMaxMerge(close) AS close, uniqMerge(traders) AS traders \
+                     FROM {table} WHERE (chain, registry) IN ( \
+                     SELECT chain, registry FROM prediction_trusted_registries_v) \
+                     GROUP BY chain, registry, token, bucket"
+                ))
+                .await,
+        ));
+    }
+
+    seen
+}
+
+/// The four forgeries review-c reproduced (findings 1, 2, 3 and 7). Each
+/// one is a real, permissionless transaction pattern; none of them may
+/// move a single number on a headline screen.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn forged_markets_trades_and_collaterals_never_reach_a_screen() {
+    let database = TestDb::create().await;
+    let now = now();
+    let traded_at = now - 3 * 3_600;
+
+    database.token(USDC_E, "USDC.e", 6).await;
+    database.token(WRAPPED_COLLATERAL, "WCOL", 6).await;
+    database.token(JUNK_COLLATERAL, "JUNK", 6).await;
+    database.venue(NEG_RISK_EXCHANGE, USDC_E).await;
+    database.trust(CTF, &[NEG_RISK_EXCHANGE]).await;
+
+    for (tx, block, timestamp) in [
+        (&fixtures::UMA_QUESTION_INITIALIZED, 900u64, traded_at - 7_000),
+        (&fixtures::V1_NEG_RISK_MATCH, 1_000, traded_at),
+        (&fixtures::USER_SPLIT, 1_001, traded_at + 10),
+    ] {
+        database.insert(&decoded(tx, block, timestamp, 0)).await;
+    }
+    database.trust_adapters(CTF).await;
+
+    let chain = CHAIN.to_string();
+    let m1_hex = hex::encode(m1());
+    let token = U256::from_be_bytes(hash(M1_NO).0).to_string();
+    database.set(&[
+        ("chain", &chain),
+        ("market_id", &m1_hex),
+        ("event_id", &m1_hex),
+        ("registry", &bare(CTF)),
+        ("token", &token),
+        ("holder", &bare(TAKER)),
+        ("text", "the"),
+        ("from_day", "2020-01-01"),
+        ("to_day", "2100-01-01"),
+    ]);
+
+    let honest = headline(&database).await;
+    let filled =
+        honest.iter().filter(|(_, rows)| !rows.is_empty()).count();
+    assert!(filled >= 6, "nothing to protect: {filled}");
+
+    let version = crate::db::next_version();
+    let forger = id32_hex(FORGER);
+    let junk = id32_hex(JUNK_COLLATERAL);
+    let ctf = id32_hex(CTF);
+    let oracle = database
+        .rows::<String>(&format!(
+            "SELECT lower(hex(oracle)) FROM prediction_markets FINAL \
+             WHERE chain = {CHAIN} AND market_id = unhex('{m1_hex}') LIMIT 1"
+        ))
+        .await;
+    let oracle = oracle.first().cloned().unwrap_or_else(|| ctf.clone());
+
+    for sql in [
+        // FINDING 1. A junk contract prepares the SAME condition, naming
+        // the REAL oracle and questionId - the decoder re-derives the
+        // conditionId and a forger can compute it too - so the live view
+        // joins it to the real title, and the market list would carry a
+        // second row for one market, at the top if the forger prints
+        // enough volume.
+        format!(
+            "INSERT INTO prediction_markets (chain, market_id, registry, protocol, \
+             oracle, question_id, outcome_count, block_number, timestamp, tx_id, \
+             tx_index, ordinal, tx_from, source, epoch, _version) VALUES \
+             ({CHAIN}, unhex('{m1_hex}'), unhex('{forger}'), 'ctf', \
+             unhex('{oracle}'), unhex('{m1_hex}'), 2, 900, {traded_at}, \
+             unhex('{m1_hex}'), 0, 0, unhex('{forger}'), 'event', 0, {version})"
+        ),
+        // FINDING 3. The junk registry puts itself in the token map of the
+        // real market, so a tape or holders query that resolves by
+        // market_id alone reads its rows.
+        format!(
+            "INSERT INTO prediction_outcome_tokens (chain, registry, \
+             outcome_token_id, market_id, outcome_index, collateral_token, \
+             first_seen_block, first_seen_timestamp, _version) VALUES \
+             ({CHAIN}, unhex('{forger}'), toUInt256('{token}'), \
+             unhex('{m1_hex}'), 1, unhex('{junk}'), 1, {traded_at}, {version})"
+        ),
+        // FINDING 7. A one wei split of a worthless ERC-20 against the
+        // REAL registry, mined earlier than anything honest: with a
+        // first-seen argMin it becomes the market's primary collateral and
+        // the real outcome tokens fall out of the market entirely.
+        format!(
+            "INSERT INTO prediction_outcome_tokens (chain, registry, \
+             outcome_token_id, market_id, outcome_index, collateral_token, \
+             first_seen_block, first_seen_timestamp, _version) VALUES \
+             ({CHAIN}, unhex('{ctf}'), toUInt256('999'), \
+             unhex('{m1_hex}'), 0, unhex('{junk}'), 1, {traded_at}, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_position_events (chain, block_number, timestamp, \
+             tx_id, tx_index, ordinal, protocol, emitter, kind, stakeholder, \
+             market_id, collateral_token, parent_collection_id, index_sets, amount, \
+             tx_from, epoch, _version) VALUES \
+             ({CHAIN}, 1, {traded_at}, unhex('{m1_hex}'), 0, 0, 'ctf', \
+             unhex('{ctf}'), 'split', unhex('{forger}'), unhex('{m1_hex}'), \
+             unhex('{junk}'), toFixedString('', 32), [1, 2], 1, \
+             unhex('{forger}'), 0, {version})"
+        ),
+        // FINDING 2. A lone OrderFilled from the forger's own contract,
+        // naming a REAL outcome token id and 10^24 shares at 0.99. Its
+        // registry is the genuine CTF, because the genuine CTF really did
+        // move that token id in the same transaction (one unit, from the
+        // permissionless splitPosition above) - `movers` cannot tell. Only
+        // `verified` can, and it is 0.
+        format!(
+            "INSERT INTO prediction_trades (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, protocol, exchange, registry, order_hash, maker, \
+             taker, tx_from, tx_to, outcome_token_id, side, share_amount, \
+             collateral_amount, match_type, verified, maker_outcome_token_id, \
+             maker_side, maker_collateral_amount, maker_fee_amount, maker_fee_unit, \
+             taker_fee_amount, taker_fee_unit, epoch, _version) VALUES \
+             ({CHAIN}, 1002, {traded_at}, unhex('{m1_hex}'), 0, 0, 'ctf_exchange', \
+             unhex('{forger}'), unhex('{ctf}'), unhex('{m1_hex}'), unhex('{forger}'), \
+             unhex('{forger}'), unhex('{forger}'), unhex('{forger}'), \
+             toUInt256('{token}'), 'buy', 1000000000000000000000000, \
+             990000000000000000000000, 'complementary', 0, toUInt256('{token}'), \
+             'sell', 990000000000000000000000, 0, 'collateral', 0, 'collateral', \
+             0, {version})"
+        ),
+        // The same fill, but on the forger's own registry AND marked
+        // verified: its own transfers really do back it. Trust, not proof,
+        // is what has to keep this one out.
+        format!(
+            "INSERT INTO prediction_trades (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, protocol, exchange, registry, order_hash, maker, \
+             taker, tx_from, tx_to, outcome_token_id, side, share_amount, \
+             collateral_amount, match_type, verified, maker_outcome_token_id, \
+             maker_side, maker_collateral_amount, maker_fee_amount, maker_fee_unit, \
+             taker_fee_amount, taker_fee_unit, epoch, _version) VALUES \
+             ({CHAIN}, 1003, {traded_at}, unhex('{m1_hex}'), 0, 1, 'ctf_exchange', \
+             unhex('{forger}'), unhex('{forger}'), unhex('{m1_hex}'), \
+             unhex('{forger}'), unhex('{forger}'), unhex('{forger}'), \
+             unhex('{forger}'), toUInt256('{token}'), 'buy', \
+             1000000000000000000000000, 990000000000000000000000, 'complementary', \
+             1, toUInt256('{token}'), 'sell', 990000000000000000000000, 0, \
+             'collateral', 0, 'collateral', 0, {version})"
+        ),
+    ] {
+        database.execute(&sql).await;
+    }
+
+    // Every screen shows exactly what it showed before the forgeries.
+    let forged = headline(&database).await;
+    assert_eq!(forged.len(), honest.len());
+    for ((screen, after), (_, before)) in forged.iter().zip(&honest) {
+        assert_eq!(after, before, "{screen}");
+    }
+
+    // The forger's ONLY presence on a leaderboard is the worthless token
+    // it really did lock one unit of, under that token's own line.
+    let forged_lines: Vec<(String, f64)> = database
+        .rows(&format!(
+            "SELECT lower(hex(collateral_token)), ifNull(net_cash_flow, -999.) \
+             FROM ({}) WHERE lower(hex(trader)) = '{forger}'",
+            cookbook::LEADERBOARD.sql
+        ))
+        .await;
+    assert_eq!(forged_lines.len(), 1, "{forged_lines:?}");
+    assert_eq!(forged_lines[0].0, id32_hex(JUNK_COLLATERAL));
+
+    // The rows were KEPT, and the forensic views show them: this is a
+    // trust boundary, not a deletion.
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM prediction_markets_all_v \
+                 WHERE chain = {CHAIN} AND market_id = unhex('{m1_hex}')"
+            ))
+            .await,
+        2,
+        "the forged market must still be visible to an operator"
+    );
+    let all: Vec<(String, u8, bool)> = database
+        .rows(&format!(
+            "SELECT lower(hex(exchange)), verified, trusted \
+             FROM prediction_trades_all_v(chain = {{chain:UInt64}}, \
+             market_id = {{market_id:String}}) \
+             WHERE lower(hex(exchange)) = '{forger}'"
+        ))
+        .await;
+    assert!(!all.is_empty(), "the forged fills must still be there");
+    assert!(all
+        .iter()
+        .all(|(_, verified, trusted)| *verified == 0 || !*trusted));
+
+    // And once the operator DOES trust the forger, its market appears -
+    // the boundary is the table, not a hard coded address list.
+    database.trust(FORGER, &[FORGER]).await;
+    database.refresh_markets().await;
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM prediction_markets_v \
+                 WHERE chain = {CHAIN} AND market_id = unhex('{m1_hex}')"
+            ))
+            .await,
+        2
+    );
 
     database.drop().await;
 }

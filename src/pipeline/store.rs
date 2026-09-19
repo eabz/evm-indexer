@@ -10,7 +10,10 @@ use crate::{
         self,
         derived::{DerivedTable, CORE_DERIVED},
         ranges::DatabaseCheckpoint,
-        schema::{live_rows_sql, min_timestamp_sql},
+        schema::{
+            live_rows_sql, min_timestamp_sql, tombstone_sql_where,
+            view_targets,
+        },
         Database,
     },
     pipeline::modules::{
@@ -89,6 +92,48 @@ impl Child {
                 db::tombstone_sql(self.table, chain, from, to, version)
             }
         }
+    }
+}
+
+/// A read-path side table of the scope, with the base table whose rows it
+/// mirrors.
+///
+/// Side tables are fed by materialized views that pass `_version` and
+/// `is_deleted` through, so a tombstone in the base table normally kills
+/// the side rows for free. "Normally": if the base insert lands and the
+/// push into one of its views does not (a failure between the parts, a
+/// process killed mid insert), the base row is dead and the side row stays
+/// alive FOR EVER - nothing else ever rewrites it. So a purge verifies the
+/// side tables too and repairs them by tombstoning them directly, which is
+/// safe because they are `ReplacingMergeTree(_version, is_deleted)` over
+/// `chain` + a block column like everything else.
+struct Side {
+    table: &'static str,
+    /// Column of the SIDE table holding the block number; it may differ
+    /// from the base table's (`block_lookup.block_number` mirrors
+    /// `blocks.number`, `dex_pools_by_token.block_number` mirrors
+    /// `dex_pools.created_block`).
+    block_column: &'static str,
+    /// The extra predicate of the BASE table (`dex_pools`: only rows that
+    /// came from an event, never the RPC resolver's). The side table
+    /// carries the same column, which a unit test asserts.
+    filter: Option<&'static str>,
+}
+
+impl Side {
+    fn predicate(&self, chain: u64, from: u64, to: Option<u64>) -> String {
+        let column = self.block_column;
+        let mut predicate =
+            format!("chain = {chain} AND `{column}` >= {from}");
+
+        if let Some(to) = to {
+            predicate.push_str(&format!(" AND `{column}` < {to}"));
+        }
+        if let Some(filter) = self.filter {
+            predicate.push_str(&format!(" AND {filter}"));
+        }
+
+        predicate
     }
 }
 
@@ -207,6 +252,68 @@ impl ClickhouseReorgStore {
         matches!(self.scope, Scope::Chain)
     }
 
+    /// Every side table of the scope: the targets the embedded migrations
+    /// declare a materialized view of a base table of the scope for, kept
+    /// down to the ones listed as side tables in Rust.
+    ///
+    /// The migrations are the single source of truth for WHICH table
+    /// mirrors which (like the column lists in `db::schema`); the Rust
+    /// lists say which of those targets is a side table and not an
+    /// aggregate (an `AggregatingMergeTree` has no `is_deleted` and is
+    /// repaired per epoch instead).
+    fn side_tables(&self) -> Vec<Side> {
+        let mut sides = Vec::new();
+
+        let mut of_base =
+            |base: &'static str, spec: Option<&'static ModuleSpec>| {
+                let declared: &[&'static str] = match spec {
+                    Some(spec) => spec.side_tables,
+                    None => db::SIDE_TABLES,
+                };
+                let filter =
+                    spec.and_then(|spec| (spec.purge_filter)(base));
+
+                let Some(targets) = view_targets().get(base) else {
+                    return;
+                };
+
+                for target in targets {
+                    let Some(table) = declared
+                        .iter()
+                        .find(|side| *side == target)
+                        .copied()
+                    else {
+                        continue;
+                    };
+
+                    // `nft_transfers_by_account` mirrors both ERC-721 and
+                    // ERC-1155 transfers: one repair covers both.
+                    if sides.iter().any(|side: &Side| side.table == table)
+                    {
+                        continue;
+                    }
+
+                    sides.push(Side {
+                        table,
+                        block_column: match spec {
+                            Some(spec) => (spec.block_column)(table),
+                            None => db::block_number_column(table),
+                        },
+                        filter,
+                    });
+                }
+            };
+
+        for child in self.children() {
+            of_base(child.table, child.spec);
+        }
+        if self.touches_blocks() {
+            of_base("blocks", None);
+        }
+
+        sides
+    }
+
     async fn count(&self, sql: &str) -> Result<u64> {
         self.db
             .db
@@ -265,9 +372,9 @@ impl ClickhouseReorgStore {
                 Scope::Module(scoped) => scoped.name == spec.name,
             };
             tables.extend(
-                spec.derived
-                    .iter()
-                    .map(|table| (table, spec.rebuild_sql, in_scope)),
+                spec.derived.iter().map(|table| {
+                    (table, spec.rebuild_statements, in_scope)
+                }),
             );
         }
 
@@ -620,6 +727,69 @@ impl ReorgStore for ClickhouseReorgStore {
         })
     }
 
+    fn live_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move {
+            let mut live = 0;
+            for side in self.side_tables() {
+                live += self
+                    .count(&format!(
+                        "SELECT toUInt64(count()) FROM `{}` FINAL WHERE {}",
+                        side.table,
+                        side.predicate(chain, from, to)
+                    ))
+                    .await?;
+            }
+            Ok(live)
+        })
+    }
+
+    fn tombstone_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move {
+            let mut tombstoned = 0;
+
+            for side in self.side_tables() {
+                let predicate = side.predicate(chain, from, to);
+
+                let live = self
+                    .count(&format!(
+                        "SELECT toUInt64(count()) FROM `{}` FINAL WHERE \
+                         {predicate}",
+                        side.table
+                    ))
+                    .await?;
+
+                if live == 0 {
+                    continue;
+                }
+
+                debug!(
+                    "purge: repairing {live} orphaned row(s) in the side \
+                     table '{}' (a materialized view push was lost).",
+                    side.table
+                );
+
+                self.execute(&tombstone_sql_where(
+                    side.table, &predicate, version,
+                )?)
+                .await?;
+                tombstoned += live;
+            }
+
+            Ok(tombstoned)
+        })
+    }
+
     fn tombstone_blocks(
         &self,
         chain: u64,
@@ -696,6 +866,104 @@ mod tests {
         assert_eq!(summary(&writes), vec![(10, 20, 1)]);
 
         assert!(checkpoint_writes(&[], 0, None, 1).is_empty());
+    }
+
+    /// The base -> side mapping comes from the migration DDL, so a view
+    /// that is renamed, retargeted or forgotten is caught here instead of
+    /// leaving permanent orphans behind after the next reorg.
+    #[test]
+    fn every_declared_side_table_is_covered_by_the_purge() {
+        use crate::db::schema::has_column;
+
+        let store = |scope| ClickhouseReorgStore {
+            db: Database::offline(1),
+            scope,
+        };
+
+        let chain = store(Scope::Chain);
+        let mut found: Vec<&str> =
+            chain.side_tables().iter().map(|side| side.table).collect();
+        found.sort_unstable();
+
+        let mut declared: Vec<&str> = db::SIDE_TABLES.to_vec();
+        for spec in ALL_MODULES {
+            declared.extend_from_slice(spec.side_tables);
+        }
+        declared.sort_unstable();
+
+        assert_eq!(
+            found, declared,
+            "a side table has no materialized view of a base table in the \
+             embedded migrations (renamed? fed from another side table?), \
+             or a view feeds a table nobody declared. A purge would leave \
+             its rows alive for ever."
+        );
+
+        // Every column the repair's predicate names really exists there.
+        for side in chain.side_tables() {
+            assert!(
+                has_column(side.table, "chain")
+                    && has_column(side.table, side.block_column),
+                "{}",
+                side.table
+            );
+            if let Some(filter) = side.filter {
+                let column =
+                    filter.split_whitespace().next().unwrap_or_default();
+                assert!(
+                    has_column(side.table, column),
+                    "the purge filter of the base table of '{}' is \
+                     `{filter}`, but it has no '{column}' column: the \
+                     repair would tombstone rows the base table keeps",
+                    side.table
+                );
+            }
+        }
+
+        // A module scoped purge only ever reaches its own read path.
+        for spec in ALL_MODULES {
+            let mut scoped: Vec<&str> = store(Scope::Module(spec))
+                .side_tables()
+                .iter()
+                .map(|side| side.table)
+                .collect();
+            scoped.sort_unstable();
+
+            let mut expected = spec.side_tables.to_vec();
+            expected.sort_unstable();
+            assert_eq!(scoped, expected, "{}", spec.name);
+        }
+    }
+
+    #[test]
+    fn the_side_predicate_uses_the_side_block_column_and_the_base_filter()
+    {
+        let sides = ClickhouseReorgStore {
+            db: Database::offline(1),
+            scope: Scope::Chain,
+        }
+        .side_tables();
+
+        let side = |name: &str| {
+            sides.iter().find(|side| side.table == name).unwrap()
+        };
+
+        // `block_lookup` mirrors `blocks`, whose block column is `number`.
+        assert_eq!(
+            side("block_lookup").predicate(1, 10, Some(20)),
+            "chain = 1 AND `block_number` >= 10 AND `block_number` < 20"
+        );
+        // `dex_pools_by_token` mirrors `dex_pools`, whose rows may also
+        // come from the RPC resolver (`created_block` 0): the filter of
+        // the base table travels with it.
+        assert_eq!(
+            side("dex_pools_by_token").predicate(7, 0, None),
+            "chain = 7 AND `block_number` >= 0 AND source = 'event'"
+        );
+        assert_eq!(
+            side("tx_lookup").predicate(1, 5, None),
+            "chain = 1 AND `block_number` >= 5"
+        );
     }
 
     #[test]

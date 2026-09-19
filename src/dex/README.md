@@ -1,7 +1,12 @@
 # DEX analytics (`src/dex`, migrations `0010`-`0012`)
 
 Chain agnostic, DEX agnostic swap / liquidity / pool indexing, enabled with
-`--dex`. Design: `docs/design.md` §5.
+`--dex`. Design: `docs/design.md` §5 and §13.
+
+**The `dex_*` tables are chain neutral**: they are meant to hold Solana (and any
+other family) beside the EVM chains, so every id is 32 bytes and every position is
+`(chain, block_number, tx_index, ordinal)`. See "Identity and position" below
+before writing a query - an EVM address is *padded*, not stored as 20 bytes.
 
 **Decoding is by event family, never by router / factory registry.** A log is a
 swap when its `topic0` AND its shape (topic count, data length, value ranges of
@@ -83,9 +88,10 @@ emit their events. Their swaps are valued ONLY when the emitter is listed by the
 operator (no seed rows ship; addresses are raw bytes):
 
 ```sql
+-- emitter is a 32 byte id: an EVM address is left padded with 12 zero bytes.
 INSERT INTO dex_trusted_emitters (chain, emitter, protocol) VALUES
-  (1, unhex('BA12222222228d8Ba445958a75a0704d566BF2C8'), 'balancer_v2'),  -- Vault (same on most chains)
-  (1, unhex('000000000004444c5dc75cB358380D2e3dE08A90'), 'uniswap_v4');   -- PoolManager, Ethereum
+  (1, unhex(concat(repeat('00', 12), 'BA12222222228d8Ba445958a75a0704d566BF2C8')), 'balancer_v2'),  -- Vault (same on most chains)
+  (1, unhex(concat(repeat('00', 12), '000000000004444c5dc75cB358380D2e3dE08A90')), 'uniswap_v4');   -- PoolManager, Ethereum
 ```
 
 Retire a row with `protocol = ''`. `price_source = 1` on any row of a chain
@@ -131,6 +137,11 @@ first. Without `--rpc` contract pools are never trusted: USD numbers still work
 * `pool_id` is 32 bytes: pool address left padded, or the native `bytes32` id
   (V4, Balancer). `emitter` is the contract that emitted the event and is part
   of a pool's identity everywhere.
+* **Position is `(chain, block_number, tx_index, ordinal)`** in every table.
+  On EVM `tx_index` is the transaction's index in the block and `ordinal` the
+  log index; `block_number` keeps its name and holds the slot on Solana.
+  `tx_id` is the raw transaction id (32 bytes on EVM, 64 on Solana) and is
+  never part of a sorting key.
 * **`tx_from` / `tx_to` are the sender and the target of the TRANSACTION**, filled
   on swaps AND liquidity rows by `DexRows::attach_transactions` from the
   transactions of the same batch. `dex_liquidity.tx_from` is who seeded (or
@@ -138,9 +149,70 @@ first. Without `--rpc` contract pools are never trusted: USD numbers still work
   it for attribution. `dex_swaps.trader` = `tx_from` when attached, else the
   event's recipient, else its sender. `tx_to` is the contract the user called:
   router / aggregator attribution without a registry.
-* Hashes / addresses are raw bytes (`FixedString`): format with
-  `concat('0x', lower(hex(x)))`, compare with `unhex('...')`. Query base tables
-  with `FINAL`.
+* Ids are raw bytes (`FixedString(32)`), never hex. Query base tables with
+  `FINAL`. How to format and compare them: next section.
+
+## Identity and position: 32 byte ids (`docs/design.md` §13)
+
+Every identity column - `pool_id`, `emitter`, `factory`, `token0` / `token1` /
+`tokens`, `hooks`, `sender`, `recipient`, `owner`, `tx_from`, `tx_to`, `trader`,
+`token_in` / `token_out`, `verified_in` / `verified_out`, `quote_tokens.token`,
+`dex_trusted_emitters.emitter` - is `FixedString(32)`:
+
+| family | encoding |
+|---|---|
+| EVM | 12 zero bytes + the 20 address bytes |
+| Solana | the 32 raw pubkey bytes |
+
+"Unknown" is the 32 zero bytes, `toFixedString('', 32)`.
+
+**Comparing.** Pad the address:
+
+```sql
+WHERE token = unhex(concat(repeat('00', 12), 'A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'))
+```
+
+**Printing.** The bytes do not say which family they belong to, so register the
+chain once in `chains` (migration `0006`) and read it through `chains_v`:
+
+```sql
+INSERT INTO chains (chain, name, family) VALUES
+  (1, 'ethereum', 'evm'),
+  (8453, 'base', 'evm'),
+  (1399811149, 'solana', 'svm');   -- family is 'evm' or 'svm'
+```
+
+Then use THE one expression, everywhere (`id` is any identity column):
+
+```sql
+SELECT if(c.family = 'svm',
+          base58Encode(substring(s.trader, 1, 32)),
+          concat('0x', lower(hex(substring(s.trader, 13))))) AS trader
+FROM dex_swaps AS s FINAL
+LEFT JOIN chains_v AS c ON c.chain = s.chain
+WHERE s.chain = 1
+```
+
+`substring()` is **not** decoration. Turning a `FixedString` into a `String` -
+`toString(id)`, `CAST(id AS String)`, and the implicit conversion
+`base58Encode(id)` performs - **trims trailing zero bytes**, so
+`base58Encode(id)` silently encodes a shortened pubkey. `substring(id, 1, 32)`
+and `concat(id, '')` keep every byte.
+
+**A `pool_id` is not an address**, even on EVM (a Uniswap V4 or Balancer id is a
+native 32 byte value), so `dex_pools_v.pool` prints all 32 bytes and must never
+go through the `'evm'` branch.
+
+**The seam with the EVM-only tables.** `tokens` (and the transfer tables) stay
+EVM shaped, `address FixedString(20)`. `dex_token_info_v` therefore pads the
+address UP to 32 bytes; it never truncates the analytics side, so a Solana token
+finds no `tokens` row instead of matching one that happens to share its last 20
+bytes.
+
+In Rust nobody hand rolls the padding: `crate::utils::format` has `id32` /
+`address_of_id32`, the `SerId32` / `SerVecId32` serializers, and `tx_id` /
+`tx_hash_of` / `SerTxId`. Reading an id whose 12 leading bytes are not zero is
+an error, never a truncation.
 
 ## Reorgs: insert-only (docs/design.md §2)
 
@@ -179,12 +251,12 @@ tables and `dex_pools` by chain. Always read with `FINAL`.
 
 | table | key | purged by |
 |---|---|---|
-| `dex_pools` | `(chain, pool_id, emitter, created_block, log_index)` | tombstones on `created_block`, event rows only |
-| `dex_swaps` | `(chain, block_number, log_index)` | tombstones on `block_number` |
-| `dex_liquidity` | `(chain, block_number, log_index)` | tombstones on `block_number` |
-| `dex_swaps_by_pool` (MV) | `(chain, pool_id, block_number, log_index)` | follows `dex_swaps` |
-| `dex_swaps_by_trader` (MV) | `(chain, trader, block_number, log_index)` | follows `dex_swaps` |
-| `dex_pools_by_token` (MV) | `(chain, token, pool_id, emitter, block_number, log_index)` | follows `dex_pools` (a claim index: join `dex_pool_current_v`) |
+| `dex_pools` | `(chain, pool_id, emitter, created_block, tx_index, ordinal)` | tombstones on `created_block`, event rows only |
+| `dex_swaps` | `(chain, block_number, tx_index, ordinal)` | tombstones on `block_number` |
+| `dex_liquidity` | `(chain, block_number, tx_index, ordinal)` | tombstones on `block_number` |
+| `dex_swaps_by_pool` (MV) | `(chain, pool_id, block_number, tx_index, ordinal)` | follows `dex_swaps` |
+| `dex_swaps_by_trader` (MV) | `(chain, trader, block_number, tx_index, ordinal)` | follows `dex_swaps` |
+| `dex_pools_by_token` (MV) | `(chain, token, pool_id, emitter, block_number, tx_index, ordinal)` | follows `dex_pools` (a claim index: join `dex_pool_current_v`) |
 | `dex_pool_current_v` (view) | what is known about every pool, and how well | - |
 | `quote_tokens`, `dex_trusted_emitters` | user data | never purged |
 
@@ -198,6 +270,11 @@ view + finalizing `*_v` view, each declared in `dex::DEX_DERIVED` with a
 |---|---|---|
 | `dex_candles_1m` / `_1h` / `_1d` | 60 / 3600 / 86400 | per pool (two token families) two price series, volume0, volume1, swaps, unique traders |
 | `dex_pool_volume_1h` | 3600 | per pool and VERIFIED `(token_in, token_out)`: volume in / out, swaps, traders. The base of every USD number, of per pool / protocol activity and of the resolver's work list |
+
+A candle's `open` / `close` is the price at the smallest / largest POSITION of
+the bucket: the `argMinIf` / `argMaxIf` states order by the
+`(block_number, tx_index, ordinal)` tuple of §13, not by a `(block, log index)`
+pair.
 
 Candle prices are token1 per token0 in RAW units, NULL when the bucket has no
 swap that defines them:
@@ -256,15 +333,18 @@ pools: set `price_source = 1` rows to pin the price to pools you trust.
 indexer ships no chain specific data and never writes it:
 
 ```sql
+-- token is a 32 byte id: an EVM address is left padded with 12 zero bytes.
 INSERT INTO quote_tokens (chain, token, kind) VALUES
-  (1, unhex('A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'), 'stable'),  -- USDC
-  (1, unhex('dAC17F958D2ee523a2206206994597C13D831ec7'), 'stable'),  -- USDT
-  (1, unhex('C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'), 'native');  -- WETH
+  (1, unhex(concat(repeat('00', 12), 'A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48')), 'stable'),  -- USDC
+  (1, unhex(concat(repeat('00', 12), 'dAC17F958D2ee523a2206206994597C13D831ec7')), 'stable'),  -- USDT
+  (1, unhex(concat(repeat('00', 12), 'C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2')), 'native');  -- WETH
 -- pseudo addresses of the native coin have no contract (and no Transfer, so
 -- their legs never verify): they only matter for display
 INSERT INTO quote_tokens (chain, token, kind, decimals, symbol) VALUES
-  (1, unhex('0000000000000000000000000000000000000000'), 'native', 18, 'ETH'),
-  (1, unhex('EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE'), 'native', 18, 'ETH');
+  (1, unhex(concat(repeat('00', 12), '0000000000000000000000000000000000000000')), 'native', 18, 'ETH'),
+  (1, unhex(concat(repeat('00', 12), 'EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE')), 'native', 18, 'ETH');
+-- on Solana a token id is the 32 pubkey bytes, so no padding:
+-- (1399811149, base58Decode('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'), 'stable')
 ```
 
 `decimals` is only a fallback for addresses without a `tokens` row and is NULL by

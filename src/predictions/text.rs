@@ -15,6 +15,27 @@
 //! Nothing here is guaranteed by a contract: whatever does not look like
 //! the above yields empty strings, never an error. The raw payload is
 //! stored next to the parsed fields.
+//!
+//! # This text is HOSTILE
+//!
+//! `QuestionInitialized` / `MarketPrepared` are permissionless: the bytes
+//! are chosen by whoever emitted the log, and they end up in
+//! `prediction_markets_v.title` / `.description` / `.outcomes`, i.e. on a
+//! screen. [`sanitize`] therefore strips, from every parsed field:
+//!
+//! * C0 controls including newline and tab (a title is one line - a
+//!   newline in a log line or a CSV export is a forged second row),
+//! * C1 controls and the Unicode line / paragraph separators,
+//! * the bidirectional overrides and isolates (`U+202A..U+202E`,
+//!   `U+2066..U+2069`) - the "Trojan Source" class, which makes a title
+//!   render as text it does not contain,
+//! * the zero width characters and `U+FEFF`,
+//! * `U+0000`,
+//!
+//! and caps the length. It does NOT escape HTML: the strings are stored as
+//! text, so **the UI must escape them** (the README says so next to the
+//! cookbook). A `<script>` in a title is data here and must stay data
+//! there.
 
 /// What could be read out of a payload.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -51,6 +72,54 @@ fn to_text(data: &[u8]) -> String {
     trimmed.to_owned()
 }
 
+/// Drops the characters that let on chain text lie about what it is
+/// (see the module docs). Collapses the runs of whitespace a stripped
+/// control leaves behind, so a title stays one readable line.
+pub fn sanitize(text: &str) -> String {
+    let kept: String = text
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() {
+                // Every kind of space, including the separators, becomes
+                // a plain one.
+                ' '
+            } else {
+                c
+            }
+        })
+        .filter(|c| {
+            let code = u32::from(*c);
+            let control = code < 0x20 || (0x7f..=0x9f).contains(&code);
+            let bidi = (0x202a..=0x202e).contains(&code)
+                || (0x2066..=0x2069).contains(&code)
+                || code == 0x200f
+                || code == 0x200e;
+            let invisible = (0x200b..=0x200d).contains(&code)
+                || code == 0xfeff
+                || code == 0x2060;
+
+            !(control || bidi || invisible)
+        })
+        .collect();
+
+    // A run of spaces where controls were removed reads as a gap.
+    let mut out = String::with_capacity(kept.len());
+    let mut space = false;
+    for c in kept.chars() {
+        if c == ' ' {
+            space = true;
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        out.push(c);
+    }
+
+    out
+}
+
 fn truncate(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
@@ -84,7 +153,12 @@ fn outcome_labels(text: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    vec![second.to_owned(), first.to_owned()]
+    let (first, second) = (sanitize(first), sanitize(second));
+    if first.is_empty() || second.is_empty() {
+        return Vec::new();
+    }
+
+    vec![second, first]
 }
 
 pub fn parse(data: &[u8]) -> QuestionText {
@@ -108,8 +182,8 @@ pub fn parse(data: &[u8]) -> QuestionText {
         .unwrap_or(rest.len());
 
     QuestionText {
-        title: truncate(title.trim(), 512),
-        description: truncate(rest[..end].trim(), MAX_DESCRIPTION),
+        title: truncate(&sanitize(title), 512),
+        description: truncate(&sanitize(&rest[..end]), MAX_DESCRIPTION),
         outcomes: outcome_labels(rest),
     }
 }
@@ -143,6 +217,62 @@ mod tests {
         let hexed =
             hex::encode("title: Winner 2026, description: x, id: 1");
         assert_eq!(parse(hexed.as_bytes()).title, "Winner 2026");
+    }
+
+    /// On chain text is chosen by whoever emitted the log. None of it
+    /// may reach a screen as anything but one line of plain characters.
+    #[test]
+    fn hostile_text_is_stripped_of_controls_and_bidi_overrides() {
+        // A newline would forge a second line in a log or a CSV export.
+        let parsed = parse(
+            "title: Real\nFAKE: resolved YES, description: a\tb\u{0}c, id: 1"
+                .as_bytes(),
+        );
+        assert_eq!(parsed.title, "Real FAKE: resolved YES");
+        assert_eq!(parsed.description, "a bc");
+        assert!(!parsed.title.contains('\n'));
+
+        // Trojan Source: the override makes the rendering lie.
+        let parsed = parse(
+            "title: Will \u{202e}SEY evloser\u{202c} happen?, description: d, id: 1"
+                .as_bytes(),
+        );
+        assert_eq!(parsed.title, "Will SEY evloser happen?");
+        for c in parsed.title.chars() {
+            assert!(!(0x202a..=0x202e).contains(&u32::from(c)));
+        }
+
+        // Zero width characters cannot smuggle a different word past a
+        // human reader or a search.
+        assert_eq!(
+            parse(
+                "title: Pol\u{200b}ymarket, description: d, id: 1"
+                    .as_bytes()
+            )
+            .title,
+            "Polymarket"
+        );
+
+        // Outcome labels go through the same door.
+        let parsed = parse(
+            "q: title: t, description: d res_data: Where p1 corresponds \
+             to N\u{0}o, p2 to Y\u{202e}es, p3 to x."
+                .as_bytes(),
+        );
+        assert_eq!(parsed.outcomes, vec!["Yes", "No"]);
+
+        // HTML is NOT escaped here - it is data, and the UI escapes it.
+        assert_eq!(
+            parse(
+                "title: <script>alert(1)</script>, description: d, id: 1"
+                    .as_bytes()
+            )
+            .title,
+            "<script>alert(1)</script>"
+        );
+
+        // Nothing but controls leaves nothing.
+        assert_eq!(sanitize("\u{202e}\u{200b}\n\t "), "");
     }
 
     #[test]

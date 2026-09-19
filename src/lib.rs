@@ -1,6 +1,7 @@
 pub mod configs;
 pub mod db;
 pub mod dex;
+pub mod launchpads;
 pub mod metrics;
 pub mod pipeline;
 pub mod predictions;

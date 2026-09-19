@@ -1,4 +1,10 @@
--- Incremental DEX aggregates (docs/design.md §1 "Aggregates", §2).
+-- Incremental DEX aggregates (docs/design.md §1 "Aggregates", §2, §13).
+--
+-- Chain neutral like 0010: identity columns (pool_id, emitter, token_in,
+-- token_out, and the uniq state over traders) are FixedString(32), and a
+-- candle's open / close are the price at the smallest / largest POSITION of
+-- the bucket - the (block_number, tx_index, ordinal) tuple of §13, not a
+-- (block, log index) pair.
 --
 -- Every table here is declared in Rust as a DerivedTable (src/dex/derived.rs)
 -- whose rebuild_sql repeats the SELECT of its materialized view - a unit
@@ -45,23 +51,23 @@ FROM
 CREATE TABLE IF NOT EXISTS dex_candles_1m (
   chain UInt64,
   pool_id FixedString(32),
-  emitter FixedString(20),
+  emitter FixedString(32),
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32,
-  open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32), UInt8),
-  close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32), UInt8),
+  open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
+  close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
   high SimpleAggregateFunction(max, Nullable(Float64)),
   low SimpleAggregateFunction(min, Nullable(Float64)),
   trades SimpleAggregateFunction(sum, UInt64),
-  pool_open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32), UInt8),
-  pool_close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32), UInt8),
+  pool_open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
+  pool_close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
   pool_high SimpleAggregateFunction(max, Nullable(Float64)),
   pool_low SimpleAggregateFunction(min, Nullable(Float64)),
   pool_prices SimpleAggregateFunction(sum, UInt64),
   volume0 SimpleAggregateFunction(sum, Float64),
   volume1 SimpleAggregateFunction(sum, Float64),
   swaps SimpleAggregateFunction(sum, UInt64),
-  traders AggregateFunction(uniq, FixedString(20))
+  traders AggregateFunction(uniq, FixedString(32))
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(bucket)
@@ -74,13 +80,13 @@ SELECT
   chain, pool_id, emitter,
   toDateTime(intDiv(toUInt32(timestamp), 60) * 60, 'UTC') AS bucket,
   epoch,
-  argMinStateIf(trade_price, (block_number, log_index), trade_ok) AS open,
-  argMaxStateIf(trade_price, (block_number, log_index), trade_ok) AS close,
+  argMinStateIf(trade_price, (block_number, tx_index, ordinal), trade_ok) AS open,
+  argMaxStateIf(trade_price, (block_number, tx_index, ordinal), trade_ok) AS close,
   max(if(trade_ok, trade_price, NULL)) AS high,
   min(if(trade_ok, trade_price, NULL)) AS low,
   countIf(trade_ok) AS trades,
-  argMinStateIf(pool_price, (block_number, log_index), pool_ok) AS pool_open,
-  argMaxStateIf(pool_price, (block_number, log_index), pool_ok) AS pool_close,
+  argMinStateIf(pool_price, (block_number, tx_index, ordinal), pool_ok) AS pool_open,
+  argMaxStateIf(pool_price, (block_number, tx_index, ordinal), pool_ok) AS pool_close,
   max(if(pool_ok, pool_price, NULL)) AS pool_high,
   min(if(pool_ok, pool_price, NULL)) AS pool_low,
   countIf(pool_ok) AS pool_prices,
@@ -95,23 +101,23 @@ GROUP BY chain, pool_id, emitter, bucket, epoch;
 CREATE TABLE IF NOT EXISTS dex_candles_1h (
   chain UInt64,
   pool_id FixedString(32),
-  emitter FixedString(20),
+  emitter FixedString(32),
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32,
-  open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32), UInt8),
-  close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32), UInt8),
+  open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
+  close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
   high SimpleAggregateFunction(max, Nullable(Float64)),
   low SimpleAggregateFunction(min, Nullable(Float64)),
   trades SimpleAggregateFunction(sum, UInt64),
-  pool_open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32), UInt8),
-  pool_close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32), UInt8),
+  pool_open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
+  pool_close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
   pool_high SimpleAggregateFunction(max, Nullable(Float64)),
   pool_low SimpleAggregateFunction(min, Nullable(Float64)),
   pool_prices SimpleAggregateFunction(sum, UInt64),
   volume0 SimpleAggregateFunction(sum, Float64),
   volume1 SimpleAggregateFunction(sum, Float64),
   swaps SimpleAggregateFunction(sum, UInt64),
-  traders AggregateFunction(uniq, FixedString(20))
+  traders AggregateFunction(uniq, FixedString(32))
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(bucket)
@@ -124,13 +130,13 @@ SELECT
   chain, pool_id, emitter,
   toDateTime(intDiv(toUInt32(timestamp), 3600) * 3600, 'UTC') AS bucket,
   epoch,
-  argMinStateIf(trade_price, (block_number, log_index), trade_ok) AS open,
-  argMaxStateIf(trade_price, (block_number, log_index), trade_ok) AS close,
+  argMinStateIf(trade_price, (block_number, tx_index, ordinal), trade_ok) AS open,
+  argMaxStateIf(trade_price, (block_number, tx_index, ordinal), trade_ok) AS close,
   max(if(trade_ok, trade_price, NULL)) AS high,
   min(if(trade_ok, trade_price, NULL)) AS low,
   countIf(trade_ok) AS trades,
-  argMinStateIf(pool_price, (block_number, log_index), pool_ok) AS pool_open,
-  argMaxStateIf(pool_price, (block_number, log_index), pool_ok) AS pool_close,
+  argMinStateIf(pool_price, (block_number, tx_index, ordinal), pool_ok) AS pool_open,
+  argMaxStateIf(pool_price, (block_number, tx_index, ordinal), pool_ok) AS pool_close,
   max(if(pool_ok, pool_price, NULL)) AS pool_high,
   min(if(pool_ok, pool_price, NULL)) AS pool_low,
   countIf(pool_ok) AS pool_prices,
@@ -145,23 +151,23 @@ GROUP BY chain, pool_id, emitter, bucket, epoch;
 CREATE TABLE IF NOT EXISTS dex_candles_1d (
   chain UInt64,
   pool_id FixedString(32),
-  emitter FixedString(20),
+  emitter FixedString(32),
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32,
-  open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32), UInt8),
-  close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32), UInt8),
+  open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
+  close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
   high SimpleAggregateFunction(max, Nullable(Float64)),
   low SimpleAggregateFunction(min, Nullable(Float64)),
   trades SimpleAggregateFunction(sum, UInt64),
-  pool_open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32), UInt8),
-  pool_close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32), UInt8),
+  pool_open AggregateFunction(argMinIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
+  pool_close AggregateFunction(argMaxIf, Float64, Tuple(UInt64, UInt32, UInt64), UInt8),
   pool_high SimpleAggregateFunction(max, Nullable(Float64)),
   pool_low SimpleAggregateFunction(min, Nullable(Float64)),
   pool_prices SimpleAggregateFunction(sum, UInt64),
   volume0 SimpleAggregateFunction(sum, Float64),
   volume1 SimpleAggregateFunction(sum, Float64),
   swaps SimpleAggregateFunction(sum, UInt64),
-  traders AggregateFunction(uniq, FixedString(20))
+  traders AggregateFunction(uniq, FixedString(32))
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(bucket)
@@ -174,13 +180,13 @@ SELECT
   chain, pool_id, emitter,
   toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS bucket,
   epoch,
-  argMinStateIf(trade_price, (block_number, log_index), trade_ok) AS open,
-  argMaxStateIf(trade_price, (block_number, log_index), trade_ok) AS close,
+  argMinStateIf(trade_price, (block_number, tx_index, ordinal), trade_ok) AS open,
+  argMaxStateIf(trade_price, (block_number, tx_index, ordinal), trade_ok) AS close,
   max(if(trade_ok, trade_price, NULL)) AS high,
   min(if(trade_ok, trade_price, NULL)) AS low,
   countIf(trade_ok) AS trades,
-  argMinStateIf(pool_price, (block_number, log_index), pool_ok) AS pool_open,
-  argMaxStateIf(pool_price, (block_number, log_index), pool_ok) AS pool_close,
+  argMinStateIf(pool_price, (block_number, tx_index, ordinal), pool_ok) AS pool_open,
+  argMaxStateIf(pool_price, (block_number, tx_index, ordinal), pool_ok) AS pool_close,
   max(if(pool_ok, pool_price, NULL)) AS pool_high,
   min(if(pool_ok, pool_price, NULL)) AS pool_low,
   countIf(pool_ok) AS pool_prices,
@@ -202,16 +208,16 @@ GROUP BY chain, pool_id, emitter, bucket, epoch;
 CREATE TABLE IF NOT EXISTS dex_pool_volume_1h (
   chain UInt64,
   pool_id FixedString(32),
-  emitter FixedString(20),
+  emitter FixedString(32),
   protocol LowCardinality(String),
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
-  token_in FixedString(20),
-  token_out FixedString(20),
+  token_in FixedString(32),
+  token_out FixedString(32),
   epoch UInt32,
   volume_in SimpleAggregateFunction(sum, Float64),
   volume_out SimpleAggregateFunction(sum, Float64),
   swaps SimpleAggregateFunction(sum, UInt64),
-  traders AggregateFunction(uniq, FixedString(20))
+  traders AggregateFunction(uniq, FixedString(32))
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(bucket)

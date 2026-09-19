@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::OnceLock};
 
 use alloy::primitives::{keccak256, Address, B256, I256, U256};
 
-use crate::db::models::log::DatabaseLog;
+use crate::{db::models::log::DatabaseLog, utils::format::tx_id};
 
 use super::{
     corroborate::Evidence,
@@ -108,10 +108,6 @@ pub(super) fn topics_of(log: &DatabaseLog) -> Topics {
 
 /// Integer widening that compiles whatever width the log model uses.
 fn to_u64<T: Into<u64>>(value: T) -> u64 {
-    value.into()
-}
-
-fn to_u32<T: Into<u32>>(value: T) -> u32 {
     value.into()
 }
 
@@ -318,7 +314,6 @@ impl Event<'_> {
     ) -> DexPool {
         let two = tokens.len() == 2 && protocol != Protocol::BalancerV2;
         let block_number = to_u64(self.log.block_number);
-        let log_index = to_u32(self.log.log_index);
 
         DexPool {
             chain: self.chain,
@@ -336,8 +331,9 @@ impl Event<'_> {
             stable: false,
             created_block: block_number,
             timestamp: self.log.timestamp,
-            transaction_hash: self.log.transaction_hash,
-            log_index,
+            tx_id: tx_id(self.log.transaction_hash),
+            tx_index: self.log.transaction_index,
+            ordinal: to_u64(self.log.log_index),
             source: PoolSource::Event,
             attempts: 0,
             epoch: 0,
@@ -371,8 +367,9 @@ impl Event<'_> {
             chain: self.chain,
             block_number: to_u64(self.log.block_number),
             timestamp: self.log.timestamp,
-            transaction_hash: self.log.transaction_hash,
-            log_index: to_u32(self.log.log_index),
+            tx_id: tx_id(self.log.transaction_hash),
+            tx_index: self.log.transaction_index,
+            ordinal: to_u64(self.log.log_index),
             pool_id,
             emitter: self.log.address,
             protocol,
@@ -413,8 +410,9 @@ impl Event<'_> {
             chain: self.chain,
             block_number: to_u64(self.log.block_number),
             timestamp: self.log.timestamp,
-            transaction_hash: self.log.transaction_hash,
-            log_index: to_u32(self.log.log_index),
+            tx_id: tx_id(self.log.transaction_hash),
+            tx_index: self.log.transaction_index,
+            ordinal: to_u64(self.log.log_index),
             pool_id,
             emitter: self.log.address,
             protocol,

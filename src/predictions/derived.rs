@@ -17,16 +17,33 @@
 //!
 //! Placeholders: `{chain}` = chain id, `{from_ts}` = unix seconds of the
 //! first bucket to rebuild (a multiple of `bucket_seconds`; the start of
-//! the UTC day recorded in `reorgs` always is), `{epoch}` = the new epoch,
-//! `{purge_from}` / `{purge_to}` = the purged block range `[from, to)`,
-//! excluded explicitly so a rebuild never depends on seeing the tombstones
-//! (the pattern every module shares).
+//! the UTC day recorded in `reorgs` always is), `{to_ts}` = the exclusive
+//! end, `{epoch}` = the new epoch, `{purge_from}` / `{purge_to}` = the
+//! purged block range `[from, to)`, excluded explicitly so a rebuild never
+//! depends on seeing the tombstones (the pattern every module shares).
+//!
+//! **Run a rebuild through [`rebuild_statements`], never as one statement.**
+//! Every aggregate here is `PARTITION BY toYYYYMM(bucket)`, and ClickHouse
+//! refuses an INSERT whose block spans more than
+//! `max_partitions_per_insert_block` (100) partitions:
+//!
+//! ```text
+//! Code: 252. Too many partitions for single INSERT block (more than 100).
+//! ```
+//!
+//! One open ended `timestamp >= {from_ts}` therefore fails for any purge
+//! more than 100 UTC months deep - a gap heal after a crash while
+//! backfilling old history, or a reorg found while filling an old gap - and
+//! because the gap is retried on every restart the chain would never
+//! progress again. [`rebuild_statements`] yields one INSERT per UTC month,
+//! exactly like `dex::derived::rebuild_statements`.
 
-use crate::db::derived::DerivedTable;
+use crate::{db::derived::DerivedTable, dex::derived::next_month_start};
 
 /// What a rebuild puts in place of the view's `WHERE is_deleted = 0`.
 pub const REBUILD_RANGE: &str = "FINAL WHERE chain = {chain} AND timestamp \
-                                 >= toDateTime({from_ts}) AND NOT \
+                                 >= toDateTime({from_ts}) AND timestamp < \
+                                 toDateTime({to_ts}) AND NOT \
                                  (block_number >= {purge_from} AND \
                                  block_number < {purge_to}) AND is_deleted = 0";
 
@@ -41,19 +58,21 @@ pub const PREDICTION_CANDLES_1M: DerivedTable = DerivedTable {
         "INSERT INTO prediction_candles_1m WITH toFloat64(tupleElement(print, 2)) /",
         " toFloat64(share_amount) AS price SELECT chain, registry, tupleElement(print, 1) AS",
         " outcome_token_id, toDateTime(intDiv(toUInt32(timestamp), 60) * 60, 'UTC') AS bucket,",
-        " toUInt32({epoch}) AS epoch, argMinState(price, (block_number, log_index)) AS open,",
-        " argMaxState(price, (block_number, log_index)) AS close, max(price) AS high, min(price)",
-        " AS low, sum(toFloat64(tupleElement(print, 2))) AS volume, sum(toFloat64(share_amount))",
-        " AS shares, count() AS trades, sum(toUInt64(tupleElement(print, 3))) AS fills,",
-        " uniqArrayState([maker, taker]) AS traders, max(timestamp) AS last_trade_at FROM ( SELECT",
-        " chain, registry, block_number, log_index, timestamp, epoch, maker, taker, share_amount,",
+        " toUInt32({epoch}) AS epoch, argMinState(price, (block_number, tx_index, ordinal)) AS",
+        " open, argMaxState(price, (block_number, tx_index, ordinal)) AS close, max(price) AS",
+        " high, min(price) AS low, sum(toFloat64(tupleElement(print, 2))) AS volume,",
+        " sum(toFloat64(share_amount)) AS shares, count() AS trades,",
+        " sum(toUInt64(tupleElement(print, 3))) AS fills, uniqArrayState([maker, taker]) AS",
+        " traders, max(timestamp) AS last_trade_at FROM ( SELECT chain, registry,",
+        " block_number, tx_index, ordinal, timestamp, epoch, maker, taker, share_amount,",
         " arrayJoin(if(maker_outcome_token_id = outcome_token_id, [(outcome_token_id,",
         " collateral_amount, toUInt8(1))], [(outcome_token_id, collateral_amount, toUInt8(1)),",
         " (maker_outcome_token_id, maker_collateral_amount, toUInt8(0))])) AS print FROM",
-        " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts}) AND",
-        " NOT (block_number >= {purge_from} AND block_number < {purge_to}) AND is_deleted = 0 AND",
-        " share_amount != 0 ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain,",
-        " registry, outcome_token_id, bucket, epoch",
+        " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
+        " AND timestamp < toDateTime({to_ts}) AND NOT (block_number >= {purge_from} AND",
+        " block_number < {purge_to}) AND is_deleted = 0 AND verified = 1 AND share_amount != 0",
+        " ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain, registry,",
+        " outcome_token_id, bucket, epoch",
     ),
 };
 
@@ -64,20 +83,22 @@ pub const PREDICTION_CANDLES_1H: DerivedTable = DerivedTable {
     rebuild_sql: concat!(
         "INSERT INTO prediction_candles_1h WITH toFloat64(tupleElement(print, 2)) /",
         " toFloat64(share_amount) AS price SELECT chain, registry, tupleElement(print, 1) AS",
-        " outcome_token_id, toDateTime(intDiv(toUInt32(timestamp), 3600) * 3600, 'UTC') AS bucket,",
-        " toUInt32({epoch}) AS epoch, argMinState(price, (block_number, log_index)) AS open,",
-        " argMaxState(price, (block_number, log_index)) AS close, max(price) AS high, min(price)",
-        " AS low, sum(toFloat64(tupleElement(print, 2))) AS volume, sum(toFloat64(share_amount))",
-        " AS shares, count() AS trades, sum(toUInt64(tupleElement(print, 3))) AS fills,",
-        " uniqArrayState([maker, taker]) AS traders, max(timestamp) AS last_trade_at FROM ( SELECT",
-        " chain, registry, block_number, log_index, timestamp, epoch, maker, taker, share_amount,",
+        " outcome_token_id, toDateTime(intDiv(toUInt32(timestamp), 3600) * 3600, 'UTC') AS",
+        " bucket, toUInt32({epoch}) AS epoch, argMinState(price, (block_number, tx_index,",
+        " ordinal)) AS open, argMaxState(price, (block_number, tx_index, ordinal)) AS close,",
+        " max(price) AS high, min(price) AS low, sum(toFloat64(tupleElement(print, 2))) AS",
+        " volume, sum(toFloat64(share_amount)) AS shares, count() AS trades,",
+        " sum(toUInt64(tupleElement(print, 3))) AS fills, uniqArrayState([maker, taker]) AS",
+        " traders, max(timestamp) AS last_trade_at FROM ( SELECT chain, registry,",
+        " block_number, tx_index, ordinal, timestamp, epoch, maker, taker, share_amount,",
         " arrayJoin(if(maker_outcome_token_id = outcome_token_id, [(outcome_token_id,",
         " collateral_amount, toUInt8(1))], [(outcome_token_id, collateral_amount, toUInt8(1)),",
         " (maker_outcome_token_id, maker_collateral_amount, toUInt8(0))])) AS print FROM",
-        " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts}) AND",
-        " NOT (block_number >= {purge_from} AND block_number < {purge_to}) AND is_deleted = 0 AND",
-        " share_amount != 0 ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain,",
-        " registry, outcome_token_id, bucket, epoch",
+        " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
+        " AND timestamp < toDateTime({to_ts}) AND NOT (block_number >= {purge_from} AND",
+        " block_number < {purge_to}) AND is_deleted = 0 AND verified = 1 AND share_amount != 0",
+        " ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain, registry,",
+        " outcome_token_id, bucket, epoch",
     ),
 };
 
@@ -89,20 +110,21 @@ pub const PREDICTION_CANDLES_1D: DerivedTable = DerivedTable {
         "INSERT INTO prediction_candles_1d WITH toFloat64(tupleElement(print, 2)) /",
         " toFloat64(share_amount) AS price SELECT chain, registry, tupleElement(print, 1) AS",
         " outcome_token_id, toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS",
-        " bucket, toUInt32({epoch}) AS epoch, argMinState(price, (block_number, log_index)) AS",
-        " open, argMaxState(price, (block_number, log_index)) AS close, max(price) AS high,",
-        " min(price) AS low, sum(toFloat64(tupleElement(print, 2))) AS volume,",
-        " sum(toFloat64(share_amount)) AS shares, count() AS trades,",
+        " bucket, toUInt32({epoch}) AS epoch, argMinState(price, (block_number, tx_index,",
+        " ordinal)) AS open, argMaxState(price, (block_number, tx_index, ordinal)) AS close,",
+        " max(price) AS high, min(price) AS low, sum(toFloat64(tupleElement(print, 2))) AS",
+        " volume, sum(toFloat64(share_amount)) AS shares, count() AS trades,",
         " sum(toUInt64(tupleElement(print, 3))) AS fills, uniqArrayState([maker, taker]) AS",
-        " traders, max(timestamp) AS last_trade_at FROM ( SELECT chain, registry, block_number,",
-        " log_index, timestamp, epoch, maker, taker, share_amount,",
+        " traders, max(timestamp) AS last_trade_at FROM ( SELECT chain, registry,",
+        " block_number, tx_index, ordinal, timestamp, epoch, maker, taker, share_amount,",
         " arrayJoin(if(maker_outcome_token_id = outcome_token_id, [(outcome_token_id,",
         " collateral_amount, toUInt8(1))], [(outcome_token_id, collateral_amount, toUInt8(1)),",
         " (maker_outcome_token_id, maker_collateral_amount, toUInt8(0))])) AS print FROM",
-        " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts}) AND",
-        " NOT (block_number >= {purge_from} AND block_number < {purge_to}) AND is_deleted = 0 AND",
-        " share_amount != 0 ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain,",
-        " registry, outcome_token_id, bucket, epoch",
+        " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
+        " AND timestamp < toDateTime({to_ts}) AND NOT (block_number >= {purge_from} AND",
+        " block_number < {purge_to}) AND is_deleted = 0 AND verified = 1 AND share_amount != 0",
+        " ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain, registry,",
+        " outcome_token_id, bucket, epoch",
     ),
 };
 
@@ -113,13 +135,14 @@ pub const PREDICTION_MARKET_FLOWS_1D: DerivedTable = DerivedTable {
     rebuild_sql: concat!(
         "INSERT INTO prediction_market_flows_1d SELECT chain, emitter AS registry, market_id,",
         " collateral_token, toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS",
-        " bucket, toUInt32({epoch}) AS epoch, sum(if(kind = 'split', toFloat64(amount), 0.)) AS",
-        " split, sum(if(kind = 'merge', toFloat64(amount), 0.)) AS merged, sum(if(kind = 'redeem',",
-        " toFloat64(amount), 0.)) AS redeemed, count() AS events, uniqState(stakeholder) AS",
-        " stakeholders FROM prediction_position_events FINAL WHERE chain = {chain} AND timestamp",
-        " >= toDateTime({from_ts}) AND NOT (block_number >= {purge_from} AND block_number <",
-        " {purge_to}) AND is_deleted = 0 AND protocol = 'ctf' GROUP BY chain, registry, market_id,",
-        " collateral_token, bucket, epoch",
+        " bucket, toUInt32({epoch}) AS epoch, sum(if(kind = 'split', toFloat64(amount), 0.))",
+        " AS split, sum(if(kind = 'merge', toFloat64(amount), 0.)) AS merged, sum(if(kind =",
+        " 'redeem', toFloat64(amount), 0.)) AS redeemed, count() AS events,",
+        " uniqState(stakeholder) AS stakeholders FROM prediction_position_events FINAL WHERE",
+        " chain = {chain} AND timestamp >= toDateTime({from_ts}) AND timestamp <",
+        " toDateTime({to_ts}) AND NOT (block_number >= {purge_from} AND block_number <",
+        " {purge_to}) AND is_deleted = 0 AND protocol = 'ctf' GROUP BY chain, registry,",
+        " market_id, collateral_token, bucket, epoch",
     ),
 };
 
@@ -132,17 +155,19 @@ pub const PREDICTION_TRADER_TRADES_1D: DerivedTable = DerivedTable {
         " toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS bucket,",
         " tupleElement(party, 1) AS trader, exchange, toUInt32({epoch}) AS epoch,",
         " sum(if(tupleElement(party, 2) = 'buy', toFloat64(tupleElement(party, 3)), 0.)) AS",
-        " bought, sum(if(tupleElement(party, 2) = 'sell', toFloat64(tupleElement(party, 3)), 0.))",
-        " AS sold, sum(if(tupleElement(party, 5) = 'collateral', toFloat64(tupleElement(party,",
-        " 4)), 0.)) AS fees, count() AS trades, uniqState(tupleElement(party, 6)) AS tokens FROM (",
-        " SELECT chain, timestamp, exchange, epoch, share_amount, arrayJoin([(maker,",
-        " toString(maker_side), maker_collateral_amount, maker_fee_amount,",
-        " toString(maker_fee_unit), maker_outcome_token_id), (taker, toString(side),",
-        " collateral_amount, taker_fee_amount, toString(taker_fee_unit), outcome_token_id)]) AS",
-        " party FROM prediction_trades FINAL WHERE chain = {chain} AND timestamp >=",
-        " toDateTime({from_ts}) AND NOT (block_number >= {purge_from} AND block_number <",
-        " {purge_to}) AND is_deleted = 0 ) WHERE tupleElement(party, 3) <= share_amount GROUP BY",
-        " chain, bucket, trader, exchange, epoch",
+        " bought, sum(if(tupleElement(party, 2) = 'sell', toFloat64(tupleElement(party, 3)),",
+        " 0.)) AS sold, sum(if(tupleElement(party, 5) = 'collateral',",
+        " toFloat64(tupleElement(party, 4)), 0.)) AS fees, count() AS trades,",
+        " uniqState(tupleElement(party, 6)) AS tokens FROM ( SELECT chain, timestamp,",
+        " exchange, epoch, share_amount, arrayJoin([(maker, toString(maker_side),",
+        " maker_collateral_amount, maker_fee_amount, toString(maker_fee_unit),",
+        " maker_outcome_token_id), (taker, toString(side), collateral_amount,",
+        " taker_fee_amount, toString(taker_fee_unit), outcome_token_id)]) AS party FROM",
+        " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
+        " AND timestamp < toDateTime({to_ts}) AND NOT (block_number >= {purge_from} AND",
+        " block_number < {purge_to}) AND is_deleted = 0 AND verified = 1 ) WHERE",
+        " tupleElement(party, 3) <= share_amount GROUP BY chain, bucket, trader, exchange,",
+        " epoch",
     ),
 };
 
@@ -152,14 +177,14 @@ pub const PREDICTION_TRADER_FLOWS_1D: DerivedTable = DerivedTable {
     bucket_column: "bucket",
     rebuild_sql: concat!(
         "INSERT INTO prediction_trader_flows_1d SELECT chain,",
-        " toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS bucket, stakeholder AS",
-        " trader, collateral_token, toUInt32({epoch}) AS epoch, sum(if(kind = 'split',",
-        " toFloat64(amount), 0.)) AS split, sum(if(kind = 'merge', toFloat64(amount), 0.)) AS",
-        " merged, sum(if(kind = 'redeem', toFloat64(amount), 0.)) AS redeemed, count() AS events",
-        " FROM prediction_position_events FINAL WHERE chain = {chain} AND timestamp >=",
-        " toDateTime({from_ts}) AND NOT (block_number >= {purge_from} AND block_number <",
-        " {purge_to}) AND is_deleted = 0 AND kind != 'convert' GROUP BY chain, bucket, trader,",
-        " collateral_token, epoch",
+        " toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS bucket, stakeholder",
+        " AS trader, emitter, collateral_token, toUInt32({epoch}) AS epoch, sum(if(kind =",
+        " 'split', toFloat64(amount), 0.)) AS split, sum(if(kind = 'merge', toFloat64(amount),",
+        " 0.)) AS merged, sum(if(kind = 'redeem', toFloat64(amount), 0.)) AS redeemed, count()",
+        " AS events FROM prediction_position_events FINAL WHERE chain = {chain} AND timestamp",
+        " >= toDateTime({from_ts}) AND timestamp < toDateTime({to_ts}) AND NOT (block_number",
+        " >= {purge_from} AND block_number < {purge_to}) AND is_deleted = 0 AND kind !=",
+        " 'convert' GROUP BY chain, bucket, trader, emitter, collateral_token, epoch",
     ),
 };
 
@@ -176,12 +201,15 @@ pub const PREDICTIONS_DERIVED: &[DerivedTable] = &[
 // STUB: until `DerivedTable::rebuild_sql(chain, from_ts, epoch, ..)` of
 // the core (docs/design.md §1) is merged, this renders the placeholders.
 // `from_ts` is aligned down to the table's bucket.
-/// `purged` = the purged block range `[from, to)`, `to = None` for an
-/// open ended purge (a reorg rollback).
+/// One rebuild statement for `[from_ts, to_ts)`. KEEP THE RANGE WITHIN ONE
+/// MONTH - use [`rebuild_statements`], see the module docs. `purged` = the
+/// purged block range `[from, to)`, `to = None` for an open ended purge (a
+/// reorg rollback).
 pub fn render_rebuild(
     table: &DerivedTable,
     chain: u64,
     from_ts: u32,
+    to_ts: u32,
     epoch: u32,
     purged: (u64, Option<u64>),
 ) -> String {
@@ -189,9 +217,38 @@ pub fn render_rebuild(
         .rebuild_sql
         .replace("{chain}", &chain.to_string())
         .replace("{from_ts}", &table.bucket_start(from_ts).to_string())
+        .replace("{to_ts}", &to_ts.to_string())
         .replace("{epoch}", &epoch.to_string())
         .replace("{purge_from}", &purged.0.to_string())
         .replace("{purge_to}", &purged.1.unwrap_or(u64::MAX).to_string())
+}
+
+/// The rebuild of `table` over `[from_ts, to_ts)` as one INSERT per UTC
+/// month, oldest first - the only safe way to run it (see the module
+/// docs: one statement over more than 100 monthly partitions is refused
+/// and the purge can then never finish).
+///
+/// `to_ts` is EXCLUSIVE: pass the timestamp of the newest stored block + 1
+/// (or "now"), never `u32::MAX`.
+pub fn rebuild_statements(
+    table: &DerivedTable,
+    chain: u64,
+    from_ts: u32,
+    to_ts: u32,
+    epoch: u32,
+    purged: (u64, Option<u64>),
+) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut start = table.bucket_start(from_ts);
+
+    while start < to_ts {
+        let end = next_month_start(start).min(u64::from(to_ts)) as u32;
+        statements
+            .push(render_rebuild(table, chain, start, end, epoch, purged));
+        start = end;
+    }
+
+    statements
 }
 
 #[cfg(test)]
@@ -287,11 +344,18 @@ mod tests {
     #[test]
     fn placeholders_render_and_align_to_the_bucket() {
         for table in PREDICTIONS_DERIVED {
-            let sql =
-                render_rebuild(table, 137, 1_700_000_123, 9, (500, None));
+            let sql = render_rebuild(
+                table,
+                137,
+                1_700_000_123,
+                1_800_000_000,
+                9,
+                (500, None),
+            );
             assert!(!sql.contains('{'), "{sql}");
             assert!(sql.contains("chain = 137"));
             assert!(sql.contains("toUInt32(9) AS epoch"));
+            assert!(sql.contains("toDateTime(1800000000)"));
             assert!(sql.contains(&format!(
                 "NOT (block_number >= 500 AND block_number < {})",
                 u64::MAX
@@ -301,6 +365,72 @@ mod tests {
                 table.bucket_start(1_700_000_123)
             )));
         }
+    }
+
+    /// One INSERT per UTC month: a single one over more than 100 monthly
+    /// partitions is refused by ClickHouse (Code 252) and the purge that
+    /// issued it can then never finish.
+    #[test]
+    fn a_deep_rebuild_is_one_statement_per_month() {
+        // 2011-01-01 .. 2026-09-19: 188 months, well past the 100 limit.
+        let from = 1_293_840_000u32;
+        let to = 1_758_240_000u32;
+
+        for table in PREDICTIONS_DERIVED {
+            let statements =
+                rebuild_statements(table, 137, from, to, 9, (500, None));
+            // Well past max_partitions_per_insert_block (100), which is
+            // the whole point of chunking.
+            assert!(statements.len() > 100, "{}", statements.len());
+
+            for sql in &statements {
+                assert!(!sql.contains('{'), "{sql}");
+            }
+            // The chunks tile [from, to) exactly, without a gap or an
+            // overlap: chunk n's {to_ts} is chunk n+1's {from_ts}.
+            let bound = |sql: &str, needle: &str| -> u32 {
+                let at = sql.find(needle).unwrap() + needle.len();
+                sql[at..]
+                    .split(')')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{sql}"))
+            };
+            let mut expected = table.bucket_start(from);
+            for sql in &statements {
+                assert_eq!(
+                    bound(sql, "timestamp >= toDateTime("),
+                    expected
+                );
+                expected = bound(sql, "timestamp < toDateTime(");
+            }
+            assert_eq!(expected, to);
+        }
+
+        // A range inside one month is one statement.
+        assert_eq!(
+            rebuild_statements(
+                &PREDICTION_CANDLES_1D,
+                137,
+                1_756_684_800,
+                1_756_771_200,
+                1,
+                (0, None)
+            )
+            .len(),
+            1
+        );
+        // An empty range asks for nothing.
+        assert!(rebuild_statements(
+            &PREDICTION_CANDLES_1D,
+            137,
+            1_756_684_800,
+            1_756_684_800,
+            1,
+            (0, None)
+        )
+        .is_empty());
     }
 
     /// Arguments of every `sum(...)` call in `sql`.
