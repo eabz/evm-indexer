@@ -2130,6 +2130,145 @@ async fn a_flush_over_a_hundred_monthly_partitions_is_split() {
     assert_eq!(stored, BLOCKS);
 }
 
+/// The untested path: ANOTHER process (`indexer backfill --module dex`)
+/// moves the chain's epoch while this one is in the middle of a flush.
+///
+/// The flush was stamped with the epoch this process read before it
+/// started sending rows. By the time they land, the backfill's `reorgs`
+/// row has raised the epoch floor of their day, so their contributions to
+/// every aggregate are HIDDEN - the rows are there, the numbers are not.
+/// `ClickhouseSink::store` re-reads the epoch after every flush for
+/// exactly this, and hands the span to the sync loop, which purges it and
+/// streams it again under the new epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_flush_racing_another_processs_purge_is_indexed_again() {
+    let scenario = Scenario::new("epoch_race").await;
+    let chain = TestChain::new(12);
+
+    // Blocks 0..8 are indexed normally; 8..12 are the flush that races.
+    scenario.index_until(&chain, 8, &[]).await;
+    assert_eq!(scenario.db.current_epoch().await.unwrap(), 0);
+
+    let workers = Workers::spawn(
+        &scenario.db,
+        None,
+        None,
+        EnabledModules::default(),
+        Metrics::disabled(),
+        fast_workers(),
+    )
+    .unwrap();
+
+    let stale: Arc<Mutex<Vec<BlockRange>>> = Arc::default();
+    let sink = ClickhouseSink {
+        db: scenario.db.clone(),
+        discovery: workers.discovery(),
+        fence: Fence::open(),
+        last_flush: LastFlush::default(),
+        stale: stale.clone(),
+    };
+
+    let racing = BlockRange::new(8, 12);
+    let mut batch = transform::transform_with(
+        CHAIN,
+        &chain.response(racing),
+        racing,
+        EnabledModules::default(),
+        &mut DecodeState::default(),
+    )
+    .unwrap()
+    .rows;
+
+    batch.set_version(next_version());
+    // What the writer does: read the epoch, then send the rows.
+    batch.set_epoch(sink.epoch().await.unwrap());
+    assert_eq!(batch.epoch(), 0);
+
+    // ... and while they are on their way, the REAL `indexer backfill
+    // --module dex` runs in another process, finds a forged swap in a
+    // block below, purges its range and bumps the chain to epoch 1.
+    let mut forged = transform::transform_with(
+        CHAIN,
+        &chain.response(BlockRange::new(3, 4)),
+        BlockRange::new(3, 4),
+        EnabledModules::default(),
+        &mut DecodeState::default(),
+    )
+    .unwrap()
+    .rows
+    .modules;
+    forged.dex.liquidity.clear();
+    forged.dex.pools.clear();
+    for swap in &mut forged.dex.swaps {
+        swap.ordinal += 1_000;
+    }
+    forged.set_version(next_version());
+    forged
+        .store(
+            &scenario.db,
+            &FlushKey {
+                chain: CHAIN,
+                span: (3, 3),
+                version: next_version(),
+            },
+            crate::db::FlushWindow::ALL,
+        )
+        .await
+        .unwrap();
+
+    let report =
+        backfill::backfill(&scenario.db, "dex", 0, 8, 5).await.unwrap();
+    assert_eq!(report.epoch, 1);
+
+    sink.store(&batch).await.unwrap();
+    workers.shutdown().await;
+
+    // The sink noticed and handed the whole span to the sync loop.
+    assert_eq!(*stale.lock().unwrap(), vec![racing]);
+
+    // It is not being careful for nothing: the rows are stored, but their
+    // contributions are behind the new floor, so the day under-counts.
+    let clean = clean_index("epoch_race_clean", &chain).await;
+    let hidden = scenario.snapshot().await;
+    let expected = clean.snapshot().await;
+    assert_ne!(
+        hidden["daily_block_stats_v"], expected["daily_block_stats_v"],
+        "the racing flush would have been invisible"
+    );
+
+    // What the sync loop does with the span on its next pass
+    // (`purge_stale_flushes`, then the ordinary gap streaming).
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    purger
+        .purge_range(
+            CHAIN,
+            racing.from,
+            Some(racing.to),
+            PurgeReason::GapHeal,
+        )
+        .await
+        .unwrap();
+
+    scenario.index_until(&chain, 12, &[]).await;
+
+    assert_same_eventually(
+        "after a flush raced a backfill",
+        &scenario,
+        &clean,
+    )
+    .await;
+    scenario.assert_consistent().await;
+}
+
 /// `checkpoints` gains one row per flush and nothing ever removes them, so
 /// a chain that has been following the head for a year holds millions of
 /// rows that all say the same thing. Compaction collapses the contiguous
