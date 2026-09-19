@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 10:45 (America/Mexico_City)
+**Last updated:** 2026-09-19 13:40 (America/Mexico_City)
 
 ## Where things are
 
@@ -37,7 +37,9 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 |---|---|---|---|---|
 | module-followups | DONE, merged e49d01c | - | dex flaky test 30/30 after the harness fix; launchpads rebuild excludes the purged range | - |
 | layout | DONE, merged 1271be1 | - | one code layout (feature modules); `tests/layout.rs` enforces it; 737 unit + 106 database tests green | - |
-| fix-a / fix-b / fix-d | Opus | worktrees (`git worktree list`) | review round 4 fixes: A Solana pipeline, B core pipeline, D Solana decoder. Shared rules: scratchpad `handoff/round4-common.md`. fix-c (SQL + Solana flush latency) is QUEUED: launch when the first one finishes (max 3 agents at a time) | commits per milestone + tirith notes |
+| fix-a, fix-b, fix-d | DONE, merged + pushed | - | review round 4: all 3 BLOCKERS + majors 3-10, M4-M9 fixed. Gate on the merged tree: 772 unit, database suites 116/116 (lead script: scratchpad `lead-gate.sh`, URL must be `http://default@host:port/<name>_test`) | - |
+| fix-c | Opus | worktree | SQL majors 11-13 + minors + Solana flush latency (measure first). Task 13d85b82 | commits + tirith notes |
+| fleet | Opus | worktree | design 15: `indexer fleet` + `src/admin` control panel. Tasks 3800c9b6, a03ba984. NEEDS an independent security review of src/admin before merge | commits + tirith notes |
 | review-e | DONE | - | review round 4: 2 BLOCKER + 11 MAJOR + 11 MINOR; full report committed as `docs/review-round-4.md` (paths are PRE-refactor, snapshot 8c23e33) | - |
 
 MAIN TREE IS CLEAN and pushed (HEAD 8c23e33+). EVERYTHING BELOW IS MERGED: HyperSync ingest,
@@ -53,6 +55,8 @@ suite by suite on a fresh ClickHouse (EVM acceptance 19/19, Solana acceptance 15
 CI on PR #16 has been green on every completed run since the pipeline wiring landed.
 
 ## Still to do, in order
+
+-1. FOLLOW-UP ROUND after fix-c merges (one Opus engineer, Solana pipeline files): (a) `src/pipeline/solana.rs` has the same destructive stale-span drain fix-b fixed for EVM (MAJOR 3 twin) and no restart recovery - reuse `Database::stale_flush_ranges`; (b) `solana_store::timestamp_span` must ignore zero timestamps like the EVM store; (c) LEAD DECISION: `solana_verify` must report a pending repair as a problem, same as EVM verify; (d) `tombstone_until_gone` stopping on the first zero-count attempt (other half of MAJOR 7, src/reorg); (e) a discriminating test for MAJOR 9 (test-only stale-read hook). Then a short re-review (Opus, read-only) of all round 4 fixes.
 
 0. NEW OWNER REQUEST (2026-09-19): one process syncing many chains + a password protected
    HTML control panel. Designed in `docs/design.md` section 15 (`indexer fleet`, `src/admin`).
