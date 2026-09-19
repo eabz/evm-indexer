@@ -36,9 +36,11 @@ use crate::{
     core::{models::log::DatabaseLog, RowBatch},
     db::format::{SerAddress, SerB256, SerU256},
     db::{
-        next_version, ranges::BlockRange, Database, FlushKey, FlushWindow,
+        flush_windows, next_version, ranges::BlockRange, Database,
+        FlushKey, FlushWindow,
     },
     pipeline::{
+        lease::{Lease, LeaseOptions},
         modules::{
             self, DecodeState, EnabledModules, ModuleRows, ModuleSpec,
         },
@@ -53,6 +55,7 @@ use futures::future::BoxFuture;
 use log::info;
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillReport {
@@ -113,6 +116,39 @@ fn only(spec: &ModuleSpec) -> Result<EnabledModules> {
     Ok(enabled)
 }
 
+/// Where every row decoded from one chunk belongs: the `timestamp` of its
+/// block (every module row carries its block's) and the block number, so
+/// a chunk that spans more monthly partitions than one insert may touch
+/// can be split the way a flush is (`db::flush_windows`).
+type ChunkBlocks = Vec<(u32, u64)>;
+
+/// The parts one chunk has to be written in: `(window, first block, last
+/// block)`, oldest first. Normally one, [`FlushWindow::ALL`].
+///
+/// `--chunk-blocks` is a block count, so on a chain with a long block time
+/// (or a very large value) one chunk can cover hundreds of UTC months,
+/// which ClickHouse refuses with code 252
+/// (`max_partitions_per_insert_block`). The backfill used to write every
+/// chunk as one insert and fail there (docs/review-round-4.md, MINOR 17).
+///
+/// The block span is per part, so each part gets a deduplication token of
+/// its own: the same token for two parts would make the server drop the
+/// second one.
+fn chunk_parts(blocks: &ChunkBlocks) -> Vec<(FlushWindow, (u64, u64))> {
+    flush_windows(blocks.iter().map(|(timestamp, _)| *timestamp))
+        .into_iter()
+        .filter_map(|window| {
+            let numbers = blocks
+                .iter()
+                .filter(|(timestamp, _)| window.holds(*timestamp))
+                .map(|(_, number)| *number);
+
+            let (low, high) = numbers.clone().min().zip(numbers.max())?;
+            Some((window, (low, high)))
+        })
+        .collect()
+}
+
 /// Decodes `chunk` from the stored logs. `state` must see the chunks in
 /// chain order.
 async fn decode_chunk(
@@ -120,7 +156,7 @@ async fn decode_chunk(
     enabled: EnabledModules,
     chunk: BlockRange,
     state: &mut DecodeState,
-) -> Result<(ModuleRows, u64)> {
+) -> Result<(ModuleRows, u64, ChunkBlocks)> {
     let client = db.db.clone().with_validation(false);
 
     let logs: Vec<DatabaseLog> = client
@@ -160,6 +196,12 @@ async fn decode_chunk(
         .collect();
 
     let count = logs.len() as u64;
+
+    // Every decoded row carries the `timestamp` of the log it came from.
+    let mut blocks: ChunkBlocks =
+        logs.iter().map(|log| (log.timestamp, log.block_number)).collect();
+    blocks.dedup();
+
     let batch = RowBatch { logs, ..Default::default() };
 
     Ok((
@@ -171,6 +213,7 @@ async fn decode_chunk(
             state,
         ),
         count,
+        blocks,
     ))
 }
 
@@ -190,6 +233,45 @@ pub async fn backfill(
     let enabled = only(spec)?;
     let chunk_blocks = chunk_blocks.max(1);
 
+    // The backfill IS a writer: it purges, bumps the chain's epoch and
+    // rebuilds every aggregate. Two of them on the same chain and module
+    // corrupt it exactly as two indexers would - both write a `reorgs`
+    // row, and the lower-epoch rebuild ends up hidden by the higher floor
+    // (docs/review-round-4.md, MINOR 16). A role of its own, so the
+    // documented combination "a backfill next to a live `indexer run`"
+    // keeps working.
+    let (fatal, _taken_over) = watch::channel(None::<String>);
+    let lease = Lease::acquire_as(
+        db,
+        &format!("backfill:{}", spec.name),
+        LeaseOptions::default(),
+        fatal,
+    )
+    .await?;
+
+    let report = run_backfill(
+        db,
+        spec,
+        enabled,
+        from_block,
+        to_block,
+        chunk_blocks,
+    )
+    .await;
+
+    lease.release().await;
+    report
+}
+
+/// [`backfill`] with the lease already held.
+async fn run_backfill(
+    db: &Database,
+    spec: &'static ModuleSpec,
+    enabled: EnabledModules,
+    from_block: u64,
+    to_block: u64,
+    chunk_blocks: u64,
+) -> Result<BackfillReport> {
     let end = if to_block > 0 {
         to_block
     } else {
@@ -225,7 +307,7 @@ pub async fn backfill(
     let mut chunks = 0;
 
     for chunk in chunks_of(range) {
-        let (decoded, count) =
+        let (decoded, count, _) =
             decode_chunk(db, enabled, chunk, &mut state).await?;
         logs += count;
         chunks += 1;
@@ -294,7 +376,7 @@ pub async fn backfill(
 
     for chunk in chunks_of(BlockRange::new(range.from, hull.to)) {
         // Below the hull: only to bring the decode state up to date.
-        let (mut decoded, _) =
+        let (mut decoded, _, blocks) =
             decode_chunk(db, enabled, chunk, &mut state).await?;
 
         if chunk.to <= hull.from || decoded.is_empty() {
@@ -335,17 +417,15 @@ pub async fn backfill(
         decoded.set_version(version);
         decoded.set_epoch(epoch);
 
-        let key = FlushKey {
-            chain: db.chain_id,
-            span: (chunk.from, chunk.to - 1),
-            version,
-        };
+        // Oldest month first, one insert per part: a chunk of blocks can
+        // still span more monthly partitions than one insert may touch.
+        for (window, span) in chunk_parts(&blocks) {
+            let key = FlushKey { chain: db.chain_id, span, version };
 
-        // The backfill writes one chunk of blocks at a time, never a
-        // span of months, so it is always one part.
-        decoded.store(db, &key, FlushWindow::ALL).await.with_context(
-            || format!("write the '{}' rows of {chunk}", spec.name),
-        )?;
+            decoded.store(db, &key, window).await.with_context(|| {
+                format!("write the '{}' rows of {chunk}", spec.name)
+            })?;
+        }
 
         rows_written += decoded.rows() as u64;
     }
@@ -366,4 +446,61 @@ pub async fn backfill(
         rows_written,
         epoch: report.epoch,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::MAX_MONTHS_PER_FLUSH;
+
+    /// Roughly one block per UTC month.
+    fn monthly(count: u64) -> ChunkBlocks {
+        let mut blocks = Vec::new();
+        let mut timestamp = 1_000_000_000u32;
+        for number in 0..count {
+            blocks.push((timestamp, number));
+            timestamp += 31 * 86_400;
+        }
+        blocks
+    }
+
+    /// A chunk of blocks is a block COUNT, so on a chain with a long block
+    /// time it can span more monthly partitions than one insert may touch
+    /// (ClickHouse code 252). It is written in parts, like a flush
+    /// (docs/review-round-4.md, MINOR 17).
+    #[test]
+    fn a_chunk_that_spans_too_many_months_is_written_in_parts() {
+        // The ordinary case: one insert, and the whole block span.
+        let blocks = monthly(12);
+        assert_eq!(
+            chunk_parts(&blocks),
+            vec![(FlushWindow::ALL, (0, 11))]
+        );
+
+        let blocks = monthly(MAX_MONTHS_PER_FLUSH as u64 * 2 + 5);
+        let parts = chunk_parts(&blocks);
+        assert!(parts.len() > 1, "{} months in one insert", blocks.len());
+
+        // Every block lands in exactly one part, oldest first, and no two
+        // parts share a deduplication token (the block span is the token).
+        let mut covered = 0;
+        let mut previous: Option<(u64, u64)> = None;
+        for (window, span) in &parts {
+            let in_part = blocks
+                .iter()
+                .filter(|(timestamp, _)| window.holds(*timestamp))
+                .count();
+            assert!(in_part > 0);
+            covered += in_part;
+
+            assert!(span.0 <= span.1);
+            if let Some(before) = previous {
+                assert!(before.1 < span.0, "{before:?} then {span:?}");
+            }
+            previous = Some(*span);
+        }
+        assert_eq!(covered, blocks.len());
+
+        assert!(chunk_parts(&Vec::new()).is_empty());
+    }
 }

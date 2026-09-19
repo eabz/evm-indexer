@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS sol_dex_swaps (
   block_number UInt64 CODEC(Delta, ZSTD),
   tx_index UInt32,
   ordinal UInt64,
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   -- Raw bytes: 64 on Solana, 32 on EVM. Never a sorting key column, so the
   -- length prefix a String carries costs nothing.
   tx_id String,

@@ -94,6 +94,11 @@ pub fn seed_version(stored: u64) {
     LAST_VERSION.fetch_max(stored, Ordering::Relaxed);
 }
 
+/// How many repair windows [`Database::stale_flush_ranges`] looks at on a
+/// start. Newest epoch first: an older purge's window was either repaired
+/// long ago or is covered by a newer one.
+const MAX_STALE_SCAN_PURGES: usize = 64;
+
 /// Attempts per table insert before the flush is reported as failed.
 const INSERT_ATTEMPTS: u32 = 6;
 const INSERT_BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -234,7 +239,13 @@ impl DatabaseParams {
 pub const MAX_MONTHS_PER_FLUSH: usize = 90;
 
 /// A slice of a flush: the rows whose `timestamp` is in `[from, to)`.
-/// Whole months, so no monthly partition is ever written by two of them.
+/// Whole UTC months, so no monthly partition is ever written by two of
+/// them - which holds because every partition key names UTC explicitly
+/// (`toYYYYMM(timestamp, 'UTC')` on the base tables, `DateTime('UTC')`
+/// bucket columns on the aggregates). Without that, the month of a plain
+/// `DateTime` would be taken in the SERVER's timezone and a 90-UTC-month
+/// slice could touch 91 local partitions (docs/review-round-4.md,
+/// MINOR 18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushWindow {
     pub from: u32,
@@ -351,6 +362,11 @@ pub struct Database {
     metrics: Metrics,
     /// The chain's purge generation, stamped on every row of a flush.
     epoch: Arc<AtomicU32>,
+    /// Lowest `from_block` the next checkpoint compaction reads. A pass is
+    /// bounded, so the cursor is what makes successive passes SWEEP the
+    /// table instead of re-reading its lowest rows for ever (see
+    /// [`Self::compact_checkpoints`]).
+    compact_from: Arc<AtomicU64>,
 }
 
 impl Database {
@@ -384,6 +400,7 @@ impl Database {
             small,
             metrics: Metrics::disabled(),
             epoch: Arc::new(AtomicU32::new(0)),
+            compact_from: Arc::new(AtomicU64::new(0)),
         };
 
         database.wait_until_ready().await?;
@@ -403,6 +420,7 @@ impl Database {
             db,
             metrics: Metrics::disabled(),
             epoch: Arc::new(AtomicU32::new(0)),
+            compact_from: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -570,6 +588,96 @@ impl Database {
         Ok(assemble_missing_ranges(range, stats, &gaps, MAX_GAPS_PER_PASS))
     }
 
+    /// Block spans that were flushed under an epoch a purge of ANOTHER
+    /// process had already superseded, re-derived from what is stored.
+    ///
+    /// A running indexer notices this itself (`pipeline::ClickhouseSink`
+    /// re-reads the epoch after every flush and queues the span), but
+    /// that queue lives in memory. This is the same question asked of the
+    /// database, so a restart - or a crash while the queue was not empty
+    /// - does not lose the spans (docs/review-round-4.md, MAJOR 3).
+    ///
+    /// The rule: a purge rebuilt every aggregate of `[from_ts, to_ts)`
+    /// from what was live when it ran, and armed the validity rule so
+    /// that only contributions of its own epoch (or newer) count there.
+    /// `tombstone_version` is the `_version` it stamped before the
+    /// rebuild, so a base row in that time window carrying a LOWER epoch
+    /// and a HIGHER `_version` was written after the rebuild had read its
+    /// input: its aggregate contributions are hidden and no repair
+    /// covered them. Those blocks have to be purged and indexed again.
+    ///
+    /// Conservative on purpose: `_version` is only approximately ordered
+    /// across processes, so a span may be listed that did not need it. A
+    /// purge is idempotent and the range is streamed again, so the only
+    /// cost is work. It converges - the rows come back stamped with the
+    /// newest epoch, which no `reorgs` row is above.
+    pub async fn stale_flush_ranges(&self) -> Result<Vec<BlockRange>> {
+        #[derive(Row, serde::Deserialize)]
+        struct PurgeWindow {
+            epoch: u32,
+            from_ts: u32,
+            to_ts: u32,
+            tombstone_version: u64,
+        }
+
+        let purges: Vec<PurgeWindow> = self
+            .db
+            .query(&format!(
+                "SELECT epoch, toUInt32(from_ts) AS from_ts, \
+                 toUInt32(to_ts) AS to_ts, tombstone_version \
+                 FROM reorgs WHERE chain = {} AND tombstone_version > 0 \
+                 AND to_ts > from_ts ORDER BY epoch DESC LIMIT {}",
+                self.chain_id, MAX_STALE_SCAN_PURGES
+            ))
+            .fetch_all()
+            .await
+            .context("read the repair windows of this chain")?;
+
+        if purges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Bounds the scan to the monthly partitions the repairs touched.
+        let low = purges.iter().map(|p| p.from_ts).min().unwrap_or(0);
+        let high = purges.iter().map(|p| p.to_ts).max().unwrap_or(0);
+
+        let windows: Vec<String> = purges
+            .iter()
+            .map(|p| {
+                format!(
+                    "(toUInt32({}), toUInt32({}), toUInt32({}), \
+                     toUInt64({}))",
+                    p.from_ts, p.to_ts, p.epoch, p.tombstone_version
+                )
+            })
+            .collect();
+
+        // One hull per stale epoch: a flush that raced a purge is a
+        // handful of adjacent blocks, so this is tight in practice.
+        let hulls: Vec<(u64, u64)> = self
+            .db
+            .query(&format!(
+                "SELECT toUInt64(min(number)), toUInt64(max(number)) \
+                 FROM blocks FINAL WHERE chain = {} AND is_deleted = 0 \
+                 AND timestamp >= toDateTime({low}) \
+                 AND timestamp < toDateTime({high}) \
+                 AND arrayExists(w -> toUInt32(timestamp) >= w.1 \
+                 AND toUInt32(timestamp) < w.2 AND epoch < w.3 \
+                 AND `_version` > w.4, [{}]) \
+                 GROUP BY epoch ORDER BY min(number) ASC",
+                self.chain_id,
+                windows.join(", ")
+            ))
+            .fetch_all()
+            .await
+            .context("look for flushes that raced another purge")?;
+
+        Ok(hulls
+            .into_iter()
+            .map(|(from, to)| BlockRange::new(from, to.saturating_add(1)))
+            .collect())
+    }
+
     /// Collapses runs of contiguous live `checkpoints` of this chain into
     /// one covering row each. Returns the rows it replaced.
     ///
@@ -586,24 +694,63 @@ impl Database {
     /// the rest waits for the next one. Nothing below
     /// [`COMPACT_CHECKPOINTS_ABOVE`] rows is touched.
     ///
+    /// Successive calls SWEEP the table: each one starts where the last
+    /// one stopped and wraps round at the end. Always reading the LOWEST
+    /// rows instead meant that on a chain with more non-contiguous live
+    /// ranges than one pass reads (a partial backfill: holes everywhere,
+    /// nothing to merge down there) the head's fast growing contiguous
+    /// run was never reached, so the table grew without bound and
+    /// `resume_point` got slower and slower
+    /// (docs/review-round-4.md, MINOR 15).
+    ///
     /// The CALLER must hold the chain's lease: this rewrites rows a purge
     /// of another process could be splitting at the same moment.
     pub async fn compact_checkpoints(&self) -> Result<u64> {
-        let live: Vec<DatabaseCheckpoint> = self
-            .db
-            .query(&format!(
+        let cursor = self.compact_from.load(Ordering::Relaxed);
+
+        let page = |from_block: u64| {
+            format!(
                 "SELECT chain, from_block, to_block, epoch, _version \
                  FROM checkpoints FINAL WHERE chain = {} \
+                 AND from_block >= {from_block} \
                  ORDER BY from_block ASC, to_block ASC LIMIT {}",
                 self.chain_id, MAX_CHECKPOINTS_PER_COMPACTION
-            ))
+            )
+        };
+
+        let mut live: Vec<DatabaseCheckpoint> = self
+            .db
+            .query(&page(cursor))
             .fetch_all()
             .await
             .context("read the live checkpoints to compact")?;
 
+        // The end of the table: start over at the bottom next time, and
+        // now, so a wrap costs no pass.
+        if live.len() <= COMPACT_CHECKPOINTS_ABOVE && cursor > 0 {
+            self.compact_from.store(0, Ordering::Relaxed);
+            live = self
+                .db
+                .query(&page(0))
+                .fetch_all()
+                .await
+                .context("read the live checkpoints to compact")?;
+        }
+
         if live.len() <= COMPACT_CHECKPOINTS_ABOVE {
             return Ok(0);
         }
+
+        // Where the next pass picks up. A full page means there is more
+        // above it; anything else has been swept.
+        self.compact_from.store(
+            if live.len() < MAX_CHECKPOINTS_PER_COMPACTION {
+                0
+            } else {
+                live.last().map(|row| row.from_block).unwrap_or(0)
+            },
+            Ordering::Relaxed,
+        );
 
         let writes = compaction_writes(&live, next_version());
         let replaced =

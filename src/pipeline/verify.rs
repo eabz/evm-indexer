@@ -12,7 +12,9 @@
 
 use crate::{
     db::{
-        ranges::{checkpoints_sql, contiguous_until, BlockRange},
+        ranges::{
+            checkpoints_sql, contiguous_until, subtract_ranges, BlockRange,
+        },
         Database,
     },
     pipeline::{
@@ -29,6 +31,11 @@ const MAX_GAPS_REPORTED: usize = 1_000;
 
 /// Blocks per orphan query: bounds the `NOT IN` set of block numbers.
 const ORPHAN_CHUNK_BLOCKS: u64 = 1_000_000;
+
+/// Gap-free parts of the range the aggregate cross-check looks at, at
+/// most: it costs one query per part and per aggregate. The rest is
+/// reported as "not checked" rather than silently left out.
+const MAX_AGGREGATE_PARTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrphanReport {
@@ -52,6 +59,19 @@ pub struct AggregateReport {
     /// that disagree.
     pub view_rows: i64,
     pub base_rows: i64,
+}
+
+impl AggregateReport {
+    /// Adds what another gap-free part of the range found for the SAME
+    /// view: one line per view, whichever part it went wrong in.
+    fn merge(&mut self, other: Self) {
+        self.days_checked += other.days_checked;
+        self.days_wrong += other.days_wrong;
+        self.first_wrong_day =
+            self.first_wrong_day.min(other.first_wrong_day);
+        self.view_rows += other.view_rows;
+        self.base_rows += other.base_rows;
+    }
 }
 
 /// An aggregate whose row count must equal a plain count over its base
@@ -120,11 +140,15 @@ pub struct VerifyReport {
     pub checkpoint_conflicts: Vec<BlockRange>,
     /// Block up to which the checkpoints cover the range without a hole.
     pub checkpoint_resume: u64,
-    /// Aggregates that disagree with their base table. Only filled when
-    /// the range has no gaps (an incomplete day is not a wrong day).
+    /// Aggregates that disagree with their base table, over the complete
+    /// UTC days of the GAP-FREE parts of the range (an incomplete day is
+    /// not a wrong day).
     pub aggregates: Vec<AggregateReport>,
     /// The aggregate cross-check did not run, and why.
     pub aggregates_skipped: Option<&'static str>,
+    /// Gap-free parts of the range the aggregate cross-check did not get
+    /// to ([`MAX_AGGREGATE_PARTS`]).
+    pub aggregate_parts_skipped: usize,
     /// The next `indexer run` will purge and re-index something: exactly
     /// what the gap heal looks for, asked with the SAME query. The orphan
     /// list above reads live rows (`FINAL`) only, so a heal that died half
@@ -134,11 +158,32 @@ pub struct VerifyReport {
 }
 
 impl VerifyReport {
+    /// Nothing found that is wrong with what is stored.
+    ///
+    /// `heal_pending` belongs here and was missing
+    /// (docs/review-round-4.md, MINOR 14): the next `indexer run` will
+    /// purge something, which means rows are tombstoned that nothing has
+    /// settled - and the aggregates of those days COUNT them right now.
+    /// The data IS wrong until the heal runs, even though the operator
+    /// need do nothing about it.
     pub fn is_consistent(&self) -> bool {
         self.gaps.is_empty()
             && self.orphans.is_empty()
             && self.checkpoint_conflicts.is_empty()
             && self.aggregates.is_empty()
+            && !self.heal_pending
+    }
+
+    /// Did the aggregate cross-check - the only one that can find a
+    /// DOUBLED aggregate - cover the whole range?
+    ///
+    /// It is skipped where no complete UTC day can be compared (a range
+    /// shorter than a day, or a gap-free part shorter than a day), which
+    /// is not a fault of the data but must not read as "checked and fine"
+    /// either: the verdict line says so.
+    pub fn fully_checked(&self) -> bool {
+        self.aggregates_skipped.is_none()
+            && self.aggregate_parts_skipped == 0
     }
 }
 
@@ -204,6 +249,14 @@ impl fmt::Display for VerifyReport {
             (Some(why), _) => {
                 writeln!(f, "Aggregates: not checked ({why}).")?
             }
+            (None, true) if self.aggregate_parts_skipped > 0 => writeln!(
+                f,
+                "Aggregates: they agree with the base tables over the \
+                 gap-free parts that were checked; {} more gap-free \
+                 part(s) were not (verify them one by one with \
+                 --start-block / --end-block).",
+                self.aggregate_parts_skipped
+            )?,
             (None, true) => writeln!(
                 f,
                 "Aggregates: they agree with the base tables."
@@ -250,10 +303,10 @@ impl fmt::Display for VerifyReport {
         write!(
             f,
             "Result: {}",
-            if self.is_consistent() {
-                "CONSISTENT"
-            } else {
-                "PROBLEMS FOUND"
+            match (self.is_consistent(), self.fully_checked()) {
+                (false, _) => "PROBLEMS FOUND",
+                (true, false) => "CONSISTENT, NOT FULLY CHECKED",
+                (true, true) => "CONSISTENT",
             }
         )
     }
@@ -446,27 +499,59 @@ pub async fn verify(
     //    twice - and nothing checked it: the base tables read perfectly
     //    while every total is wrong, which is worse than missing data.
     //
-    //    Only over days that are COMPLETE in the range: a partial day
-    //    disagrees for a legitimate reason. That means no gaps, and the
-    //    edge days of the range are left out.
+    //    Only over days that are COMPLETE: a partial day disagrees for a
+    //    legitimate reason. So the check runs over the GAP-FREE parts of
+    //    the range, and the edge days of each part are left out.
+    //
+    //    It used to be skipped outright as soon as the range had ANY gap,
+    //    i.e. essentially always while a backfill is in progress - so the
+    //    one check that finds a doubled aggregate was almost never on
+    //    (docs/review-round-4.md, MINOR 14). A complete day of a gap-free
+    //    part holds only blocks of that part, so the comparison is exact.
     let (mut aggregates, mut aggregates_skipped) = (Vec::new(), None);
+    let mut aggregate_parts_skipped = 0;
+    let mut days_checked = 0;
 
-    if !gaps.is_empty() {
-        aggregates_skipped =
-            Some("the range has gaps, so no day in it is complete");
-    } else if let Some((first_day, last_day)) =
-        complete_days(db, range).await?
-    {
-        for check in AGGREGATE_CHECKS {
-            if let Some(report) =
-                check.run(db, range, first_day, last_day).await?
-            {
-                aggregates.push(report);
+    if gaps_truncated {
+        aggregates_skipped = Some(
+            "the range has more gaps than can be listed, so its gap-free \
+             parts are not known",
+        );
+    } else {
+        let parts = subtract_ranges(&[range], &gaps);
+        aggregate_parts_skipped =
+            parts.len().saturating_sub(MAX_AGGREGATE_PARTS);
+
+        for part in parts.iter().take(MAX_AGGREGATE_PARTS) {
+            let Some((first_day, last_day)) =
+                complete_days(db, *part).await?
+            else {
+                continue;
+            };
+            days_checked += 1;
+
+            for check in AGGREGATE_CHECKS {
+                let Some(report) =
+                    check.run(db, *part, first_day, last_day).await?
+                else {
+                    continue;
+                };
+
+                // One line per view, whichever part it went wrong in.
+                match aggregates.iter_mut().find(
+                    |seen: &&mut AggregateReport| seen.view == report.view,
+                ) {
+                    Some(seen) => seen.merge(report),
+                    None => aggregates.push(report),
+                }
             }
         }
-    } else {
-        aggregates_skipped =
-            Some("the range holds less than one complete UTC day");
+
+        if days_checked == 0 {
+            aggregates_skipped = Some(
+                "no gap-free part of the range holds a complete UTC day",
+            );
+        }
     }
 
     Ok(VerifyReport {
@@ -480,6 +565,7 @@ pub async fn verify(
         checkpoint_resume,
         aggregates,
         aggregates_skipped,
+        aggregate_parts_skipped,
         heal_pending,
         epoch: db.current_epoch().await?,
     })
@@ -614,6 +700,7 @@ mod tests {
             checkpoint_resume: 100,
             aggregates: vec![],
             aggregates_skipped: None,
+            aggregate_parts_skipped: 0,
             heal_pending: false,
             epoch: 0,
         }
@@ -640,15 +727,66 @@ mod tests {
         assert!(text.ends_with("Result: PROBLEMS FOUND"));
     }
 
+    /// "Not checked" must not read as "consistent", and neither must "the
+    /// next start will purge something" (docs/review-round-4.md,
+    /// MINOR 14): both used to leave the verdict at CONSISTENT.
     #[test]
-    fn a_partial_range_says_the_aggregates_were_not_checked() {
-        let mut report = report();
-        report.aggregates_skipped = Some("the range has gaps");
+    fn what_was_not_checked_is_not_reported_as_consistent() {
+        // Nothing is WRONG, but the one check that finds a doubled
+        // aggregate did not run: the verdict has to say so.
+        let skipped = VerifyReport {
+            aggregates_skipped: Some("the range has gaps"),
+            ..report()
+        };
 
-        assert!(report.is_consistent());
-        assert!(report
-            .to_string()
-            .contains("Aggregates: not checked (the range has gaps)"));
+        assert!(skipped.is_consistent());
+        assert!(!skipped.fully_checked());
+        let text = skipped.to_string();
+        assert!(
+            text.contains("Aggregates: not checked (the range has gaps)"),
+            "{text}"
+        );
+        assert!(text.ends_with("Result: CONSISTENT, NOT FULLY CHECKED"));
+
+        // Gap-free parts the check did not get to.
+        let partial =
+            VerifyReport { aggregate_parts_skipped: 3, ..report() };
+        assert!(!partial.fully_checked());
+        assert!(
+            partial.to_string().contains("3 more gap-free part(s)"),
+            "{partial}"
+        );
+
+        // A pending heal IS wrong right now: the rows are tombstoned but
+        // nothing settled them, so the aggregates still count them.
+        let pending = VerifyReport { heal_pending: true, ..report() };
+        assert!(!pending.is_consistent());
+        assert!(
+            pending.to_string().contains("a gap heal is pending"),
+            "{pending}"
+        );
+    }
+
+    /// One line per view, whichever gap-free part it went wrong in.
+    #[test]
+    fn a_view_that_is_wrong_in_two_parts_is_reported_once() {
+        let wrong = |first_wrong_day| AggregateReport {
+            view: "daily_block_stats_v",
+            base: "blocks",
+            days_checked: 10,
+            days_wrong: 1,
+            first_wrong_day,
+            view_rows: 20,
+            base_rows: 10,
+        };
+
+        let mut report = wrong(1_700_086_400);
+        report.merge(wrong(1_700_000_000));
+
+        assert_eq!(report.days_checked, 20);
+        assert_eq!(report.days_wrong, 2);
+        assert_eq!(report.first_wrong_day, 1_700_000_000);
+        assert_eq!((report.view_rows, report.base_rows), (40, 20));
     }
 
     /// Only aggregates whose grouping partitions their base table can be

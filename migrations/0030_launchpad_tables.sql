@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS launchpad_tokens (
   pool_kind LowCardinality(String),
   launch_config_id UInt256,
   block_number UInt64 CODEC(Delta, ZSTD),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   tx_id String,
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
@@ -126,7 +126,7 @@ SETTINGS do_not_merge_across_partitions_select_final = 1;
 CREATE TABLE IF NOT EXISTS launchpad_trades (
   chain UInt64,
   block_number UInt64 CODEC(Delta, ZSTD),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   tx_id String,
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
@@ -164,7 +164,7 @@ SETTINGS do_not_merge_across_partitions_select_final = 1;
 CREATE TABLE IF NOT EXISTS launchpad_graduations (
   chain UInt64,
   block_number UInt64 CODEC(Delta, ZSTD),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   tx_id String,
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
@@ -197,7 +197,7 @@ SETTINGS do_not_merge_across_partitions_select_final = 1;
 CREATE TABLE IF NOT EXISTS launchpad_creator_fees (
   chain UInt64,
   block_number UInt64 CODEC(Delta, ZSTD),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   tx_id String,
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
@@ -232,7 +232,7 @@ CREATE TABLE IF NOT EXISTS launchpad_trades_by_token (
   block_number UInt64 CODEC(Delta, ZSTD),
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   family LowCardinality(String),
   emitter FixedString(32),
   side LowCardinality(String),
@@ -275,7 +275,7 @@ CREATE TABLE IF NOT EXISTS launchpad_trades_by_trader (
   block_number UInt64 CODEC(Delta, ZSTD),
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   family LowCardinality(String),
   emitter FixedString(32),
   token FixedString(32),
@@ -309,7 +309,7 @@ FROM launchpad_trades;
 -- primary key read of the newest granules of one chain partition.
 CREATE TABLE IF NOT EXISTS launchpad_launches_by_time (
   chain UInt64,
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   block_number UInt64 CODEC(Delta, ZSTD),
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
@@ -347,7 +347,7 @@ FROM launchpad_tokens;
 CREATE TABLE IF NOT EXISTS launchpad_launches_by_creator (
   chain UInt64,
   creator FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   block_number UInt64 CODEC(Delta, ZSTD),
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),

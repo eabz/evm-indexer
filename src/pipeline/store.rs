@@ -27,8 +27,17 @@ use alloy::primitives::B256;
 use anyhow::{Context, Result};
 use clickhouse::Row;
 use futures::future::BoxFuture;
-use log::debug;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
+
+/// How many completed purges [`ReorgStore::has_orphan_children`] reads to
+/// decide whether a tombstone is settled debris.
+///
+/// `reorgs` is insert only and nothing compacts it: two rows per purge on
+/// a chain with frequent tip reorgs. The query only reads the purges whose
+/// block range overlaps the range being checked, newest tombstone version
+/// first, and stops here.
+const MAX_SETTLED_PURGES: usize = 1_000;
 
 /// Which tables a purge reaches.
 #[derive(Debug, Clone, Copy)]
@@ -467,11 +476,35 @@ impl ReorgStore for ClickhouseReorgStore {
 
             // The purges of this chain that FINISHED, as (first block,
             // exclusive last block, the `_version` they stamped on their
-            // tombstones). `reorgs` holds a handful of rows per chain.
+            // tombstones).
+            //
+            // `reason != 'redecode'`: a MODULE purge (`indexer backfill
+            // --module X`) only ever touched that module's tables, and
+            // its repair window is the timestamp span of THOSE rows - it
+            // can be far narrower in time than its block range. Counting
+            // it here let it settle core orphans it never repaired: the
+            // heal was skipped, the tombstoned core rows stayed in the
+            // aggregates, and the range was counted again when it was
+            // streamed a second time (docs/review-round-4.md, MAJOR 5).
+            //
+            // Only the purges whose block range can cover a row of
+            // [from, to) are read, newest tombstones first: a chain with
+            // frequent tip reorgs collects two `reorgs` rows per purge
+            // and nothing compacts them. Leaving an old row out can only
+            // LOWER a block's settled version, i.e. heal once too often
+            // (safe); it can never hide an unfinished purge.
+            let overlaps = to
+                .map(|to| format!(" AND fork_block < {to}"))
+                .unwrap_or_default();
+
             let done = format!(
                 "(SELECT groupArray((fork_block, to_block, \
-                 tombstone_version)) FROM reorgs WHERE chain = {chain} \
-                 AND completed = 1) AS done"
+                 tombstone_version)) FROM (SELECT fork_block, to_block, \
+                 tombstone_version FROM reorgs WHERE chain = {chain} \
+                 AND completed = 1 AND reason != 'redecode' \
+                 AND to_block > {from}{overlaps} \
+                 ORDER BY tombstone_version DESC \
+                 LIMIT {MAX_SETTLED_PURGES})) AS done"
             );
 
             // Highest tombstone version a completed purge of this block
@@ -540,11 +573,21 @@ impl ReorgStore for ClickhouseReorgStore {
         to: Option<u64>,
     ) -> BoxFuture<'_, Result<Option<(u32, u32)>>> {
         Box::pin(async move {
-            let mut span: Option<(u32, u32)> = None;
+            // `minIf(timestamp > 0)`: a timestamp of 0 is a MISSING block
+            // time, not a block time of 1970, and taking it as the start
+            // of the repair window hides every aggregate bucket of the
+            // chain (docs/review-round-4.md, MAJOR 6). It reads 0 when
+            // the table has no row with a real timestamp in the range,
+            // which is why the row count and the zero count come too.
+            const COUNTED: &str = "SELECT toUInt64(count()), \
+                 toUInt32(minIf(timestamp, timestamp > 0)), \
+                 toUInt32(max(timestamp)), \
+                 toUInt64(countIf(timestamp = 0))";
 
-            const COUNTED: &str =
-                "SELECT toUInt64(count()), toUInt32(min(timestamp)), \
-                 toUInt32(max(timestamp))";
+            // (smallest real timestamp, largest timestamp seen).
+            let mut low: Option<u32> = None;
+            let mut high: Option<u32> = None;
+            let mut missing = 0u64;
 
             let mut queries: Vec<String> = self
                 .children()
@@ -570,7 +613,7 @@ impl ReorgStore for ClickhouseReorgStore {
             }
 
             for sql in queries {
-                let (rows, min, max): (u64, u32, u32) = self
+                let (rows, min, max, zeros): (u64, u32, u32, u64) = self
                     .db
                     .db
                     .query(&sql)
@@ -578,15 +621,33 @@ impl ReorgStore for ClickhouseReorgStore {
                     .await
                     .with_context(|| format!("query failed: {sql}"))?;
 
-                if rows > 0 {
-                    span = Some(match span {
-                        Some((low, high)) => (low.min(min), high.max(max)),
-                        None => (min, max),
-                    });
+                if rows == 0 {
+                    continue;
+                }
+
+                missing += zeros;
+                high = Some(high.map_or(max, |high: u32| high.max(max)));
+                if min > 0 {
+                    low = Some(low.map_or(min, |low: u32| low.min(min)));
                 }
             }
 
-            Ok(span)
+            if missing > 0 {
+                warn!(
+                    "Chain {chain}: {missing} stored row(s) of blocks \
+                     [{from}, {to:?}) have `timestamp` 0, which is not a \
+                     block time but a missing one. They are left out of \
+                     the repair window of this purge (they would set it \
+                     to every day since 1970 and hide every aggregate of \
+                     the chain until the rebuild finished). Fix the \
+                     source: a block time it does not report is being \
+                     stored as 0."
+                );
+            }
+
+            // Every row of the range has timestamp 0: day 0 really is the
+            // only bucket they contributed to.
+            Ok(high.map(|high| (low.unwrap_or(0).min(high), high)))
         })
     }
 

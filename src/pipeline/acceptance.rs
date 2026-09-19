@@ -1859,6 +1859,161 @@ async fn debris_of_a_finished_purge_is_not_healed_again() {
     scenario.assert_consistent().await;
 }
 
+/// A MODULE purge (`indexer backfill --module X`) settles nothing outside
+/// its own tables, so its `reorgs` row must not tell the next start that
+/// somebody else's orphans are finished business.
+///
+/// The damage it used to hide (docs/review-round-4.md, MAJOR 5): a flush
+/// dies before its `blocks` insert, a gap heal tombstones the core
+/// children and dies before writing its `reorgs` row - and then a module
+/// backfill over the same block range writes a COMPLETED row with a higher
+/// tombstone version. The heal detector saw every core orphan as settled
+/// and skipped the repair, so the tombstoned rows stayed in the aggregates
+/// AND were counted a second time when the range was streamed again. A
+/// module purge's repair window is the timestamp span of its own rows,
+/// which can be far narrower than its block range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_module_purge_does_not_settle_somebody_elses_orphans() {
+    let scenario = Scenario::new("module_settle").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let store =
+        ClickhouseReorgStore::new(scenario.db.clone(), Scope::Chain);
+
+    // A gap heal that tombstoned every child of blocks [9, 12) and died
+    // before its `reorgs` row: the blocks are gone, the children are
+    // tombstoned, and nothing recorded that it happened. No LIVE orphan
+    // is left, so the tombstones are the only trace.
+    let interrupted = next_version();
+    store
+        .tombstone_children(CHAIN, 9, Some(12), interrupted)
+        .await
+        .unwrap();
+    store.tombstone_blocks(CHAIN, 9, Some(12), interrupted).await.unwrap();
+    assert_eq!(store.live_children(CHAIN, 9, Some(12)).await.unwrap(), 0);
+
+    assert!(
+        store.has_orphan_children(CHAIN, 9, Some(12)).await.unwrap(),
+        "the debris of an interrupted heal must be found"
+    );
+
+    // Now the operator re-decodes one module over the SAME block range.
+    let dex = ALL_MODULES.iter().find(|s| s.name == "dex").unwrap();
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Module(dex),
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    purger
+        .purge_range(CHAIN, 9, Some(12), PurgeReason::Redecode)
+        .await
+        .unwrap();
+
+    let redecodes: u64 = scenario
+        .count(
+            "SELECT toUInt64(count()) FROM reorgs WHERE completed = 1 \
+             AND reason = 'redecode'",
+        )
+        .await;
+    assert_eq!(redecodes, 1);
+
+    assert!(
+        store.has_orphan_children(CHAIN, 9, Some(12)).await.unwrap(),
+        "a module purge repaired only its own tables: the core orphans \
+         are still there and must still be healed"
+    );
+
+    // And the heal really does repair them.
+    let chain_purger = Purger::new(
+        Arc::new(store.clone()),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    chain_purger
+        .purge_range(CHAIN, 9, Some(12), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert!(
+        !store.has_orphan_children(CHAIN, 9, Some(12)).await.unwrap(),
+        "a finished chain purge settles its own debris"
+    );
+
+    scenario.index_until(&chain, 12, &[]).await;
+    scenario.assert_consistent().await;
+}
+
+/// A stored row whose block time is MISSING (`timestamp` 0 - an EVM
+/// genesis block, a Solana slot whose `blockTime` the node omitted) must
+/// not set a purge's repair window to "every day since 1970".
+///
+/// Measured in the report (docs/review-round-4.md, MAJOR 6): `from_ts` 0
+/// makes `epoch_floor_v` expand ~20,700 day rows and raise the floor on
+/// every day since the epoch - the whole chain reads as zero - while the
+/// rebuild slices fifty years into ~678 monthly INSERTs per aggregate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_row_without_a_block_time_does_not_blank_the_chain() {
+    let scenario = Scenario::new("no_block_time").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    // One stored log of block 5 with no block time, at a key of its own.
+    let version = next_version();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO logs SELECT * REPLACE (\
+             toDateTime(0) AS timestamp, toUInt32(999) AS log_index, \
+             toUInt64({version}) AS _version) FROM (SELECT * FROM logs \
+             FINAL WHERE chain = {CHAIN} AND block_number = 5 LIMIT 1)"
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+
+    let report = purger
+        .purge_range(CHAIN, 4, Some(8), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+
+    let day = BASE_TIMESTAMP - BASE_TIMESTAMP % 86_400;
+    assert_eq!(
+        (report.from_ts, report.to_ts),
+        (Some(day), Some(day + 86_400)),
+        "the repair covers the day the real rows are on, not every day \
+         since 1970"
+    );
+
+    // And the `reorgs` row the validity rule reads says the same.
+    let armed_at_zero: u64 = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM reorgs WHERE chain = {CHAIN} \
+             AND toUInt32(from_ts) = 0"
+        ))
+        .await;
+    assert_eq!(armed_at_zero, 0);
+
+    scenario.index_until(&chain, 12, &[]).await;
+}
+
 // ------------------------------------------------------ side tables
 
 /// Tombstones reach the read-path side tables only through their
@@ -2492,7 +2647,7 @@ async fn a_second_process_on_the_same_chain_refuses_to_start() {
             .await
             .err()
             .expect("the second instance must refuse");
-    assert!(format!("{error:#}").contains("already indexing chain 1"));
+    assert!(format!("{error:#}").contains("already writing chain 1"));
 
     // After a clean shutdown the next start does not even wait.
     first.release().await;
@@ -2513,4 +2668,140 @@ async fn a_second_process_on_the_same_chain_refuses_to_start() {
             .unwrap();
     assert!(started.elapsed() >= patient_lease().ttl);
     third.release().await;
+}
+
+/// `indexer backfill --module X` is a WRITER: it purges, bumps the chain's
+/// epoch and rebuilds every aggregate. Two of them on one chain and module
+/// corrupt it exactly as two indexers would - both write a `reorgs` row,
+/// and the lower-epoch rebuild ends up hidden by the higher floor
+/// (docs/review-round-4.md, MINOR 16). It took no lease at all.
+///
+/// It must still be able to run NEXT TO a live `indexer run`, which is
+/// documented and handled (`pipeline::backfill`), so it holds a lease of
+/// its own role instead of the indexer's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn two_backfills_of_one_module_refuse_to_run_together() {
+    use crate::pipeline::lease::ROLE_RUN;
+
+    let scenario = Scenario::new("backfill_lease").await;
+    let (fatal, _) = watch::channel(None);
+
+    let dex = Lease::acquire_as(
+        &scenario.db,
+        "backfill:dex",
+        patient_lease(),
+        fatal.clone(),
+    )
+    .await
+    .unwrap();
+
+    // A live indexer is unaffected, and so is a backfill of a DIFFERENT
+    // module: neither waits, neither is refused.
+    let started = std::time::Instant::now();
+    let running =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
+    let predictions = Lease::acquire_as(
+        &scenario.db,
+        "backfill:predictions",
+        patient_lease(),
+        fatal.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() < patient_lease().ttl);
+
+    // A second backfill of the SAME module is refused.
+    let error = Lease::acquire_as(
+        &scenario.db,
+        "backfill:dex",
+        patient_lease(),
+        fatal.clone(),
+    )
+    .await
+    .err()
+    .expect("a second backfill of 'dex' must refuse");
+    let message = format!("{error:#}");
+    assert!(message.contains("'backfill:dex'"), "{message}");
+    assert!(message.contains("already writing chain 1"), "{message}");
+
+    // And a second indexer still is, by its own role.
+    let error =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .err()
+            .expect("the second indexer must refuse");
+    assert!(format!("{error:#}").contains(&format!("'{ROLE_RUN}'")));
+
+    dex.release().await;
+    predictions.release().await;
+    running.release().await;
+}
+
+/// The aggregate cross-check is the only thing that finds a DOUBLED
+/// aggregate, and it used to be switched off by ANY gap in the range -
+/// i.e. essentially always while a backfill is in progress
+/// (docs/review-round-4.md, MINOR 14). It runs over the complete UTC days
+/// of the GAP-FREE parts now, which is exact: a complete day of a gap-free
+/// part holds only blocks of that part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_gap_elsewhere_does_not_switch_the_aggregate_check_off() {
+    const DAY: u32 = 86_400;
+
+    let scenario = Scenario::new("gap_aggregates").await;
+    // One block per day, so the range holds complete UTC days.
+    let chain = TestChain::with_block_time(12, DAY);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+
+    // A clean hole in the middle: block 9 is purged and not streamed
+    // again, so the range has a gap and no orphan.
+    purger
+        .purge_range(CHAIN, 9, Some(10), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+
+    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    assert_eq!(report.gaps, vec![BlockRange::new(9, 10)], "{report}");
+    assert!(
+        report.aggregates_skipped.is_none(),
+        "the gap-free parts are still checkable: {report}"
+    );
+
+    // Now double a range that lies in the FIRST gap-free part: the check
+    // has to find it although the range has a gap above it.
+    let mut batch = transform::transform_with(
+        CHAIN,
+        &chain.response(BlockRange::new(4, 6)),
+        BlockRange::new(4, 6),
+        EnabledModules::default(),
+        &mut DecodeState::default(),
+    )
+    .unwrap()
+    .rows;
+    batch.set_version(next_version());
+    batch.set_epoch(scenario.db.current_epoch().await.unwrap());
+    crate::core::store(&scenario.db, &batch).await.unwrap();
+
+    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    assert!(!report.is_consistent(), "{report}");
+    let wrong: Vec<&str> =
+        report.aggregates.iter().map(|a| a.view).collect();
+    assert!(wrong.contains(&"daily_block_stats_v"), "{report}");
+    assert!(
+        report.to_string().contains("Aggregates DISAGREE"),
+        "{report}"
+    );
 }

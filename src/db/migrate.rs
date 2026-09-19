@@ -3116,9 +3116,33 @@ FROM transactions;
 /// ```
 ///
 /// Only the server part of the url is used: every test works in its own
-/// throwaway database (`migrate_*_test`), dropped at the end. The url's
-/// user must be allowed to create databases and users (the least-privilege
-/// tests create their own user).
+/// throwaway database (`migrate_*_test`), dropped at the end.
+///
+/// # What the server has to offer
+///
+/// The url's user must be allowed to create databases AND USERS:
+/// `least_privilege_user_starts_only_when_nothing_is_pending` creates a
+/// user of its own with `CREATE USER ... GRANT SELECT, INSERT` to prove
+/// that a reader-plus-writer without DDL rights can start once the
+/// migrations are applied. That needs two things on the server:
+///
+/// * a WRITABLE access storage, i.e. a `<user_directories>` with a
+///   `<local_directory>` entry (the official `clickhouse/clickhouse-server`
+///   image has one by default, pointing at `/var/lib/clickhouse/access/`).
+///   A server configured with `users_xml` alone refuses `CREATE USER` with
+///   "there are no writable access storages", and these tests fail;
+/// * `<access_management>1</access_management>` for the url's user
+///   (`CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1` in the image, which the
+///   `integration` job of `.github/workflows/build.yml` sets).
+///
+/// A throwaway server started by hand needs both in its config file:
+///
+/// ```xml
+/// <user_directories>
+///   <users_xml><path>users.xml</path></users_xml>
+///   <local_directory><path>/tmp/ch/access/</path></local_directory>
+/// </user_directories>
+/// ```
 #[cfg(test)]
 mod integration {
     use super::*;
