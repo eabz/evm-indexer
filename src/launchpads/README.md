@@ -144,33 +144,45 @@ Chain), **Clanker v3.1** (`TokenCreated` verified on Base
 ## 2. Data model (Phase 2)
 
 Four base tables, four MV-fed side tables, six aggregates, two operator
-tables. Migrations `0030` (tables), `0031` (aggregates), `0032` (views).
-Every storage rule of docs/design.md §1-§2 applies: binary columns,
-`ReplacingMergeTree(_version, is_deleted)`, `epoch`, month partitions for
-the event streams, `chain` partitions for lookups, no `DELETE` anywhere,
-`epoch` LAST in every aggregate sorting key, and no
-`non_replicated_deduplication_window` in my `CREATE`s (migration `0090`
-adds it for every module).
+tables. Migrations `0030` (tables), `0031` (aggregates), `0032` (views),
+`0033` (deduplication windows). Every storage rule of docs/design.md
+§1-§2 applies: binary columns, `ReplacingMergeTree(_version, is_deleted)`,
+`epoch`, month partitions for the event streams, `chain` partitions for
+lookups, no `DELETE` anywhere, `epoch` LAST in every aggregate sorting
+key, and no `non_replicated_deduplication_window` in a `CREATE`. `0090`
+did that for the modules that existed when it was written and an applied
+migration never changes, so `0033` is this module's own copy: every base
+table AND every materialized-view target, or the side tables and the
+aggregates would count a retried insert twice.
 
 ### 2.1 Chain neutral from day one
 
-`docs/solana-research.md` §0 landed while this module was being designed,
-so the tables follow it:
+The tables follow docs/design.md §13, exactly like `dex_*` and
+`prediction_*`:
 
 | | launchpad_* |
 |---|---|
-| identity columns (token, emitter, curve, creator, trader, caller, recipient, quote_token, tx_from, tx_to) | `FixedString(32)`: on EVM the 20 address bytes left-padded with 12 zero bytes, exactly like `dex_pools.pool_id` |
-| pool ids | `FixedString(32)`, natively 32 bytes for Uniswap V4, left-padded for a pool contract; `pool_kind` says which |
+| identity columns (token, emitter, curve, creator, trader, caller, recipient, quote_token, tx_from, tx_to) | `FixedString(32)`: on EVM the 20 address bytes left-padded with 12 zero bytes, on Solana the 32 raw pubkey bytes. Rust side: `Address` through `crate::utils::format::SerId32` - nothing here hand rolls the padding, and reading a row whose padding is not zero fails loudly instead of truncating a pubkey |
+| pool ids | `FixedString(32)`, natively 32 bytes for Uniswap V4, left-padded for a pool contract; `pool_kind` says which. Rust side: `B256` with `SerB256`, because a pool id is NOT an address even on EVM |
+| transaction id | `tx_id String`, the RAW bytes (32 on EVM, 64 for a Solana signature, which a `FixedString(32)` could not hold). Never a sorting-key column. Rust side: `Bytes` through `SerTxId`, built with `utils::format::tx_id()`, read back with `tx_hash_of()` |
 | position of a row | `(chain, block_number, tx_index, ordinal)`. `ordinal` IS the log index on EVM; there is no `log_index` column |
 | amounts | `UInt256` exact in the base tables, `Float64` in every aggregate (the 256-bit rule) |
 
-Two deliberate deltas from the note, both free to converge later: the Rust
-row fields are `B256` with the existing `SerB256` plus a local `id_of()`
-(the shared `SerId32` helper belongs to `src/utils/format.rs`, which this
-module may not modify), and the transaction id stays
-`transaction_hash FixedString(32)` rather than `tx_id String` - it is not
-a sorting-key column anywhere, so `ALTER ... MODIFY COLUMN` converts it the
-day a 64-byte Solana signature has to fit.
+**Printing an id** is the one thing the bytes cannot say by themselves, so
+use THE expression of migration `0006`, where `chains_v` gives the family:
+`base58Encode(substring(id, 1, 32))` for `svm`, `concat('0x',
+lower(hex(substring(id, 13))))` for `evm`. The `substring()` is not
+decoration - `toString()`, a `CAST` to `String` and the implicit
+conversion `base58Encode(id)` performs all trim trailing zero bytes.
+
+**The 20 vs 32 byte seam.** The only EVM-only table these views touch is
+`erc20_transfers` (`launchpad_token_holders_v`), whose `token_address` /
+`from` / `to` are `FixedString(20)`. They are PADDED up to 32 bytes there,
+never the other way round: `substring(id, 13, 20)` on the 32-byte side
+would map every Solana pubkey onto some EVM address, while padding simply
+finds no row. Same rule as `dex_token_info_v`. Joins into
+`dex_pools` / `dex_pool_current_v` are direct - both sides are already
+32-byte ids.
 
 ### 2.2 Tables
 
@@ -326,7 +338,8 @@ One query per screen. Every query below is also a `Recipe` in
 `cookbook.rs` (a unit test asserts the two texts are identical) and is run
 by the ClickHouse integration tests with hand-computed assertions.
 Placeholders `{chain}`, `{token}` ... are request parameters; ids are 32
-bytes, so an EVM address is 24 zeros plus its 40 hex characters.
+bytes, so an EVM address is 24 zeros plus its 40 hex characters. `tx_id`
+comes back as the raw transaction bytes - `hex(tx_id)` to print it.
 
 ### New launch feed
 
@@ -394,7 +407,7 @@ curve can never be added into a real token's candle.
 ```sql
 SELECT timestamp, side, trader, caller, token_amount_raw, quote_amount_raw,
        price_raw, fee_amount_raw, token_verified, quote_verified,
-       transaction_hash
+       tx_id
 FROM launchpad_token_trades_v(chain = {chain}, token = unhex('{token}'),
                               from_block = {from_block})
 LIMIT 50

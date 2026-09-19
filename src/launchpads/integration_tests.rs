@@ -35,9 +35,9 @@ use crate::{
         cookbook, decode,
         derived::rebuild_statements,
         fixtures::{self, address, Place, RawTx},
-        models::id_of,
         LaunchpadRows, BASE_TABLES, LAUNCHPADS_DERIVED, SIDE_TABLES,
     },
+    utils::format::id32,
 };
 
 const CHAIN: u64 = 4663;
@@ -196,11 +196,11 @@ impl TestDb {
 
 /// A `FixedString(32)` identity literal for SQL.
 fn id_literal(address_hex: &str) -> String {
-    format!("unhex('{}')", hex::encode(id_of(address(address_hex))))
+    format!("unhex('{}')", id_hex(address_hex))
 }
 
 fn id_hex(address_hex: &str) -> String {
-    hex::encode(id_of(address(address_hex)))
+    hex::encode(id32(address(address_hex)))
 }
 
 /// Every fixture decoded the way the pipeline does it, stamped.

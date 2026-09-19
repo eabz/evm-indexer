@@ -1427,7 +1427,7 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
         .map(|(emitter, family)| {
             format!(
                 "({CHAIN}, unhex('{}'), '{}', '', 1)",
-                hex::encode(emitter.0),
+                hex::encode(crate::utils::format::id32(*emitter)),
                 family.as_str()
             )
         })

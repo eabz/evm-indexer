@@ -64,16 +64,17 @@ pub(crate) mod sql;
 
 use std::collections::HashSet;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
+
+use crate::utils::format::tx_hash_of;
 
 pub use self::{
     decode::decode,
     derived::LAUNCHPADS_DERIVED,
     models::{
-        address_of, id_of, Family, FeeKind, FeePhase, Id,
-        LaunchpadCreatorFee, LaunchpadFrontend, LaunchpadGraduation,
-        LaunchpadToken, LaunchpadTrade, LaunchpadTrustedEmitter, PoolKind,
-        Side,
+        Family, FeeKind, FeePhase, LaunchpadCreatorFee, LaunchpadFrontend,
+        LaunchpadGraduation, LaunchpadToken, LaunchpadTrade,
+        LaunchpadTrustedEmitter, PoolKind, Side,
     },
 };
 
@@ -206,32 +207,36 @@ impl LaunchpadRows {
         F: Fn(&B256) -> Option<TxOrigin>,
     {
         for row in &mut self.tokens {
-            if let Some(origin) = lookup(&row.transaction_hash) {
-                row.tx_from = id_of(origin.from);
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
+                row.tx_from = origin.from;
             }
         }
         for row in &mut self.trades {
-            if let Some(origin) = lookup(&row.transaction_hash) {
-                row.tx_from = id_of(origin.from);
-                row.tx_to = origin.to.map(id_of).unwrap_or_default();
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
+                row.tx_from = origin.from;
+                row.tx_to = origin.to.unwrap_or_default();
                 row.tx_value = origin.value;
             }
         }
         for row in &mut self.graduations {
-            if let Some(origin) = lookup(&row.transaction_hash) {
-                row.tx_from = id_of(origin.from);
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
+                row.tx_from = origin.from;
             }
         }
         for row in &mut self.creator_fees {
-            if let Some(origin) = lookup(&row.transaction_hash) {
-                row.tx_from = id_of(origin.from);
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
+                row.tx_from = origin.from;
             }
         }
     }
 
     /// Emitters this batch showed: what an operator has to decide about
     /// (`launchpad_trusted_emitters`). Deduplicated, in first-seen order.
-    pub fn emitters(&self) -> Vec<(Id, Family)> {
+    pub fn emitters(&self) -> Vec<(Address, Family)> {
         let mut seen = HashSet::new();
 
         self.tokens
@@ -248,7 +253,7 @@ impl LaunchpadRows {
 
     /// Tokens this batch named, for the token metadata worker (the views
     /// need their decimals). EVM addresses only.
-    pub fn token_addresses(&self) -> Vec<alloy::primitives::Address> {
+    pub fn token_addresses(&self) -> Vec<Address> {
         let mut seen = HashSet::new();
 
         self.tokens
@@ -259,8 +264,7 @@ impl LaunchpadRows {
                     .iter()
                     .flat_map(|row| [row.token, row.quote_token]),
             )
-            .filter(|id| *id != B256::ZERO && seen.insert(*id))
-            .filter_map(address_of)
+            .filter(|token| !token.is_zero() && seen.insert(*token))
             .collect()
     }
 }
@@ -304,14 +308,14 @@ mod tests {
         });
 
         let trade = &rows.trades[0];
-        assert_eq!(trade.tx_from, id_of(tx.origin().from));
-        assert_eq!(trade.tx_to, id_of(tx.origin().to.unwrap()));
+        assert_eq!(trade.tx_from, tx.origin().from);
+        assert_eq!(trade.tx_to, tx.origin().to.unwrap());
         assert_eq!(trade.tx_value, tx.origin().value);
         // The launch forwarder sent the transaction; the trader is the
         // creator, and the event's `caller` is the forwarder.
         assert_eq!(trade.caller, trade.tx_to);
         assert_ne!(trade.trader, trade.caller);
-        assert_eq!(trade.trader, id_of(tx.origin().from));
+        assert_eq!(trade.trader, tx.origin().from);
     }
 
     #[test]
@@ -319,13 +323,13 @@ mod tests {
         let rows = all_rows();
 
         let emitters = rows.emitters();
-        let unique: HashSet<&(Id, Family)> = emitters.iter().collect();
+        let unique: HashSet<&(Address, Family)> =
+            emitters.iter().collect();
         assert_eq!(unique.len(), emitters.len());
         assert!(emitters.len() >= 6);
 
         let tokens = rows.token_addresses();
-        let unique: HashSet<&alloy::primitives::Address> =
-            tokens.iter().collect();
+        let unique: HashSet<&Address> = tokens.iter().collect();
         assert_eq!(unique.len(), tokens.len());
         assert!(tokens.iter().all(|token| !token.is_zero()));
     }
@@ -460,7 +464,7 @@ mod tests {
         }
     }
 
-    /// Every identity column is chain neutral (docs/solana-research.md §0).
+    /// Every identity column is chain neutral (docs/design.md §13).
     #[test]
     fn identity_columns_are_32_bytes_and_positions_are_chain_neutral() {
         for (name, body) in tables() {
@@ -469,6 +473,12 @@ mod tests {
             }
             assert!(!body.contains("FixedString(20)"), "{name}");
             assert!(!body.contains(" log_index "), "{name}");
+            // The transaction id is `tx_id String` (raw bytes): a Solana
+            // signature is 64 bytes and does not fit a FixedString(32).
+            assert!(!body.contains("transaction_hash"), "{name}");
+            if body.contains(" tx_index ") {
+                assert!(body.contains(" tx_id String,"), "{name}");
+            }
             for column in
                 ["token", "emitter", "creator", "trader", "recipient"]
             {

@@ -22,9 +22,18 @@
 -- Token-scoped views are not filtered (the caller already picked the
 -- token), and launchpad_token_v tells whether it is trusted.
 --
--- Ids are 32 bytes (docs/solana-research.md section 0). Format one with
--- concat('0x', lower(hex(substring(id, 13)))). Joins into the EVM-only
--- tokens / erc20_transfers tables use toFixedString(substring(id, 13, 20), 20).
+-- Ids are 32 bytes (docs/design.md section 13) and NOTHING here assumes
+-- the top 12 bytes are zero. Print one with the family of its chain, using
+-- THE expression documented in migration 0006, where chains_v gives the
+-- family: concat('0x', lower(hex(substring(id, 13)))) for 'evm',
+-- base58Encode(substring(id, 1, 32)) for 'svm'. The substring() is NOT
+-- decoration - toString(), CAST to String and the implicit conversion
+-- base58Encode() performs all trim trailing zero bytes. A pool_id prints
+-- as all 32 bytes, because a Uniswap V4 / Balancer pool id is not an
+-- address. Joins into the EVM-only erc20_transfers table PAD that table's
+-- FixedString(20) address up to 32 bytes (the dex_token_info_v rule of
+-- 0012): padding lets a non-EVM id simply find no row, while truncating
+-- the 32 byte side would map every pubkey onto some address.
 --
 -- *_raw columns are the on-chain integers as Float64. Columns without the
 -- suffix are divided by 10^decimals of the asset and are NULL - never 0 -
@@ -152,7 +161,7 @@ SELECT
   l.name AS name, l.symbol AS symbol, l.quote_token AS quote_token,
   toFloat64(l.initial_supply) AS initial_supply_raw,
   toFloat64(l.graduation_threshold) AS graduation_threshold_raw,
-  l.pool_id AS launch_pool_id, l.transaction_hash AS launch_tx,
+  l.pool_id AS launch_pool_id, l.tx_id AS launch_tx,
   l.emitter IN (
     SELECT curve FROM launchpad_trusted_curves_v
     WHERE chain = {chain:UInt64}) AS trusted,
@@ -231,7 +240,7 @@ FROM
     argMin(quote_token, (block_number, tx_index, ordinal)) AS first_quote_token,
     min(block_number) AS launch_block,
     argMin(timestamp, (block_number, tx_index, ordinal)) AS launch_time,
-    argMin(transaction_hash, (block_number, tx_index, ordinal)) AS launch_tx,
+    argMin(tx_id, (block_number, tx_index, ordinal)) AS launch_tx,
     argMin(toFloat64(initial_supply), (block_number, tx_index, ordinal)) AS initial_supply_raw,
     argMin(toFloat64(graduation_threshold), (block_number, tx_index, ordinal)) AS graduation_threshold_raw
   FROM launchpad_tokens FINAL
@@ -286,7 +295,7 @@ SELECT
   toFloat64(tax_amount) AS tax_amount_raw,
   if(token_amount != 0 AND quote_amount != 0,
      toFloat64(quote_amount) / toFloat64(token_amount), NULL) AS price_raw,
-  token_verified, quote_verified, quote_token, graduating, transaction_hash
+  token_verified, quote_verified, quote_token, graduating, tx_id
 FROM launchpad_trades_by_token FINAL
 WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
   AND is_deleted = 0 AND block_number >= {from_block:UInt64}
@@ -297,6 +306,14 @@ ORDER BY block_number DESC, tx_index DESC, ordinal DESC;
 -- its launch block: the scalar subquery prunes erc20_transfers by its
 -- primary key (chain, block_number). as_of_block = the concentration at
 -- graduation, or a huge number for "now".
+--
+-- THE 20 vs 32 byte seam of this module (the dex_token_info_v rule of
+-- migration 0012): erc20_transfers is EVM only, so its FixedString(20)
+-- token_address / from / to are PADDED up to 32 bytes here. Never
+-- substring(token, 13, 20) on the 32 byte side - that would map every
+-- Solana pubkey onto some EVM address, while padding just finds no row.
+-- token_address is not in the table's sorting key, so nothing is lost:
+-- the block_number range above is what prunes.
 CREATE VIEW IF NOT EXISTS launchpad_token_holders_v AS
 SELECT
   account,
@@ -309,10 +326,10 @@ SELECT
   countIf(delta < 0) AS sent
 FROM
 (
-  SELECT `to` AS account, toFloat64(amount) AS delta
+  SELECT toFixedString(concat(unhex('000000000000000000000000'), `to`), 32) AS account, toFloat64(amount) AS delta
   FROM erc20_transfers FINAL
   WHERE chain = {chain:UInt64}
-    AND token_address = toFixedString(substring({token:FixedString(32)}, 13, 20), 20)
+    AND toFixedString(concat(unhex('000000000000000000000000'), token_address), 32) = {token:FixedString(32)}
     AND block_number >= (
       SELECT min(block_number) FROM launchpad_tokens FINAL
       WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
@@ -320,10 +337,10 @@ FROM
     AND block_number <= {as_of_block:UInt64}
     AND is_deleted = 0
   UNION ALL
-  SELECT `from` AS account, -toFloat64(amount) AS delta
+  SELECT toFixedString(concat(unhex('000000000000000000000000'), `from`), 32) AS account, -toFloat64(amount) AS delta
   FROM erc20_transfers FINAL
   WHERE chain = {chain:UInt64}
-    AND token_address = toFixedString(substring({token:FixedString(32)}, 13, 20), 20)
+    AND toFixedString(concat(unhex('000000000000000000000000'), token_address), 32) = {token:FixedString(32)}
     AND block_number >= (
       SELECT min(block_number) FROM launchpad_tokens FINAL
       WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
@@ -351,14 +368,14 @@ SELECT
   toFloat64(g.token_amount) AS token_amount_raw,
   toFloat64(g.quote_amount) AS quote_amount_raw,
   toFloat64(g.position_id) AS position_id,
-  g.transaction_hash AS graduation_tx,
+  g.tx_id AS graduation_tx,
   g.emitter IN (
     SELECT curve FROM launchpad_trusted_curves_v
     WHERE chain = {chain:UInt64}) AS trusted,
   ifNull(p.best_status, '') AS pool_status,
   ifNull(p.best_trusted, 0) AS pool_trusted,
   ifNull(p.best_protocol, '') AS pool_protocol,
-  ifNull(p.best_emitter, toFixedString('', 20)) AS pool_emitter
+  ifNull(p.best_emitter, toFixedString('', 32)) AS pool_emitter
 FROM launchpad_graduations AS g FINAL
 LEFT JOIN
 (
@@ -394,7 +411,7 @@ SELECT
   l.chain AS chain, l.creator AS creator, l.token AS token,
   l.family AS family, l.emitter AS emitter, l.curve AS curve,
   l.name AS name, l.symbol AS symbol, l.timestamp AS launch_time,
-  l.block_number AS launch_block, l.transaction_hash AS launch_tx,
+  l.block_number AS launch_block, l.tx_id AS launch_tx,
   toFloat64(l.graduation_threshold) AS graduation_threshold_raw,
   toUInt8(g.g_token != toFixedString('', 32)) AS graduated,
   g.g_pool_id AS pool_id, g.g_time AS graduation_time,
@@ -494,7 +511,7 @@ FROM
     SELECT
       trader, block_number, tx_index, ordinal, token_amount, quote_amount,
       tx_from,
-      count(DISTINCT trader) OVER (PARTITION BY transaction_hash) AS bundle
+      count(DISTINCT trader) OVER (PARTITION BY tx_id) AS bundle
     FROM launchpad_trades_by_token FINAL
     WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
       AND is_deleted = 0 AND side = 'buy'

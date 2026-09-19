@@ -7,7 +7,8 @@
 //! Placeholders (`{chain}`, `{token}`...) stand for request parameters.
 //! Ids are 32 bytes and are passed as hex without `0x` through `unhex()`;
 //! an EVM address is therefore 24 zeros followed by the 40 address
-//! characters. `{now}` / `{since}` are unix seconds.
+//! characters. `{now}` / `{since}` are unix seconds. `tx_id` comes back as
+//! the raw transaction bytes - `hex(tx_id)` to print it.
 
 /// A screen and the query that serves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +64,7 @@ pub const TRADES_TAPE: Recipe = Recipe {
     sql: "\
 SELECT timestamp, side, trader, caller, token_amount_raw, quote_amount_raw,
        price_raw, fee_amount_raw, token_verified, quote_verified,
-       transaction_hash
+       tx_id
 FROM launchpad_token_trades_v(chain = {chain}, token = unhex('{token}'),
                               from_block = {from_block})
 LIMIT 50",

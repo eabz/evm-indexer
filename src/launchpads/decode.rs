@@ -37,14 +37,17 @@
 
 use std::collections::HashMap;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 
-use crate::db::models::log::DatabaseLog;
+use crate::{
+    db::models::log::DatabaseLog,
+    utils::format::{address_of_id32, id32, tx_id},
+};
 
 use super::{
     events::{self, EventDef},
     models::{
-        id_of, Family, FeeKind, FeePhase, Id, LaunchpadCreatorFee,
+        Family, FeeKind, FeePhase, LaunchpadCreatorFee,
         LaunchpadGraduation, LaunchpadToken, LaunchpadTrade, PoolKind,
         Side,
     },
@@ -88,21 +91,17 @@ impl Topics {
         }
     }
 
-    /// Topic `index` as an identity, zero when it is not an EVM address
+    /// Topic `index` as an address, zero when it is not an EVM address
     /// (the 12 leading bytes must be zero).
-    fn id(&self, index: usize) -> Id {
-        clean_id(self.at(index))
+    fn address(&self, index: usize) -> Address {
+        clean_address(self.at(index))
     }
 }
 
-/// A 32 byte word holding an EVM address, or zero when the padding is not
+/// The EVM address inside a 32 byte word, zero when the padding is not
 /// zero (so a forged word can never turn into someone else's address).
-fn clean_id(word: B256) -> Id {
-    if word.0[..12].iter().all(|byte| *byte == 0) {
-        word
-    } else {
-        B256::ZERO
-    }
+fn clean_address(word: B256) -> Address {
+    address_of_id32(word).unwrap_or(Address::ZERO)
 }
 
 /// Bounds-checked view over the data section of a log.
@@ -124,8 +123,8 @@ impl<'a> Data<'a> {
         U256::from_be_bytes(self.word(index).0)
     }
 
-    fn id(&self, index: usize) -> Id {
-        clean_id(self.word(index))
+    fn address(&self, index: usize) -> Address {
+        clean_address(self.word(index))
     }
 
     /// An `int24` stored in a 32 byte word, as `i32`.
@@ -191,17 +190,17 @@ fn matches(log: &DatabaseLog, topics: &Topics, def: &EventDef) -> bool {
 // ------------------------------------------------------------- evidence
 
 struct TransferSeen {
-    token: Id,
-    from: Id,
-    to: Id,
+    token: Address,
+    from: Address,
+    to: Address,
     amount: U256,
     ordinal: u64,
     used: bool,
 }
 
 struct CreditSeen {
-    recipient: Id,
-    source: Id,
+    recipient: Address,
+    source: Address,
     amount: U256,
     used: bool,
 }
@@ -213,14 +212,14 @@ struct TxEvidence {
     transfers: Vec<TransferSeen>,
     credits: Vec<CreditSeen>,
     /// `flap_portal` `TokenQuoteSet`: token -> quote asset.
-    quote_of: HashMap<Id, Id>,
+    quote_of: HashMap<Address, Address>,
     /// `flap_portal` `FlapTokenProgressChanged`: (token, wad, ordinal),
     /// in log order. A transaction can hold several per token.
-    progress: Vec<(Id, U256, u64)>,
+    progress: Vec<(Address, U256, u64)>,
     /// `pons_v2` `PoolRegistered`: token -> (pool id, quote, creator).
-    registered: HashMap<Id, (B256, Id, Id)>,
+    registered: HashMap<Address, (B256, Address, Address)>,
     /// `pons_v2` curves that emitted `CurveCompleted`.
-    completed: Vec<Id>,
+    completed: Vec<Address>,
 }
 
 impl TxEvidence {
@@ -228,13 +227,13 @@ impl TxEvidence {
     /// `emitter`, consuming the transfer that proves it.
     fn verify_leg(
         &mut self,
-        emitter: Id,
+        emitter: Address,
         amount: U256,
         inbound: bool,
         before: Option<u64>,
-    ) -> Option<Id> {
+    ) -> Option<Address> {
         let mut found: Option<usize> = None;
-        let mut token: Option<Id> = None;
+        let mut token: Option<Address> = None;
 
         for (index, transfer) in self.transfers.iter().enumerate() {
             let side = if inbound { transfer.to } else { transfer.from };
@@ -265,7 +264,11 @@ impl TxEvidence {
     }
 
     /// Who an escrow credited `amount` on behalf of `source`.
-    fn credited(&mut self, source: Id, amount: U256) -> Option<Id> {
+    fn credited(
+        &mut self,
+        source: Address,
+        amount: U256,
+    ) -> Option<Address> {
         let index = self.credits.iter().position(|credit| {
             !credit.used
                 && credit.source == source
@@ -277,17 +280,17 @@ impl TxEvidence {
 
     /// Supply minted by `token` itself in this transaction (the largest
     /// `Transfer` from the zero address emitted BY the token).
-    fn minted(&self, token: Id) -> U256 {
+    fn minted(&self, token: Address) -> U256 {
         self.transfers
             .iter()
-            .filter(|t| t.token == token && t.from == B256::ZERO)
+            .filter(|t| t.token == token && t.from == Address::ZERO)
             .map(|t| t.amount)
             .max()
             .unwrap_or(U256::ZERO)
     }
 
     /// Curve progress reported for `token` right AFTER `ordinal`.
-    fn progress_after(&self, token: Id, ordinal: u64) -> U256 {
+    fn progress_after(&self, token: Address, ordinal: u64) -> U256 {
         self.progress
             .iter()
             .filter(|(seen, _, at)| *seen == token && *at > ordinal)
@@ -297,15 +300,15 @@ impl TxEvidence {
     }
 
     /// The asset that moved exactly `amount` INTO `pool` (graduations).
-    fn moved_into(&self, pool: Id, amount: U256) -> Id {
-        let mut token = B256::ZERO;
+    fn moved_into(&self, pool: Address, amount: U256) -> Address {
+        let mut token = Address::ZERO;
 
         for transfer in &self.transfers {
             if transfer.to != pool || transfer.amount != amount {
                 continue;
             }
-            if token != B256::ZERO && token != transfer.token {
-                return B256::ZERO;
+            if token != Address::ZERO && token != transfer.token {
+                return Address::ZERO;
             }
             token = transfer.token;
         }
@@ -323,7 +326,7 @@ fn collect(logs: &[DatabaseLog]) -> HashMap<B256, TxEvidence> {
             continue;
         }
         let data = Data(log.data.as_ref());
-        let emitter = id_of(log.address);
+        let emitter = log.address;
         let topic0 = topics.at(0);
 
         if topic0 == events::ERC20_TRANSFER.topic0
@@ -335,8 +338,8 @@ fn collect(logs: &[DatabaseLog]) -> HashMap<B256, TxEvidence> {
                 .transfers
                 .push(TransferSeen {
                     token: emitter,
-                    from: topics.id(1),
-                    to: topics.id(2),
+                    from: topics.address(1),
+                    to: topics.address(2),
                     amount: data.u256(0),
                     ordinal: u64::from(log.log_index),
                     used: false,
@@ -352,8 +355,8 @@ fn collect(logs: &[DatabaseLog]) -> HashMap<B256, TxEvidence> {
                 .or_default()
                 .credits
                 .push(CreditSeen {
-                    recipient: topics.id(1),
-                    source: topics.id(2),
+                    recipient: topics.address(1),
+                    source: topics.address(2),
                     amount: data.u256(0),
                     used: false,
                 });
@@ -367,7 +370,7 @@ fn collect(logs: &[DatabaseLog]) -> HashMap<B256, TxEvidence> {
                 .entry(log.transaction_hash)
                 .or_default()
                 .quote_of
-                .insert(data.id(0), data.id(1));
+                .insert(data.address(0), data.address(1));
             continue;
         }
 
@@ -379,7 +382,7 @@ fn collect(logs: &[DatabaseLog]) -> HashMap<B256, TxEvidence> {
                 .or_default()
                 .progress
                 .push((
-                    data.id(0),
+                    data.address(0),
                     data.u256(1),
                     u64::from(log.log_index),
                 ));
@@ -394,8 +397,8 @@ fn collect(logs: &[DatabaseLog]) -> HashMap<B256, TxEvidence> {
                 .or_default()
                 .registered
                 .insert(
-                    data.id(0),
-                    (topics.at(1), data.id(1), data.id(2)),
+                    data.address(0),
+                    (topics.at(1), data.address(1), data.address(2)),
                 );
             continue;
         }
@@ -443,20 +446,20 @@ impl Place {
 fn token_row(
     place: Place,
     family: Family,
-    emitter: Id,
-    token: Id,
+    emitter: Address,
+    token: Address,
 ) -> LaunchpadToken {
     LaunchpadToken {
         chain: place.chain,
         token,
         family,
         emitter,
-        curve: B256::ZERO,
-        creator: B256::ZERO,
+        curve: Address::ZERO,
+        creator: Address::ZERO,
         name: String::new(),
         symbol: String::new(),
         metadata_uri: String::new(),
-        quote_token: B256::ZERO,
+        quote_token: Address::ZERO,
         initial_supply: U256::ZERO,
         graduation_threshold: U256::ZERO,
         pool_id: B256::ZERO,
@@ -464,10 +467,10 @@ fn token_row(
         launch_config_id: U256::ZERO,
         block_number: place.block_number,
         timestamp: place.timestamp,
-        transaction_hash: place.transaction_hash,
+        tx_id: tx_id(place.transaction_hash),
         tx_index: place.tx_index,
         ordinal: place.ordinal,
-        tx_from: B256::ZERO,
+        tx_from: Address::ZERO,
         epoch: 0,
         _version: 0,
     }
@@ -478,9 +481,9 @@ fn fee_row(
     place: Place,
     component: u32,
     family: Family,
-    emitter: Id,
-    token: Id,
-    pool_id: Id,
+    emitter: Address,
+    token: Address,
+    pool_id: B256,
     phase: FeePhase,
     kind: FeeKind,
     amount: U256,
@@ -489,7 +492,7 @@ fn fee_row(
         chain: place.chain,
         block_number: place.block_number,
         timestamp: place.timestamp,
-        transaction_hash: place.transaction_hash,
+        tx_id: tx_id(place.transaction_hash),
         tx_index: place.tx_index,
         ordinal: place.ordinal,
         component,
@@ -499,11 +502,11 @@ fn fee_row(
         pool_id,
         phase,
         kind,
-        recipient: B256::ZERO,
+        recipient: Address::ZERO,
         recipient_known: 0,
-        quote_token: B256::ZERO,
+        quote_token: Address::ZERO,
         amount,
-        tx_from: B256::ZERO,
+        tx_from: Address::ZERO,
         epoch: 0,
         _version: 0,
     }
@@ -525,7 +528,7 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
 
         let topic0 = topics.at(0);
         let data = Data(log.data.as_ref());
-        let emitter = id_of(log.address);
+        let emitter = log.address;
         let place = Place::of(chain, log);
         let evidence = evidence.entry(log.transaction_hash).or_default();
 
@@ -533,11 +536,11 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
         if topic0 == events::PONS_V2_TOKEN_LAUNCHED.topic0
             && matches(log, &topics, &events::PONS_V2_TOKEN_LAUNCHED)
         {
-            let token = topics.id(1);
+            let token = topics.address(1);
             rows.tokens.push(LaunchpadToken {
-                curve: topics.id(2),
-                creator: topics.id(3),
-                quote_token: data.id(0),
+                curve: topics.address(2),
+                creator: topics.address(3),
+                quote_token: data.address(0),
                 launch_config_id: data.u256(1),
                 graduation_threshold: data.u256(2),
                 initial_supply: evidence.minted(token),
@@ -550,10 +553,10 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
         if topic0 == events::FLAP_TOKEN_CREATED.topic0
             && matches(log, &topics, &events::FLAP_TOKEN_CREATED)
         {
-            let token = data.id(3);
+            let token = data.address(3);
             rows.tokens.push(LaunchpadToken {
                 curve: emitter,
-                creator: data.id(1),
+                creator: data.address(1),
                 name: data.text(4),
                 symbol: data.text(5),
                 metadata_uri: data.text(6),
@@ -561,7 +564,7 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
                     .quote_of
                     .get(&token)
                     .copied()
-                    .unwrap_or(B256::ZERO),
+                    .unwrap_or(Address::ZERO),
                 initial_supply: evidence.minted(token),
                 launch_config_id: data.u256(2),
                 ..token_row(place, Family::FlapPortal, emitter, token)
@@ -573,11 +576,11 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
         if topic0 == events::PONS_V1_TOKEN_LAUNCHED.topic0
             && matches(log, &topics, &events::PONS_V1_TOKEN_LAUNCHED)
         {
-            let token = topics.id(1);
+            let token = topics.address(1);
             rows.tokens.push(LaunchpadToken {
-                creator: topics.id(2),
-                quote_token: data.id(0),
-                pool_id: data.id(1),
+                creator: topics.address(2),
+                quote_token: data.address(0),
+                pool_id: id32(data.address(1)),
                 pool_kind: PoolKind::PoolAddress,
                 launch_config_id: data.u256(3),
                 initial_supply: evidence.minted(token),
@@ -589,9 +592,9 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
         if topic0 == events::LETSCASH_TOKEN_LAUNCHED.topic0
             && matches(log, &topics, &events::LETSCASH_TOKEN_LAUNCHED)
         {
-            let token = topics.id(1);
+            let token = topics.address(1);
             rows.tokens.push(LaunchpadToken {
-                creator: topics.id(2),
+                creator: topics.address(2),
                 pool_id: topics.at(3),
                 launch_config_id: data.u256(0),
                 initial_supply: evidence.minted(token),
@@ -603,10 +606,10 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
         if topic0 == events::BAGS_TOKEN_CREATED.topic0
             && matches(log, &topics, &events::BAGS_TOKEN_CREATED)
         {
-            let token = topics.id(1);
+            let token = topics.address(1);
             rows.tokens.push(LaunchpadToken {
-                curve: topics.id(2),
-                creator: topics.id(3),
+                curve: topics.address(2),
+                creator: topics.address(3),
                 pool_id: data.word(2),
                 name: data.text(3),
                 symbol: data.text(4),
@@ -620,14 +623,14 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
         if topic0 == events::CLANKER_V4_TOKEN_CREATED.topic0
             && matches(log, &topics, &events::CLANKER_V4_TOKEN_CREATED)
         {
-            let token = topics.id(1);
+            let token = topics.address(1);
             rows.tokens.push(LaunchpadToken {
-                creator: topics.id(2),
+                creator: topics.address(2),
                 metadata_uri: data.text(1),
                 name: data.text(2),
                 symbol: data.text(3),
                 pool_id: data.word(8),
-                quote_token: data.id(9),
+                quote_token: data.address(9),
                 launch_config_id: U256::from(
                     i64::from(data.int24(6)).unsigned_abs(),
                 ),
@@ -657,30 +660,38 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
             let at = Some(place.ordinal);
             let token = evidence
                 .verify_leg(emitter, token_amount, pons_sell, at)
-                .unwrap_or(B256::ZERO);
+                .unwrap_or(Address::ZERO);
             let quote = evidence
                 .verify_leg(emitter, quote_amount, pons_buy, at)
-                .unwrap_or(B256::ZERO);
+                .unwrap_or(Address::ZERO);
 
             rows.trades.push(LaunchpadTrade {
                 chain,
                 block_number: place.block_number,
                 timestamp: place.timestamp,
-                transaction_hash: place.transaction_hash,
+                tx_id: tx_id(place.transaction_hash),
                 tx_index: place.tx_index,
                 ordinal: place.ordinal,
                 family: Family::PonsV2,
                 emitter,
                 token,
-                token_verified: u8::from(token != B256::ZERO),
+                token_verified: u8::from(token != Address::ZERO),
                 quote_token: quote,
-                quote_verified: u8::from(quote != B256::ZERO),
+                quote_verified: u8::from(quote != Address::ZERO),
                 side,
                 // buy: the recipient of the tokens; sell: the account the
                 // tokens came from. The other one is a router, the launch
                 // forwarder or the quote recipient.
-                trader: if pons_buy { topics.id(2) } else { topics.id(1) },
-                caller: if pons_buy { topics.id(1) } else { topics.id(2) },
+                trader: if pons_buy {
+                    topics.address(2)
+                } else {
+                    topics.address(1)
+                },
+                caller: if pons_buy {
+                    topics.address(1)
+                } else {
+                    topics.address(2)
+                },
                 token_amount,
                 quote_amount,
                 fee_amount: data.u256(2),
@@ -690,8 +701,8 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
                     evidence.completed.contains(&emitter),
                 ),
                 sole_unverified_quote: 0,
-                tx_from: B256::ZERO,
-                tx_to: B256::ZERO,
+                tx_from: Address::ZERO,
+                tx_to: Address::ZERO,
                 tx_value: U256::ZERO,
                 epoch: 0,
                 _version: 0,
@@ -706,7 +717,7 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
             && matches(log, &topics, &events::FLAP_TOKEN_SOLD);
 
         if flap_buy || flap_sell {
-            let token = data.id(1);
+            let token = data.address(1);
             let token_amount = data.u256(3);
             let quote_amount = data.u256(4);
 
@@ -721,13 +732,13 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
             );
             let quote = evidence
                 .verify_leg(emitter, quote_amount, flap_buy, None)
-                .unwrap_or(B256::ZERO);
+                .unwrap_or(Address::ZERO);
 
             rows.trades.push(LaunchpadTrade {
                 chain,
                 block_number: place.block_number,
                 timestamp: place.timestamp,
-                transaction_hash: place.transaction_hash,
+                tx_id: tx_id(place.transaction_hash),
                 tx_index: place.tx_index,
                 ordinal: place.ordinal,
                 family: Family::FlapPortal,
@@ -737,10 +748,10 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
                 // token itself confirmed the movement.
                 token_verified: u8::from(proven_token == Some(token)),
                 quote_token: quote,
-                quote_verified: u8::from(quote != B256::ZERO),
+                quote_verified: u8::from(quote != Address::ZERO),
                 side: if flap_buy { Side::Buy } else { Side::Sell },
-                trader: data.id(2),
-                caller: data.id(2),
+                trader: data.address(2),
+                caller: data.address(2),
                 token_amount,
                 quote_amount,
                 fee_amount: data.u256(5),
@@ -748,8 +759,8 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
                 progress_wad: progress,
                 graduating: u8::from(progress == WAD),
                 sole_unverified_quote: 0,
-                tx_from: B256::ZERO,
-                tx_to: B256::ZERO,
+                tx_from: Address::ZERO,
+                tx_to: Address::ZERO,
                 tx_value: U256::ZERO,
                 epoch: 0,
                 _version: 0,
@@ -761,18 +772,18 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
         if topic0 == events::PONS_V2_POOL_GRADUATED.topic0
             && matches(log, &topics, &events::PONS_V2_POOL_GRADUATED)
         {
-            let token = topics.id(1);
+            let token = topics.address(1);
             let (pool_id, quote_token, _) = evidence
                 .registered
                 .get(&token)
                 .copied()
-                .unwrap_or((B256::ZERO, B256::ZERO, B256::ZERO));
+                .unwrap_or((B256::ZERO, Address::ZERO, Address::ZERO));
 
             rows.graduations.push(LaunchpadGraduation {
                 chain,
                 block_number: place.block_number,
                 timestamp: place.timestamp,
-                transaction_hash: place.transaction_hash,
+                tx_id: tx_id(place.transaction_hash),
                 tx_index: place.tx_index,
                 ordinal: place.ordinal,
                 family: Family::PonsV2,
@@ -784,7 +795,7 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
                 token_amount: data.u256(1),
                 quote_amount: data.u256(2),
                 position_id: data.u256(0),
-                tx_from: B256::ZERO,
+                tx_from: Address::ZERO,
                 epoch: 0,
                 _version: 0,
             });
@@ -794,27 +805,27 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
         if topic0 == events::FLAP_LAUNCHED_TO_DEX.topic0
             && matches(log, &topics, &events::FLAP_LAUNCHED_TO_DEX)
         {
-            let pool = data.id(1);
+            let pool = data.address(1);
             let quote_amount = data.u256(3);
 
             rows.graduations.push(LaunchpadGraduation {
                 chain,
                 block_number: place.block_number,
                 timestamp: place.timestamp,
-                transaction_hash: place.transaction_hash,
+                tx_id: tx_id(place.transaction_hash),
                 tx_index: place.tx_index,
                 ordinal: place.ordinal,
                 family: Family::FlapPortal,
                 emitter,
-                token: data.id(0),
-                pool_id: pool,
+                token: data.address(0),
+                pool_id: id32(pool),
                 pool_kind: PoolKind::PoolAddress,
                 // Proven by the asset that really moved into the pair.
                 quote_token: evidence.moved_into(pool, quote_amount),
                 token_amount: data.u256(2),
                 quote_amount,
                 position_id: U256::ZERO,
-                tx_from: B256::ZERO,
+                tx_from: Address::ZERO,
                 epoch: 0,
                 _version: 0,
             });
@@ -876,7 +887,7 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> LaunchpadRows {
                     0,
                     Family::FlapPortal,
                     emitter,
-                    topics.id(1),
+                    topics.address(1),
                     B256::ZERO,
                     FeePhase::Curve,
                     FeeKind::Tax,
@@ -896,8 +907,8 @@ fn push_sweep(
     evidence: &mut TxEvidence,
     place: Place,
     family: Family,
-    emitter: Id,
-    pool_id: Id,
+    emitter: Address,
+    pool_id: B256,
     phase: FeePhase,
     components: &[(FeeKind, U256)],
 ) {
@@ -911,7 +922,7 @@ fn push_sweep(
             index as u32,
             family,
             emitter,
-            B256::ZERO,
+            Address::ZERO,
             pool_id,
             phase,
             *kind,
@@ -935,18 +946,18 @@ fn push_sweep(
 /// that buys for fifteen wallets in one transaction (a real fixture) sends
 /// one `value` for all of them.
 fn mark_sole_unverified_quotes(rows: &mut LaunchpadRows) {
-    let mut unverified: HashMap<B256, u32> = HashMap::new();
+    let mut unverified: HashMap<Bytes, u32> = HashMap::new();
 
     for trade in &rows.trades {
         if trade.quote_verified == 0 {
-            *unverified.entry(trade.transaction_hash).or_default() += 1;
+            *unverified.entry(trade.tx_id.clone()).or_default() += 1;
         }
     }
 
     for trade in &mut rows.trades {
         trade.sole_unverified_quote = u8::from(
             trade.quote_verified == 0
-                && unverified.get(&trade.transaction_hash) == Some(&1),
+                && unverified.get(&trade.tx_id) == Some(&1),
         );
     }
 }
@@ -955,7 +966,6 @@ fn mark_sole_unverified_quotes(rows: &mut LaunchpadRows) {
 mod tests {
     use super::*;
     use crate::db::models::log::test_support::log_with;
-    use alloy::primitives::Address;
 
     #[test]
     fn words_and_text_are_bounds_checked() {
@@ -989,10 +999,10 @@ mod tests {
 
     #[test]
     fn a_padded_word_is_not_an_address() {
-        assert_eq!(clean_id(B256::repeat_byte(0x11)), B256::ZERO);
+        assert_eq!(clean_address(B256::repeat_byte(0x11)), Address::ZERO);
         assert_eq!(
-            clean_id(id_of(Address::repeat_byte(0x11))),
-            id_of(Address::repeat_byte(0x11))
+            clean_address(id32(Address::repeat_byte(0x11))),
+            Address::repeat_byte(0x11)
         );
     }
 
