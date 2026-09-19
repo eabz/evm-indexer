@@ -17,13 +17,19 @@
 pub mod decode;
 pub mod events;
 pub mod fixtures;
+pub mod launchpads;
 pub mod models;
 pub mod pda;
 pub mod programs;
+pub mod registry;
 pub mod venues;
 
 #[cfg(test)]
 mod tests;
+
+/// The launchpad decoders, on their own recorded transactions.
+#[cfg(test)]
+mod launchpad_tests;
 
 #[cfg(test)]
 mod integration_tests;
@@ -37,7 +43,9 @@ mod profile;
 mod live_tests;
 
 use decode::{Diagnostics, SvmTransaction};
+use launchpads::SolLaunchpadRows;
 use models::{SolSlot, SolToken, SolTransaction, SvmSwap};
+use registry::ProgramNames;
 
 /// Block scoped `sol_*` tables, in the order a purge must tombstone them:
 /// children first, the commit marker LAST. Same rule as
@@ -48,6 +56,21 @@ use models::{SolSlot, SolToken, SolTransaction, SvmSwap};
 /// a slot, exactly like the EVM `tokens` table.
 pub const BASE_TABLES: &[&str] =
     &["sol_dex_swaps", "sol_transactions", "sol_slots"];
+
+/// Block scoped SHARED tables this module also writes, children first.
+///
+/// They are the chain-neutral `launchpad_*` tables of docs/design.md §11 -
+/// the very same rows the EVM decoder writes, with 32-byte Solana ids - so
+/// they are listed separately from [`BASE_TABLES`]: a Solana purge must
+/// tombstone only the Solana rows, and `launchpads::BASE_TABLES` is where
+/// the order is defined.
+pub const SHARED_BASE_TABLES: &[&str] = crate::launchpads::BASE_TABLES;
+
+/// Solana-only operator and attribution tables (migration `0042`). NOT
+/// block scoped: `sol_dex_programs` is a judgement and
+/// `sol_launchpad_configs` is chain state, exactly like `sol_tokens`.
+pub const UNSCOPED_TABLES: &[&str] =
+    &["sol_dex_programs", "sol_launchpad_configs"];
 
 /// Read-path side tables. None yet: phase 1 writes the base tables and the
 /// candle query in the README reads them with `FINAL`.
@@ -60,6 +83,9 @@ pub struct SvmRows {
     pub transactions: Vec<SolTransaction>,
     pub swaps: Vec<SvmSwap>,
     pub tokens: Vec<SolToken>,
+    /// The shared `launchpad_*` rows: pump.fun, Meteora DBC and Raydium
+    /// LaunchLab launches, curve trades, graduations and fee sweeps.
+    pub launchpads: SolLaunchpadRows,
     pub diagnostics: Diagnostics,
 }
 
@@ -69,6 +95,7 @@ impl SvmRows {
             + self.transactions.len()
             + self.swaps.len()
             + self.tokens.len()
+            + self.launchpads.rows()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -80,6 +107,7 @@ impl SvmRows {
         self.transactions.append(&mut other.transactions);
         self.swaps.append(&mut other.swaps);
         self.tokens.append(&mut other.tokens);
+        self.launchpads.append(&mut other.launchpads);
         self.diagnostics.merge(&other.diagnostics);
     }
 
@@ -98,6 +126,7 @@ impl SvmRows {
         for row in &mut self.tokens {
             row._version = version;
         }
+        self.launchpads.set_version(version);
     }
 
     /// Stamps the chain's purge generation on every block scoped row.
@@ -112,6 +141,7 @@ impl SvmRows {
         for row in &mut self.swaps {
             row.epoch = epoch;
         }
+        self.launchpads.set_epoch(epoch);
     }
 }
 
@@ -129,7 +159,25 @@ pub struct SvmSlotBatch {
 }
 
 /// Turns streamed slots into rows. Pure: no I/O, no clock, no RPC.
+///
+/// Uses the built-in program names. [`decode_with`] takes an operator's
+/// `sol_dex_programs` overlay instead.
 pub fn decode(chain: u64, batches: &[SvmSlotBatch]) -> SvmRows {
+    decode_with(chain, batches, &ProgramNames::default())
+}
+
+/// [`decode`], with the operator's curated program registry applied to the
+/// `protocol` column.
+///
+/// The overlay can only ADD knowledge: an unlisted program keeps the
+/// built-in `Venue` name, so an empty registry - a fresh database - decodes
+/// exactly as before. See `registry.rs` for why that judgement is a table
+/// and not a constant.
+pub fn decode_with(
+    chain: u64,
+    batches: &[SvmSlotBatch],
+    names: &ProgramNames,
+) -> SvmRows {
     let mut rows = SvmRows::default();
     let mut seen_mints: std::collections::HashMap<
         models::Pubkey,
@@ -188,10 +236,56 @@ pub fn decode(chain: u64, batches: &[SvmSlotBatch]) -> SvmRows {
                 }
             }
 
-            let outcome =
+            let mut outcome =
                 decode::decode_transaction(chain, batch.timestamp, tx);
+
+            // The operator's names, applied where they exist. Done here
+            // rather than inside the pure decoder so the decoder stays a
+            // function of the chain data alone.
+            if !names.is_empty() {
+                for swap in &mut outcome.swaps {
+                    let named = names
+                        .protocol(&swap.venue_program, &swap.protocol);
+                    if named != swap.protocol {
+                        swap.protocol = named.to_owned();
+                    }
+                }
+            }
+
+            // The launchpad rows of this transaction, corroborated by the
+            // swap rows the movement layer just proved.
+            let mut launchpads = launchpads::decode_transaction(
+                chain,
+                batch.timestamp,
+                tx,
+                &outcome.swaps,
+            );
+            let has_launchpad_rows = !launchpads.is_empty();
+            rows.launchpads.append(&mut launchpads);
+
             if outcome.swaps.is_empty() {
                 rows.diagnostics.merge(&outcome.diagnostics);
+                // A `create` or a `migrate` moves no tokens and so is not
+                // a swap, but its transaction still has to be stored or
+                // the launch row would point at a slot with no
+                // transaction row beside it.
+                if has_launchpad_rows {
+                    rows.transactions.push(SolTransaction {
+                        chain,
+                        block_number: batch.slot,
+                        tx_index: tx.tx_index,
+                        signature: tx.signature,
+                        fee_payer: tx.fee_payer,
+                        success: tx.success,
+                        fee: tx.fee,
+                        compute_units: tx.compute_units,
+                        dropped_logs: tx.dropped_logs,
+                        timestamp: batch.timestamp,
+                        epoch: 0,
+                        _version: 0,
+                        is_deleted: 0,
+                    });
+                }
                 continue;
             }
 

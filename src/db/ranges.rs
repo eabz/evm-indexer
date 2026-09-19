@@ -130,6 +130,112 @@ pub fn subtract_ranges(
     result
 }
 
+/// A row written to `checkpoints`: a live range, or the tombstone of one.
+#[derive(Debug, Clone, Copy, Row, Serialize, PartialEq, Eq)]
+pub struct CheckpointWrite {
+    pub chain: u64,
+    pub from_block: u64,
+    pub to_block: u64,
+    pub epoch: u32,
+    pub _version: u64,
+    pub is_deleted: u8,
+}
+
+/// Live checkpoints read per compaction pass: the work one pass does is
+/// bounded, whatever the table looks like. What is left over is compacted
+/// by the next pass.
+pub const MAX_CHECKPOINTS_PER_COMPACTION: usize = 2_000;
+
+/// A chain with fewer live checkpoints than this is left alone: one row
+/// per flush is only a problem once there are many, and rewriting the tip
+/// every second would be pure churn.
+pub const COMPACT_CHECKPOINTS_ABOVE: usize = 256;
+
+/// Replaces every run of contiguous or overlapping live checkpoints by ONE
+/// covering row: the cover plus a tombstone per row it replaces.
+///
+/// `checkpoints` gains a row per flush and nothing ever removes them, so a
+/// long running chain accumulates millions of rows that all say the same
+/// thing ("this range is committed"). Compaction keeps the ANSWER
+/// identical - the union of the live ranges never changes - while the row
+/// count collapses to the number of holes plus one.
+///
+/// Insert only, like everything else (docs/design.md, section 2): the
+/// cover and the tombstones go out in ONE insert, so a reader never sees
+/// the tombstones without the cover, and a crash before it leaves the
+/// table exactly as it was. Repeating it is free.
+///
+/// `live` must be the live rows of ONE chain ordered by `from_block` then
+/// `to_block`. A row that is already the cover of its run is left alone
+/// (it must not be tombstoned and re-inserted in the same block: same
+/// key, same `_version`, and `ReplacingMergeTree` would pick either).
+pub fn compaction_writes(
+    live: &[DatabaseCheckpoint],
+    version: u64,
+) -> Vec<CheckpointWrite> {
+    let mut writes = Vec::new();
+    let mut run: Vec<&DatabaseCheckpoint> = Vec::new();
+    let mut end = 0u64;
+
+    fn flush(
+        run: &mut Vec<&DatabaseCheckpoint>,
+        end: u64,
+        version: u64,
+        writes: &mut Vec<CheckpointWrite>,
+    ) {
+        if run.len() >= 2 {
+            let first = run[0];
+            let epoch =
+                run.iter().map(|c| c.epoch).max().unwrap_or_default();
+
+            writes.push(CheckpointWrite {
+                chain: first.chain,
+                from_block: first.from_block,
+                to_block: end,
+                epoch,
+                _version: version,
+                is_deleted: 0,
+            });
+
+            writes.extend(
+                run.iter()
+                    .filter(|c| {
+                        c.from_block != first.from_block
+                            || c.to_block != end
+                    })
+                    .map(|c| CheckpointWrite {
+                        chain: c.chain,
+                        from_block: c.from_block,
+                        to_block: c.to_block,
+                        epoch: c.epoch,
+                        _version: version,
+                        is_deleted: 1,
+                    }),
+            );
+        }
+
+        run.clear();
+    }
+
+    for checkpoint in live {
+        if !run.is_empty() && checkpoint.from_block > end {
+            flush(&mut run, end, version, &mut writes);
+        }
+
+        if run.is_empty() {
+            end = checkpoint.to_block;
+        } else {
+            end = end.max(checkpoint.to_block);
+        }
+
+        run.push(checkpoint);
+    }
+
+    flush(&mut run, end, version, &mut writes);
+
+    writes
+}
+
 /// Upper bound on the gap rows fetched per pass, so memory stays bounded
 /// even for a table that looks like swiss cheese. The remaining holes are
 /// picked up by the next pass.
@@ -306,6 +412,129 @@ mod tests {
         );
         // A hole stops it, whatever comes later.
         assert_eq!(contiguous_until(0, [(0, 10), (11, 50)]), 10);
+    }
+
+    fn checkpoint(from_block: u64, to_block: u64) -> DatabaseCheckpoint {
+        DatabaseCheckpoint {
+            chain: 7,
+            from_block,
+            to_block,
+            epoch: 0,
+            _version: 1,
+        }
+    }
+
+    /// What a compaction writes, `(from, to, is_deleted)` each.
+    type Written = Vec<(u64, u64, u8)>;
+    /// The live ranges a reader sees afterwards.
+    type Claimed = Vec<(u64, u64)>;
+
+    fn writes(live: &[DatabaseCheckpoint]) -> (Written, Claimed) {
+        let written = compaction_writes(live, 99);
+        assert!(
+            written.iter().all(|w| w._version == 99 && w.chain == 7),
+            "{written:?}"
+        );
+
+        // What a reader sees afterwards: the live rows that were not
+        // tombstoned, plus the covers.
+        let dead: Vec<(u64, u64)> = written
+            .iter()
+            .filter(|w| w.is_deleted == 1)
+            .map(|w| (w.from_block, w.to_block))
+            .collect();
+
+        let mut after: Vec<(u64, u64)> = live
+            .iter()
+            .map(|c| (c.from_block, c.to_block))
+            .filter(|range| !dead.contains(range))
+            .chain(
+                written
+                    .iter()
+                    .filter(|w| w.is_deleted == 0)
+                    .map(|w| (w.from_block, w.to_block)),
+            )
+            .collect();
+        after.sort_unstable();
+        after.dedup();
+
+        (
+            written
+                .iter()
+                .map(|w| (w.from_block, w.to_block, w.is_deleted))
+                .collect(),
+            after,
+        )
+    }
+
+    #[test]
+    fn compaction_collapses_contiguous_checkpoints() {
+        // The normal case: a run of flushes at the tip becomes one row.
+        let live =
+            [checkpoint(0, 10), checkpoint(10, 20), checkpoint(20, 30)];
+        let (written, after) = writes(&live);
+        assert_eq!(
+            written,
+            vec![(0, 30, 0), (0, 10, 1), (10, 20, 1), (20, 30, 1)]
+        );
+        assert_eq!(after, vec![(0, 30)]);
+        // Same resume point before and after.
+        assert_eq!(contiguous_until(0, after.iter().copied()), 30);
+
+        // A hole is never bridged: the two runs stay two rows, and the
+        // blocks in the hole stay missing.
+        let live = [
+            checkpoint(0, 10),
+            checkpoint(10, 20),
+            checkpoint(30, 40),
+            checkpoint(40, 50),
+        ];
+        let (_, after) = writes(&live);
+        assert_eq!(after, vec![(0, 20), (30, 50)]);
+        assert_eq!(contiguous_until(0, after.iter().copied()), 20);
+
+        // Overlapping and contained ranges (a re-streamed range after a
+        // rollback) collapse too, and nothing is lost.
+        let live = [
+            checkpoint(0, 10),
+            checkpoint(5, 30),
+            checkpoint(7, 9),
+            checkpoint(30, 31),
+        ];
+        let (_, after) = writes(&live);
+        assert_eq!(after, vec![(0, 31)]);
+
+        // A row that already IS the cover of its run is left alone: it
+        // must never be tombstoned and re-inserted in the same block.
+        let live = [checkpoint(0, 30), checkpoint(0, 10)];
+        let (written, after) = writes(&live);
+        assert_eq!(written, vec![(0, 30, 0), (0, 10, 1)]);
+        assert_eq!(after, vec![(0, 30)]);
+
+        // Nothing to do.
+        assert!(compaction_writes(&[], 1).is_empty());
+        assert!(compaction_writes(&[checkpoint(0, 10)], 1).is_empty());
+        assert!(compaction_writes(
+            &[checkpoint(0, 10), checkpoint(20, 30)],
+            1
+        )
+        .is_empty());
+    }
+
+    /// Running it again on the result writes nothing: a pass that died
+    /// after the insert must not make the next one rewrite everything.
+    #[test]
+    fn compaction_is_idempotent() {
+        let live =
+            [checkpoint(0, 10), checkpoint(10, 20), checkpoint(25, 30)];
+        let (_, after) = writes(&live);
+
+        let compacted: Vec<DatabaseCheckpoint> = after
+            .iter()
+            .map(|(from, to)| checkpoint(*from, *to))
+            .collect();
+
+        assert!(compaction_writes(&compacted, 100).is_empty());
     }
 
     #[test]

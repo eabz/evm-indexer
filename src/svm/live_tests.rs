@@ -49,8 +49,51 @@ const SLOTS: u64 = 150;
 /// with "no progress" at the tip.
 const HEAD_MARGIN: u64 = 400;
 
+/// The API token, from the environment or from the git-ignored `.env`.
+///
+/// The file fallback exists because a git WORKTREE has no `.env` of its
+/// own - the file lives once, at the main checkout - and because putting a
+/// secret on a command line publishes it to every process table on the
+/// machine. The value is never printed, logged or written anywhere.
 fn token() -> Option<String> {
-    std::env::var("ENVIO_API_TOKEN").ok().filter(|t| !t.trim().is_empty())
+    if let Some(value) = std::env::var("ENVIO_API_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(value);
+    }
+    dotenv_token()
+}
+
+/// Reads `ENVIO_API_TOKEN` out of the nearest `.env`, searching this crate's
+/// directory and its parents (a worktree sits three levels under the main
+/// checkout, which is where the file is).
+fn dotenv_token() -> Option<String> {
+    let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for _ in 0..5 {
+        let candidate = dir.join(".env");
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            for line in text.lines() {
+                let line = line.trim();
+                let Some(value) = line.strip_prefix("ENVIO_API_TOKEN=")
+                else {
+                    continue;
+                };
+                let value = value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_owned();
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
 
 /// What one live run measured, beyond the rows themselves.
@@ -230,6 +273,479 @@ async fn live_response_caps_decide_slots_per_query() {
     );
 }
 
+/// The four launchpad row kinds, live, for all three Solana launchpads.
+///
+/// Prints what a UI would actually have, per family, and asserts the three
+/// properties that make the rows usable at all:
+///
+/// 1. every launch's curve was RE-DERIVED as a PDA of the launch's own
+///    fields, so no row rests on an account meta index being right;
+/// 2. every curve trade's token leg is corroborated by the movement layer;
+/// 3. a pump.fun graduation names a PumpSwap pool that the DEX decoder
+///    also wrote a swap for - the join that makes a token's chart continue
+///    after the curve is gone.
+///
+/// `LAUNCHPAD_SLOTS` widens the window (default 400). Graduations are rare -
+/// a few hundred a day against millions of trades - so property 3 needs a
+/// wide one and reports rather than fails when the window holds none.
+#[tokio::test]
+#[ignore]
+async fn live_launchpad_rows() {
+    use crate::svm::launchpads::SolFamily;
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+    let slots: u64 = std::env::var("LAUNCHPAD_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+    let mut cursor = head - HEAD_MARGIN - slots;
+    let end = cursor + slots;
+
+    let mut rows = svm::SvmRows::default();
+    let mut queries = 0u32;
+    while cursor < end {
+        let batch = source.fetch(cursor, end).await.expect("fetch");
+        assert!(batch.next_slot > cursor, "no progress at {cursor}");
+        queries += 1;
+        let mut decoded = svm::decode(SOLANA_CHAIN, &batch.batches);
+        rows.append(&mut decoded);
+        cursor = batch.next_slot;
+    }
+
+    let pads = &rows.launchpads;
+    println!(
+        "\n=== Solana launchpads: {slots} slots, {queries} queries ==="
+    );
+    println!(
+        "launches {}  curve trades {}  graduations {}  fee rows {}  \
+         configs {}  holder balances {}",
+        pads.tokens.len(),
+        pads.trades.len(),
+        pads.graduations.len(),
+        pads.creator_fees.len(),
+        pads.configs.len(),
+        pads.balances.len(),
+    );
+    println!("diagnostics {:?}", pads.diagnostics);
+
+    for family in SolFamily::ALL {
+        let name = family.as_str();
+        let launches =
+            pads.tokens.iter().filter(|r| r.family == name).count();
+        let trades =
+            pads.trades.iter().filter(|r| r.family == name).count();
+        let verified = pads
+            .trades
+            .iter()
+            .filter(|r| r.family == name && r.token_verified == 1)
+            .count();
+        let graduating = pads
+            .trades
+            .iter()
+            .filter(|r| r.family == name && r.graduating == 1)
+            .count();
+        let graduations =
+            pads.graduations.iter().filter(|r| r.family == name).count();
+        let fees =
+            pads.creator_fees.iter().filter(|r| r.family == name).count();
+        let with_progress = pads
+            .trades
+            .iter()
+            .filter(|r| r.family == name && !r.progress_wad.is_zero())
+            .count();
+        println!(
+            "  {name:<18} launches {launches:>4}  trades {trades:>6} \
+             ({verified} token-verified, {with_progress} with progress)  \
+             curve filled {graduating:>3}  graduations {graduations:>3}  \
+             fee rows {fees:>4}"
+        );
+    }
+
+    // (1) Every launch was proven, not claimed: a row only exists when the
+    //     curve re-derived from the launch's own fields.
+    assert_eq!(
+        pads.diagnostics.curve_not_derived, 0,
+        "a launch whose curve could not be re-derived was refused; if this \
+         is not zero an account meta index has moved"
+    );
+    assert_eq!(
+        pads.diagnostics.bad_length, 0,
+        "an event arrived at a length no layout here expects, i.e. a \
+         program appended a field"
+    );
+
+    // (2) The movement layer corroborates the curve trades.
+    let trades = pads.trades.len();
+    assert!(trades > 0, "no curve trades in {slots} slots");
+    let verified =
+        pads.trades.iter().filter(|r| r.token_verified == 1).count();
+    println!(
+        "\ntoken leg corroborated by real token movement: {verified} of \
+         {trades} ({:.2}%)",
+        100.0 * verified as f64 / trades as f64
+    );
+    assert!(
+        verified * 100 >= trades * 95,
+        "only {verified} of {trades} curve trades were corroborated"
+    );
+
+    // Every trade's emitter must be a curve some launch announced, or the
+    // token join and the trusted-curve filter would both miss it.
+    let curves: std::collections::HashSet<Pubkey> =
+        pads.tokens.iter().map(|row| row.curve).collect();
+    let known = pads
+        .trades
+        .iter()
+        .filter(|row| curves.contains(&row.emitter))
+        .count();
+    println!(
+        "trades whose curve was ALSO launched inside this window: {known} \
+         (the rest launched earlier, exactly as on EVM)"
+    );
+
+    // (3) The graduation join. This is the whole point of the module.
+    let pools: std::collections::HashSet<Pubkey> =
+        rows.swaps.iter().map(|swap| swap.pool_id).collect();
+    let mut joined = 0;
+    for row in &pads.graduations {
+        if row.pool_id == crate::svm::models::ZERO_PUBKEY {
+            continue;
+        }
+        println!(
+            "\n  graduation: {} -> pool {} ({} in the same window: {})",
+            to_base58(&row.token),
+            to_base58(&row.pool_id),
+            row.family,
+            if pools.contains(&row.pool_id) {
+                "the DEX decoder wrote swaps for that pool too"
+            } else {
+                "no swap on that pool in this window yet"
+            }
+        );
+        if pools.contains(&row.pool_id) {
+            joined += 1;
+        }
+    }
+    println!(
+        "\ngraduations naming a destination pool: {} of {} (pump.fun's \
+         CompletePumpAmmMigrationEvent names one; DBC and LaunchLab emit \
+         nothing at migration)",
+        pads.graduations
+            .iter()
+            .filter(|r| r.pool_id != crate::svm::models::ZERO_PUBKEY)
+            .count(),
+        pads.graduations.len()
+    );
+    println!("of those, {joined} already join a sol_dex_swaps pool id");
+}
+
+/// Every pump.fun curve instruction in a live window, bucketed by what the
+/// decoder did with it and WHY.
+///
+/// The README reported 98.2% agreement on the pump.fun curve and left the
+/// remaining 1.8% unexplained. A rate is a symptom; this prints the
+/// diagnosis, per instruction rather than per row, because the interesting
+/// cases are the ones that produced NO row at all and therefore never
+/// reached the agreement statistic.
+///
+/// Run with `PUMPFUN_SLOTS` to widen the window (default 120).
+#[tokio::test]
+#[ignore]
+async fn live_explain_pumpfun() {
+    use crate::svm::{
+        events::PumpFunTrade,
+        programs::{registry, to_base58, Venue, EVENT_CPI_PREFIX},
+    };
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+    let slots: u64 = std::env::var("PUMPFUN_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+    let curve = crate::svm::programs::pubkey(Venue::PumpFun.program_b58());
+    let wsol = registry().wsol;
+
+    let mut buckets: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut examples: BTreeMap<&'static str, Vec<String>> =
+        BTreeMap::new();
+    let note =
+        |bucket: &'static str,
+         line: String,
+         buckets: &mut BTreeMap<&'static str, u64>,
+         examples: &mut BTreeMap<&'static str, Vec<String>>| {
+            *buckets.entry(bucket).or_insert(0) += 1;
+            let shown = examples.entry(bucket).or_default();
+            if shown.len() < 4 {
+                shown.push(line);
+            }
+        };
+
+    let mut cursor = head - HEAD_MARGIN - slots;
+    let end = cursor + slots;
+    let mut instructions_seen = 0u64;
+
+    while cursor < end {
+        let batch = source.fetch(cursor, end).await.expect("fetch");
+        assert!(batch.next_slot > cursor, "no progress at {cursor}");
+
+        for slot in &batch.batches {
+            for tx in &slot.transactions {
+                let has_curve =
+                    tx.instructions.iter().any(|ix| ix.program == curve);
+                if !has_curve {
+                    continue;
+                }
+                let outcome = crate::svm::decode::decode_transaction(
+                    SOLANA_CHAIN,
+                    slot.timestamp,
+                    tx,
+                );
+                let signature = bs58::encode(tx.signature).into_string();
+
+                // The curve instructions of this transaction, excluding the
+                // self-CPI event rows (which are not instructions).
+                let calls: Vec<&crate::svm::decode::SvmInstruction> = tx
+                    .instructions
+                    .iter()
+                    .filter(|ix| {
+                        ix.program == curve
+                            && !ix.data.starts_with(&EVENT_CPI_PREFIX)
+                    })
+                    .collect();
+
+                for call in &calls {
+                    instructions_seen += 1;
+                    let ordinal =
+                        crate::svm::models::pack_ordinal(&call.path)
+                            .unwrap_or(0);
+                    let row = outcome.swaps.iter().find(|swap| {
+                        swap.ordinal == ordinal
+                            && swap.protocol == Venue::PumpFun.as_str()
+                    });
+
+                    // The event the curve emitted for THIS instruction.
+                    let event = tx
+                        .instructions
+                        .iter()
+                        .find(|candidate| {
+                            candidate.program == curve
+                                && candidate.path.len()
+                                    == call.path.len() + 1
+                                && candidate.path.starts_with(&call.path)
+                                && candidate
+                                    .data
+                                    .starts_with(&EVENT_CPI_PREFIX)
+                        })
+                        .and_then(|ix| PumpFunTrade::parse(&ix.data));
+
+                    let Some(event) = event else {
+                        // No TradeEvent: `create`, `migrate`, `withdraw`,
+                        // `collect_creator_fee` and the other non-trade
+                        // instructions all land here, so they are named
+                        // rather than counted as failures.
+                        let kind = match row {
+                            Some(_) => "no_event_but_row",
+                            None => "not_a_trade_instruction",
+                        };
+                        note(
+                            kind,
+                            format!(
+                                "{signature} path {:?} disc {}",
+                                call.path,
+                                hex::encode(
+                                    call.data.get(..8).unwrap_or_default()
+                                )
+                            ),
+                            &mut buckets,
+                            &mut examples,
+                        );
+                        continue;
+                    };
+
+                    let Some(row) = row else {
+                        // A real trade the decoder produced no row for.
+                        // Which curves this transaction touches more than
+                        // once is the thing to look at: a lamport delta
+                        // cannot be split between two trades.
+                        let same_curve = calls
+                            .iter()
+                            .filter(|other| {
+                                tx.instructions
+                                    .iter()
+                                    .find(|ix| {
+                                        ix.program == curve
+                                            && ix.path.len()
+                                                == other.path.len() + 1
+                                            && ix
+                                                .path
+                                                .starts_with(&other.path)
+                                            && ix.data.starts_with(
+                                                &EVENT_CPI_PREFIX,
+                                            )
+                                    })
+                                    .and_then(|ix| {
+                                        PumpFunTrade::parse(&ix.data)
+                                    })
+                                    .is_some_and(|other_event| {
+                                        other_event.mint == event.mint
+                                    })
+                            })
+                            .count();
+                        // The exact flows the movement layer saw inside
+                        // this subtree, which is what says whether a fee
+                        // leg, a refund or a second mint broke the rule.
+                        let all = crate::svm::decode::Movements::new(
+                            tx,
+                            registry(),
+                        );
+                        let mut flows = String::new();
+                        for movement in all.movements.iter().filter(|m| {
+                            m.path.len() > call.path.len()
+                                && m.path.starts_with(&call.path)
+                        }) {
+                            flows.push_str(&format!(
+                                "\n        {} {} {} -> {}",
+                                &to_base58(&movement.mint)[..8],
+                                movement.amount,
+                                &to_base58(
+                                    &movement
+                                        .source_owner
+                                        .unwrap_or_default()
+                                )[..8],
+                                &to_base58(
+                                    &movement
+                                        .destination_owner
+                                        .unwrap_or_default()
+                                )[..8],
+                            ));
+                        }
+                        note(
+                            if same_curve > 1 {
+                                "dropped_same_curve_twice"
+                            } else {
+                                "dropped_other"
+                            },
+                            format!(
+                                "{signature} path {:?} mint {} buy {} \
+                                 sol {} token {} curve_calls {same_curve} \
+                                 unclassified {} ambiguous {} \
+                                 liquidity {}{flows}",
+                                call.path,
+                                to_base58(&event.mint),
+                                event.is_buy,
+                                event.sol_amount,
+                                event.token_amount,
+                                outcome.diagnostics.unclassified,
+                                outcome.diagnostics.ambiguous_native,
+                                outcome.diagnostics.liquidity,
+                            ),
+                            &mut buckets,
+                            &mut examples,
+                        );
+                        continue;
+                    };
+
+                    if row.confidence == "decoded" {
+                        note(
+                            "agreed",
+                            signature.clone(),
+                            &mut buckets,
+                            &mut examples,
+                        );
+                        continue;
+                    }
+
+                    // A row that stayed `movement`: run the three checks of
+                    // `events::enrich_pumpfun` by hand and say which failed.
+                    let (expected_in, expected_out) = if event.is_buy {
+                        (wsol, event.mint)
+                    } else {
+                        (event.mint, wsol)
+                    };
+                    let mints_ok = row.token_in == expected_in
+                        && row.token_out == expected_out;
+                    let movement_sol: u128 = if event.is_buy {
+                        row.amount_in.to::<u128>()
+                    } else {
+                        row.amount_out_gross.to::<u128>()
+                    };
+                    let movement_token: u128 = if event.is_buy {
+                        row.amount_out_gross.to::<u128>()
+                    } else {
+                        row.amount_in.to::<u128>()
+                    };
+                    let token_ok =
+                        movement_token == u128::from(event.token_amount);
+                    let sol_gap = movement_sol
+                        .abs_diff(u128::from(event.sol_amount));
+                    let sol_ok = sol_gap <= u128::from(event.total_fee());
+
+                    let bucket = match (mints_ok, token_ok, sol_ok) {
+                        (false, _, _) => "disagreed_mints",
+                        (_, false, _) => "disagreed_token_leg",
+                        (_, _, false) => "disagreed_sol_leg",
+                        _ => "movement_but_all_checks_pass",
+                    };
+                    note(
+                        bucket,
+                        format!(
+                            "{signature} path {:?} buy {} | movement sol \
+                             {movement_sol} token {movement_token} | event \
+                             sol {} token {} fee {} creator_fee {} | \
+                             sol_gap {sol_gap} (tolerance {}) | in {} out {}",
+                            call.path,
+                            event.is_buy,
+                            event.sol_amount,
+                            event.token_amount,
+                            event.fee,
+                            event.creator_fee,
+                            event.total_fee(),
+                            to_base58(&row.token_in),
+                            to_base58(&row.token_out),
+                        ),
+                        &mut buckets,
+                        &mut examples,
+                    );
+                }
+            }
+        }
+        cursor = batch.next_slot;
+    }
+
+    println!(
+        "\n=== pump.fun curve: {instructions_seen} instructions over \
+         {slots} slots ==="
+    );
+    let total: u64 = buckets.values().sum();
+    for (bucket, count) in &buckets {
+        println!(
+            "  {bucket:<28} {count:>6}  ({:>5.2}%)",
+            100.0 * *count as f64 / total.max(1) as f64
+        );
+    }
+    for (bucket, lines) in &examples {
+        if *bucket == "agreed" {
+            continue;
+        }
+        println!("\n  --- {bucket} ---");
+        for line in lines {
+            println!("    {line}");
+        }
+    }
+}
+
 /// Why a venue's event contradicted the movement layer, in its own numbers.
 ///
 /// A disagreement rate is a symptom; this prints the diagnosis. It re-reads
@@ -277,6 +793,71 @@ async fn live_explain_disagreements() {
         else {
             continue;
         };
+
+        // A self-CPI venue keeps its event in an INSTRUCTION, not a log.
+        if venue_filter == "raydium_launchlab"
+            || venue_filter == "meteora_dbc"
+        {
+            let cpi = tx.instructions.iter().find(|candidate| {
+                candidate.program == instruction.program
+                    && candidate.path.len() == path.len() + 1
+                    && candidate.path.starts_with(&path)
+                    && candidate.data.starts_with(
+                        &crate::svm::programs::EVENT_CPI_PREFIX,
+                    )
+            });
+            println!(
+                "\n  {} ordinal {:?}\n    movement : in {:>20} out(gross) \
+                 {:>20} pool {}",
+                bs58::encode(&swap.tx_id).into_string(),
+                path,
+                swap.amount_in,
+                swap.amount_out_gross,
+                to_base58(&swap.pool_id),
+            );
+            match cpi.map(|ix| (ix.data.len(), ix)) {
+                Some((len, ix)) => {
+                    match crate::svm::venues::LaunchlabTrade::parse(
+                        &ix.data,
+                    ) {
+                        Some(event) => println!(
+                            "    event({len}) : in {:>20} out {:>20}\n    \
+                             fees     : protocol {} platform {} creator {} \
+                             share {}\n    reserves : base {} -> {} quote \
+                             {} -> {}\n    flags    : direction {} status \
+                             {} exact_in {} pool {}",
+                            event.amount_in,
+                            event.amount_out,
+                            event.protocol_fee,
+                            event.platform_fee,
+                            event.creator_fee,
+                            event.share_fee,
+                            event.real_base_before,
+                            event.real_base_after,
+                            event.real_quote_before,
+                            event.real_quote_after,
+                            event.trade_direction,
+                            event.pool_status,
+                            event.exact_in,
+                            to_base58(&event.pool_state),
+                        ),
+                        None => println!(
+                            "    event({len}) : did not parse at this \
+                             length (disc {})",
+                            hex::encode(
+                                ix.data.get(8..16).unwrap_or_default()
+                            )
+                        ),
+                    }
+                }
+                None => println!("    event    : no self-CPI child"),
+            }
+            shown += 1;
+            if shown >= 12 {
+                break;
+            }
+            continue;
+        }
 
         let event = tx
             .logs
@@ -815,6 +1396,327 @@ async fn live_swaps_match_the_public_rpc() {
     }
 }
 
+/// Every account the RPC lists for a transaction, as base58.
+fn account_keys(result: &Value) -> Vec<String> {
+    result["transaction"]["message"]["accountKeys"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|key| {
+            key.get("pubkey")
+                .and_then(|v| v.as_str())
+                .or_else(|| key.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The raw instruction data of every instruction the RPC did NOT parse,
+/// decoded from its base58.
+///
+/// This is the second independent witness for a value that is an
+/// instruction ARGUMENT rather than an account - pump.fun's `create` takes
+/// its `creator` that way, so the wallet credited with a launch need never
+/// sign or even appear in the account list. The bytes here are the RPC's,
+/// not HyperSync's, so finding a pubkey in them proves the two servers
+/// agree about what the transaction contained.
+fn raw_instruction_data(result: &Value) -> Vec<Vec<u8>> {
+    fn collect(instructions: &Value, out: &mut Vec<Vec<u8>>) {
+        for instruction in instructions.as_array().into_iter().flatten() {
+            let Some(data) =
+                instruction.get("data").and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            if let Ok(bytes) = bs58::decode(data).into_vec() {
+                out.push(bytes);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    collect(&result["transaction"]["message"]["instructions"], &mut out);
+    for group in result["meta"]["innerInstructions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        collect(&group["instructions"], &mut out);
+    }
+    out
+}
+
+/// Every mint the RPC's own token-balance metadata names.
+fn mints_of(meta: &Value) -> std::collections::HashSet<String> {
+    ["preTokenBalances", "postTokenBalances"]
+        .into_iter()
+        .flat_map(|key| {
+            meta.get(key).and_then(|v| v.as_array()).into_iter().flatten()
+        })
+        .filter_map(|entry| {
+            entry.get("mint").and_then(|v| v.as_str()).map(str::to_owned)
+        })
+        .collect()
+}
+
+/// (iii) LAUNCHES and CURVE TRADES must match the public RPC exactly.
+///
+/// The counterpart of `live_swaps_match_the_public_rpc`, for the launchpad
+/// tables. Nothing here comes from HyperSync: every value is recomputed
+/// from the RPC's own `getTransaction` - its account list, its
+/// `jsonParsed` transfer instructions and its balance metadata - which is
+/// a different server, a different wire format and a different parser.
+///
+/// # What is asserted, and why these particular equalities
+///
+/// A launch:
+/// 1. the mint the launch names is a real account of that transaction AND
+///    the RPC's own token metadata names it, so it is a mint and not any
+///    other account;
+/// 2. the CURVE is an account of the transaction, and re-derives as the
+///    program's PDA of that mint - the forgery-proof part;
+/// 3. the creator is an account of the transaction;
+/// 4. `tx_from` is the fee payer, which the RPC puts first.
+///
+/// A curve trade:
+/// 5. the traded token is one the RPC's balance metadata names;
+/// 6. a real SPL transfer of EXACTLY `token_amount` happened, as the RPC's
+///    own parser reads it. This is a SENDER-side equality on purpose: a
+///    Token-2022 transfer fee comes out of what the receiver is credited,
+///    never out of what the sender is debited, so it needs no tolerance;
+/// 7. on a SOL curve the quote leg is the curve's own lamport delta, to
+///    the unit - the leg that has no instruction at all.
+#[tokio::test]
+#[ignore]
+async fn live_launchpads_match_the_public_rpc() {
+    use crate::svm::launchpads::SolFamily;
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+    /// Launches and curve trades to cross-check.
+    const LAUNCHES: usize = 15;
+    const TRADES: usize = 30;
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+    let mut cursor = head - HEAD_MARGIN - 250;
+    let end = cursor + 250;
+
+    let mut rows = svm::SvmRows::default();
+    while cursor < end {
+        let batch = source.fetch(cursor, end).await.expect("fetch");
+        assert!(batch.next_slot > cursor, "no progress at {cursor}");
+        let mut decoded = svm::decode(SOLANA_CHAIN, &batch.batches);
+        rows.append(&mut decoded);
+        cursor = batch.next_slot;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let wsol = to_base58(&crate::svm::programs::registry().wsol);
+
+    // --- launches ---------------------------------------------------
+    let mut checked_launches = 0usize;
+    let mut creators_in_data = 0usize;
+    let mut per_family: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unavailable = 0usize;
+
+    for launch in &rows.launchpads.tokens {
+        if checked_launches >= LAUNCHES {
+            break;
+        }
+        let signature = bs58::encode(&launch.tx_id).into_string();
+        let Some(result) = rpc_transaction(&client, &signature).await
+        else {
+            unavailable += 1;
+            continue;
+        };
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let keys = account_keys(&result);
+        let meta = result.get("meta").expect("meta");
+        let mints = mints_of(meta);
+        let token = to_base58(&launch.token);
+        let curve = to_base58(&launch.curve);
+
+        // (4) the fee payer.
+        assert_eq!(
+            keys.first().map(String::as_str),
+            Some(to_base58(&launch.tx_from).as_str()),
+            "{signature}: tx_from must be the fee payer"
+        );
+        // (1) the mint is a real account, and really is a mint.
+        assert!(
+            keys.contains(&token),
+            "{signature}: the launched mint {token} is not an account of \
+             its own launch transaction"
+        );
+        assert!(
+            mints.contains(&token),
+            "{signature}: the RPC's token metadata does not know {token} \
+             as a mint"
+        );
+        // (2) the curve is a real account, and is the program's PDA.
+        assert!(
+            keys.contains(&curve),
+            "{signature}: the curve {curve} is not an account of the launch"
+        );
+        let seeds: &[&[u8]] = match launch.family.as_str() {
+            "pumpfun" => &[b"bonding-curve", &launch.token],
+            "raydium_launchlab" => {
+                &[b"pool", &launch.token, &launch.quote_token]
+            }
+            // Meteora DBC sorts its two mints and mixes in the config, so
+            // the quote mint - which lives on the config account this
+            // pipeline does not read - is not available here.
+            _ => &[],
+        };
+        if !seeds.is_empty() {
+            let (derived, _) = crate::svm::pda::find_program_address(
+                seeds,
+                &launch.emitter,
+            )
+            .expect("a bump exists");
+            assert_eq!(
+                to_base58(&derived),
+                curve,
+                "{signature}: the curve is not the program's PDA of the \
+                 launch's own fields"
+            );
+        }
+        // (3) the creator. It is an instruction ARGUMENT, not an account -
+        //     pump.fun's `create` takes `creator: Pubkey` - so a launch can
+        //     credit a wallet that never signs and never appears in the
+        //     account list. The RPC's own raw instruction bytes are
+        //     therefore the witness, and finding the 32 bytes there proves
+        //     the two servers saw the same transaction.
+        if launch.creator != crate::svm::models::ZERO_PUBKEY {
+            let named = keys.contains(&to_base58(&launch.creator))
+                || raw_instruction_data(&result).iter().any(|data| {
+                    data.windows(32).any(|window| window == launch.creator)
+                });
+            assert!(
+                named,
+                "{signature}: the creator {} is in neither the account \
+                 list nor the RPC's own instruction bytes",
+                to_base58(&launch.creator)
+            );
+            creators_in_data += 1;
+        }
+
+        *per_family.entry(launch.family.clone()).or_insert(0) += 1;
+        checked_launches += 1;
+    }
+
+    // --- curve trades -------------------------------------------------
+    // One trade per transaction, so a per-transaction transfer list can be
+    // matched against one row without ambiguity.
+    let mut once: BTreeMap<(u64, u32), usize> = BTreeMap::new();
+    for trade in &rows.launchpads.trades {
+        *once.entry((trade.block_number, trade.tx_index)).or_insert(0) +=
+            1;
+    }
+
+    let mut checked_trades = 0usize;
+    let mut native_legs = 0usize;
+    let mut trades_per_family: BTreeMap<String, usize> = BTreeMap::new();
+
+    for trade in &rows.launchpads.trades {
+        if checked_trades >= TRADES {
+            break;
+        }
+        if once[&(trade.block_number, trade.tx_index)] != 1 {
+            continue;
+        }
+        if trade.token_verified != 1 {
+            continue;
+        }
+        let signature = bs58::encode(&trade.tx_id).into_string();
+        let Some(result) = rpc_transaction(&client, &signature).await
+        else {
+            unavailable += 1;
+            continue;
+        };
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let meta = result.get("meta").expect("meta");
+        let mints = mints_of(meta);
+        let token = to_base58(&trade.token);
+
+        // (5) the RPC knows the mint.
+        assert!(
+            mints.contains(&token),
+            "{signature}: the RPC's metadata does not name {token}"
+        );
+
+        // (6) a transfer of exactly this many token units happened.
+        let amount: i128 =
+            trade.token_amount.to_string().parse().expect("fits i128");
+        let transfers = transfer_amounts(&result);
+        assert!(
+            transfers.contains(&amount),
+            "{signature} ({}): the RPC shows no transfer of exactly \
+             {amount} {token}; it saw {transfers:?}",
+            trade.family
+        );
+
+        // (7) a SOL curve's quote leg is the curve's own lamport delta.
+        let quote = to_base58(&trade.quote_token);
+        if quote == wsol && trade.family == SolFamily::PumpFun.as_str() {
+            let curve = to_base58(&trade.emitter);
+            if let Some(delta) = lamport_delta(&result, &curve) {
+                let expected: i128 = trade
+                    .quote_amount
+                    .to_string()
+                    .parse()
+                    .expect("fits i128");
+                let signed =
+                    if trade.side == "buy" { expected } else { -expected };
+                assert_eq!(
+                    delta, signed,
+                    "{signature}: the curve's lamport delta is not the \
+                     quote leg the event reported"
+                );
+                native_legs += 1;
+            }
+        }
+
+        *trades_per_family.entry(trade.family.clone()).or_insert(0) += 1;
+        checked_trades += 1;
+    }
+
+    println!("\n=== launchpad cross-check against {RPC} ===");
+    println!(
+        "launches matched exactly: {checked_launches} ({creators_in_data} \
+         with their creator confirmed by the RPC's own bytes)"
+    );
+    for (family, count) in &per_family {
+        println!("  {family:<18} {count}");
+    }
+    println!("curve trades matched exactly: {checked_trades}");
+    for (family, count) in &trades_per_family {
+        println!("  {family:<18} {count}");
+    }
+    println!(
+        "  of those, {native_legs} had their SOL leg checked against the \
+         curve's own lamport delta"
+    );
+    println!("  {unavailable} the RPC could not serve");
+
+    assert!(
+        checked_launches >= LAUNCHES,
+        "wanted {LAUNCHES} launches cross-checked, got {checked_launches}"
+    );
+    assert!(
+        checked_trades >= TRADES,
+        "wanted {TRADES} curve trades cross-checked, got {checked_trades}"
+    );
+}
+
 /// The three tricky transactions of docs/solana-research.md are recorded
 /// fixtures and are asserted in `svm::tests`; this checks the RECORDING is
 /// still faithful to what the chain says, so a stale fixture cannot quietly
@@ -1024,6 +1926,188 @@ fn fixture_json(
             "message": log.message,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// The launchpad shapes, and why each is worth a recording.
+const WANTED_LAUNCHPADS: &[(&str, &str)] = &[
+    (
+        "pumpfun_create",
+        "a pump.fun LAUNCH: three Borsh Strings at the front of CreateEvent, \
+         so nothing in it is at a fixed offset, and a bonding curve that \
+         must re-derive as the program's own PDA of the mint",
+    ),
+    (
+        "pumpfun_multi_buy",
+        "ONE transaction holding SEVERAL pump.fun curve trades - the bundle \
+         a sniper sends. Each must stay its own row: a decoder reading \
+         transaction level balances would report one netted trade",
+    ),
+    (
+        "pumpfun_graduation",
+        "the curve moving into PumpSwap. Its \
+         CompletePumpAmmMigrationEvent NAMES the destination pool, which is \
+         the join key that makes a token's chart continue after the curve \
+         is gone - the whole point of the module",
+    ),
+    (
+        "pumpfun_quote_curve",
+        "a pump.fun curve quoted in something other than SOL. sol_amount is \
+         0 and the real leg is in the TradeEvent tail, behind a Borsh \
+         String and a Vec - the case that cost 1.8-11.5% of curve trades",
+    ),
+    (
+        "dbc_launch",
+        "a Meteora DBC launch: EvtInitializePool names the partner CONFIG, \
+         which is how bags.fm and the other front ends are attributed \
+         without ever becoming venues",
+    ),
+    (
+        "launchlab_launch",
+        "a Raydium LaunchLab launch. PoolCreateEvent names NEITHER mint, so \
+         they come from account metas and are proved against the pool's own \
+         PDA seeds",
+    ),
+];
+
+/// Records the launchpad fixtures from live mainnet.
+///
+/// `cargo test --release svm::live_tests::record_launchpad -- --ignored
+/// --nocapture`
+#[tokio::test]
+#[ignore]
+async fn record_launchpad_fixtures() {
+    use crate::svm::{
+        launchpads::SolFamily,
+        programs::{
+            DISC_DBC_INITIALIZE_POOL, DISC_LAUNCHLAB_POOL_CREATE,
+            DISC_PUMPFUN_CREATE, DISC_PUMPFUN_MIGRATED,
+            DISC_PUMPFUN_TRADE_EVENT, EVENT_CPI_PREFIX,
+        },
+    };
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+
+    let mut found: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    let mut used: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    // A graduation is rare - a few hundred a day against millions of
+    // trades - so this sweeps several windows rather than one.
+    let mut window = 0u64;
+    while found.len() < WANTED_LAUNCHPADS.len() && window < 14 {
+        let from = head - HEAD_MARGIN - 120 - window * 900;
+        let batch = source.fetch(from, from + 120).await.expect("fetch");
+        window += 1;
+
+        for slot in &batch.batches {
+            for tx in &slot.transactions {
+                let signature = bs58::encode(tx.signature).into_string();
+                if used.contains(&signature) {
+                    continue;
+                }
+                // Every self-CPI event of a launchpad program, with the
+                // family that emitted it.
+                let events: Vec<(SolFamily, &[u8])> = tx
+                    .instructions
+                    .iter()
+                    .filter(|ix| ix.data.starts_with(&EVENT_CPI_PREFIX))
+                    .filter_map(|ix| {
+                        SolFamily::from_program(&ix.program)
+                            .map(|family| (family, ix.data.as_slice()))
+                    })
+                    .collect();
+                if events.is_empty() {
+                    continue;
+                }
+                let has = |family: SolFamily, disc: [u8; 8]| {
+                    events.iter().any(|(f, data)| {
+                        *f == family && data.get(8..16) == Some(&disc[..])
+                    })
+                };
+
+                let mut take = |name: &'static str, why: &'static str| {
+                    if found.contains_key(name)
+                        || used.contains(&signature)
+                    {
+                        return;
+                    }
+                    found.insert(name, fixture_json(name, why, slot, tx));
+                    used.insert(signature.clone());
+                };
+
+                if has(SolFamily::PumpFun, DISC_PUMPFUN_MIGRATED) {
+                    take("pumpfun_graduation", WANTED_LAUNCHPADS[2].1);
+                }
+                if has(SolFamily::PumpFun, DISC_PUMPFUN_CREATE) {
+                    take("pumpfun_create", WANTED_LAUNCHPADS[0].1);
+                }
+                if has(SolFamily::MeteoraDbc, DISC_DBC_INITIALIZE_POOL) {
+                    take("dbc_launch", WANTED_LAUNCHPADS[4].1);
+                }
+                if has(
+                    SolFamily::RaydiumLaunchlab,
+                    DISC_LAUNCHLAB_POOL_CREATE,
+                ) {
+                    take("launchlab_launch", WANTED_LAUNCHPADS[5].1);
+                }
+
+                // A bundle: more than one curve TradeEvent in one
+                // transaction.
+                let trades = events
+                    .iter()
+                    .filter(|(family, data)| {
+                        *family == SolFamily::PumpFun
+                            && data.get(8..16)
+                                == Some(&DISC_PUMPFUN_TRADE_EVENT[..])
+                    })
+                    .count();
+                if trades > 1 {
+                    take("pumpfun_multi_buy", WANTED_LAUNCHPADS[1].1);
+                }
+
+                // A curve quoted in something other than SOL: the event's
+                // own tail says so.
+                let quote_curve = events.iter().any(|(family, data)| {
+                    *family == SolFamily::PumpFun
+                        && crate::svm::events::PumpFunTrade::parse(data)
+                            .is_some_and(|event| {
+                                event.sol_amount == 0
+                                    && event.token_amount > 0
+                            })
+                });
+                if quote_curve {
+                    take("pumpfun_quote_curve", WANTED_LAUNCHPADS[3].1);
+                }
+            }
+        }
+        println!(
+            "  window {window}: have {} of {} ({:?})",
+            found.len(),
+            WANTED_LAUNCHPADS.len(),
+            found.keys().collect::<Vec<_>>()
+        );
+    }
+
+    for (name, why) in WANTED_LAUNCHPADS {
+        if !found.contains_key(name) {
+            println!("  MISSING {name}: {why}");
+        }
+    }
+
+    let out: Vec<serde_json::Value> = found.into_values().collect();
+    let path = "src/svm/fixtures/launchpads.json";
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&out).expect("serialise"),
+    )
+    .expect("write fixtures");
+    println!("\nwrote {} fixtures to {path}", out.len());
 }
 
 /// Scans live slots for the four wanted shapes and records the first of

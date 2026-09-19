@@ -80,6 +80,15 @@ pub enum Venue {
     MeteoraDlmm,
     /// Meteora's constant product AMM v2 (`cp-amm`).
     MeteoraDammV2,
+    /// Meteora's Dynamic Bonding Curve: a LAUNCHPAD whose curve is also the
+    /// market until migration, exactly like the pump.fun curve. bags.fm and
+    /// the other DBC front ends are configurations of this ONE program and
+    /// are never venues of their own (see `launchpads.rs`).
+    MeteoraDbc,
+    /// Raydium LaunchLab: the launchpad behind StonkFun, BONK.fun / LetsBonk
+    /// and Raydium's own launches. Same story - the platforms are
+    /// `platform_config` accounts under one program.
+    RaydiumLaunchlab,
     /// Prop AMM, no IDL and no event (research section 2). NAMED but not
     /// streamed: the movement layer needs only a program id and a name, so
     /// registering it is one line - see
@@ -89,7 +98,7 @@ pub enum Venue {
 
 impl Venue {
     /// Every venue this module can NAME.
-    pub const ALL: [Venue; 9] = [
+    pub const ALL: [Venue; 11] = [
         Venue::PumpSwap,
         Venue::PumpFun,
         Venue::RaydiumAmmV4,
@@ -98,6 +107,8 @@ impl Venue {
         Venue::OrcaWhirlpool,
         Venue::MeteoraDlmm,
         Venue::MeteoraDammV2,
+        Venue::MeteoraDbc,
+        Venue::RaydiumLaunchlab,
         Venue::BisonFi,
     ];
 
@@ -114,7 +125,9 @@ impl Venue {
             Venue::OrcaWhirlpool => 5,
             Venue::MeteoraDlmm => 6,
             Venue::MeteoraDammV2 => 7,
-            Venue::BisonFi => 8,
+            Venue::MeteoraDbc => 8,
+            Venue::RaydiumLaunchlab => 9,
+            Venue::BisonFi => 10,
         }
     }
 
@@ -129,6 +142,8 @@ impl Venue {
             Venue::OrcaWhirlpool => "orca_whirlpool",
             Venue::MeteoraDlmm => "meteora_dlmm",
             Venue::MeteoraDammV2 => "meteora_damm_v2",
+            Venue::MeteoraDbc => "meteora_dbc",
+            Venue::RaydiumLaunchlab => "raydium_launchlab",
             Venue::BisonFi => "bisonfi",
         }
     }
@@ -159,6 +174,12 @@ impl Venue {
             Venue::MeteoraDammV2 => {
                 "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
             }
+            Venue::MeteoraDbc => {
+                "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"
+            }
+            Venue::RaydiumLaunchlab => {
+                "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+            }
             Venue::BisonFi => {
                 "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi"
             }
@@ -183,7 +204,9 @@ impl Venue {
             Venue::PumpSwap
             | Venue::PumpFun
             | Venue::MeteoraDlmm
-            | Venue::MeteoraDammV2 => EventSource::SelfCpi,
+            | Venue::MeteoraDammV2
+            | Venue::MeteoraDbc
+            | Venue::RaydiumLaunchlab => EventSource::SelfCpi,
             Venue::RaydiumAmmV4
             | Venue::RaydiumCpmm
             | Venue::RaydiumClmm
@@ -240,7 +263,7 @@ impl std::fmt::Display for Venue {
 /// the list reads as the coverage it buys:
 /// PumpSwap 23.1 + Orca 10.0 + Raydium 9.5 + Meteora DLMM 8.0 +
 /// pump.fun 3.2 + Meteora DAMM v2 0.4 = **~54% of Solana DEX volume**.
-pub const VENUES: [Venue; 8] = [
+pub const VENUES: [Venue; 10] = [
     Venue::PumpSwap,
     Venue::OrcaWhirlpool,
     Venue::RaydiumAmmV4,
@@ -249,6 +272,8 @@ pub const VENUES: [Venue; 8] = [
     Venue::MeteoraDlmm,
     Venue::PumpFun,
     Venue::MeteoraDammV2,
+    Venue::MeteoraDbc,
+    Venue::RaydiumLaunchlab,
 ];
 
 // --- routers ------------------------------------------------------------
@@ -449,6 +474,92 @@ const METEORA_DAMM2_IX: &[(&str, IxKind)] = &[
     ("claim_reward", IxKind::Admin),
 ];
 
+/// Meteora Dynamic Bonding Curve, from `MeteoraAg/dynamic-bonding-curve`
+/// v0.2.1 `programs/dynamic-bonding-curve/src/lib.rs`.
+///
+/// The on-chain IDL account of this program is STALE (it still advertises
+/// 0.1.10, with two instructions the deployed binary no longer has and none
+/// of the 0.2.x transfer-hook work), so the names come from the source at
+/// the release commit whose deploy timestamp matches the live ProgramData.
+/// This is the second time an on-chain IDL has been wrong in this module.
+const METEORA_DBC_IX: &[(&str, IxKind)] = &[
+    ("swap", IxKind::Swap),
+    ("swap2", IxKind::Swap),
+    ("swap2_with_transfer_hook", IxKind::Swap),
+    // Both legs leave the pool together, which is the shape
+    // `IxKind::Liquidity` names.
+    ("claim_trading_fee", IxKind::Liquidity),
+    ("claim_trading_fee2", IxKind::Liquidity),
+    ("claim_creator_trading_fee", IxKind::Liquidity),
+    ("claim_creator_trading_fee2", IxKind::Liquidity),
+    ("claim_protocol_fee2", IxKind::Liquidity),
+    ("partner_withdraw_surplus", IxKind::Liquidity),
+    ("creator_withdraw_surplus", IxKind::Liquidity),
+    ("withdraw_leftover", IxKind::Liquidity),
+    ("withdraw_migration_fee", IxKind::Liquidity),
+    ("migrate_meteora_damm", IxKind::Liquidity),
+    ("migration_damm_v2", IxKind::Liquidity),
+    ("migrate_meteora_damm_lock_lp_token", IxKind::Liquidity),
+    ("migrate_meteora_damm_claim_lp_token", IxKind::Liquidity),
+    ("create_locker", IxKind::Liquidity),
+    ("initialize_virtual_pool_with_spl_token", IxKind::Admin),
+    ("initialize_virtual_pool_with_token2022", IxKind::Admin),
+    (
+        "initialize_virtual_pool_with_token2022_transfer_hook",
+        IxKind::Admin,
+    ),
+    ("create_config", IxKind::Admin),
+    ("create_config_with_transfer_hook", IxKind::Admin),
+    ("create_partner_metadata", IxKind::Admin),
+    ("create_virtual_pool_metadata", IxKind::Admin),
+    ("migration_meteora_damm_create_metadata", IxKind::Admin),
+    ("migration_damm_v2_create_metadata", IxKind::Admin),
+    ("create_token_badge", IxKind::Admin),
+    ("close_token_badge", IxKind::Admin),
+    ("create_operator_account", IxKind::Admin),
+    ("close_operator_account", IxKind::Admin),
+    ("transfer_pool_creator", IxKind::Admin),
+    ("claim_partner_pool_creation_fee", IxKind::Admin),
+    ("claim_protocol_pool_creation_fee", IxKind::Admin),
+    ("close_claim_protocol_fee_operator", IxKind::Admin),
+];
+
+/// Raydium LaunchLab, from the DEPLOYED program's own on-chain IDL
+/// (`metadata.version` 0.2.0). The program is closed source and the public
+/// `raydium-io/raydium-idl` copy is stale - it lacks `claim_creator_fee`,
+/// `collect_excess_lamports` and the platform curve rules - so the on-chain
+/// IDL is the only current source.
+const RAYDIUM_LAUNCHLAB_IX: &[(&str, IxKind)] = &[
+    ("buy_exact_in", IxKind::Swap),
+    ("buy_exact_out", IxKind::Swap),
+    ("sell_exact_in", IxKind::Swap),
+    ("sell_exact_out", IxKind::Swap),
+    ("migrate_to_amm", IxKind::Liquidity),
+    ("migrate_to_cpswap", IxKind::Liquidity),
+    ("claim_platform_fee", IxKind::Liquidity),
+    ("claim_platform_fee_from_vault", IxKind::Liquidity),
+    ("claim_creator_fee", IxKind::Liquidity),
+    ("claim_vested_token", IxKind::Liquidity),
+    ("collect_fee", IxKind::Liquidity),
+    ("collect_migrate_fee", IxKind::Liquidity),
+    ("initialize", IxKind::Admin),
+    ("initialize_v2", IxKind::Admin),
+    ("initialize_with_token_2022", IxKind::Admin),
+    ("create_config", IxKind::Admin),
+    ("update_config", IxKind::Admin),
+    ("create_platform_config", IxKind::Admin),
+    ("update_platform_config", IxKind::Admin),
+    ("create_vesting_account", IxKind::Admin),
+    ("create_platform_vesting_account", IxKind::Admin),
+    ("create_platform_curve_rule", IxKind::Admin),
+    ("update_platform_curve_rule", IxKind::Admin),
+    ("remove_platform_curve_rule", IxKind::Admin),
+    ("close_platform_curve_rule", IxKind::Admin),
+    ("create_platform_allow_config", IxKind::Admin),
+    ("close_platform_allow_config", IxKind::Admin),
+    ("collect_excess_lamports", IxKind::Admin),
+];
+
 impl Venue {
     /// Anchor instruction names of this venue, and what each one does.
     /// Empty for the programs that are not Anchor programs.
@@ -461,6 +572,8 @@ impl Venue {
             Venue::OrcaWhirlpool => ORCA_IX,
             Venue::MeteoraDlmm => METEORA_DLMM_IX,
             Venue::MeteoraDammV2 => METEORA_DAMM2_IX,
+            Venue::MeteoraDbc => METEORA_DBC_IX,
+            Venue::RaydiumLaunchlab => RAYDIUM_LAUNCHLAB_IX,
             // pump.fun and PumpSwap dispatch on the EVENT (phase 1's
             // finding: the instruction variants multiplied but the event did
             // not), and BisonFi publishes nothing at all.
@@ -528,6 +641,83 @@ pub const DISC_DLMM_SWAP2: [u8; 8] =
 /// Meteora DAMM v2 `EvtSwap2`.
 pub const DISC_DAMM2_SWAP: [u8; 8] =
     [0xbd, 0x42, 0x33, 0xa8, 0x26, 0x50, 0x75, 0x99];
+
+// --- launchpad events ----------------------------------------------------
+//
+// Every one of these is DERIVED from the event NAME by
+// `launchpad_discriminators_are_sighashes`, never copied as a magic number,
+// and every layout states the exact byte count it implies so a program that
+// appends a field shows up as "event not found" rather than as a wrong
+// number (the rule the phase 2 venues already follow).
+//
+// ONE COLLISION MATTERS: pump.fun's `TradeEvent` and Raydium LaunchLab's
+// `TradeEvent` have the SAME discriminator, because Anchor hashes only the
+// struct name and both programs chose it. Their payloads have nothing in
+// common - 139 fixed bytes against 363 + two variable-length fields - so a
+// dispatcher keyed on the discriminator alone silently reads one as the
+// other. Everything here dispatches on (program, discriminator).
+
+/// pump.fun `CreateEvent`: the launch. Three Borsh `String`s at the FRONT,
+/// so every field of it is at a variable offset.
+pub const DISC_PUMPFUN_CREATE: [u8; 8] =
+    [0x1b, 0x72, 0xa9, 0x4d, 0xde, 0xeb, 0x63, 0x76];
+/// pump.fun `CompleteEvent`: the curve FILLED. Names no destination pool -
+/// at this point there is none.
+pub const DISC_PUMPFUN_COMPLETE: [u8; 8] =
+    [0x5f, 0x72, 0x61, 0x9c, 0xd4, 0x2e, 0x98, 0x08];
+/// pump.fun `CompletePumpAmmMigrationEvent`: the liquidity actually moved
+/// into PumpSwap. This one DOES name the destination `pool`, which is the
+/// join key into `sol_dex_swaps`.
+pub const DISC_PUMPFUN_MIGRATED: [u8; 8] =
+    [0xbd, 0xe9, 0x5d, 0xb9, 0x5c, 0x94, 0xea, 0x94];
+/// pump.fun `CollectCreatorFeeEvent`: a creator actually swept their vault.
+pub const DISC_PUMPFUN_CREATOR_FEE: [u8; 8] =
+    [0x7a, 0x02, 0x7f, 0x01, 0x0e, 0xbf, 0x0c, 0xaf];
+
+/// Meteora DBC `EvtInitializePool`: the launch.
+pub const DISC_DBC_INITIALIZE_POOL: [u8; 8] =
+    [0xe4, 0x32, 0xf6, 0x55, 0xcb, 0x42, 0x86, 0x25];
+/// Meteora DBC `EvtSwap2`, the richer of the two events every DBC swap
+/// emits: it is the only one carrying `quote_reserve_amount` and
+/// `migration_threshold`, i.e. the curve's PROGRESS.
+pub const DISC_DBC_SWAP2: [u8; 8] =
+    [0xbd, 0x42, 0x33, 0xa8, 0x26, 0x50, 0x75, 0x99];
+/// Meteora DBC `EvtSwap`, the older event, emitted alongside `EvtSwap2`.
+pub const DISC_DBC_SWAP: [u8; 8] =
+    [0x1b, 0x3c, 0x15, 0xd5, 0x8a, 0xaa, 0xbb, 0x93];
+/// Meteora DBC `EvtCurveComplete`: the curve filled and the pool is ready to
+/// migrate. The migration instructions themselves emit NOTHING.
+pub const DISC_DBC_CURVE_COMPLETE: [u8; 8] =
+    [0xe5, 0xe7, 0x56, 0x54, 0x9c, 0x86, 0x4b, 0x18];
+/// Meteora DBC `EvtCreateConfigV2`: the PARTNER's configuration, and the
+/// only place `fee_claimer` - the front end's wallet - is published.
+pub const DISC_DBC_CREATE_CONFIG_V2: [u8; 8] =
+    [0xa3, 0x4a, 0x42, 0xbb, 0x77, 0xc3, 0x1a, 0x90];
+/// Meteora DBC `EvtCreateConfig`, the deprecated form, still emitted
+/// alongside V2.
+pub const DISC_DBC_CREATE_CONFIG: [u8; 8] =
+    [0x83, 0xcf, 0xb4, 0xae, 0xb4, 0x49, 0xa5, 0x36];
+/// Meteora DBC `EvtClaimCreatorTradingFee`.
+pub const DISC_DBC_CLAIM_CREATOR_FEE: [u8; 8] =
+    [0x9a, 0xe4, 0xd7, 0xca, 0x85, 0x9b, 0xd6, 0x8a];
+/// Meteora DBC `EvtClaimTradingFee`: the PARTNER's (front end's) share.
+pub const DISC_DBC_CLAIM_TRADING_FEE: [u8; 8] =
+    [0x1a, 0x53, 0x75, 0xf0, 0x5c, 0xca, 0x70, 0xfe];
+/// Meteora DBC `EvtCreatorWithdrawSurplus`.
+pub const DISC_DBC_CREATOR_SURPLUS: [u8; 8] =
+    [0x98, 0x49, 0x15, 0x0f, 0x42, 0x57, 0x35, 0x9d];
+/// Meteora DBC `EvtPartnerWithdrawSurplus`.
+pub const DISC_DBC_PARTNER_SURPLUS: [u8; 8] =
+    [0xc3, 0x38, 0x98, 0x09, 0xe8, 0x48, 0x23, 0x16];
+
+/// Raydium LaunchLab `PoolCreateEvent`: the launch. Three Borsh `String`s
+/// inside `base_mint_param`, and it does NOT name the mint - that comes from
+/// the instruction's own accounts, checked against the pool PDA.
+pub const DISC_LAUNCHLAB_POOL_CREATE: [u8; 8] =
+    [0x97, 0xd7, 0xe2, 0x09, 0x76, 0xa1, 0x73, 0xae];
+/// Raydium LaunchLab `TradeEvent`. 139 fixed bytes - and the SAME
+/// discriminator as pump.fun's, see the note above.
+pub const DISC_LAUNCHLAB_TRADE: [u8; 8] = DISC_PUMPFUN_TRADE_EVENT;
 
 /// Anchor's discriminator: the first 8 bytes of `sha256("<namespace>:<Name>")`.
 ///
@@ -676,6 +866,58 @@ mod tests {
             anchor_discriminator("event", "TradeEvent"),
             DISC_PUMPFUN_TRADE_EVENT
         );
+    }
+
+    /// Every launchpad event discriminator is Anchor's sighash of its own
+    /// name, derived here rather than trusted as a literal.
+    #[test]
+    fn launchpad_discriminators_are_sighashes() {
+        for (name, expected) in [
+            ("CreateEvent", DISC_PUMPFUN_CREATE),
+            ("CompleteEvent", DISC_PUMPFUN_COMPLETE),
+            ("CompletePumpAmmMigrationEvent", DISC_PUMPFUN_MIGRATED),
+            ("CollectCreatorFeeEvent", DISC_PUMPFUN_CREATOR_FEE),
+            ("EvtInitializePool", DISC_DBC_INITIALIZE_POOL),
+            ("EvtSwap", DISC_DBC_SWAP),
+            ("EvtSwap2", DISC_DBC_SWAP2),
+            ("EvtCurveComplete", DISC_DBC_CURVE_COMPLETE),
+            ("EvtCreateConfig", DISC_DBC_CREATE_CONFIG),
+            ("EvtCreateConfigV2", DISC_DBC_CREATE_CONFIG_V2),
+            ("EvtClaimCreatorTradingFee", DISC_DBC_CLAIM_CREATOR_FEE),
+            ("EvtClaimTradingFee", DISC_DBC_CLAIM_TRADING_FEE),
+            ("EvtCreatorWithdrawSurplus", DISC_DBC_CREATOR_SURPLUS),
+            ("EvtPartnerWithdrawSurplus", DISC_DBC_PARTNER_SURPLUS),
+            ("PoolCreateEvent", DISC_LAUNCHLAB_POOL_CREATE),
+            ("TradeEvent", DISC_LAUNCHLAB_TRADE),
+        ] {
+            assert_eq!(
+                anchor_discriminator("event", name),
+                expected,
+                "event:{name}"
+            );
+        }
+    }
+
+    /// The collision that decides the whole dispatch design: two programs
+    /// named their event `TradeEvent`, so the 8 bytes are identical and the
+    /// payloads are not. Anything keyed on the discriminator alone reads
+    /// one as the other and returns plausible nonsense - the same failure
+    /// Raydium's two `SwapEvent`s already caused in this module.
+    #[test]
+    fn pumpfun_and_launchlab_share_the_trade_event_discriminator() {
+        assert_eq!(DISC_PUMPFUN_TRADE_EVENT, DISC_LAUNCHLAB_TRADE);
+        assert_ne!(
+            Venue::PumpFun.program_b58(),
+            Venue::RaydiumLaunchlab.program_b58()
+        );
+    }
+
+    /// Meteora reused `EvtSwap2` for DAMM v2 and for the DBC, so those two
+    /// collide as well - and unlike Raydium's pair they are not even the
+    /// same length, which is what makes the program check load bearing.
+    #[test]
+    fn the_dbc_and_damm_v2_swap_events_collide_too() {
+        assert_eq!(DISC_DBC_SWAP2, DISC_DAMM2_SWAP);
     }
 
     #[test]

@@ -307,6 +307,11 @@ pub struct Diagnostics {
     pub decoder_disagreed: u64,
     /// A native SOL leg was needed but could not be attributed unambiguously.
     pub ambiguous_native: u64,
+    /// Both legs were real token transfers, but every candidate for the
+    /// pool survived all three tests of `resolve_pool` and no venue event
+    /// settled it - live, a bot VAULT trading against a bonding curve,
+    /// where taker and pool are both program derived addresses.
+    pub ambiguous_pool: u64,
     /// Swaps per venue, indexed by [`Venue::index`].
     pub swaps_by_venue: [u64; Venue::ALL.len()],
     /// Of those, how many the venue's own event CONFIRMED.
@@ -328,6 +333,7 @@ impl Diagnostics {
         self.unclassified += other.unclassified;
         self.decoder_disagreed += other.decoder_disagreed;
         self.ambiguous_native += other.ambiguous_native;
+        self.ambiguous_pool += other.ambiguous_pool;
         self.kind_disagreed += other.kind_disagreed;
         for index in 0..Venue::ALL.len() {
             self.swaps_by_venue[index] += other.swaps_by_venue[index];
@@ -374,7 +380,9 @@ pub struct Movement {
 pub struct Movements<'a> {
     tx: &'a SvmTransaction,
     registry: &'a Registry,
-    movements: Vec<Movement>,
+    /// Public so the live diagnostics can print the exact flows an
+    /// instruction produced; nothing outside this module mutates it.
+    pub movements: Vec<Movement>,
     /// For each movement, the path of its NEAREST registered venue ancestor.
     ///
     /// Computed once here rather than per lookup. It used to be recomputed
@@ -488,6 +496,40 @@ impl<'a> Movements<'a> {
     fn received_by(&self, account: &Pubkey) -> Option<i128> {
         self.by_account.get(account).and_then(|row| row.token_delta())
     }
+
+    /// What the pool's vault was actually CREDITED on the input leg.
+    ///
+    /// The mirror of `SvmSwap::with_received`. A Token-2022 transfer fee
+    /// comes out of the receiver's credit on BOTH legs, and until this was
+    /// measured the only way to check an event that reports the credited
+    /// figure - Raydium LaunchLab does - was to invent a tolerance.
+    ///
+    /// Returns the amount sent when the vault's delta is not readable or
+    /// not smaller, so a caller always gets a usable number and the gap it
+    /// implies is never negative.
+    fn input_received(&self, swap: &MovementSwap) -> u64 {
+        let credited = self
+            .movements
+            .iter()
+            .filter(|movement| {
+                movement.destination_owner == Some(swap.authority)
+                    && movement.mint == swap.mint_in
+                    && swap.path.len() < movement.path.len()
+                    && movement.path.starts_with(&swap.path)
+            })
+            .filter_map(|movement| self.received_by(&movement.destination))
+            .next();
+
+        match credited {
+            Some(delta)
+                if delta > 0
+                    && (delta as u128) <= u128::from(swap.amount_in) =>
+            {
+                delta as u64
+            }
+            _ => swap.amount_in,
+        }
+    }
 }
 
 /// Parses an SPL Token / Token-2022 / System transfer instruction.
@@ -600,8 +642,21 @@ pub struct MovementSwap {
     pub authority: Pubkey,
     pub mint_in: Pubkey,
     pub mint_out: Pubkey,
-    /// Into the pool.
+    /// Into the pool, as SENT by the taker.
     pub amount_in: u64,
+    /// Into the pool, as CREDITED to the pool's vault.
+    ///
+    /// The mirror image of [`Self::amount_out`] / [`Self::amount_out_gross`],
+    /// and it exists for the same reason: a Token-2022 transfer fee comes
+    /// out of what the RECEIVER is credited. Equal to `amount_in` on a
+    /// classic SPL mint.
+    ///
+    /// It is not a stored column - what the taker sent is the trade - but
+    /// it is what lets a venue's event be checked without inventing a
+    /// tolerance. Raydium LaunchLab states no transfer fee anywhere, and
+    /// its agreement with the movement layer was 4.8% until the gap was
+    /// measured from the chain instead of guessed at.
+    pub amount_in_received: u64,
     /// Out of the pool, as SENT.
     pub amount_out_gross: u64,
     /// Out of the pool, as RECEIVED by the taker. Differs from the gross
@@ -693,7 +748,10 @@ pub fn decode_transaction_with(
             &natives,
             &authority_uses,
         ) {
-            Classified::Swap(swap) => {
+            Classified::Swap(mut swap) => {
+                // What the vault was CREDITED, which a Token-2022 transfer
+                // fee makes smaller than what the taker sent.
+                swap.amount_in_received = movements.input_received(&swap);
                 let mut row =
                     build_row(chain, timestamp, tx, &movements, &swap);
                 let enriched = crate::svm::events::enrich(
@@ -712,15 +770,19 @@ pub fn decode_transaction_with(
                 );
                 outcome.swaps.push(row);
             }
-            // The movement layer proposed both sides of a symmetric
-            // native-leg trade; the venue's own event decides which is the
-            // pool. Exactly one reading can validate, because the event
-            // names the user and the direction.
-            Classified::NativeCandidates(proposals) => {
+            // The movement layer proposed both sides of a symmetric trade;
+            // the venue's own event decides which is the pool. Exactly one
+            // reading can validate, because the event names the user and
+            // the direction.
+            Classified::Candidates(proposals) => {
                 let only_one = proposals.len() == 1;
                 let mut accepted = None;
                 let mut verdict = crate::svm::events::Enrichment::None;
                 for swap in &proposals {
+                    let mut swap = swap.clone();
+                    swap.amount_in_received =
+                        movements.input_received(&swap);
+                    let swap = &swap;
                     let mut row =
                         build_row(chain, timestamp, tx, &movements, swap);
                     match crate::svm::events::enrich(
@@ -757,7 +819,17 @@ pub fn decode_transaction_with(
                         );
                         outcome.swaps.push(row);
                     }
-                    None => outcome.diagnostics.ambiguous_native += 1,
+                    // No reading validated, so the trade is real but its
+                    // direction is unknown. Never guessed: which of the two
+                    // counters it lands in says whether a SOL leg or a
+                    // symmetric pair of PDAs was the cause.
+                    None if proposals
+                        .first()
+                        .is_some_and(|s| s.native_leg) =>
+                    {
+                        outcome.diagnostics.ambiguous_native += 1
+                    }
+                    None => outcome.diagnostics.ambiguous_pool += 1,
                 }
             }
             Classified::Liquidity => {
@@ -819,12 +891,23 @@ fn record(
     }
 }
 
+/// `Swap` is much larger than the other variants, and boxing it would cost
+/// an allocation on the hot path for every swap on the chain to save a few
+/// bytes of stack in a value that never leaves this function.
+#[allow(clippy::large_enum_variant)]
 enum Classified {
     Swap(MovementSwap),
-    /// A native-leg trade whose pool side the movement layer cannot pick on
-    /// its own. Each entry is the same trade read from one candidate's point
-    /// of view, so at most ONE can be right; the per-program decoder picks.
-    NativeCandidates(Vec<MovementSwap>),
+    /// A trade whose pool side the movement layer cannot pick on its own.
+    /// Each entry is the same trade read from one candidate's point of
+    /// view, so at most ONE can be right; the per-program decoder picks.
+    ///
+    /// Two shapes reach this. A native-leg trade is symmetric by
+    /// construction. A two-sided trade gets here when EVERY candidate
+    /// survives all three steps of [`resolve_pool`] - measured live, that
+    /// is a bot VAULT buying on a bonding curve: the vault is a program
+    /// derived address too, so the off-curve test cannot tell it from the
+    /// pool, and before this the row was dropped as unclassified.
+    Candidates(Vec<MovementSwap>),
     Liquidity,
     Unclassified,
     AmbiguousNative,
@@ -1005,6 +1088,31 @@ fn classify(
         return classify_two_sided(venue, instruction, owned, authority);
     }
 
+    // Two or more candidates survived every test, so the movement layer
+    // genuinely cannot tell the pool from the taker. Rather than drop the
+    // trade, propose each reading and let the venue's own event pick -
+    // exactly what the native-leg path below has always done. The readings
+    // differ in DIRECTION, which is precisely what an event states.
+    if pools.len() > 1 {
+        let proposals: Vec<MovementSwap> = pools
+            .iter()
+            .filter_map(|authority| {
+                match classify_two_sided(
+                    venue,
+                    instruction,
+                    owned,
+                    *authority,
+                ) {
+                    Classified::Swap(swap) => Some(swap),
+                    _ => None,
+                }
+            })
+            .collect();
+        if !proposals.is_empty() {
+            return Classified::Candidates(proposals);
+        }
+    }
+
     // One mint only: the other leg may be native SOL moved without an
     // instruction (a bonding curve decrements its own lamports).
     let mints: Vec<Pubkey> = {
@@ -1041,7 +1149,7 @@ fn classify(
 
     match swaps.len() {
         0 => Classified::AmbiguousNative,
-        _ => Classified::NativeCandidates(swaps),
+        _ => Classified::Candidates(swaps),
     }
 }
 
@@ -1123,6 +1231,9 @@ fn classify_native(
         mint_in,
         mint_out,
         amount_in,
+        // A native lamport leg has no token account and therefore no
+        // transfer fee.
+        amount_in_received: amount_in,
         amount_out_gross: amount_out,
         amount_out,
         fee_amount: 0,
@@ -1193,9 +1304,11 @@ fn classify_two_sided(
         mint_in,
         mint_out,
         amount_in,
+        // Both "received" figures are filled in by the caller, which can
+        // see the destination's real balance delta (a Token-2022 transfer
+        // fee makes it smaller than what was sent).
+        amount_in_received: amount_in,
         amount_out_gross,
-        // Filled in by the caller, which can see the destination's real
-        // balance delta (a Token-2022 transfer fee makes it smaller).
         amount_out: amount_out_gross,
         fee_amount: fees,
         payer,

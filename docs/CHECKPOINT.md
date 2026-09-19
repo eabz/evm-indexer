@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 03:30 (America/Mexico_City)
+**Last updated:** 2026-09-19 05:45 (America/Mexico_City)
 
 ## Where things are
 
@@ -36,8 +36,8 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
 | hardening (round 2) | Opus | MAIN tree (uncommitted edits possible) | flaky-under-load root cause, bounded rebuild / interval validity rule, checkpoint compaction, month-split flush, epoch-moves-mid-flush test, purged range into dex/launchpads rebuild SQL | commits `hardening:` + tirith notes |
-| solana-launchpads | Opus | worktree (see `git worktree list`) | Solana launchpads into `launchpad_*` (pump.fun, Meteora DBC, LaunchLab), pump.fun 1.8-3.8% disagreement, `sol_dex_programs` registry, live proof | commits + tirith notes |
-| solana-run | Opus | worktree | `indexer run --chain solana`: head follower in NEW `src/pipeline/solana*.rs`, `sol_slots` commit marker, block_height contiguity, tripwire, lease, verify, acceptance tests + 10 min live run | commits + tirith notes |
+| solana-launchpads | DONE, merged 3bb94e9 | - | pump.fun / Meteora DBC / LaunchLab into `launchpad_*`; pump.fun agreement 100%; migration renumbered to 0043 by the lead (0042 belongs to solana-run) | - |
+| solana-run | RESUMED 05:45 to adapt (Opus) | worktree `agent-a703082e8726f3841` (4 commits + a merge of the branch) | BLOCKED on an interface drift: hardening round 2 changed `reorg::ReorgStore` (`min_timestamp` gone, `rebuild_derived` 7 params) and `src/pipeline/solana_store.rs` implements the old trait. When hardening finishes and posts its trait-change list, resume solana-run (or a fresh Opus agent in that worktree) to adapt, re-run its 13 acceptance scenarios, then merge. Live proof already done: 10 min head following, 202,105 swaps, 6.2 queries/min, 20/20 vs public RPC, restart resumes exactly. | commits in the worktree |
 
 MAIN TREE IS CLEAN and pushed (HEAD 7a4487e+). NO worktrees exist. Everything below is merged: pipeline wiring +
 zero-flag proof, migrator fixes, launchpads (+ wiring, id alignment, review fixes), chain

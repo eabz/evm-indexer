@@ -107,6 +107,14 @@ pub trait Progress: Send + Sync + 'static {
         &self,
         range: BlockRange,
     ) -> impl Future<Output = Result<MissingRanges>> + Send;
+
+    /// Collapses runs of contiguous live checkpoints into one row each
+    /// (`Database::compact_checkpoints`). Returns the rows replaced.
+    fn compact_checkpoints(
+        &self,
+    ) -> impl Future<Output = Result<u64>> + Send {
+        async { Ok(0) }
+    }
 }
 
 impl Progress for Database {
@@ -116,7 +124,16 @@ impl Progress for Database {
     ) -> Result<MissingRanges> {
         Database::missing_ranges(self, range).await
     }
+
+    async fn compact_checkpoints(&self) -> Result<u64> {
+        Database::compact_checkpoints(self).await
+    }
 }
+
+/// How often the sync loop compacts `checkpoints`. Rarely: it is
+/// housekeeping, the work per pass is bounded anyway, and at the tip a
+/// pass runs every second.
+const COMPACT_CHECKPOINTS_EVERY: Duration = Duration::from_secs(300);
 
 /// How often the chain head is polled once caught up.
 const HEAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -303,6 +320,12 @@ struct Indexer<S: BlockSource, P: Progress> {
     stale: Arc<Mutex<Vec<BlockRange>>>,
     /// Shares the epoch memory with the guard's purger.
     purger: Purger,
+    /// The chain's lease. Checkpoint compaction rewrites rows a purge of
+    /// another process could be splitting at the same moment, so it only
+    /// runs while this process is the one that holds the chain.
+    fence: Fence,
+    /// When `checkpoints` was last compacted.
+    compacted: Option<tokio::time::Instant>,
 }
 
 /// What [`run_with`] needs besides the configuration: everything that
@@ -538,6 +561,8 @@ pub async fn run_with<S: BlockSource>(
         metrics: metrics.clone(),
         committed: Vec::new(),
         stale,
+        fence: lease.fence(),
+        compacted: None,
     };
 
     // 1. Stop the stream ...
@@ -720,6 +745,7 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
                             last_tip_commit =
                                 Some(tokio::time::Instant::now());
                         }
+                        self.compact_checkpoints().await;
                     }
                     Ok(PassOutcome::RolledBack(fork_point)) => {
                         failures = 0;
@@ -757,6 +783,40 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
                 }
                 Err(e) => warn!("Could not fetch the chain head: {e:#}"),
             }
+        }
+    }
+
+    /// Housekeeping after a committed pass: collapse the runs of
+    /// contiguous `checkpoints` this process keeps adding to (one row per
+    /// flush, for ever) into one covering row each.
+    ///
+    /// Never fatal: it changes no answer, only how many rows hold it. And
+    /// never without the lease - a purge of another process may be
+    /// splitting the very rows this would merge.
+    async fn compact_checkpoints(&mut self) {
+        let now = tokio::time::Instant::now();
+
+        if self
+            .compacted
+            .is_some_and(|last| now - last < COMPACT_CHECKPOINTS_EVERY)
+        {
+            return;
+        }
+
+        if let Err(e) = self.fence.check() {
+            debug!("Not compacting the checkpoints: {e:#}");
+            return;
+        }
+
+        self.compacted = Some(now);
+
+        if let Err(e) = self.progress.compact_checkpoints().await {
+            warn!(
+                "Chain {}: could not compact the checkpoints: {e:#}. \
+                 Nothing is wrong with what is stored; the next pass \
+                 tries again.",
+                self.settings.chain_id
+            );
         }
     }
 
