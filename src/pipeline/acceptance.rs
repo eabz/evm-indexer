@@ -733,6 +733,8 @@ impl Scenario {
         };
 
         let runtime = Runtime {
+            metrics: None,
+            status: StatusSink::off(),
             source: chain.clone(),
             canonical: Arc::new(chain.clone()),
             caller,

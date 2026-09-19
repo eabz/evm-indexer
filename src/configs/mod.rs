@@ -1,3 +1,18 @@
+mod fleet;
+
+pub use fleet::{
+    apply_chain_settings, chain_setting_keys, ChainSetting, ChainSettings,
+    Desired, FleetConfig, SettingError, SettingKind, ADMIN_PASSWORD_ENV,
+    CHAIN_SETTINGS,
+};
+
+/// `--chain` as the command line parses it: a chain id, or a name the CLI
+/// knows (`solana`). The control panel calls THIS, so a chain added in a
+/// web page and a chain named on the command line mean the same thing.
+pub fn parse_chain_argument(value: &str) -> Result<u64, String> {
+    parse_chain(value)
+}
+
 use clap::{ArgAction, Args, Parser, Subcommand};
 use std::ffi::OsString;
 
@@ -89,6 +104,128 @@ pub enum CliCommand {
     /// Re-decode a module's rows from the STORED logs (no re-sync), e.g.
     /// after a decoder fix or a new event family. Safe while `run` is live.
     Backfill(BackfillArgs),
+    /// Index MANY chains in one process, with a web control panel.
+    /// Applies pending schema migrations once, at start.
+    Fleet(Box<FleetArgs>),
+}
+
+/// Options of `indexer fleet`. Everything here is the same for every chain
+/// in the process; the per-chain options of `indexer run` come from the
+/// `fleet_chains` table and the control panel (see `configs::fleet`).
+#[derive(Args, Debug)]
+pub struct FleetArgs {
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        hide_env_values = true,
+        help = "Clickhouse database url with username and password. The database is created when missing."
+    )]
+    pub database: String,
+
+    #[arg(
+        long,
+        env = "ENVIO_API_TOKEN",
+        hide_env_values = true,
+        help = "HyperSync (Envio) API token. One token serves every chain in the fleet."
+    )]
+    pub hypersync_token: String,
+
+    #[arg(
+        long = "chain",
+        value_name = "CHAIN",
+        help = "Index this chain even when the fleet_chains table does not list it yet. Repeatable; a chain id or the name `solana`. A fresh database needs this once, after that the panel adds chains.",
+        value_parser = parse_chain
+    )]
+    pub chains: Vec<u64>,
+
+    #[arg(
+        long,
+        env = "RPC_URL",
+        hide_env_values = true,
+        help = "Default JSON-RPC endpoints for token and pool metadata, for chains whose own setting is empty. Same syntax as `indexer run --rpc`."
+    )]
+    pub rpc: Option<String>,
+
+    #[arg(
+        long,
+        env = "REDIS_URL",
+        hide_env_values = true,
+        help = "Redis (or Dragonfly) url for the token metadata cache, shared by every chain."
+    )]
+    pub redis: Option<String>,
+
+    #[arg(
+        long,
+        env = "METRICS_ADDR",
+        help = "ip:port to serve ONE Prometheus endpoint for the whole fleet on; every series carries a `chain` label. Off when unset."
+    )]
+    pub metrics_addr: Option<String>,
+
+    #[arg(
+        long,
+        env = "ADMIN_ADDR",
+        help = "ip:port of the control panel. The panel only serves anything when the ADMIN_PASSWORD environment variable is set.",
+        default_value = fleet::DEFAULT_ADMIN_ADDR
+    )]
+    pub admin_addr: String,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        value_parser = parse_flag,
+        help = "Allow the control panel to bind an address other than localhost. Only do this behind a TLS reverse proxy; the panel speaks plain HTTP."
+    )]
+    pub admin_allow_remote: bool,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        value_parser = parse_flag,
+        help = "Mark the session cookie `Secure` (the panel is behind a TLS reverse proxy)."
+    )]
+    pub admin_secure_cookie: bool,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        value_parser = parse_flag,
+        help = "Believe an `X-Forwarded-Proto: https` header from the reverse proxy when deciding whether the session cookie is `Secure`. Only switch this on when a proxy you trust always sets it."
+    )]
+    pub admin_trust_forwarded_proto: bool,
+
+    #[arg(
+        long,
+        env = "FLEET_MAX_INFLIGHT_MB",
+        help = "Rough upper bound, in megabytes, on the rows the whole fleet buffers before writing. Split over the running chains, so one more chain makes every chain's write batch smaller instead of growing the process.",
+        default_value_t = 2_048
+    )]
+    pub fleet_max_inflight_mb: u64,
+
+    #[arg(
+        long,
+        env = "SOLANA_QUERIES_PER_MINUTE",
+        help = "Metered Solana HyperSync queries a minute, shared by every Solana chain in the process. The free tier allows 30.",
+        default_value_t = 25
+    )]
+    pub solana_queries_per_minute: u32,
+
+    #[arg(
+        long,
+        env = "NO_MIGRATE",
+        action = ArgAction::SetTrue,
+        value_parser = parse_flag,
+        help = "Do not apply pending schema migrations at startup (run `indexer migrate` yourself)."
+    )]
+    pub no_migrate: bool,
+
+    #[arg(
+        long,
+        env = "DEBUG",
+        action = ArgAction::SetTrue,
+        value_parser = parse_flag,
+        help = "Start log with debug."
+    )]
+    pub debug: bool,
 }
 
 #[derive(Args, Debug)]
@@ -456,6 +593,7 @@ pub enum Command {
     Migrate(MigrateConfig),
     Verify(VerifyConfig),
     Backfill(BackfillConfig),
+    Fleet(Box<FleetConfig>),
 }
 
 /// docker-compose passes `VAR=` for blank entries: empty means unset.
@@ -550,6 +688,70 @@ impl From<VerifyArgs> for VerifyConfig {
     }
 }
 
+/// `--admin-addr`: `ip:port`; refused when it is not a loopback address
+/// and `--admin-allow-remote` was not given. The panel speaks plain HTTP
+/// and holds the only control over what the process indexes, so putting it
+/// on the network has to be a deliberate act (docs/design.md section 15).
+fn parse_admin_addr(
+    value: &str,
+    allow_remote: bool,
+) -> Result<std::net::SocketAddr, clap::Error> {
+    let bad = |message: String| {
+        clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!(
+                "invalid value '{value}' for '--admin-addr': {message}\n"
+            ),
+        )
+    };
+
+    let addr: std::net::SocketAddr =
+        value.trim().parse().map_err(|e| {
+            bad(format!("{e} (expected ip:port, e.g. 127.0.0.1:8090)"))
+        })?;
+
+    if !addr.ip().is_loopback() && !allow_remote {
+        return Err(bad(format!(
+            "{} is not a loopback address. The control panel speaks plain \
+             HTTP and can start and stop indexing, so it refuses to listen \
+             on the network unless you pass --admin-allow-remote and put a \
+             TLS reverse proxy (or an SSH tunnel) in front of it. See the \
+             README",
+            addr.ip()
+        )));
+    }
+
+    Ok(addr)
+}
+
+impl TryFrom<FleetArgs> for FleetConfig {
+    type Error = clap::Error;
+
+    fn try_from(args: FleetArgs) -> Result<Self, clap::Error> {
+        Ok(Self {
+            database_url: args.database,
+            hypersync_token: args.hypersync_token.trim().to_string(),
+            rpc_url: non_empty(args.rpc),
+            redis_url: non_empty(args.redis),
+            metrics_addr: parse_metrics_addr(args.metrics_addr)?,
+            admin_addr: parse_admin_addr(
+                &args.admin_addr,
+                args.admin_allow_remote,
+            )?,
+            admin_allow_remote: args.admin_allow_remote,
+            admin_secure_cookie: args.admin_secure_cookie,
+            admin_trust_forwarded_proto: args.admin_trust_forwarded_proto,
+            chains: args.chains,
+            max_inflight_mb: args.fleet_max_inflight_mb.max(1),
+            solana_queries_per_minute: args
+                .solana_queries_per_minute
+                .max(1),
+            no_migrate: args.no_migrate,
+            debug: args.debug,
+        })
+    }
+}
+
 impl TryFrom<Cli> for Command {
     type Error = clap::Error;
 
@@ -561,12 +763,22 @@ impl TryFrom<Cli> for Command {
             CliCommand::Migrate(args) => Self::Migrate(args.into()),
             CliCommand::Verify(args) => Self::Verify(args.into()),
             CliCommand::Backfill(args) => Self::Backfill(args.into()),
+            CliCommand::Fleet(args) => {
+                Self::Fleet(Box::new((*args).try_into()?))
+            }
         })
     }
 }
 
 /// Environment variables read by the CLI.
-const ENV_VARS: [&str; 19] = [
+///
+/// `ADMIN_PASSWORD` is deliberately NOT here: it is read directly by
+/// `src/admin`, never by clap, so it cannot end up in a help text, a
+/// `--help` default or a `Debug` print of the parsed arguments.
+const ENV_VARS: [&str; 22] = [
+    "ADMIN_ADDR",
+    "FLEET_MAX_INFLIGHT_MB",
+    "SOLANA_QUERIES_PER_MINUTE",
     "CHAIN_ID",
     "DATABASE_URL",
     "HYPERSYNC_URL",
@@ -654,6 +866,7 @@ impl Command {
             Self::Migrate(config) => config.debug,
             Self::Verify(config) => config.debug,
             Self::Backfill(config) => config.debug,
+            Self::Fleet(config) => config.debug,
         }
     }
 }

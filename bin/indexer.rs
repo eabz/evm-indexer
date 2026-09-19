@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use evm_indexer::{
     configs::{
-        BackfillConfig, Command, Config, MigrateConfig, VerifyConfig,
+        BackfillConfig, Command, Config, FleetConfig, MigrateConfig,
+        VerifyConfig,
     },
     db::{migrate, Database},
-    pipeline,
+    fleet, pipeline,
 };
 use log::{error, info, LevelFilter};
 use simple_logger::SimpleLogger;
@@ -59,6 +60,7 @@ fn execute(command: Command) -> Result<ExitCode> {
         Command::Backfill(config) => {
             runtime.block_on(run_backfill(config))?
         }
+        Command::Fleet(config) => runtime.block_on(run_fleet(*config))?,
     }
 
     Ok(ExitCode::SUCCESS)
@@ -100,6 +102,15 @@ async fn run(config: Config) -> Result<()> {
     } else {
         pipeline::run(config).await
     }
+}
+
+/// `indexer fleet`: one process, many chains, plus the control panel
+/// (docs/design.md section 15). `indexer run` is untouched by it.
+async fn run_fleet(config: FleetConfig) -> Result<()> {
+    info!("Starting EVM Indexer.");
+    info!("{}", fleet::describe(&config));
+
+    fleet::run(config).await
 }
 
 /// Read only. Exit code 0 = consistent, 1 = problems found.

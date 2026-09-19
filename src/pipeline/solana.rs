@@ -43,6 +43,7 @@ use crate::{
             ClickhouseSvmSink, LastFlush, SvmBatch, SvmWriter,
             SvmWriterHandle, SvmWriterStopped,
         },
+        status::{ChainState, StatusSink},
     },
     reorg::{
         DiscoveryCache, PurgeReason, Purger, ReorgMetrics, ReorgStore,
@@ -465,10 +466,23 @@ pub fn check_continuity(
 pub struct SolanaRuntime<S: SlotSource> {
     pub source: S,
     pub lease: LeaseOptions,
-    /// Resolves when the process should stop (SIGINT / SIGTERM).
+    /// Resolves when this chain should stop. `indexer run` passes the
+    /// process signal, `indexer fleet` a per-chain cancellation handle.
     pub shutdown: BoxFuture<'static, ()>,
-    /// Metered queries a minute this process allows itself.
+    /// Metered queries a minute this process allows itself. Ignored when
+    /// [`Self::budget`] is set.
     pub max_queries_per_minute: u32,
+    /// A budget SHARED with other chains. The Envio rate limit is per
+    /// token, not per chain, so a fleet with two Solana endpoints under one
+    /// token must not hand each of them the whole allowance
+    /// (docs/design.md section 15). `None` = a private budget of
+    /// `max_queries_per_minute`, which is what `indexer run` uses.
+    pub budget: Option<Arc<Budget>>,
+    /// The metrics handle to record into; `None` = build one from
+    /// `--metrics-addr` and serve it here (`indexer run`).
+    pub metrics: Option<Metrics>,
+    /// Where the chain reports what it is doing. Off for `indexer run`.
+    pub status: StatusSink,
 }
 
 impl<S: SlotSource> SolanaRuntime<S> {
@@ -478,6 +492,9 @@ impl<S: SlotSource> SolanaRuntime<S> {
             lease: LeaseOptions::default(),
             shutdown: Box::pin(shutdown_signal()),
             max_queries_per_minute: DEFAULT_MAX_QUERIES_PER_MINUTE,
+            budget: None,
+            metrics: None,
+            status: StatusSink::off(),
         }
     }
 }
@@ -765,6 +782,10 @@ struct SolanaIndexer<S: SlotSource> {
     swaps_stored: Arc<AtomicU64>,
     launchpad_rows: Arc<AtomicU64>,
     skipped_slots: Arc<AtomicU64>,
+    /// Where the chain says what it is doing. Off outside `indexer fleet`.
+    status: StatusSink,
+    /// The last state sent to `status`, so only CHANGES are reported.
+    reported: Option<ChainState>,
 }
 
 /// How a pass ended.
@@ -798,14 +819,21 @@ pub async fn run_with<S: SlotSource>(
 
     let chain = config.chain_id;
 
-    let metrics = match config.metrics_addr {
-        Some(_) => Metrics::new(chain, READY_STALENESS),
-        None => Metrics::disabled(),
+    // The fleet hands its own handle in and serves one endpoint for every
+    // chain; `indexer run` builds one here and serves it itself.
+    let fleet_metrics = runtime.metrics.is_some();
+    let metrics = match (runtime.metrics, config.metrics_addr) {
+        (Some(metrics), _) => metrics,
+        (None, Some(_)) => Metrics::new(chain, READY_STALENESS),
+        (None, None) => Metrics::disabled(),
     };
+
+    let status = runtime.status;
+    status.state(ChainState::Starting);
 
     let (stop_metrics, metrics_stopped) = watch::channel(false);
 
-    if let Some(addr) = config.metrics_addr {
+    if let Some(addr) = config.metrics_addr.filter(|_| !fleet_metrics) {
         let server = metrics::bind(addr, metrics.clone())
             .await
             .with_context(|| format!("bind --metrics-addr {addr}"))?;
@@ -911,7 +939,11 @@ pub async fn run_with<S: SlotSource>(
         config.start_block
     };
 
-    let budget = Arc::new(Budget::new(runtime.max_queries_per_minute));
+    // One HyperSync token serves every chain, and Envio meters the TOKEN:
+    // a fleet passes one budget in and every Solana chain draws from it.
+    let budget = runtime.budget.unwrap_or_else(|| {
+        Arc::new(Budget::new(runtime.max_queries_per_minute))
+    });
 
     let mut indexer = SolanaIndexer {
         settings: SolanaSettings {
@@ -939,6 +971,8 @@ pub async fn run_with<S: SlotSource>(
         swaps_stored: Arc::new(AtomicU64::new(0)),
         launchpad_rows: Arc::new(AtomicU64::new(0)),
         skipped_slots: Arc::new(AtomicU64::new(0)),
+        status: status.clone(),
+        reported: None,
     };
 
     // 1. Stop the stream ...
@@ -1060,6 +1094,13 @@ impl<S: SlotSource> SolanaIndexer<S> {
                 && last_tip_commit
                     .is_some_and(|at| at.elapsed() < TIP_CADENCE);
 
+            // One comparison per turn, a call only when it changed.
+            self.report(if behind <= TIP_PACE_SLOTS {
+                ChainState::Following
+            } else {
+                ChainState::Backfilling
+            });
+
             if target > cursor && !paced {
                 match self.pass(BlockRange::new(cursor, target)).await {
                     Ok(PassOutcome::Covered(covered)) => {
@@ -1084,6 +1125,11 @@ impl<S: SlotSource> SolanaIndexer<S> {
                         warn!(
                             "Solana sync pass failed: {e:#}. Retrying in \
                              {wait:?}."
+                        );
+                        self.status.failed(
+                            &crate::tokens::redact::redact_urls(&format!(
+                                "{e:#}"
+                            )),
                         );
                         tokio::time::sleep(wait).await;
                     }
@@ -1115,6 +1161,14 @@ impl<S: SlotSource> SolanaIndexer<S> {
                 }
                 Err(e) => warn!("Could not fetch the Solana head: {e:#}"),
             }
+        }
+    }
+
+    /// Tells the status sink about a state CHANGE and nothing else.
+    fn report(&mut self, state: ChainState) {
+        if self.reported != Some(state) {
+            self.reported = Some(state);
+            self.status.state(state);
         }
     }
 

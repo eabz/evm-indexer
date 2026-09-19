@@ -407,6 +407,8 @@ async fn indexer(
     );
 
     Indexer {
+        status: StatusSink::off(),
+        reported: None,
         settings,
         progress: store,
         guard: ReorgGuard::new(
