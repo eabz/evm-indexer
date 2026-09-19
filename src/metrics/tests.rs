@@ -505,7 +505,7 @@ fn readiness_needs_the_flag_and_a_recent_sign_of_life() {
 async fn concurrent_updates_are_not_lost() {
     const TASKS: u64 = 32;
     const ROUNDS: u64 = 2_000;
-    const TABLES: [&str; 4] = ["blocks", "logs", "traces", "transactions"];
+    const TABLES: [&str; 4] = ["blocks", "logs", "dex_swaps", "transactions"];
 
     let metrics = Metrics::new(1, Duration::from_secs(60));
 

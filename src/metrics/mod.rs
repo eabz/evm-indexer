@@ -49,8 +49,9 @@ const FLUSH_BUCKETS: &[f64] = &[
     120.0, 300.0,
 ];
 
-/// Upper bounds (seconds) of `purge_duration_seconds`: synchronous
-/// lightweight deletes over every table plus the bucket repair.
+/// Upper bounds (seconds) of `purge_duration_seconds`: tombstone inserts
+/// (`INSERT .. SELECT .. FINAL`) over every block scoped table plus the
+/// bucket repair of the aggregates. Nothing is ever deleted.
 const PURGE_BUCKETS: &[f64] =
     &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0];
 
@@ -58,23 +59,48 @@ const PURGE_BUCKETS: &[f64] =
 /// numbers. The pipeline maps the workers' own statistics into this, so
 /// neither side depends on the other.
 ///
-/// `resolved`, `negative`, `dropped`, `cache_hits` and `cache_misses` are
-/// totals since the worker started (exposed as counters); `queue_depth`,
-/// `breaker_open` and `endpoints_healthy` are the current state.
+/// `queue_depth`, `breaker_open`, `endpoints_total` and
+/// `endpoints_healthy` are the current state; everything else is a total
+/// since the worker started (exposed as counters).
+///
+/// **`resolved` and `negative` are DISJOINT here**: `resolved` counts
+/// answers WITH metadata only, `negative` the "checked, nothing there"
+/// ones, so `resolved + negative` is the number of addresses answered.
+/// (`tokens::TokenWorkerStats::resolved` INCLUDES the negative rows: the
+/// pipeline subtracts them when it maps the stats, see
+/// `pipeline::workers`. `dex::PoolWorkerStats` is already disjoint.)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WorkerStatsSnapshot {
     /// Addresses waiting to be resolved.
     pub queue_depth: u64,
-    /// Resolved with metadata.
+    /// Resolved WITH metadata (negatives not included).
     pub resolved: u64,
     /// Resolved to "nothing there" (reverts, garbage).
     pub negative: u64,
-    /// Discoveries dropped because the queue was full.
+    /// No contract code at the address (asked again later, no row).
+    pub codeless: u64,
+    /// Discoveries dropped because the queue was full. Not a loss by
+    /// itself: the database backfill finds them again.
     pub dropped: u64,
+    /// Rows durably inserted by the worker.
+    pub inserted: u64,
+    /// Batches the worker could not store even after its retries. The
+    /// rows are found again by the backfill; a growing number means the
+    /// database rejects them.
+    pub insert_failures: u64,
+    /// Addresses the RPC could not be asked about (tried again later).
+    pub rpc_failures: u64,
+    /// Addresses the database backfill reported as missing: what the live
+    /// path lost (drops, RPC outages, restarts) and the backfill healed.
+    pub backfill_found: u64,
+    /// Backfill queries that failed.
+    pub backfill_failures: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     /// True when every RPC endpoint's circuit breaker is open.
     pub breaker_open: bool,
+    /// RPC endpoints configured or discovered.
+    pub endpoints_total: u64,
     /// RPC endpoints currently considered healthy.
     pub endpoints_healthy: u64,
 }
@@ -110,15 +136,22 @@ struct BuildInfo {
 #[derive(Default)]
 struct WorkerStats {
     /// Absent from the exposition until the first snapshot arrives, so a
-    /// disabled worker (no `--dex`) has no series.
+    /// disabled worker (`--no-dex`, `--rpc none`) has no series.
     seen: AtomicBool,
     queue_depth: AtomicU64,
     resolved: Counter,
     negative: Counter,
+    codeless: Counter,
     dropped: Counter,
+    inserted: Counter,
+    insert_failures: Counter,
+    rpc_failures: Counter,
+    backfill_found: Counter,
+    backfill_failures: Counter,
     cache_hits: Counter,
     cache_misses: Counter,
     breaker_open: AtomicBool,
+    endpoints_total: AtomicU64,
     endpoints_healthy: AtomicU64,
 }
 
@@ -127,10 +160,17 @@ impl WorkerStats {
         self.queue_depth.store(stats.queue_depth, Relaxed);
         self.resolved.set(stats.resolved);
         self.negative.set(stats.negative);
+        self.codeless.set(stats.codeless);
         self.dropped.set(stats.dropped);
+        self.inserted.set(stats.inserted);
+        self.insert_failures.set(stats.insert_failures);
+        self.rpc_failures.set(stats.rpc_failures);
+        self.backfill_found.set(stats.backfill_found);
+        self.backfill_failures.set(stats.backfill_failures);
         self.cache_hits.set(stats.cache_hits);
         self.cache_misses.set(stats.cache_misses);
         self.breaker_open.store(stats.breaker_open, Relaxed);
+        self.endpoints_total.store(stats.endpoints_total, Relaxed);
         self.endpoints_healthy.store(stats.endpoints_healthy, Relaxed);
         self.seen.store(true, Relaxed);
     }
@@ -140,10 +180,17 @@ impl WorkerStats {
             queue_depth: self.queue_depth.load(Relaxed),
             resolved: self.resolved.get(),
             negative: self.negative.get(),
+            codeless: self.codeless.get(),
             dropped: self.dropped.get(),
+            inserted: self.inserted.get(),
+            insert_failures: self.insert_failures.get(),
+            rpc_failures: self.rpc_failures.get(),
+            backfill_found: self.backfill_found.get(),
+            backfill_failures: self.backfill_failures.get(),
             cache_hits: self.cache_hits.get(),
             cache_misses: self.cache_misses.get(),
             breaker_open: self.breaker_open.load(Relaxed),
+            endpoints_total: self.endpoints_total.load(Relaxed),
             endpoints_healthy: self.endpoints_healthy.load(Relaxed),
         })
     }
@@ -159,6 +206,10 @@ struct Inner {
     /// Unix ms of the last `set_head` / successful flush; 0 = never.
     last_head_poll_ms: AtomicU64,
     last_flush_ok_ms: AtomicU64,
+    /// Unix ms the flush that is running right now started; 0 = none.
+    flush_started_ms: AtomicU64,
+    /// The most recent flush attempt failed.
+    last_flush_failed: AtomicBool,
 
     head_block: Gauge,
     indexed_block: Gauge,
@@ -222,6 +273,8 @@ impl Metrics {
                 ready: AtomicBool::new(false),
                 last_head_poll_ms: AtomicU64::new(0),
                 last_flush_ok_ms: AtomicU64::new(0),
+                flush_started_ms: AtomicU64::new(0),
+                last_flush_failed: AtomicBool::new(false),
                 head_block: Gauge::default(),
                 indexed_block: Gauge::default(),
                 head_timestamp: Gauge::default(),
@@ -310,6 +363,19 @@ impl Metrics {
         inner.rows_inserted.add(table, n);
     }
 
+    /// A flush is starting (its insert retries can take minutes). Paired
+    /// with [`Self::flush_observed`]; lets `/readyz` see a flush that is
+    /// stuck retrying.
+    pub fn flush_started(&self) {
+        self.flush_started_at(unix_ms());
+    }
+
+    fn flush_started_at(&self, now_ms: u64) {
+        let Some(inner) = &self.inner else { return };
+
+        inner.flush_started_ms.store(now_ms.max(1), Relaxed);
+    }
+
     /// One flush (all tables of a batch) finished after `duration`,
     /// retries included. Failed flushes are observed too.
     pub fn flush_observed(&self, duration: Duration, rows: u64, ok: bool) {
@@ -327,6 +393,8 @@ impl Metrics {
 
         inner.flush_duration.observe(duration);
         inner.last_flush_rows.set(rows);
+        inner.flush_started_ms.store(0, Relaxed);
+        inner.last_flush_failed.store(!ok, Relaxed);
 
         if ok {
             inner.flushes_ok.add(1);
@@ -396,9 +464,20 @@ impl Metrics {
         inner.ready.store(ready, Relaxed);
     }
 
-    /// What `/readyz` answers: `Ok` when the ready flag is set and the
-    /// last successful flush or head poll is at most `ready_staleness`
-    /// old, otherwise a one-line reason.
+    /// What `/readyz` answers, a one-line reason when not ready. Ready
+    /// means ALL of:
+    ///
+    /// * the ready flag is set (startup completed);
+    /// * the most recent flush attempt did not fail;
+    /// * no flush has been running (retrying) for longer than
+    ///   `ready_staleness`;
+    /// * the last successful flush or head poll is at most
+    ///   `ready_staleness` old.
+    ///
+    /// It answers "is this indexer serving fresh data", for load balancers
+    /// and dashboards. It is NOT a liveness probe: do not restart the
+    /// process on it (a ClickHouse outage makes it not-ready, and a
+    /// restart loop would not help). Use `/healthz` for liveness.
     pub fn readiness(&self) -> Result<(), String> {
         self.readiness_at(unix_ms())
     }
@@ -412,6 +491,27 @@ impl Metrics {
             return Err("not ready: startup has not completed".to_string());
         }
 
+        let limit_ms = inner.ready_staleness.as_millis();
+
+        if inner.last_flush_failed.load(Relaxed) {
+            return Err(
+                "not ready: the most recent flush failed".to_string()
+            );
+        }
+
+        let flush_started_ms = inner.flush_started_ms.load(Relaxed);
+        if flush_started_ms != 0 {
+            let running_ms = now_ms.saturating_sub(flush_started_ms);
+            if u128::from(running_ms) > limit_ms {
+                return Err(format!(
+                    "not ready: a flush has been retrying for {}s (limit \
+                     {}s)",
+                    running_ms / 1000,
+                    inner.ready_staleness.as_secs()
+                ));
+            }
+        }
+
         let last_sign_of_life = inner
             .last_flush_ok_ms
             .load(Relaxed)
@@ -423,7 +523,6 @@ impl Metrics {
         }
 
         let age_ms = now_ms.saturating_sub(last_sign_of_life);
-        let limit_ms = inner.ready_staleness.as_millis();
 
         if u128::from(age_ms) > limit_ms {
             return Err(format!(
@@ -677,7 +776,7 @@ fn render_workers(e: &mut Encoder, inner: &Inner) {
 
     type Field = fn(&WorkerStatsSnapshot) -> u64;
 
-    let families: [(&str, &str, Kind, Field); 8] = [
+    let families: [(&str, &str, Kind, Field); 15] = [
         (
             "resolver_queue_depth",
             "Addresses waiting to be resolved by a background worker.",
@@ -686,7 +785,7 @@ fn render_workers(e: &mut Encoder, inner: &Inner) {
         ),
         (
             "resolver_resolved_total",
-            "Addresses resolved with metadata.",
+            "Addresses resolved WITH metadata (negatives not included).",
             Kind::Counter,
             |s| s.resolved,
         ),
@@ -697,10 +796,46 @@ fn render_workers(e: &mut Encoder, inner: &Inner) {
             |s| s.negative,
         ),
         (
+            "resolver_codeless_total",
+            "Addresses without contract code (asked again later).",
+            Kind::Counter,
+            |s| s.codeless,
+        ),
+        (
             "resolver_dropped_total",
             "Discoveries dropped because the queue was full.",
             Kind::Counter,
             |s| s.dropped,
+        ),
+        (
+            "resolver_inserted_total",
+            "Rows durably inserted by the worker.",
+            Kind::Counter,
+            |s| s.inserted,
+        ),
+        (
+            "resolver_insert_failures_total",
+            "Batches the worker could not store after its retries.",
+            Kind::Counter,
+            |s| s.insert_failures,
+        ),
+        (
+            "resolver_rpc_failures_total",
+            "Addresses the RPC could not be asked about.",
+            Kind::Counter,
+            |s| s.rpc_failures,
+        ),
+        (
+            "resolver_backfill_found_total",
+            "Addresses the database backfill reported as missing.",
+            Kind::Counter,
+            |s| s.backfill_found,
+        ),
+        (
+            "resolver_backfill_failures_total",
+            "Backfill queries that failed.",
+            Kind::Counter,
+            |s| s.backfill_failures,
         ),
         (
             "resolver_cache_hits_total",
@@ -719,6 +854,12 @@ fn render_workers(e: &mut Encoder, inner: &Inner) {
             "1 when every RPC endpoint's circuit breaker is open.",
             Kind::Gauge,
             |s| u64::from(s.breaker_open),
+        ),
+        (
+            "resolver_endpoints_total",
+            "RPC endpoints configured or discovered.",
+            Kind::Gauge,
+            |s| s.endpoints_total,
         ),
         (
             "resolver_endpoints_healthy",
