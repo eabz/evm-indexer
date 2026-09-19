@@ -838,9 +838,21 @@ pub async fn run_with<S: SlotSource>(
             Ok(())
         }
         reason = async {
-            match fatal.wait_for(|reason| reason.is_some()).await {
-                Ok(reason) => reason.clone().unwrap_or_default(),
-                Err(_) => std::future::pending().await,
+            // The borrow of the watch cell is dropped before the `pending`
+            // await below, so this future stays `Send` and the whole loop
+            // can be spawned (the acceptance test for "a second process is
+            // refused" does exactly that).
+            let verdict = match
+                fatal.wait_for(|reason| reason.is_some()).await
+            {
+                Ok(reason) => Some(reason.clone().unwrap_or_default()),
+                // The lease task ended without a verdict: never fatal.
+                Err(_) => None,
+            };
+
+            match verdict {
+                Some(reason) => reason,
+                None => std::future::pending().await,
             }
         } => Err(anyhow::anyhow!(reason)),
     };
