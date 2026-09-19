@@ -67,6 +67,11 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 ENGINE = ReplacingMergeTree(_version, is_deleted)
 ORDER BY (chain, from_block, to_block);
 
+-- ifNull(epoch_floor, 0): a chain without any reorg has no row to join.
+-- By default the unmatched side reads 0, but under join_use_nulls = 1 (a
+-- per user / per profile setting a BI tool may set) it reads NULL, and a
+-- bare comparison would silently drop EVERY row.
+--
 -- Reader views of the aggregates of 0003: they finalize the states and
 -- apply the validity rule BEFORE merging them (a hidden contribution must
 -- not reach a sum or a uniq state). The views only expose plain types (no
@@ -87,7 +92,7 @@ SELECT
   avgMerge(s.base_fee_per_gas) AS avg_base_fee_per_gas
 FROM daily_block_stats AS s
 ASOF LEFT JOIN epoch_floor_v AS r ON r.chain = s.chain AND s.day >= r.from_ts
-WHERE s.epoch >= r.epoch_floor
+WHERE s.epoch >= ifNull(r.epoch_floor, 0)
 GROUP BY chain, day;
 
 CREATE VIEW IF NOT EXISTS daily_transaction_stats_v AS
@@ -106,7 +111,7 @@ SELECT
   avgMerge(s.effective_gas_price) AS avg_effective_gas_price
 FROM daily_transaction_stats AS s
 ASOF LEFT JOIN epoch_floor_v AS r ON r.chain = s.chain AND s.day >= r.from_ts
-WHERE s.epoch >= r.epoch_floor
+WHERE s.epoch >= ifNull(r.epoch_floor, 0)
 GROUP BY chain, day;
 
 -- volume is volume_raw scaled by the token decimals. NULL (never 0) while
@@ -133,7 +138,7 @@ FROM
     uniqMerge(a.recipients) AS unique_recipients
   FROM daily_erc20_transfer_stats AS a
   ASOF LEFT JOIN epoch_floor_v AS r ON r.chain = a.chain AND a.day >= r.from_ts
-  WHERE a.epoch >= r.epoch_floor
+  WHERE a.epoch >= ifNull(r.epoch_floor, 0)
   GROUP BY chain, token_address, day
 ) AS s
 LEFT JOIN

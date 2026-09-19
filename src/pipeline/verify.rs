@@ -231,15 +231,23 @@ pub async fn verify(
         range.len().saturating_sub(missing_blocks)
     };
 
-    // 2. Orphan children, in bounded chunks.
+    // 2. Orphan children, in bounded chunks. Without an explicit end the
+    //    check is open ended: rows ABOVE the highest block are exactly
+    //    what a flush that died before its `blocks` insert leaves behind.
     let mut orphans: Vec<OrphanReport> = Vec::new();
     let mut from = range.from;
+    let orphans_to = if end_block > 0 { range.to } else { u64::MAX };
 
-    while from < range.to {
-        let chunk = BlockRange::new(
-            from,
-            from.saturating_add(ORPHAN_CHUNK_BLOCKS).min(range.to),
-        );
+    while from < orphans_to {
+        let chunk = if from >= range.to {
+            // Above the head: no block there, one open ended look.
+            BlockRange::new(from, u64::MAX)
+        } else {
+            BlockRange::new(
+                from,
+                from.saturating_add(ORPHAN_CHUNK_BLOCKS).min(range.to),
+            )
+        };
 
         for (table, column, predicate) in child_tables(chain, chunk) {
             let sql = format!(

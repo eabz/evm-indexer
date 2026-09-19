@@ -13,7 +13,9 @@ use crate::{
         schema::{live_rows_sql, min_timestamp_sql},
         Database,
     },
-    pipeline::modules::{range_predicate, ModuleSpec, ALL_MODULES},
+    pipeline::modules::{
+        plain_rebuild, range_predicate, ModuleSpec, Rebuild, ALL_MODULES,
+    },
     reorg::{ReorgRecord, ReorgStore},
     utils::format::SerB256,
 };
@@ -242,24 +244,38 @@ impl ClickhouseReorgStore {
             .context("query overlapping checkpoints")
     }
 
-    /// Every aggregate of the chain, with whether it belongs to the scope.
-    fn derived(&self) -> Vec<(&'static DerivedTable, bool)> {
-        let mut tables: Vec<(&'static DerivedTable, bool)> = CORE_DERIVED
-            .iter()
-            .map(|table| (table, matches!(self.scope, Scope::Chain)))
-            .collect();
+    /// Every aggregate of the chain: how to rebuild it, and whether it
+    /// belongs to the scope.
+    fn derived(&self) -> Vec<(&'static DerivedTable, RebuildFn, bool)> {
+        let mut tables: Vec<(&'static DerivedTable, RebuildFn, bool)> =
+            CORE_DERIVED
+                .iter()
+                .map(|table| {
+                    (
+                        table,
+                        plain_rebuild as RebuildFn,
+                        matches!(self.scope, Scope::Chain),
+                    )
+                })
+                .collect();
 
         for spec in ALL_MODULES {
             let in_scope = match self.scope {
                 Scope::Chain => true,
                 Scope::Module(scoped) => scoped.name == spec.name,
             };
-            tables.extend(spec.derived.iter().map(|t| (t, in_scope)));
+            tables.extend(
+                spec.derived.iter().map(|table| {
+                    (table, spec.rebuild_statements, in_scope)
+                }),
+            );
         }
 
         tables
     }
 }
+
+type RebuildFn = fn(&DerivedTable, &Rebuild) -> Vec<String>;
 
 impl ReorgStore for ClickhouseReorgStore {
     fn current_epoch(&self, chain: u64) -> BoxFuture<'_, Result<u32>> {
@@ -554,30 +570,50 @@ impl ReorgStore for ClickhouseReorgStore {
         purged_to: Option<u64>,
     ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
+            // Exclusive end of the rebuild: the newest row there is.
+            // No FINAL: an upper bound is all that is needed.
+            let newest: u32 = self
+                .db
+                .db
+                .query(&format!(
+                    "SELECT toUInt32(max(timestamp)) FROM blocks \
+                     WHERE chain = {chain}"
+                ))
+                .fetch_one()
+                .await
+                .context("query the newest block timestamp")?;
+            let to_ts = newest.max(from_ts).saturating_add(1);
+
             // EVERY aggregate of the chain: the epoch and the validity rule
             // are per chain, so the new `reorgs` row hides every older
             // contribution from `from_ts` on, whoever wrote it.
-            for (table, in_scope) in self.derived() {
+            for (table, rebuild, in_scope) in self.derived() {
                 // Out of scope (a module re-decode): the rows of the range
                 // stay alive and nobody writes them again, so the rebuild
                 // has to count them: exclude an empty block range.
-                let (exclude_from, exclude_to) = if in_scope {
+                let (purged_from, purged_to) = if in_scope {
                     (purged_from, purged_to)
                 } else {
                     (u64::MAX, None)
                 };
 
-                let sql = table.rebuild_sql(
-                    chain,
-                    from_ts,
-                    epoch,
-                    exclude_from,
-                    exclude_to,
+                let statements = rebuild(
+                    table,
+                    &Rebuild {
+                        chain,
+                        from_ts,
+                        to_ts,
+                        epoch,
+                        purged_from,
+                        purged_to,
+                    },
                 );
 
-                self.execute(&sql).await.with_context(|| {
-                    format!("rebuild of '{}'", table.name)
-                })?;
+                for sql in statements {
+                    self.execute(&sql).await.with_context(|| {
+                        format!("rebuild of '{}'", table.name)
+                    })?;
+                }
             }
 
             Ok(())

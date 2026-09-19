@@ -3,13 +3,16 @@
 //! Every `migrations/NNNN_name.sql` is compiled into the binary by
 //! `build.rs`. At startup (and through `indexer migrate`) the runner:
 //!
-//! 1. creates the database named in the url when it is missing,
-//! 2. creates `schema_migrations (version, name, checksum, applied_at)`,
-//! 3. refuses to go on when an applied migration's checksum differs from
+//! 1. reads `schema_migrations (version, name, checksum, applied_at)`,
+//! 2. refuses to go on when an applied migration's checksum differs from
 //!    the embedded one, or when the database holds a version this binary
 //!    does not know (binary older than the schema),
-//! 4. applies what is pending in version order, one statement at a time,
-//!    and records a migration only after its last statement succeeded.
+//! 3. stops there when nothing is pending: a start on an up to date schema
+//!    only needs `SELECT` on `schema_migrations`, so the indexer can run
+//!    with a least-privilege user on a schema an admin applied,
+//! 4. otherwise creates the database / bookkeeping tables when missing and
+//!    applies what is pending in version order, one statement at a time,
+//!    recording a migration only after its last statement succeeded.
 //!
 //! DDL in migration files carries no database prefix: statements run
 //! against the database of the connection.
@@ -17,15 +20,28 @@
 //! # Failure model
 //!
 //! ClickHouse DDL is not transactional. A migration that fails midway is
-//! NOT recorded and leaves its earlier statements applied. Migrations are
-//! written idempotently (`IF NOT EXISTS` / `IF EXISTS`), so re-running after
-//! fixing the cause is safe.
+//! NOT recorded and leaves its earlier statements applied. Two things make
+//! fixing the cause and running again safe:
+//!
+//! - Statements are idempotent (`IF NOT EXISTS` / `IF EXISTS` / `MODIFY`).
+//!   This is enforced for the embedded set by a unit test over
+//!   [`idempotency_violation`], with [`IDEMPOTENCY_EXCEPTIONS`] as the
+//!   reviewed escape hatch.
+//! - Every executed statement of a not yet recorded migration is written
+//!   to `schema_migrations_progress` (position + checksum). The next run
+//!   skips those, and REFUSES to go on when one of them was edited in the
+//!   meantime: `IF NOT EXISTS` would silently keep the old definition.
+//!
+//! A database that already holds tables while `schema_migrations` does
+//! not even exist is refused as well ([`ForeignSchemaError`]): `IF NOT
+//! EXISTS` would record the schema on top of whatever those tables are.
+//! The bookkeeping table is created before the first statement of the
+//! first migration, so that test never misfires on a concurrent runner.
 //!
 //! # Concurrent startup
 //!
-//! One indexer process per chain may start at the same time against the
-//! same database (`docker compose up` with several chains does exactly
-//! that on the first boot). Two layers:
+//! Dozens of indexer processes (one per chain) may start at the same time
+//! against the same database. Two layers:
 //!
 //! **Correctness comes from idempotency, never from a lock**, because
 //! ClickHouse has no advisory locks and nothing survives a `kill -9`:
@@ -40,23 +56,41 @@
 //!   the second one is a no-op. A statement that still reports "already
 //!   exists" (DDL written without `IF NOT EXISTS`) is tolerated with a
 //!   warning.
-//! - Recording is idempotent: the table is a `ReplacingMergeTree` ordered by
-//!   `(version, checksum)` and always read with `FINAL`. Two runners
-//!   recording the same migration collapse into one row, while two
-//!   DIFFERENT binaries recording different content for one version leave
-//!   two rows, which every later start reports as a checksum conflict.
+//! - Getting to that no-op can itself fail while the other runner is
+//!   half way through the same statement: `CREATE OR REPLACE` is a
+//!   create-then-EXCHANGE, and the loser of the exchange gets an
+//!   errno-based `ATOMIC_RENAME_FAIL`, not a tidy "already exists". Those
+//!   collisions ([`is_race`]) are retried with a short jittered backoff
+//!   instead of failing the migration.
+//! - Recording is idempotent: the tables are `ReplacingMergeTree`s ordered
+//!   by `(version, checksum)` / `(version, statement, checksum)` and always
+//!   read with `FINAL`. Two runners recording the same thing collapse into
+//!   one row, while two DIFFERENT binaries recording different content for
+//!   one version leave two rows, which every later start reports as a
+//!   checksum conflict.
 //!
-//! **A best-effort lock keeps the common case tidy.** Only when something
-//! is pending, a runner takes `schema_migrations_lock` by creating that
-//! table WITHOUT `IF NOT EXISTS`: table creation is atomic, exactly one
-//! creator wins. The others poll until nothing is pending (then go on
-//! without ever holding the lock) or until the lock is free. The holder
-//! touches the lock before every statement and drops it when done, also on
-//! failure. A lock left behind by a killed process is taken over once it
-//! was not touched for [`LOCK_STALE`]; a wrong takeover (one statement
-//! slower than that) only degrades to the lock-free behaviour above. So
-//! with the lock each statement normally runs once (seed `INSERT`s are not
-//! duplicated); without it nothing breaks.
+//! **A lock keeps the common case tidy** (each statement runs once):
+//!
+//! - Only when something is pending, a runner takes
+//!   `schema_migrations_lock` by creating that table WITHOUT
+//!   `IF NOT EXISTS`: table creation is atomic, exactly one creator wins.
+//! - Waiters poll `system.tables` and `schema_migrations` about once per
+//!   [`LOCK_POLL`] (jittered): two trivial `SELECT`s, no failing DDL. They
+//!   go on WITHOUT the lock as soon as nothing is pending, and only try to
+//!   create the lock when it is absent.
+//! - The holder touches the lock while it works and drops it when done,
+//!   also on failure.
+//! - A lock not touched for [`LOCK_STALE`] belongs to a dead process. All
+//!   waiters notice that in the same poll, so the right to remove THAT
+//!   lock instance is decided by another atomic creation: a marker table
+//!   named after the instance (uuid + last touch). Exactly one waiter
+//!   creates it; only that one drops the lock (after checking it is still
+//!   the same, untouched instance). Nobody can delete the fresh lock of
+//!   whoever comes next, because a fresh lock is another instance with
+//!   another marker name.
+//! - Whatever is left (a holder that is alive but slower than
+//!   [`LOCK_STALE`] per statement, two `kill -9` in a row) degrades to the
+//!   lock-free layer above.
 
 mod filename;
 
@@ -68,7 +102,10 @@ use clickhouse::{error::Error as ClickhouseError, Client, Row};
 use log::{info, warn};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
@@ -81,9 +118,24 @@ pub const LOCK_TABLE: &str = "schema_migrations_lock";
 /// A lock not touched for this long belongs to a dead process.
 pub const LOCK_STALE: Duration = Duration::from_secs(60);
 
-const LOCK_POLL: Duration = Duration::from_millis(250);
+/// How often a waiter looks at the lock (+-25 % jitter). Waiting is two
+/// small `SELECT`s per poll, so 50 waiters cost ~100 trivial queries/s.
+pub const LOCK_POLL: Duration = Duration::from_secs(1);
+
+/// Statements executed for a migration that is not recorded yet, so a
+/// half-applied migration can be resumed and an edit of a statement that
+/// already ran is noticed.
+pub const PROGRESS_TABLE: &str = "schema_migrations_progress";
 
 const CONNECT_ATTEMPTS: u32 = 10;
+
+/// How often a statement that lost a race with a concurrent runner is
+/// tried again before the failure is real. See [`is_race`].
+const RACE_ATTEMPTS: u32 = 5;
+
+/// Wait before the first retry of a lost race; doubled each time, always
+/// jittered. Four retries take roughly 50 + 100 + 200 + 400 ms.
+pub const RACE_BACKOFF: Duration = Duration::from_millis(50);
 
 /// ClickHouse error codes the runner reacts to.
 const CODE_TABLE_ALREADY_EXISTS: u32 = 57;
@@ -91,11 +143,38 @@ const CODE_UNKNOWN_TABLE: u32 = 60;
 const CODE_UNKNOWN_DATABASE: u32 = 81;
 const CODE_DATABASE_ALREADY_EXISTS: u32 = 82;
 
+/// Collisions inside the database's store directory. Two runners
+/// executing the SAME `CREATE` at the same time can hit these; no
+/// statement produces them on its own, so they are always a lost race:
+/// DIRECTORY_ALREADY_EXISTS (84), FILE_ALREADY_EXISTS (504),
+/// ATOMIC_RENAME_FAIL (521, `renameat2` on a path the winner moved).
+const CODES_DDL_RACE: [u32; 3] = [84, 504, 521];
+
+/// Extra codes an atomic replace can lose with (see
+/// [`replaces_atomically`]): the object is created under a temporary name
+/// and then EXCHANGEd into place, so a concurrent replace of the same
+/// object is seen as the target appearing, vanishing or being dropped
+/// mid-flight. TABLE_ALREADY_EXISTS (57), UNKNOWN_TABLE (60),
+/// TABLE_IS_DROPPED (218), ABORTED (236), UNFINISHED (341).
+const CODES_REPLACE_RACE: [u32; 5] = [57, 60, 218, 236, 341];
+
+/// The server answered and said no to who we are: AUTHENTICATION_FAILED
+/// (516), ACCESS_DENIED (497), UNKNOWN_USER (192), WRONG_PASSWORD (193),
+/// REQUIRED_PASSWORD (194), IP_ADDRESS_NOT_ALLOWED (195). Never retried.
+const CODES_REJECTED: [u32; 6] = [516, 497, 192, 193, 194, 195];
+
+/// The user may not change the schema: READONLY (164), ACCESS_DENIED (497).
+const CODES_DENIED: [u32; 2] = [164, 497];
+
 /// Appended to every failure that can leave a migration half applied.
 const RERUN_HINT: &str = "ClickHouse DDL is not transactional: the \
-    migration was NOT recorded in schema_migrations and its earlier \
-    statements stay applied. Migrations are idempotent (IF NOT EXISTS), so \
-    fix the cause and run `indexer migrate` (or restart) again; it is safe.";
+    migration was NOT recorded in schema_migrations and the statements \
+    before the failing one stay applied; they are remembered in \
+    schema_migrations_progress and skipped by the next run. Fix the cause \
+    and run `indexer migrate` (or restart) again. What a re-run does NOT \
+    fix: an edit of a statement that already ran (IF NOT EXISTS would keep \
+    the old definition, so the runner refuses it); put such a change in a \
+    later statement or a new migration.";
 
 /// One versioned migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,72 +294,28 @@ fn is_word(byte: u8) -> bool {
 /// - `'strings'` with `\'` and `''` escapes,
 /// - `` `quoted` `` and `"quoted"` identifiers (same escapes),
 /// - `-- line comments` (also `#!` and `# `),
-/// - `/* block comments */` (not nested, like ClickHouse),
+/// - `/* block /* comments */ */` (nested, like ClickHouse),
 /// - `$tag$ heredoc strings $tag$`.
 ///
 /// Statements are returned trimmed, without the `;` and without leading
 /// comments; pieces holding only whitespace / comments are dropped.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, SplitError> {
-    // Every delimiter is ASCII, so byte offsets found here are always
-    // UTF-8 boundaries.
-    let bytes = sql.as_bytes();
-    let line_of = |at: usize| {
-        bytes[..at].iter().filter(|&&b| b == b'\n').count() + 1
-    };
-
     let mut statements = Vec::new();
     // Offset of the first code byte of the statement being scanned.
     let mut start: Option<usize> = None;
-    let mut i = 0;
 
-    while i < bytes.len() {
-        let byte = bytes[i];
-        let next = bytes.get(i + 1).copied();
-
-        match byte {
-            b';' => {
+    for (piece, range) in lex(sql)? {
+        match piece {
+            Piece::Separator => {
                 if let Some(from) = start.take() {
-                    statements.push(sql[from..i].trim_end().to_string());
+                    let statement = &sql[from..range.start];
+                    statements.push(statement.trim_end().to_string());
                 }
-                i += 1;
             }
-            b'\'' | b'"' | b'`' => {
-                start.get_or_insert(i);
-                i = skip_quoted(bytes, i).ok_or_else(|| SplitError {
-                    what: match byte {
-                        b'\'' => "string literal",
-                        _ => "quoted identifier",
-                    },
-                    line: line_of(i),
-                })?;
+            Piece::Code | Piece::Quoted => {
+                start.get_or_insert(range.start);
             }
-            b'-' if next == Some(b'-') => i = skip_line(bytes, i),
-            b'#' if matches!(next, Some(b' ' | b'!')) => {
-                i = skip_line(bytes, i)
-            }
-            b'/' if next == Some(b'*') => {
-                i = find(bytes, i + 2, b"*/").ok_or_else(|| {
-                    SplitError { what: "block comment", line: line_of(i) }
-                })?;
-            }
-            b'$' if i == 0
-                || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'$') =>
-            {
-                start.get_or_insert(i);
-                i = match heredoc_tag(bytes, i) {
-                    Some(tag) => find(bytes, i + tag.len(), tag)
-                        .ok_or_else(|| SplitError {
-                            what: "heredoc string",
-                            line: line_of(i),
-                        })?,
-                    None => i + 1,
-                };
-            }
-            _ if byte.is_ascii_whitespace() => i += 1,
-            _ => {
-                start.get_or_insert(i);
-                i += 1;
-            }
+            Piece::Comment | Piece::Space => {}
         }
     }
 
@@ -289,6 +324,121 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, SplitError> {
     }
 
     Ok(statements)
+}
+
+/// What a stretch of a SQL script is, for [`lex`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Piece {
+    /// Keywords, names, numbers, operators.
+    Code,
+    /// String literal, quoted identifier or heredoc, quotes included.
+    Quoted,
+    Comment,
+    /// A `;` outside of everything else.
+    Separator,
+    Space,
+}
+
+/// Cuts a script into [`Piece`]s covering it entirely. Every delimiter is
+/// ASCII, so the ranges always fall on UTF-8 boundaries.
+fn lex(
+    sql: &str,
+) -> Result<Vec<(Piece, std::ops::Range<usize>)>, SplitError> {
+    let bytes = sql.as_bytes();
+    let unterminated = |what: &'static str, at: usize| SplitError {
+        what,
+        line: bytes[..at].iter().filter(|&&b| b == b'\n').count() + 1,
+    };
+
+    let mut pieces: Vec<(Piece, std::ops::Range<usize>)> = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        let next = bytes.get(i + 1).copied();
+
+        let (piece, end) = match byte {
+            b';' => (Piece::Separator, i + 1),
+            b'\'' | b'"' | b'`' => {
+                let what = match byte {
+                    b'\'' => "string literal",
+                    _ => "quoted identifier",
+                };
+                let end = skip_quoted(bytes, i)
+                    .ok_or_else(|| unterminated(what, i))?;
+                (Piece::Quoted, end)
+            }
+            b'-' if next == Some(b'-') => {
+                (Piece::Comment, skip_line(bytes, i))
+            }
+            b'#' if matches!(next, Some(b' ' | b'!')) => {
+                (Piece::Comment, skip_line(bytes, i))
+            }
+            b'/' if next == Some(b'*') => {
+                let end = skip_block_comment(bytes, i)
+                    .ok_or_else(|| unterminated("block comment", i))?;
+                (Piece::Comment, end)
+            }
+            b'$' if i == 0
+                || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'$') =>
+            {
+                match heredoc_tag(bytes, i) {
+                    Some(tag) => {
+                        let end = find(bytes, i + tag.len(), tag)
+                            .ok_or_else(|| {
+                                unterminated("heredoc string", i)
+                            })?;
+                        (Piece::Quoted, end)
+                    }
+                    None => (Piece::Code, i + 1),
+                }
+            }
+            _ if byte.is_ascii_whitespace() => (Piece::Space, i + 1),
+            _ => (Piece::Code, i + 1),
+        };
+
+        match pieces.last_mut() {
+            // Runs of code / space are one piece.
+            Some((last, range))
+                if *last == piece
+                    && matches!(piece, Piece::Code | Piece::Space) =>
+            {
+                range.end = end;
+            }
+            _ => pieces.push((piece, i..end)),
+        }
+
+        i = end;
+    }
+
+    Ok(pieces)
+}
+
+/// `at` is on `/*`; returns the offset after the matching `*/`. Block
+/// comments NEST in ClickHouse (verified on 25.12: `SELECT /* a /* b */ c
+/// */ 1` is valid, `SELECT /* a /* b */ 1` is "comment is not closed").
+fn skip_block_comment(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut i = at;
+
+    while i + 1 < bytes.len() {
+        match (bytes[i], bytes[i + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                i += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    None
 }
 
 /// `at` is on the opening quote; returns the offset after the closing one.
@@ -339,6 +489,156 @@ fn heredoc_tag(bytes: &[u8], at: usize) -> Option<&[u8]> {
 fn escape_placeholders(statement: &str) -> String {
     statement.replace('?', "??")
 }
+
+// ---- idempotency lint ------------------------------------------------------
+
+/// A statement reduced to what the lint looks at: comments removed, every
+/// quoted section replaced by `_`, upper case, single spaces.
+pub fn skeleton(statement: &str) -> Result<String, SplitError> {
+    let mut code = String::new();
+
+    for (piece, range) in lex(statement)? {
+        match piece {
+            Piece::Code => code.push_str(&statement[range]),
+            Piece::Quoted => code.push_str(" _ "),
+            Piece::Comment | Piece::Space | Piece::Separator => {
+                code.push(' ')
+            }
+        }
+    }
+
+    // Parentheses and commas are word boundaries for the lint.
+    let code = code.replace(['(', ')', ','], " ").to_ascii_uppercase();
+
+    Ok(code.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// `ALTER TABLE` clauses that need `IF NOT EXISTS` right after them.
+const ALTER_NEEDS_IF_NOT_EXISTS: [&str; 5] = [
+    "ADD COLUMN",
+    "ADD INDEX",
+    "ADD PROJECTION",
+    "ADD CONSTRAINT",
+    "ADD STATISTICS",
+];
+
+/// `ALTER TABLE` clauses that need `IF EXISTS` right after them.
+const ALTER_NEEDS_IF_EXISTS: [&str; 8] = [
+    "DROP COLUMN",
+    "DROP INDEX",
+    "DROP PROJECTION",
+    "DROP CONSTRAINT",
+    "DROP STATISTICS",
+    "CLEAR COLUMN",
+    "CLEAR INDEX",
+    "RENAME COLUMN",
+];
+
+/// `ALTER TABLE` clauses that are never safe to replay blindly.
+const ALTER_NOT_IDEMPOTENT: [&str; 7] = [
+    "UPDATE",
+    "ATTACH PARTITION",
+    "ATTACH PART",
+    "DETACH PARTITION",
+    "DETACH PART",
+    "MOVE PARTITION",
+    "REPLACE PARTITION",
+];
+
+/// Why replaying `statement` could fail or change the outcome, `None`
+/// when it is idempotent. The runner's failure model (re-run after a
+/// partial failure, several processes racing) REQUIRES idempotent
+/// statements; a unit test holds every embedded migration to it.
+///
+/// Accepted: `CREATE ... IF NOT EXISTS` / `CREATE OR REPLACE`, `DROP` /
+/// `TRUNCATE ... IF EXISTS`, `ALTER TABLE` with `ADD ... IF NOT EXISTS`,
+/// `DROP|CLEAR|RENAME COLUMN ... IF EXISTS`, and every `MODIFY ...`
+/// (`MODIFY SETTING`, `MODIFY COLUMN`, `MODIFY TTL`, ...), `RESET
+/// SETTING`, `COMMENT COLUMN`, `MATERIALIZE ...`, `DELETE WHERE`; plus
+/// statements without lasting effect on the schema (`SELECT`, `SYSTEM`,
+/// `OPTIMIZE`, `GRANT`, `REVOKE`, lightweight `DELETE`).
+///
+/// Refused: plain `INSERT` (seed rows are duplicated by a replay),
+/// `RENAME` / `EXCHANGE`, `ATTACH` / `DETACH`, `ALTER ... UPDATE`,
+/// partition moves, and anything the lint does not know.
+pub fn idempotency_violation(statement: &str) -> Option<String> {
+    let code = match skeleton(statement) {
+        Ok(code) => code,
+        Err(e) => return Some(e.to_string()),
+    };
+    let padded = format!(" {code} ");
+    let first = code.split(' ').next().unwrap_or_default();
+
+    // Every `clause` occurrence must be followed by `guard`.
+    let unguarded = |clause: &str, guard: &str| {
+        padded.match_indices(&format!(" {clause} ")).any(|(at, found)| {
+            !padded[at + found.len()..].starts_with(&format!("{guard} "))
+        })
+    };
+
+    match first {
+        "CREATE" => {
+            let guarded = code.starts_with("CREATE OR REPLACE ")
+                || padded.contains(" IF NOT EXISTS ");
+            (!guarded).then(|| {
+                "CREATE without IF NOT EXISTS (or OR REPLACE)".to_string()
+            })
+        }
+        "DROP" | "TRUNCATE" => (!padded.contains(" IF EXISTS "))
+            .then(|| format!("{first} without IF EXISTS")),
+        "ALTER" => {
+            for clause in ALTER_NEEDS_IF_NOT_EXISTS {
+                if unguarded(clause, "IF NOT EXISTS") {
+                    return Some(format!(
+                        "ALTER ... {clause} without IF NOT EXISTS"
+                    ));
+                }
+            }
+            for clause in ALTER_NEEDS_IF_EXISTS {
+                if unguarded(clause, "IF EXISTS") {
+                    return Some(format!(
+                        "ALTER ... {clause} without IF EXISTS"
+                    ));
+                }
+            }
+            ALTER_NOT_IDEMPOTENT
+                .iter()
+                .find(|clause| padded.contains(&format!(" {clause} ")))
+                .map(|clause| {
+                    format!("ALTER ... {clause} is not idempotent")
+                })
+        }
+        "SELECT" | "WITH" | "SYSTEM" | "OPTIMIZE" | "GRANT" | "REVOKE"
+        | "DELETE" => None,
+        "INSERT" => Some(
+            "INSERT is duplicated by a replay; seed data does not belong \
+             in a migration"
+                .to_string(),
+        ),
+        "RENAME" | "EXCHANGE" | "ATTACH" | "DETACH" => {
+            Some(format!("{first} is not idempotent"))
+        }
+        other => Some(format!(
+            "'{other}' statements are not known to be idempotent"
+        )),
+    }
+}
+
+/// A reviewed exception to [`idempotency_violation`] for one embedded
+/// statement. Adding one is a code review decision: say in `reason` why
+/// replaying the statement (after a partial failure, or by two racing
+/// processes) is harmless.
+#[derive(Debug, Clone, Copy)]
+pub struct IdempotencyException {
+    /// `0004_reorgs_checkpoints`.
+    pub migration: &'static str,
+    /// Start of the statement's [`skeleton`].
+    pub skeleton_starts_with: &'static str,
+    pub reason: &'static str,
+}
+
+/// See [`IdempotencyException`]. Entries that match nothing fail the tests.
+pub const IDEMPOTENCY_EXCEPTIONS: &[IdempotencyException] = &[];
 
 // ---- plan ------------------------------------------------------------------
 
@@ -500,7 +800,127 @@ pub struct Report {
     pub applied: Vec<String>,
     /// Labels another process applied while this run was going.
     pub applied_elsewhere: Vec<String>,
+    /// This run removed the stale lock of a dead process.
+    pub took_over_lock: bool,
 }
+
+/// A row of `schema_migrations_progress`.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Deserialize)]
+pub struct StatementProgress {
+    /// 1-based position in the migration.
+    pub statement: u32,
+    /// [`checksum`] of the statement as it was executed.
+    pub checksum: String,
+}
+
+/// A statement that already ran (in an earlier, failed attempt at its
+/// migration) is not what the file says any more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftError {
+    /// 1-based.
+    pub statement: u32,
+    /// `None`: the file has fewer statements now.
+    pub current: Option<String>,
+}
+
+impl fmt::Display for DriftError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.current {
+            Some(current) => write!(
+                f,
+                "statement {} already ran in an earlier attempt and was \
+                 changed afterwards (now: {current}).",
+                self.statement
+            )?,
+            None => write!(
+                f,
+                "statement {} already ran in an earlier attempt and the \
+                 migration now has fewer statements.",
+                self.statement
+            )?,
+        }
+
+        write!(
+            f,
+            " Running it again would NOT apply the change: IF NOT EXISTS \
+             keeps what the old statement created. Restore the statement \
+             (also its position) and put the change in a later statement \
+             or a new migration."
+        )
+    }
+}
+
+impl std::error::Error for DriftError {}
+
+/// Which statements of a half-applied migration ran already (`true` =
+/// skip). Pure. Statements are identified by position + [`checksum`], so
+/// an edit, a removal, or an insertion in front of an executed statement
+/// is a [`DriftError`]; editing or adding statements AFTER the executed
+/// ones (where the failure was) is what fixing a migration looks like.
+pub fn resume(
+    statements: &[String],
+    progress: &[StatementProgress],
+) -> Result<Vec<bool>, DriftError> {
+    let mut executed = vec![false; statements.len()];
+
+    for row in progress {
+        let index = (row.statement as usize).wrapping_sub(1);
+
+        let Some(statement) = statements.get(index) else {
+            return Err(DriftError {
+                statement: row.statement,
+                current: None,
+            });
+        };
+
+        if checksum(statement) != row.checksum.trim_end_matches('\0') {
+            return Err(DriftError {
+                statement: row.statement,
+                current: Some(excerpt(statement)),
+            });
+        }
+
+        executed[index] = true;
+    }
+
+    Ok(executed)
+}
+
+/// The database holds tables but no migration was ever recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignSchemaError {
+    pub database: String,
+    /// The first few foreign tables.
+    pub tables: Vec<String>,
+}
+
+impl ForeignSchemaError {
+    const SHOWN: usize = 8;
+}
+
+impl fmt::Display for ForeignSchemaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut names = self.tables.clone();
+        let more = names.len() > Self::SHOWN;
+        names.truncate(Self::SHOWN);
+
+        write!(
+            f,
+            "database '{}' already holds tables ({}{}) but no migration \
+             was ever recorded in it: it was not created by this indexer \
+             version (for example a 2.x docker-entrypoint-initdb.d schema). \
+             CREATE ... IF NOT EXISTS would silently keep those tables and \
+             record this schema on top of them. There is no upgrade path \
+             from that schema: point the database url at a new or empty \
+             database, or drop the old one.",
+            self.database,
+            names.join(", "),
+            if more { ", ..." } else { "" }
+        )
+    }
+}
+
+impl std::error::Error for ForeignSchemaError {}
 
 /// `Code: 57. DB::Exception: ...` -> `57`.
 fn parse_error_code(message: &str) -> Option<u32> {
@@ -514,6 +934,88 @@ fn error_code(error: &ClickhouseError) -> Option<u32> {
         ClickhouseError::BadResponse(message) => parse_error_code(message),
         _ => None,
     }
+}
+
+/// Whether ClickHouse puts this statement in place with an atomic
+/// exchange: `CREATE OR REPLACE ...` builds the object under a temporary
+/// name and then EXCHANGEs it with the existing one (`EXCHANGE` does the
+/// swap directly). The exchange is atomic against readers, NOT against a
+/// second process exchanging the same paths: the loser fails with an
+/// errno-based error although its own work was fine.
+///
+/// Comments and quoted text are stripped first, so `-- CREATE OR REPLACE`
+/// above an `ALTER` does not count.
+pub fn replaces_atomically(statement: &str) -> bool {
+    match skeleton(statement) {
+        Ok(code) => {
+            code.starts_with("CREATE OR REPLACE ")
+                || code.starts_with("EXCHANGE ")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether `code` means "another runner was executing this same statement
+/// at the same instant and won", which a retry resolves, rather than
+/// something wrong with the statement.
+///
+/// Deliberately narrow. The path collisions in [`CODES_DDL_RACE`] cannot
+/// be produced by a statement on its own, so they are a race whatever the
+/// statement is. The codes in [`CODES_REPLACE_RACE`] are ordinary errors
+/// in general (an `ALTER` on a missing table is really code 60), so they
+/// only count for a statement that [`replaces_atomically`], where the
+/// runner itself is what makes the target come and go.
+pub fn is_race(replaces_atomically: bool, code: u32) -> bool {
+    CODES_DDL_RACE.contains(&code)
+        || (replaces_atomically && CODES_REPLACE_RACE.contains(&code))
+}
+
+/// Runs `execute` again while it loses a race with a concurrent runner
+/// ([`is_race`]), at most `attempts` times in total, waiting `backoff`
+/// (jittered, doubling) in between. Returns the last result and how many
+/// retries it took.
+///
+/// Statements are idempotent by construction, so repeating one is always
+/// allowed; this only decides how long to keep trying before calling the
+/// failure real.
+async fn with_race_retries<F, Fut>(
+    statement: &str,
+    attempts: u32,
+    backoff: Duration,
+    mut execute: F,
+) -> (Result<(), ClickhouseError>, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ClickhouseError>>,
+{
+    let replaces = replaces_atomically(statement);
+    let mut wait = backoff;
+
+    for retry in 0..attempts.saturating_sub(1) {
+        let error = match execute().await {
+            Ok(()) => return (Ok(()), retry),
+            Err(error) => error,
+        };
+
+        match error_code(&error) {
+            Some(code) if is_race(replaces, code) => {}
+            _ => return (Err(error), retry),
+        }
+
+        if retry == 0 {
+            warn!(
+                "A concurrent indexer is running the same statement; \
+                 retrying up to {} times ({error}). Statement: {}",
+                attempts - 1,
+                excerpt(statement)
+            );
+        }
+
+        tokio::time::sleep(jittered(wait)).await;
+        wait = wait.saturating_mul(2);
+    }
+
+    (execute().await, attempts.saturating_sub(1))
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -541,23 +1043,72 @@ pub struct Migrator {
     server: Client,
     database: String,
     lock_stale: Duration,
+    lock_poll: Duration,
+    race_backoff: Duration,
+}
+
+/// The lock this process holds.
+struct HeldLock {
+    token: String,
+    touched: Instant,
+    beat: u64,
+}
+
+/// `system.tables` view of a lock (or takeover marker) table.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Deserialize)]
+struct LockState {
+    /// Table uuid: tells a re-created lock from the one seen before.
+    id: String,
+    /// Unix time of the last touch.
+    touched: u32,
+    /// Seconds since the last touch, by the server's clock.
+    age: u64,
 }
 
 /// Unique enough to tell lock holders apart in logs and in the lock's
 /// comment.
 fn lock_token() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("pid{}-{:016x}", std::process::id(), random_u64())
+}
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
+/// Good enough for tokens and jitter; no dependency.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
 
-    format!(
-        "pid{}-{nanos:x}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    let mut hasher =
+        std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    hasher.finish()
+}
+
+/// `poll` +-25 %, so 50 waiters do not hit the server in the same instant.
+fn jittered(poll: Duration) -> Duration {
+    let quarter = (poll.as_millis() as u64) / 4;
+    let jitter =
+        if quarter == 0 { 0 } else { random_u64() % (2 * quarter) };
+
+    poll - Duration::from_millis(quarter) + Duration::from_millis(jitter)
+}
+
+/// Name of the table whose creation decides who takes over the stale lock
+/// instance `state`. Distinct per instance, so a marker left behind can
+/// never block the takeover of a later lock.
+fn takeover_marker(state: &LockState) -> String {
+    let id: String =
+        state.id.chars().filter(char::is_ascii_alphanumeric).collect();
+
+    format!("{LOCK_TABLE}_takeover_{id}_{}", state.touched)
+}
+
+fn clickhouse_code(error: &anyhow::Error) -> Option<u32> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ClickhouseError>())
+        .and_then(error_code)
 }
 
 impl Migrator {
@@ -579,6 +1130,8 @@ impl Migrator {
             server,
             database: params.database,
             lock_stale: LOCK_STALE,
+            lock_poll: LOCK_POLL,
+            race_backoff: RACE_BACKOFF,
         })
     }
 
@@ -588,7 +1141,23 @@ impl Migrator {
         self
     }
 
+    /// Overrides [`LOCK_POLL`].
+    pub fn with_lock_poll(mut self, lock_poll: Duration) -> Self {
+        self.lock_poll = lock_poll;
+        self
+    }
+
+    /// Overrides [`RACE_BACKOFF`].
+    pub fn with_race_backoff(mut self, race_backoff: Duration) -> Self {
+        self.race_backoff = race_backoff;
+        self
+    }
+
     /// Waits for the server and reports whether the database exists.
+    ///
+    /// Only failures to REACH the server are retried. Once ClickHouse
+    /// answers that the credentials or the grants are wrong, waiting
+    /// cannot help: that error is returned at once.
     async fn database_exists(&self) -> Result<bool> {
         let mut attempt = 0;
 
@@ -598,14 +1167,22 @@ impl Migrator {
             let error =
                 match self.db.query("SELECT 1").fetch_one::<u8>().await {
                     Ok(_) => return Ok(true),
-                    Err(e)
-                        if error_code(&e)
-                            == Some(CODE_UNKNOWN_DATABASE) =>
-                    {
-                        return Ok(false)
-                    }
                     Err(e) => e,
                 };
+
+            match error_code(&error) {
+                Some(CODE_UNKNOWN_DATABASE) => return Ok(false),
+                Some(code) if CODES_REJECTED.contains(&code) => {
+                    return Err(anyhow!(error).context(format!(
+                        "ClickHouse rejected the connection to database \
+                         '{}' (code {code}): check the user, the password \
+                         and the grants in the database url. Not retried: \
+                         waiting does not fix credentials",
+                        self.database
+                    )));
+                }
+                _ => {}
+            }
 
             if attempt >= CONNECT_ATTEMPTS {
                 return Err(anyhow!(error).context(format!(
@@ -650,10 +1227,12 @@ impl Migrator {
         }
     }
 
-    async fn create_migrations_table(&self) -> Result<()> {
+    /// Creates the bookkeeping tables. Only called when something is
+    /// pending: a start with nothing to do issues no DDL at all.
+    async fn create_bookkeeping(&self) -> Result<()> {
         // No version column: identical records collapse, conflicting
         // checksums for one version both survive and are reported.
-        let statement = format!(
+        let migrations = format!(
             "CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE} (
                 version UInt32,
                 name String,
@@ -663,17 +1242,34 @@ impl Migrator {
             ENGINE = ReplacingMergeTree
             ORDER BY (version, checksum)"
         );
+        // Statements of a migration that is not recorded yet.
+        let progress = format!(
+            "CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} (
+                version UInt32,
+                statement UInt32,
+                checksum String,
+                executed_at DateTime DEFAULT now()
+            )
+            ENGINE = ReplacingMergeTree
+            ORDER BY (version, statement, checksum)"
+        );
 
-        match self.db.query(&statement).execute().await {
-            Ok(()) => Ok(()),
-            Err(e)
-                if error_code(&e) == Some(CODE_TABLE_ALREADY_EXISTS) =>
-            {
-                Ok(())
+        for (table, statement) in
+            [(MIGRATIONS_TABLE, migrations), (PROGRESS_TABLE, progress)]
+        {
+            match self.db.query(&statement).execute().await {
+                Ok(()) => {}
+                Err(e)
+                    if error_code(&e)
+                        == Some(CODE_TABLE_ALREADY_EXISTS) => {}
+                Err(e) => {
+                    return Err(anyhow!(e)
+                        .context(format!("create table {table}")))
+                }
             }
-            Err(e) => Err(anyhow!(e)
-                .context(format!("create table {MIGRATIONS_TABLE}"))),
         }
+
+        Ok(())
     }
 
     /// `None` when the bookkeeping table does not exist.
@@ -692,6 +1288,56 @@ impl Migrator {
                 Err(anyhow!(e).context(format!("read {MIGRATIONS_TABLE}")))
             }
         }
+    }
+
+    /// Executed statements of the not yet recorded migration `version`.
+    /// Empty when the table does not exist.
+    async fn read_progress(
+        &self,
+        version: u32,
+    ) -> Result<Vec<StatementProgress>> {
+        let query = format!(
+            "SELECT statement, checksum FROM {PROGRESS_TABLE} FINAL \
+             WHERE version = {version} ORDER BY statement, checksum"
+        );
+
+        match self.db.query(&query).fetch_all::<StatementProgress>().await
+        {
+            Ok(rows) => Ok(rows),
+            Err(e) if error_code(&e) == Some(CODE_UNKNOWN_TABLE) => {
+                Ok(Vec::new())
+            }
+            Err(e) => {
+                Err(anyhow!(e).context(format!("read {PROGRESS_TABLE}")))
+            }
+        }
+    }
+
+    async fn record_progress(
+        &self,
+        migration: &Migration,
+        statement: usize,
+        text: &str,
+    ) -> Result<()> {
+        let query = format!(
+            "INSERT INTO {PROGRESS_TABLE} (version, statement, checksum, \
+             executed_at) VALUES (?, ?, ?, now())"
+        );
+
+        self.db
+            .query(&query)
+            .bind(migration.version)
+            .bind(statement as u32)
+            .bind(checksum(text))
+            .execute()
+            .await
+            .with_context(|| {
+                format!(
+                    "record statement {statement} of migration {} in \
+                     {PROGRESS_TABLE}",
+                    migration.label()
+                )
+            })
     }
 
     async fn is_recorded(&self, version: u32) -> Result<bool> {
@@ -726,11 +1372,64 @@ impl Migrator {
             .with_context(|| {
                 format!(
                     "migration {} was applied but could not be recorded in \
-                     {MIGRATIONS_TABLE}; it will be applied again on the \
-                     next run, which is safe (idempotent DDL)",
+                     {MIGRATIONS_TABLE}; the next run records it (its \
+                     statements are remembered and not executed again)",
                     migration.label()
                 )
             })
+    }
+
+    /// Tables of the database that are not the runner's own.
+    async fn foreign_tables(&self) -> Result<Vec<String>> {
+        let query = format!(
+            "SELECT name FROM system.tables \
+             WHERE database = currentDatabase() \
+             AND NOT startsWith(name, '{MIGRATIONS_TABLE}') \
+             AND NOT startsWith(name, '.inner') \
+             ORDER BY name LIMIT {}",
+            ForeignSchemaError::SHOWN + 1
+        );
+
+        self.db
+            .query(&query)
+            .fetch_all::<String>()
+            .await
+            .context("list the tables of the database")
+    }
+
+    /// Refuses a database that holds tables although `schema_migrations`
+    /// does not exist: `IF NOT EXISTS` would "apply" everything on top of
+    /// whatever those tables are (e.g. a 2.x initdb schema).
+    ///
+    /// Only called when [`read_applied`](Self::read_applied) just reported
+    /// the bookkeeping table absent, which is the race-free signal: a
+    /// runner creates `schema_migrations` BEFORE the first statement of
+    /// the first migration, so "tables but no `schema_migrations`" can
+    /// never be a migration of ours in flight. (Testing for "no recorded
+    /// migration" instead would misfire on a concurrent runner that has
+    /// created a table but not recorded it yet.)
+    async fn refuse_foreign_schema(&self) -> Result<()> {
+        let tables = self.foreign_tables().await?;
+
+        if tables.is_empty() {
+            return Ok(());
+        }
+
+        Err(ForeignSchemaError { database: self.database.clone(), tables }
+            .into())
+    }
+
+    /// Migrations recorded in the database, refusing a foreign schema.
+    /// Empty both when nothing was applied and when the bookkeeping table
+    /// does not exist yet.
+    async fn read_applied_checked(&self) -> Result<Vec<AppliedMigration>> {
+        match self.read_applied().await? {
+            Some(rows) => Ok(rows),
+            None => {
+                self.refuse_foreign_schema().await?;
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// What [`apply`](Self::apply) would do. Creates nothing.
@@ -743,7 +1442,7 @@ impl Migrator {
         let database_exists = self.database_exists().await?;
 
         let applied = if database_exists {
-            self.read_applied().await?.unwrap_or_default()
+            self.read_applied_checked().await?
         } else {
             Vec::new()
         };
@@ -758,16 +1457,21 @@ impl Migrator {
     }
 
     /// Brings the database up to date with `migrations`.
+    ///
+    /// When nothing is pending this only READS (`SELECT` on
+    /// `schema_migrations`): a least-privilege indexer user starts fine on
+    /// a schema an admin applied with `indexer migrate`.
     pub async fn apply(&self, migrations: &[Migration]) -> Result<Report> {
         validate(migrations)?;
 
-        if !self.database_exists().await? {
-            self.create_database().await?;
-        }
+        let database_exists = self.database_exists().await?;
 
-        self.create_migrations_table().await?;
+        let applied = if database_exists {
+            self.read_applied_checked().await?
+        } else {
+            Vec::new()
+        };
 
-        let applied = self.read_applied().await?.unwrap_or_default();
         let first = plan(migrations, &applied)?;
 
         for warning in &first.warnings {
@@ -791,29 +1495,73 @@ impl Migrator {
             self.database
         );
 
-        let lock = self.acquire_lock(migrations).await?;
-
         let result = self
-            .apply_pending(
+            .apply_locked(
                 migrations,
                 &first.pending,
-                lock.as_deref(),
+                database_exists,
                 &mut report,
             )
             .await;
 
-        if let Some(token) = &lock {
-            self.release_lock(token).await;
+        match result {
+            Ok(()) => Ok(report),
+            Err(e)
+                if clickhouse_code(&e)
+                    .is_some_and(|code| CODES_DENIED.contains(&code)) =>
+            {
+                let pending: Vec<String> =
+                    first.pending.iter().map(|m| m.label()).collect();
+
+                Err(e.context(format!(
+                    "{} migration(s) are pending ({}) but the database \
+                     user is not allowed to apply them. Either run \
+                     `indexer migrate` once with a user that may CREATE / \
+                     ALTER / DROP tables and views and INSERT in database \
+                     '{}' (the indexer then starts with its restricted \
+                     user, it only reads {MIGRATIONS_TABLE}), or grant \
+                     those rights to the indexer's user",
+                    pending.len(),
+                    pending.join(", "),
+                    self.database
+                )))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Everything that writes.
+    async fn apply_locked(
+        &self,
+        migrations: &[Migration],
+        pending: &[&Migration],
+        database_exists: bool,
+        report: &mut Report,
+    ) -> Result<()> {
+        if !database_exists {
+            self.create_database().await?;
         }
 
-        result.map(|()| report)
+        self.create_bookkeeping().await?;
+
+        let mut lock = self.acquire_lock(migrations, report).await?;
+
+        let result = self
+            .apply_pending(migrations, pending, lock.as_mut(), report)
+            .await;
+
+        if let Some(lock) = &lock {
+            self.release_lock(lock).await;
+        }
+
+        result
     }
 
     async fn apply_pending(
         &self,
         migrations: &[Migration],
         pending: &[&Migration],
-        lock: Option<&str>,
+        mut lock: Option<&mut HeldLock>,
         report: &mut Report,
     ) -> Result<()> {
         for &migration in pending {
@@ -825,7 +1573,9 @@ impl Migrator {
 
             let done =
                 applied.iter().any(|r| r.version == migration.version)
-                    || !self.run_statements(migration, lock).await?;
+                    || !self
+                        .run_statements(migration, lock.as_deref_mut())
+                        .await?;
 
             if done {
                 info!(
@@ -844,38 +1594,85 @@ impl Migrator {
         Ok(())
     }
 
+    async fn lock_state(&self, table: &str) -> Result<Option<LockState>> {
+        let query = format!(
+            "SELECT toString(uuid) AS id, \
+             toUnixTimestamp(metadata_modification_time) AS touched, \
+             toUInt64(greatest(now() - metadata_modification_time, 0)) \
+             AS age \
+             FROM system.tables \
+             WHERE database = currentDatabase() AND name = '{table}'"
+        );
+
+        self.db
+            .query(&query)
+            .fetch_optional::<LockState>()
+            .await
+            .context("read the migration lock")
+    }
+
+    /// `Ok(false)`: the table exists already (somebody else won).
+    async fn create_lock_table(
+        &self,
+        table: &str,
+        token: &str,
+    ) -> Result<bool> {
+        // Memory engine: no data directory, the table is only a name.
+        let create = format!(
+            "CREATE TABLE {table} (holder String) ENGINE = Memory \
+             COMMENT '{token}'"
+        );
+
+        match self.db.query(&create).execute().await {
+            Ok(()) => Ok(true),
+            Err(e)
+                if error_code(&e) == Some(CODE_TABLE_ALREADY_EXISTS) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(anyhow!(e).context("take the migration lock")),
+        }
+    }
+
+    async fn drop_lock_table(&self, table: &str) {
+        let drop = format!("DROP TABLE IF EXISTS {table} SYNC");
+
+        if let Err(e) = self.db.query(&drop).execute().await {
+            warn!(
+                "Could not drop the migration lock table {table} ({e}); \
+                 it is taken over after {:?}.",
+                self.lock_stale
+            );
+        }
+    }
+
     /// Takes the best-effort lock. `None`: nothing is pending any more
     /// (another process finished while this one waited), no lock held.
+    ///
+    /// Waiting costs the server two small `SELECT`s per poll. A `CREATE`
+    /// is only attempted when the lock is absent, so waiters do not flood
+    /// the server (and its log) with failing DDL.
     async fn acquire_lock(
         &self,
         migrations: &[Migration],
-    ) -> Result<Option<String>> {
+        report: &mut Report,
+    ) -> Result<Option<HeldLock>> {
         let token = lock_token();
-        // Memory engine: no data directory, the table is only a name.
-        let create = format!(
-            "CREATE TABLE {LOCK_TABLE} (holder String) ENGINE = Memory \
-             COMMENT '{token}'"
-        );
-        let age = format!(
-            "SELECT toUInt64(greatest(now() - metadata_modification_time, \
-             0)) FROM system.tables WHERE database = currentDatabase() \
-             AND name = '{LOCK_TABLE}'"
-        );
-
         let mut announced = false;
 
         loop {
-            match self.db.query(&create).execute().await {
-                Ok(()) => return Ok(Some(token)),
-                Err(e)
-                    if error_code(&e)
-                        == Some(CODE_TABLE_ALREADY_EXISTS) => {}
-                Err(e) => {
-                    return Err(
-                        anyhow!(e).context("take the migration lock")
-                    )
+            let Some(state) = self.lock_state(LOCK_TABLE).await? else {
+                if self.create_lock_table(LOCK_TABLE, &token).await? {
+                    return Ok(Some(HeldLock {
+                        token,
+                        touched: Instant::now(),
+                        beat: 0,
+                    }));
                 }
-            }
+
+                // Lost the race for a free lock: wait for the winner.
+                continue;
+            };
 
             // Somebody else is migrating. Maybe they are done already.
             let applied = self.read_applied().await?.unwrap_or_default();
@@ -891,61 +1688,125 @@ impl Migrator {
                 announced = true;
             }
 
-            let age = self
-                .db
-                .query(&age)
-                .fetch_optional::<u64>()
-                .await
-                .context("read the migration lock")?;
-
-            match age {
-                // Released in the meantime: try again right away.
-                None => continue,
-                Some(age) if age >= self.lock_stale.as_secs() => {
-                    warn!(
-                        "The migration lock was not touched for {age}s: \
-                         its holder is gone. Taking over."
-                    );
-                    self.drop_lock().await;
-                }
-                Some(_) => tokio::time::sleep(LOCK_POLL).await,
+            if state.age < self.lock_stale.as_secs() {
+                tokio::time::sleep(jittered(self.lock_poll)).await;
+                continue;
             }
+
+            if self.take_over(&state, &token).await? {
+                report.took_over_lock = true;
+                // Straight to the CREATE: the others are still asleep.
+                continue;
+            }
+
+            tokio::time::sleep(jittered(self.lock_poll)).await;
         }
     }
 
-    /// Keeps a held lock from looking stale. Best effort.
-    async fn touch_lock(&self, token: &str, beat: usize) {
+    /// Removes the stale lock instance `state`. `Ok(true)`: this process
+    /// did it.
+    ///
+    /// Every waiter sees the lock go stale within the same poll, so "drop
+    /// it and create a new one" would let a late dropper delete the fresh
+    /// lock of an early one. Instead the right to remove THIS instance is
+    /// itself decided by an atomic table creation: the marker's name is
+    /// derived from the instance (uuid + last touch), exactly one process
+    /// creates it, and only that process drops the lock. (A `RENAME` of
+    /// the lock is atomic too, but a late renamer would grab the fresh
+    /// lock just the same: what has to be atomic is the pairing of "this
+    /// instance is stale" with "I remove it".)
+    async fn take_over(
+        &self,
+        state: &LockState,
+        token: &str,
+    ) -> Result<bool> {
+        let marker = takeover_marker(state);
+
+        if !self.create_lock_table(&marker, token).await? {
+            // Another waiter is on it. Unless it died right there: then
+            // the marker goes stale too and is simply removed, the next
+            // round decides again.
+            if let Some(marker_state) = self.lock_state(&marker).await? {
+                if marker_state.age >= self.lock_stale.as_secs().max(1) * 2
+                {
+                    warn!(
+                        "The lock takeover marker {marker} was abandoned; \
+                         removing it."
+                    );
+                    self.drop_lock_table(&marker).await;
+                }
+            }
+
+            return Ok(false);
+        }
+
+        // The holder may have been slow, not dead: only an untouched,
+        // same instance is removed.
+        let unchanged =
+            self.lock_state(LOCK_TABLE).await?.is_some_and(|now| {
+                now.id == state.id && now.touched == state.touched
+            });
+
+        if unchanged {
+            warn!(
+                "The migration lock was not touched for {}s: its holder is \
+                 gone. Taking over.",
+                state.age
+            );
+            self.drop_lock_table(LOCK_TABLE).await;
+        }
+
+        self.drop_lock_table(&marker).await;
+
+        Ok(unchanged)
+    }
+
+    /// Keeps a held lock from looking stale. Best effort, and only as
+    /// often as needed.
+    async fn touch_lock(&self, lock: &mut HeldLock) {
+        if lock.touched.elapsed() < self.lock_stale / 4 {
+            return;
+        }
+
+        lock.beat += 1;
+        lock.touched = Instant::now();
+
         // The comment has to change for the metadata time to move.
         let touch = format!(
-            "ALTER TABLE {LOCK_TABLE} MODIFY COMMENT '{token} {beat}'"
+            "ALTER TABLE {LOCK_TABLE} MODIFY COMMENT '{} {}'",
+            lock.token, lock.beat
         );
 
-        // Failing means the lock was taken over; the takeover is safe
-        // (idempotent DDL), so there is nothing to do about it.
+        // Failing means the lock was taken over; that is safe (idempotent
+        // DDL), so there is nothing to do about it.
         let _ = self.db.query(&touch).execute().await;
     }
 
-    async fn drop_lock(&self) {
-        let drop = format!("DROP TABLE IF EXISTS {LOCK_TABLE} SYNC");
-
-        if let Err(e) = self.db.query(&drop).execute().await {
-            warn!(
-                "Could not drop the migration lock table {LOCK_TABLE} \
-                 ({e}); other processes take it over after {:?}.",
-                self.lock_stale
-            );
-        }
-    }
-
     /// Drops the lock if it is still ours (it is not after a takeover).
-    async fn release_lock(&self, token: &str) {
+    ///
+    /// Fails CLOSED: when the check itself fails we do not know whose lock
+    /// is there, and dropping it could remove the fresh lock of the runner
+    /// that took over from us. Leaving it costs at most [`LOCK_STALE`],
+    /// after which it is taken over like any abandoned lock.
+    async fn release_lock(&self, lock: &HeldLock) {
         let holder = format!(
-            "SELECT comment FROM system.tables WHERE database =              currentDatabase() AND name = '{LOCK_TABLE}'"
+            "SELECT comment FROM system.tables WHERE database = \
+             currentDatabase() AND name = '{LOCK_TABLE}'"
         );
 
         match self.db.query(&holder).fetch_optional::<String>().await {
-            Ok(Some(comment)) if !comment.starts_with(token) => {}
-            _ => self.drop_lock().await,
+            // Ours: drop it so the next runner starts at once.
+            Ok(Some(comment)) if comment.starts_with(&lock.token) => {
+                self.drop_lock_table(LOCK_TABLE).await;
+            }
+            // Somebody else's (we were taken over), or already gone.
+            Ok(_) => {}
+            Err(e) => warn!(
+                "Could not tell whether the migration lock is still ours \
+                 ({e}); leaving it alone rather than risk dropping another \
+                 runner's lock. It is taken over after {:?}.",
+                self.lock_stale
+            ),
         }
     }
 
@@ -955,26 +1816,70 @@ impl Migrator {
     async fn run_statements(
         &self,
         migration: &Migration,
-        lock: Option<&str>,
+        mut lock: Option<&mut HeldLock>,
     ) -> Result<bool> {
         let statements = split_statements(&migration.sql)
             .with_context(|| format!("migration {}", migration.label()))?;
         let total = statements.len();
 
+        // Statements an earlier, failed run went through already.
+        let progress = self.read_progress(migration.version).await?;
+        let executed =
+            resume(&statements, &progress).map_err(|drift| {
+                anyhow!(drift).context(format!(
+                    "migration {} was half applied by an earlier run and \
+                     edited since (to start it over instead: undo by hand \
+                     what its statements created, then `DELETE FROM \
+                     {PROGRESS_TABLE} WHERE version = {}`)",
+                    migration.label(),
+                    migration.version
+                ))
+            })?;
+
+        let skipped = executed.iter().filter(|&&done| done).count();
+        if skipped > 0 {
+            info!(
+                "Resuming migration {}: {skipped} of {total} statement(s) \
+                 ran in an earlier attempt.",
+                migration.label()
+            );
+        }
+
         for (index, statement) in statements.iter().enumerate() {
+            if executed[index] {
+                continue;
+            }
+
             if index > 0 && self.is_recorded(migration.version).await? {
                 return Ok(false);
             }
 
-            if let Some(token) = lock {
-                self.touch_lock(token, index).await;
+            if let Some(lock) = lock.as_deref_mut() {
+                self.touch_lock(lock).await;
             }
 
-            let result = self
-                .db
-                .query(&escape_placeholders(statement))
-                .execute()
-                .await;
+            // Two runners inside the same migration execute the same
+            // statement. Idempotent DDL makes the second one a no-op, but
+            // ClickHouse can still fail it on the way there (an atomic
+            // replace whose paths the winner already moved, a store
+            // directory the winner already made). Those are retried.
+            let query = escape_placeholders(statement);
+            let (result, retries) = with_race_retries(
+                statement,
+                RACE_ATTEMPTS,
+                self.race_backoff,
+                || self.db.query(&query).execute(),
+            )
+            .await;
+
+            if retries > 0 && result.is_ok() {
+                info!(
+                    "Migration {} statement {}/{total} went through after \
+                     {retries} retry/retries.",
+                    migration.label(),
+                    index + 1
+                );
+            }
 
             match result {
                 Ok(()) => {}
@@ -1007,6 +1912,8 @@ impl Migrator {
                     )));
                 }
             }
+
+            self.record_progress(migration, index + 1, statement).await?;
         }
 
         Ok(true)
@@ -1029,6 +1936,7 @@ pub async fn status(database_url: &str) -> Result<Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::Cell, rc::Rc};
 
     fn split(sql: &str) -> Vec<String> {
         split_statements(sql).unwrap()
@@ -1166,12 +2074,27 @@ mod tests {
     }
 
     #[test]
-    fn block_comments_do_not_nest() {
-        // Like ClickHouse: the first `*/` closes the comment.
+    fn block_comments_nest() {
+        // Like ClickHouse 25.12: `SELECT /* a /* b */ c */ 1` returns 1 and
+        // `SELECT /* a /* b */ 1` is "Multiline comment is not closed".
         assert_eq!(
-            split("/* a /* b */ SELECT 1; SELECT 2"),
+            split("SELECT /* a; /* b; */ c; */ 1; SELECT 2"),
+            ["SELECT /* a; /* b; */ c; */ 1", "SELECT 2"]
+        );
+        assert_eq!(
+            split("/* x /* y /* z */ ; */ ; */ SELECT 1; SELECT 2"),
             ["SELECT 1", "SELECT 2"]
         );
+        assert_eq!(
+            split_statements("/* a /* b */ SELECT 1; SELECT 2"),
+            Err(SplitError { what: "block comment", line: 1 })
+        );
+        assert_eq!(
+            split_statements("SELECT 1;\n/* a /* b */ c"),
+            Err(SplitError { what: "block comment", line: 2 })
+        );
+        // A quote inside a nested comment stays inert.
+        assert_eq!(split("/* a /* ' */ ' */ SELECT 1;"), ["SELECT 1"]);
     }
 
     #[test]
@@ -1299,6 +2222,157 @@ FROM transactions;
             escape_placeholders("SELECT a ? 'x?' : 'y'"),
             "SELECT a ?? 'x??' : 'y'"
         );
+    }
+
+    // ---- idempotency lint ----
+
+    #[test]
+    fn skeleton_drops_comments_and_quoted_text() {
+        assert_eq!(
+            skeleton(
+                "create table /* c */ if not exists `my table` (\n  a \
+                 String DEFAULT 'INSERT; x' -- DROP\n)"
+            )
+            .unwrap(),
+            "CREATE TABLE IF NOT EXISTS _ A STRING DEFAULT _"
+        );
+        assert!(skeleton("SELECT 'oops").is_err());
+    }
+
+    #[test]
+    fn lint_accepts_idempotent_statements() {
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS t (a UInt8) ENGINE = Memory",
+            "create table if not exists t (a UInt8) ENGINE = Memory",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t AS SELECT 1",
+            "CREATE VIEW IF NOT EXISTS v AS SELECT 1",
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "CREATE OR REPLACE FUNCTION f AS (x) -> x",
+            "CREATE DICTIONARY IF NOT EXISTS d (a UInt8) PRIMARY KEY a",
+            "CREATE DATABASE IF NOT EXISTS x",
+            "DROP TABLE IF EXISTS t",
+            "DROP VIEW IF EXISTS v SYNC",
+            "TRUNCATE TABLE IF EXISTS t",
+            // The pipeline's 0090_dedup_windows.
+            "ALTER TABLE blocks MODIFY SETTING \
+             non_replicated_deduplication_window = 10000",
+            "ALTER TABLE t RESET SETTING non_replicated_deduplication_window",
+            "ALTER TABLE t MODIFY COLUMN a UInt64 CODEC(ZSTD(3))",
+            "ALTER TABLE t MODIFY TTL ts + INTERVAL 1 DAY",
+            "ALTER TABLE t MODIFY COMMENT 'x'",
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS b UInt8, \
+             ADD COLUMN IF NOT EXISTS c UInt8 AFTER b",
+            "ALTER TABLE t ADD INDEX IF NOT EXISTS i a TYPE minmax",
+            "ALTER TABLE t DROP COLUMN IF EXISTS b",
+            "ALTER TABLE t RENAME COLUMN IF EXISTS b TO c",
+            "ALTER TABLE t MATERIALIZE INDEX i",
+            "ALTER TABLE t DELETE WHERE a = 1",
+            "ALTER TABLE t COMMENT COLUMN IF EXISTS a 'ADD COLUMN x'",
+            "SELECT 1",
+            "SYSTEM RELOAD DICTIONARIES",
+            "OPTIMIZE TABLE t FINAL",
+            "GRANT SELECT ON t TO reader",
+            "DELETE FROM t WHERE a = 1",
+            // Scary words inside comments / strings / identifiers.
+            "CREATE TABLE IF NOT EXISTS t (\n  a UInt8 COMMENT 'INSERT \
+             INTO x', -- DROP TABLE y\n  `RENAME` UInt8\n) ENGINE = Memory",
+        ] {
+            assert_eq!(idempotency_violation(statement), None, "{statement}");
+        }
+    }
+
+    #[test]
+    fn lint_refuses_non_idempotent_statements() {
+        for (statement, why) in [
+            ("CREATE TABLE t (a UInt8) ENGINE = Memory", "IF NOT EXISTS"),
+            ("CREATE VIEW v AS SELECT 1", "IF NOT EXISTS"),
+            ("CREATE MATERIALIZED VIEW mv TO t AS SELECT 1", "IF NOT EXISTS"),
+            // The guard must be code, not a comment or a string.
+            (
+                "CREATE TABLE /* IF NOT EXISTS */ t (a UInt8) ENGINE = Memory",
+                "IF NOT EXISTS",
+            ),
+            ("DROP TABLE t", "IF EXISTS"),
+            ("TRUNCATE TABLE t", "IF EXISTS"),
+            ("INSERT INTO t VALUES (1)", "INSERT"),
+            ("insert into t select 1", "INSERT"),
+            ("ALTER TABLE t ADD COLUMN b UInt8", "ADD COLUMN"),
+            (
+                "ALTER TABLE t ADD COLUMN IF NOT EXISTS b UInt8, \
+                 ADD COLUMN c UInt8",
+                "ADD COLUMN",
+            ),
+            ("ALTER TABLE t ADD INDEX i a TYPE minmax", "ADD INDEX"),
+            ("ALTER TABLE t DROP COLUMN b", "DROP COLUMN"),
+            ("ALTER TABLE t RENAME COLUMN b TO c", "RENAME COLUMN"),
+            ("ALTER TABLE t UPDATE a = a + 1 WHERE 1", "UPDATE"),
+            ("ALTER TABLE t ATTACH PARTITION 1 FROM u", "ATTACH PARTITION"),
+            ("RENAME TABLE a TO b", "RENAME"),
+            ("EXCHANGE TABLES a AND b", "EXCHANGE"),
+            ("DETACH TABLE a", "DETACH"),
+            ("USE other", "USE"),
+            ("SELECT 'oops", "unterminated"),
+        ] {
+            let violation = idempotency_violation(statement)
+                .unwrap_or_else(|| panic!("accepted: {statement}"));
+            assert!(violation.contains(why), "{statement}: {violation}");
+        }
+    }
+
+    /// Correctness of the runner (re-run after a partial failure, racing
+    /// processes, lock takeover) rests on this.
+    #[test]
+    fn embedded_migrations_are_idempotent() {
+        let mut used = vec![false; IDEMPOTENCY_EXCEPTIONS.len()];
+        let mut violations = Vec::new();
+
+        for migration in embedded().unwrap() {
+            let statements = split_statements(&migration.sql).unwrap();
+
+            for (index, statement) in statements.iter().enumerate() {
+                let Some(violation) = idempotency_violation(statement)
+                else {
+                    continue;
+                };
+
+                let code = skeleton(statement).unwrap();
+                let exception =
+                    IDEMPOTENCY_EXCEPTIONS.iter().position(|e| {
+                        e.migration == migration.label()
+                            && code.starts_with(e.skeleton_starts_with)
+                    });
+
+                match exception {
+                    Some(at) => used[at] = true,
+                    None => violations.push(format!(
+                        "{} statement {}: {violation}: {}",
+                        migration.label(),
+                        index + 1,
+                        excerpt(statement)
+                    )),
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "non-idempotent statements in embedded migrations (fix them, \
+             or add a reviewed IDEMPOTENCY_EXCEPTIONS entry):\n{}",
+            violations.join("\n")
+        );
+
+        for (exception, used) in IDEMPOTENCY_EXCEPTIONS.iter().zip(used) {
+            assert!(
+                used,
+                "stale idempotency exception (matches nothing): \
+                 {exception:?}"
+            );
+            assert!(
+                exception.reason.len() >= 20
+                    && !exception.skeleton_starts_with.is_empty(),
+                "exception without a real reason / pattern: {exception:?}"
+            );
+        }
     }
 
     // ---- file names (shared with build.rs) ----
@@ -1637,6 +2711,356 @@ FROM transactions;
         assert!(plan(&migrations, &rows).is_ok());
     }
 
+    // ---- resume (half-applied migrations) ----
+
+    fn statements(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn progress_of(list: &[&str]) -> Vec<StatementProgress> {
+        list.iter()
+            .enumerate()
+            .map(|(index, statement)| StatementProgress {
+                statement: index as u32 + 1,
+                checksum: checksum(statement),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resume_without_progress_runs_everything() {
+        assert_eq!(
+            resume(&statements(&["A", "B"]), &[]),
+            Ok(vec![false, false])
+        );
+        assert_eq!(resume(&[], &[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn resume_skips_what_ran_and_allows_fixing_the_rest() {
+        // A and B ran, C failed. C is fixed, D is added.
+        let progress = progress_of(&["A", "B"]);
+
+        assert_eq!(
+            resume(&statements(&["A", "B", "C fixed", "D"]), &progress),
+            Ok(vec![true, true, false, false])
+        );
+        // Duplicate rows (two racing runners) are fine.
+        let mut doubled = progress.clone();
+        doubled.extend(progress.clone());
+        assert_eq!(
+            resume(&statements(&["A", "B", "C"]), &doubled),
+            Ok(vec![true, true, false])
+        );
+    }
+
+    #[test]
+    fn resume_refuses_an_edited_executed_statement() {
+        let progress = progress_of(&["A", "B"]);
+
+        let error =
+            resume(&statements(&["A", "B edited", "C"]), &progress)
+                .unwrap_err();
+        assert_eq!(
+            error,
+            DriftError { statement: 2, current: Some("B edited".into()) }
+        );
+        let text = error.to_string();
+        assert!(text.contains("statement 2 already ran"), "{text}");
+        assert!(text.contains("would NOT apply the change"), "{text}");
+    }
+
+    #[test]
+    fn resume_refuses_insertions_and_removals_before_executed_ones() {
+        let progress = progress_of(&["A", "B"]);
+
+        // Inserted in front: positions shift.
+        assert!(matches!(
+            resume(&statements(&["NEW", "A", "B"]), &progress),
+            Err(DriftError { statement: 1, current: Some(_) })
+        ));
+        // Removed.
+        assert_eq!(
+            resume(&statements(&["A"]), &progress),
+            Err(DriftError { statement: 2, current: None })
+        );
+        // Conflicting rows for one statement (two different binaries).
+        let mut conflicting = progress.clone();
+        conflicting.push(StatementProgress {
+            statement: 1,
+            checksum: checksum("other"),
+        });
+        assert!(resume(&statements(&["A", "B"]), &conflicting).is_err());
+        // Garbage position.
+        assert!(resume(
+            &statements(&["A"]),
+            &[StatementProgress { statement: 0, checksum: checksum("A") }]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn foreign_schema_error_names_the_tables() {
+        let error = ForeignSchemaError {
+            database: "indexer".into(),
+            tables: (0..9).map(|n| format!("t{n}")).collect(),
+        };
+        let text = error.to_string();
+
+        assert!(text.contains("database 'indexer'"), "{text}");
+        assert!(text.contains("t0, t1"), "{text}");
+        assert!(text.contains("t7, ..."), "{text}");
+        assert!(!text.contains("t8"), "{text}");
+        assert!(text.contains("no upgrade path"), "{text}");
+    }
+
+    // ---- lock helpers ----
+
+    #[test]
+    fn takeover_marker_is_a_plain_identifier_unique_per_lock_instance() {
+        let state = |id: &str, touched| LockState {
+            id: id.into(),
+            touched,
+            age: 99,
+        };
+        let a =
+            state("3f2b6c1e-0000-4000-8000-0123456789ab", 1_700_000_000);
+
+        let marker = takeover_marker(&a);
+        assert_eq!(
+            marker,
+            "schema_migrations_lock_takeover_\
+             3f2b6c1e0000400080000123456789ab_1700000000"
+        );
+        assert!(marker.bytes().all(is_word));
+        // The bookkeeping prefix keeps it out of the foreign schema check.
+        assert!(marker.starts_with(MIGRATIONS_TABLE));
+        assert!(LOCK_TABLE.starts_with(MIGRATIONS_TABLE));
+        assert!(PROGRESS_TABLE.starts_with(MIGRATIONS_TABLE));
+
+        // Same instance seen by every waiter: same marker.
+        assert_eq!(
+            marker,
+            takeover_marker(&LockState { age: 61, ..a.clone() })
+        );
+        // A re-created or touched lock is another instance.
+        assert_ne!(
+            marker,
+            takeover_marker(&state(
+                "99999999-0000-4000-8000-0123456789ab",
+                1_700_000_000
+            ))
+        );
+        assert_ne!(marker, takeover_marker(&state(&a.id, 1_700_000_001)));
+    }
+
+    #[test]
+    fn poll_jitter_stays_within_a_quarter() {
+        let poll = Duration::from_millis(1000);
+        let mut distinct = std::collections::BTreeSet::new();
+
+        for _ in 0..200 {
+            let wait = jittered(poll);
+            assert!(wait >= Duration::from_millis(750), "{wait:?}");
+            assert!(wait < Duration::from_millis(1250), "{wait:?}");
+            distinct.insert(wait);
+        }
+        assert!(distinct.len() > 20);
+
+        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            jittered(Duration::from_millis(3)),
+            Duration::from_millis(3)
+        );
+    }
+
+    #[test]
+    fn rejected_and_denied_codes() {
+        // Wrong password / denied database are never retried.
+        assert!(CODES_REJECTED.contains(&516));
+        assert!(CODES_REJECTED.contains(&497));
+        // A missing database or table is part of the normal flow.
+        assert!(!CODES_REJECTED.contains(&CODE_UNKNOWN_DATABASE));
+        assert!(!CODES_REJECTED.contains(&CODE_UNKNOWN_TABLE));
+        assert!(CODES_DENIED.contains(&164));
+    }
+
+    // ---- lost races with a concurrent runner ----
+
+    #[test]
+    fn atomic_replacements_are_recognised() {
+        for statement in [
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "create or replace table t (a UInt8) ENGINE = Memory",
+            "CREATE OR REPLACE DICTIONARY d (a UInt8) PRIMARY KEY a",
+            "/* c */ -- x\nCREATE OR REPLACE FUNCTION f AS (x) -> x",
+            "EXCHANGE TABLES a AND b",
+        ] {
+            assert!(replaces_atomically(statement), "{statement}");
+        }
+
+        for statement in [
+            "CREATE VIEW IF NOT EXISTS v AS SELECT 1",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t AS SELECT 1",
+            "CREATE TABLE IF NOT EXISTS t (a UInt8) ENGINE = Memory",
+            "DROP TABLE IF EXISTS t",
+            // The words only count as code, not as comment or string.
+            "-- CREATE OR REPLACE VIEW v\nALTER TABLE t MODIFY TTL d",
+            "INSERT INTO t VALUES ('CREATE OR REPLACE VIEW v')",
+            "SELECT 'unterminated",
+        ] {
+            assert!(!replaces_atomically(statement), "{statement}");
+        }
+    }
+
+    #[test]
+    fn race_codes_are_classified_per_statement_kind() {
+        // Store-path collisions are a race whatever the statement is.
+        for code in CODES_DDL_RACE {
+            assert!(is_race(false, code), "{code}");
+            assert!(is_race(true, code), "{code}");
+        }
+        assert!(is_race(false, 521), "the code CI hit");
+
+        // The ambiguous ones only count for an atomic replacement: an
+        // ALTER on a table that really is missing must fail, not spin.
+        for code in CODES_REPLACE_RACE {
+            assert!(is_race(true, code), "{code}");
+            assert!(!is_race(false, code), "{code}");
+        }
+        assert!(!is_race(false, CODE_UNKNOWN_TABLE));
+
+        // Never a race: a broken statement, or a refused user.
+        for code in [50, 62, too_denied(), 516, 497] {
+            assert!(!is_race(true, code), "{code}");
+            assert!(!is_race(false, code), "{code}");
+        }
+    }
+
+    /// READONLY: retrying it would hide finding 14's error message.
+    fn too_denied() -> u32 {
+        164
+    }
+
+    /// Error as the client reports one from the server.
+    fn server_error(code: u32, text: &str) -> ClickhouseError {
+        ClickhouseError::BadResponse(format!(
+            "Code: {code}. DB::Exception: {text} (version 25.12.1.322)"
+        ))
+    }
+
+    /// The exact failure CI saw on Linux/ClickHouse 25.8; it cannot be
+    /// reproduced on macOS/APFS, so the loop is tested against it here.
+    fn exchange_race() -> ClickhouseError {
+        server_error(
+            521,
+            "DB::ErrnoException: Paths cannot be exchanged because \
+             /var/lib/clickhouse/store/abc/... does not exist",
+        )
+    }
+
+    /// Counts calls and fails the first `failures` of them with `error`.
+    fn flaky(
+        failures: usize,
+        error: impl Fn() -> ClickhouseError,
+    ) -> (impl Fn() -> Result<(), ClickhouseError>, Rc<Cell<usize>>) {
+        let calls = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&calls);
+
+        let run = move || {
+            let call = seen.get();
+            seen.set(call + 1);
+            if call < failures {
+                Err(error())
+            } else {
+                Ok(())
+            }
+        };
+
+        (run, calls)
+    }
+
+    /// No real waiting in the tests.
+    const QUICK: Duration = Duration::from_millis(1);
+
+    #[tokio::test]
+    async fn a_lost_exchange_race_is_retried_until_it_goes_through() {
+        let statement = "CREATE OR REPLACE VIEW v AS SELECT 1";
+        let (run, calls) = flaky(3, exchange_race);
+
+        let (result, retries) =
+            with_race_retries(statement, RACE_ATTEMPTS, QUICK, || {
+                std::future::ready(run())
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(retries, 3);
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_race_that_never_clears_fails_with_the_server_error() {
+        let (run, calls) = flaky(usize::MAX, exchange_race);
+
+        let (result, retries) = with_race_retries(
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            RACE_ATTEMPTS,
+            QUICK,
+            || std::future::ready(run()),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error_code(&error), Some(521));
+        assert!(error.to_string().contains("cannot be exchanged"));
+        // Tried once, then retried, and no more than that.
+        assert_eq!(retries, RACE_ATTEMPTS - 1);
+        assert_eq!(calls.get(), RACE_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_real_error_is_not_retried() {
+        for (statement, code) in [
+            // A broken statement, on a statement kind that DOES retry.
+            ("CREATE OR REPLACE VIEW v AS SELECT nope()", 46),
+            // UNKNOWN_TABLE is a race only for an atomic replacement.
+            ("ALTER TABLE gone MODIFY TTL d", CODE_UNKNOWN_TABLE),
+            // Finding 15 must keep failing fast.
+            ("CREATE OR REPLACE VIEW v AS SELECT 1", 497),
+        ] {
+            let (run, calls) =
+                flaky(usize::MAX, || server_error(code, "no"));
+
+            let (result, retries) =
+                with_race_retries(statement, RACE_ATTEMPTS, QUICK, || {
+                    std::future::ready(run())
+                })
+                .await;
+
+            assert!(result.is_err(), "{statement}");
+            assert_eq!(retries, 0, "{statement}");
+            assert_eq!(calls.get(), 1, "{statement}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_statement_that_works_at_once_is_run_exactly_once() {
+        let (run, calls) = flaky(0, exchange_race);
+
+        let (result, retries) = with_race_retries(
+            "CREATE TABLE IF NOT EXISTS t (a UInt8) ENGINE = Memory",
+            RACE_ATTEMPTS,
+            QUICK,
+            || std::future::ready(run()),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(retries, 0);
+        assert_eq!(calls.get(), 1);
+    }
+
     // ---- helpers ----
 
     #[test]
@@ -1692,7 +3116,9 @@ FROM transactions;
 /// ```
 ///
 /// Only the server part of the url is used: every test works in its own
-/// throwaway database (`migrate_test_*`), dropped at the end.
+/// throwaway database (`migrate_*_test`), dropped at the end. The url's
+/// user must be allowed to create databases and users (the least-privilege
+/// tests create their own user).
 #[cfg(test)]
 mod integration {
     use super::*;
@@ -1718,7 +3144,7 @@ mod integration {
                 .unwrap()
                 .subsec_nanos();
             let name = format!(
-                "migrate_test_{label}_{}_{nanos}_{}",
+                "migrate_{label}_{}_{nanos}_{}_test",
                 std::process::id(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             );
@@ -1735,8 +3161,56 @@ mod integration {
             Self { name, url: url.to_string(), server }
         }
 
+        /// Polls and backs off faster than production so the tests stay
+        /// quick; the code paths are the same.
         fn migrator(&self) -> Migrator {
-            Migrator::new(&self.url).unwrap()
+            Migrator::new(&self.url)
+                .unwrap()
+                .with_lock_poll(Duration::from_millis(200))
+                .with_race_backoff(Duration::from_millis(10))
+        }
+
+        /// Url of the same database for another user.
+        fn url_as(&self, user: &str, password: &str) -> String {
+            let mut url = url::Url::parse(&self.url).unwrap();
+            url.set_username(user).unwrap();
+            url.set_password(Some(password)).unwrap();
+            url.to_string()
+        }
+
+        async fn execute(&self, query: &str) {
+            self.server
+                .query(&query.replace("{db}", &self.name))
+                .execute()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+        }
+
+        /// A user that may read and write rows of this database, nothing
+        /// else: what an indexer needs once the schema exists.
+        async fn restricted_user(&self) -> (String, String) {
+            let user = format!("{}_user", self.name);
+            let password = "least-privilege-pw".to_string();
+
+            self.execute(&format!(
+                "CREATE USER IF NOT EXISTS {user} IDENTIFIED WITH \
+                 plaintext_password BY '{password}'"
+            ))
+            .await;
+            self.execute(&format!(
+                "GRANT SELECT, INSERT ON {{db}}.* TO {user}"
+            ))
+            .await;
+
+            (user, password)
+        }
+
+        async fn leave_dead_lock(&self) {
+            self.execute(&format!(
+                "CREATE TABLE {{db}}.{LOCK_TABLE} (holder String) \
+                 ENGINE = Memory COMMENT 'dead'"
+            ))
+            .await;
         }
 
         async fn count(&self, query: &str) -> u64 {
@@ -1777,6 +3251,11 @@ mod integration {
         }
 
         async fn drop(self) {
+            self.execute(&format!(
+                "DROP USER IF EXISTS {}_user",
+                self.name
+            ))
+            .await;
             self.server
                 .query(&format!(
                     "DROP DATABASE IF EXISTS {} SYNC",
@@ -1804,10 +3283,15 @@ mod integration {
             Migration::new(
                 2,
                 "read_path",
+                // The OR REPLACE view is what makes the racing tests
+                // exercise the create-then-EXCHANGE path: on Linux two
+                // concurrent runners can lose it with ATOMIC_RENAME_FAIL.
                 "CREATE TABLE IF NOT EXISTS t1_by_b (b String, a UInt64)\n\
                  ENGINE = ReplacingMergeTree ORDER BY (b, a);\n\
                  CREATE MATERIALIZED VIEW IF NOT EXISTS t1_by_b_mv TO t1_by_b\n\
-                 AS SELECT b, a FROM t1;",
+                 AS SELECT b, a FROM t1;\n\
+                 CREATE OR REPLACE VIEW t1_head AS\n\
+                 SELECT a, b FROM t1 ORDER BY a LIMIT 10;",
             ),
             Migration::new(
                 10,
@@ -1983,7 +3467,11 @@ mod integration {
             "{text}"
         );
         assert!(text.contains("NOT recorded"), "{text}");
-        assert!(text.contains("it is safe"), "{text}");
+        // The hint no longer promises a re-run fixes everything: it says
+        // what it does (skip the remembered statements) and what it does
+        // not (pick up an edit of a statement that already ran).
+        assert!(text.contains("skipped by the next run"), "{text}");
+        assert!(text.contains("does NOT fix"), "{text}");
 
         // 0001 recorded, 0002 half applied and not recorded.
         assert_eq!(scratch.recorded().await, [1]);
@@ -2003,6 +3491,43 @@ mod integration {
         assert_eq!(report.applied, ["0002_half"]);
         assert!(scratch.table_exists("d").await);
         assert_eq!(scratch.recorded().await, [1, 2]);
+
+        scratch.drop().await;
+    }
+
+    /// The unit tests drive [`with_race_retries`] directly; this one
+    /// proves it is wired into the runner against a real server, using a
+    /// retryable code that can be provoked deterministically (60 on an
+    /// atomic replacement). ATOMIC_RENAME_FAIL itself cannot be produced
+    /// on macOS/APFS, so it is only covered by the unit tests.
+    #[tokio::test]
+    #[ignore = "needs ClickHouse (TEST_DATABASE_URL)"]
+    async fn a_retryable_failure_that_never_clears_still_fails() {
+        let scratch = Scratch::new("retry");
+
+        let broken = vec![Migration::new(
+            1,
+            "replace",
+            "CREATE OR REPLACE VIEW v AS SELECT * FROM no_such_table;",
+        )];
+
+        let started = Instant::now();
+        let error = scratch.migrator().apply(&broken).await.unwrap_err();
+        let text = format!("{error:#}");
+
+        // Retried (the backoff is 10 ms here), then the server's own
+        // error, not a retry message, is what the operator reads.
+        assert_eq!(
+            clickhouse_code(&error),
+            Some(CODE_UNKNOWN_TABLE),
+            "{text}"
+        );
+        assert!(text.contains("failed at statement 1/1"), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{text}");
+
+        // Nothing recorded, nothing left behind.
+        assert!(scratch.recorded().await.is_empty());
+        assert!(!scratch.table_exists(LOCK_TABLE).await);
 
         scratch.drop().await;
     }
@@ -2157,6 +3682,9 @@ mod integration {
         // Duplicate records collapse.
         assert_eq!(scratch.recorded().await, [1, 2]);
         assert!(scratch.table_exists("t1_by_b_mv").await);
+        // The OR REPLACE view survived every runner replacing it at the
+        // same time (on Linux some of those lose the exchange and retry).
+        assert!(scratch.table_exists("t1_head").await);
 
         let report = scratch.migrator().apply(&migrations).await.unwrap();
         assert_eq!(report.already_applied, 2);
@@ -2214,6 +3742,266 @@ mod integration {
         let report = scratch.migrator().apply(&migrations).await.unwrap();
         assert_eq!(report.already_applied, 3);
         assert!(started.elapsed() < Duration::from_secs(2));
+
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ClickHouse (TEST_DATABASE_URL)"]
+    async fn least_privilege_user_starts_only_when_nothing_is_pending() {
+        let scratch = Scratch::new("restricted");
+        let migrations = sample();
+
+        // The admin applies all but the last migration.
+        scratch.migrator().apply(&migrations[..2]).await.unwrap();
+
+        let (user, password) = scratch.restricted_user().await;
+        let restricted = Migrator::new(&scratch.url_as(&user, &password))
+            .unwrap()
+            .with_lock_poll(Duration::from_millis(200));
+
+        // Up to date schema: starts fine, without any DDL.
+        let report = restricted.apply(&migrations[..2]).await.unwrap();
+        assert_eq!(report.already_applied, 2);
+        assert!(report.applied.is_empty());
+
+        let status = restricted.status(&migrations[..2]).await.unwrap();
+        assert!(status.pending.is_empty());
+
+        // Something pending: says who has to do what, at once.
+        let started = Instant::now();
+        let error = restricted.apply(&migrations).await.unwrap_err();
+        let text = format!("{error:#}");
+
+        assert!(started.elapsed() < Duration::from_secs(5), "{text}");
+        assert!(text.contains("1 migration(s) are pending"), "{text}");
+        assert!(text.contains("0010_seed"), "{text}");
+        assert!(text.contains("not allowed to apply them"), "{text}");
+        assert!(text.contains("indexer migrate"), "{text}");
+        // Nothing was half done, no lock left behind.
+        assert_eq!(scratch.recorded().await, [1, 2]);
+        assert!(!scratch.table_exists(LOCK_TABLE).await);
+
+        // The dry run still works for that user.
+        let status = restricted.status(&migrations).await.unwrap();
+        assert_eq!(status.pending, ["0010_seed"]);
+
+        // The admin catches up, the restricted user starts again.
+        scratch.migrator().apply(&migrations).await.unwrap();
+        let report = restricted.apply(&migrations).await.unwrap();
+        assert_eq!(report.already_applied, 3);
+
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ClickHouse (TEST_DATABASE_URL)"]
+    async fn wrong_password_fails_fast() {
+        let scratch = Scratch::new("password");
+        let migrations = sample();
+
+        scratch.migrator().apply(&migrations).await.unwrap();
+        let (user, _) = scratch.restricted_user().await;
+
+        for url in [
+            scratch.url_as(&user, "not-the-password"),
+            scratch.url_as("no_such_user_anywhere", "x"),
+        ] {
+            let migrator = Migrator::new(&url).unwrap();
+
+            let started = Instant::now();
+            let error = migrator.apply(&migrations).await.unwrap_err();
+            let text = format!("{error:#}");
+
+            assert!(started.elapsed() < Duration::from_secs(5), "{text}");
+            assert!(text.contains("rejected the connection"), "{text}");
+            assert!(text.contains("Not retried"), "{text}");
+            assert!(!text.contains("not-the-password"), "{text}");
+
+            let started = Instant::now();
+            assert!(migrator.status(&migrations).await.is_err());
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        scratch.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs ClickHouse (TEST_DATABASE_URL)"]
+    async fn dead_holder_is_taken_over_exactly_once_by_twenty_runners() {
+        const RUNNERS: usize = 20;
+
+        let scratch = Scratch::new("takeover");
+        let migrations = sample();
+
+        // The holder was killed right after taking the lock.
+        scratch.migrator().apply(&migrations[..1]).await.unwrap();
+        scratch.leave_dead_lock().await;
+
+        // Everybody waits, then sees the lock go stale in the same poll.
+        let started = Instant::now();
+        let handles: Vec<_> = (0..RUNNERS)
+            .map(|_| {
+                let migrator = scratch
+                    .migrator()
+                    .with_lock_stale(Duration::from_secs(3));
+                let migrations = migrations.clone();
+                tokio::spawn(
+                    async move { migrator.apply(&migrations).await },
+                )
+            })
+            .collect();
+
+        let mut takeovers = 0;
+        let mut applied = Vec::new();
+
+        for handle in handles {
+            let report = handle.await.unwrap().unwrap();
+            eprintln!("runner report: {report:?}");
+
+            assert_eq!(
+                report.already_applied
+                    + report.applied.len()
+                    + report.applied_elsewhere.len(),
+                migrations.len(),
+                "{report:?}"
+            );
+            takeovers += usize::from(report.took_over_lock);
+            applied.extend(report.applied);
+        }
+
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(takeovers, 1, "exactly one process removes the lock");
+
+        // Nobody deleted the fresh lock of the first one through: every
+        // migration ran in exactly one runner, the seed row exists once.
+        applied.sort();
+        assert_eq!(applied, ["0002_read_path", "0010_seed"]);
+        assert_eq!(scratch.count("SELECT count() FROM {db}.t1").await, 1);
+        assert_eq!(scratch.recorded().await, [1, 2, 10]);
+
+        // No lock, no takeover marker left.
+        assert_eq!(
+            scratch
+                .count(&format!(
+                    "SELECT count() FROM system.tables WHERE database = \
+                     '{{db}}' AND startsWith(name, '{LOCK_TABLE}')"
+                ))
+                .await,
+            0
+        );
+
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ClickHouse (TEST_DATABASE_URL)"]
+    async fn foreign_schema_is_refused() {
+        let scratch = Scratch::new("foreign");
+        let migrations = sample();
+
+        // A 2.x style database: tables, no bookkeeping. `t1` even has the
+        // name of a current table, with another shape.
+        scratch.execute("CREATE DATABASE {db}").await;
+        scratch
+            .execute(
+                "CREATE TABLE {db}.t1 (hash String) \
+                 ENGINE = MergeTree ORDER BY hash",
+            )
+            .await;
+
+        for attempt in 0..2 {
+            let error =
+                scratch.migrator().apply(&migrations).await.unwrap_err();
+            let foreign = error
+                .downcast_ref::<ForeignSchemaError>()
+                .unwrap_or_else(|| panic!("attempt {attempt}: {error:#}"));
+
+            assert_eq!(foreign.tables, ["t1"]);
+            assert!(error.to_string().contains("no upgrade path"));
+            // The refusal comes before ANY write: not even the
+            // bookkeeping tables were created next to the old schema, so
+            // the second attempt sees exactly the same database.
+            assert!(!scratch.table_exists(MIGRATIONS_TABLE).await);
+            assert!(!scratch.table_exists(PROGRESS_TABLE).await);
+            assert!(!scratch.table_exists("t2").await);
+            assert!(!scratch.table_exists(LOCK_TABLE).await);
+        }
+
+        // The dry run says the same.
+        let error =
+            scratch.migrator().status(&migrations).await.unwrap_err();
+        assert!(error.downcast_ref::<ForeignSchemaError>().is_some());
+
+        // An empty database that merely exists is fine.
+        scratch.execute("DROP TABLE {db}.t1 SYNC").await;
+        let report = scratch.migrator().apply(&migrations).await.unwrap();
+        assert_eq!(report.applied.len(), 3);
+
+        scratch.drop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs ClickHouse (TEST_DATABASE_URL)"]
+    async fn half_applied_migration_edited_afterwards_is_refused() {
+        let scratch = Scratch::new("drift");
+
+        let table = |name: &str, column: &str| {
+            format!(
+                "CREATE TABLE IF NOT EXISTS {name} ({column}) \
+                 ENGINE = MergeTree ORDER BY tuple();"
+            )
+        };
+        let migration = |statements: [String; 3]| {
+            vec![Migration::new(1, "half", statements.join("\n"))]
+        };
+
+        // Statement 3 fails; 1 and 2 stay applied.
+        let broken = migration([
+            table("a", "x UInt8"),
+            table("b", "x UInt8"),
+            table("c", "x NoSuchType"),
+        ]);
+        let error = scratch.migrator().apply(&broken).await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("failed at statement 3/3"), "{text}");
+        assert!(text.contains("does NOT fix"), "{text}");
+
+        // The developer fixes statement 3 AND edits statement 2, which
+        // already ran: IF NOT EXISTS would keep the old `b`.
+        let edited = migration([
+            table("a", "x UInt8"),
+            table("b", "x UInt64, y String"),
+            table("c", "x UInt8"),
+        ]);
+        let error = scratch.migrator().apply(&edited).await.unwrap_err();
+        let text = format!("{error:#}");
+        assert_eq!(
+            error.downcast_ref::<DriftError>().map(|d| d.statement),
+            Some(2),
+            "{text}"
+        );
+        assert!(text.contains("0001_half was half applied"), "{text}");
+        assert!(text.contains("WHERE version = 1"), "{text}");
+        assert!(scratch.recorded().await.is_empty());
+        assert!(!scratch.table_exists("c").await);
+        assert!(!scratch.table_exists(LOCK_TABLE).await);
+
+        // Fixing only what failed resumes after the executed statements.
+        let fixed = migration([
+            table("a", "x UInt8"),
+            table("b", "x UInt8"),
+            table("c", "x UInt8"),
+        ]);
+        // Proof that 1 and 2 are skipped, not replayed: `a` is gone and
+        // does not come back.
+        scratch.execute("DROP TABLE {db}.a SYNC").await;
+
+        let report = scratch.migrator().apply(&fixed).await.unwrap();
+        assert_eq!(report.applied, ["0001_half"]);
+        assert!(scratch.table_exists("c").await);
+        assert!(!scratch.table_exists("a").await);
+        assert_eq!(scratch.recorded().await, [1]);
 
         scratch.drop().await;
     }

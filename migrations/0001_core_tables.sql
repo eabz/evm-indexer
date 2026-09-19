@@ -213,6 +213,10 @@ SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final =
 -- created by other contracts (factories) are out of scope by design, so do
 -- not build statistics on top of this. Query it with a chain and a block or
 -- time range: `transactions FINAL` is what is being read.
+--
+-- `status` is NULL before Byzantium (receipts had no status field) and
+-- `NULL = 'success'` is NULL: a creation that carries a contract address
+-- and no status succeeded, so NULL counts as success.
 CREATE VIEW IF NOT EXISTS contracts AS
 SELECT
   chain,
@@ -222,7 +226,8 @@ SELECT
   `from` AS creator,
   hash AS transaction_hash
 FROM transactions FINAL
-WHERE contract_created != toFixedString('', 20) AND status = 'success';
+WHERE contract_created != toFixedString('', 20)
+  AND ifNull(status, 'success') = 'success';
 
 -- Token metadata is not block scoped (a name does not change with the
 -- fork) and is written by the token worker, outside of the block flushes:

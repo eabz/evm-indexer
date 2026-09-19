@@ -81,7 +81,13 @@ struct OriginRow {
 }
 
 /// The backfill has no writer to quiesce; it only adopts the epoch.
-struct EpochOnly(Database);
+pub(crate) struct EpochOnly(Database);
+
+impl EpochOnly {
+    pub(crate) fn new(db: Database) -> Self {
+        Self(db)
+    }
+}
 
 impl WriterControl for EpochOnly {
     fn quiesce(&self) -> BoxFuture<'_, Result<()>> {
@@ -178,6 +184,7 @@ pub async fn backfill(
     };
     let range = BlockRange::new(from_block, end.max(from_block));
 
+    db.seed_version(&modules::versioned_tables()).await?;
     db.set_epoch(db.current_epoch().await?);
 
     let chunks_of = |range: BlockRange| {
@@ -250,7 +257,7 @@ pub async fn backfill(
             db.clone(),
             Scope::Module(spec),
         )),
-        Arc::new(EpochOnly(db.clone())),
+        Arc::new(EpochOnly::new(db.clone())),
         Arc::new(NoHooks),
         Arc::new(NoHooks),
     );
