@@ -2181,3 +2181,62 @@ async fn missing_ranges_are_computed_in_clickhouse() {
         vec![BlockRange::new(50, 60), BlockRange::new(90, 100)]
     );
 }
+
+/// A flush that landed while ANOTHER process's purge was rebuilding the
+/// same days carries an epoch the validity rule now hides, and nothing
+/// else will ever ask for those blocks again: their rows ARE stored, so no
+/// gap query reports them. The running indexer queues them in memory; this
+/// is the same question asked of the database, so a restart does not lose
+/// them (docs/review-round-4.md, MAJOR 3).
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart() {
+    const CHAIN: u64 = 990_013;
+
+    let database = database(CHAIN).await;
+
+    // Nothing has ever been purged: nothing to look for.
+    assert!(database.stale_flush_ranges().await.unwrap().is_empty());
+
+    core::store(&database, &rows_at(CHAIN, 0, 8, FULL, 0)).await.unwrap();
+
+    // Another process purges and rebuilds every bucket of both days
+    // under epoch 1; `tombstone_version` is what it stamped BEFORE the
+    // rebuild read its input.
+    let tombstoned = next_version();
+    execute(
+        &database,
+        &format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+               fork_block, to_block, old_head, depth, rows_tombstoned, \
+               reason, tombstone_version, completed) \
+             VALUES ({CHAIN}, 1, {DAY_1}, {}, 0, 4, 0, 0, 0, \
+               'redecode', {tombstoned}, 1)",
+            DAY_2 + 86_400
+        ),
+    )
+    .await;
+
+    // Still nothing: every stored block was written BEFORE the rebuild.
+    assert!(database.stale_flush_ranges().await.unwrap().is_empty());
+
+    // Now the flush that raced it: written after the rebuild, still
+    // stamped with the old epoch.
+    core::store(&database, &rows_at(CHAIN, 8, 12, FULL, 0)).await.unwrap();
+
+    assert_eq!(
+        database.stale_flush_ranges().await.unwrap(),
+        vec![BlockRange::new(8, 12)],
+        "the blocks flushed under the superseded epoch have to be \
+         purged and indexed again"
+    );
+
+    // Written again under the epoch in force: the question answers
+    // itself, so a restart loop is impossible.
+    core::store(&database, &rows_at(CHAIN, 8, 12, FULL, 1)).await.unwrap();
+
+    assert!(
+        database.stale_flush_ranges().await.unwrap().is_empty(),
+        "a range re-indexed under the epoch in force is not stale"
+    );
+}

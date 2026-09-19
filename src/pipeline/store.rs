@@ -30,6 +30,15 @@ use futures::future::BoxFuture;
 use log::debug;
 use serde::{Deserialize, Serialize};
 
+/// How many completed purges [`ReorgStore::has_orphan_children`] reads to
+/// decide whether a tombstone is settled debris.
+///
+/// `reorgs` is insert only and nothing compacts it: two rows per purge on
+/// a chain with frequent tip reorgs. The query only reads the purges whose
+/// block range overlaps the range being checked, newest tombstone version
+/// first, and stops here.
+const MAX_SETTLED_PURGES: usize = 1_000;
+
 /// Which tables a purge reaches.
 #[derive(Debug, Clone, Copy)]
 pub enum Scope {
@@ -467,11 +476,35 @@ impl ReorgStore for ClickhouseReorgStore {
 
             // The purges of this chain that FINISHED, as (first block,
             // exclusive last block, the `_version` they stamped on their
-            // tombstones). `reorgs` holds a handful of rows per chain.
+            // tombstones).
+            //
+            // `reason != 'redecode'`: a MODULE purge (`indexer backfill
+            // --module X`) only ever touched that module's tables, and
+            // its repair window is the timestamp span of THOSE rows - it
+            // can be far narrower in time than its block range. Counting
+            // it here let it settle core orphans it never repaired: the
+            // heal was skipped, the tombstoned core rows stayed in the
+            // aggregates, and the range was counted again when it was
+            // streamed a second time (docs/review-round-4.md, MAJOR 5).
+            //
+            // Only the purges whose block range can cover a row of
+            // [from, to) are read, newest tombstones first: a chain with
+            // frequent tip reorgs collects two `reorgs` rows per purge
+            // and nothing compacts them. Leaving an old row out can only
+            // LOWER a block's settled version, i.e. heal once too often
+            // (safe); it can never hide an unfinished purge.
+            let overlaps = to
+                .map(|to| format!(" AND fork_block < {to}"))
+                .unwrap_or_default();
+
             let done = format!(
                 "(SELECT groupArray((fork_block, to_block, \
-                 tombstone_version)) FROM reorgs WHERE chain = {chain} \
-                 AND completed = 1) AS done"
+                 tombstone_version)) FROM (SELECT fork_block, to_block, \
+                 tombstone_version FROM reorgs WHERE chain = {chain} \
+                 AND completed = 1 AND reason != 'redecode' \
+                 AND to_block > {from}{overlaps} \
+                 ORDER BY tombstone_version DESC \
+                 LIMIT {MAX_SETTLED_PURGES})) AS done"
             );
 
             // Highest tombstone version a completed purge of this block

@@ -1859,6 +1859,106 @@ async fn debris_of_a_finished_purge_is_not_healed_again() {
     scenario.assert_consistent().await;
 }
 
+/// A MODULE purge (`indexer backfill --module X`) settles nothing outside
+/// its own tables, so its `reorgs` row must not tell the next start that
+/// somebody else's orphans are finished business.
+///
+/// The damage it used to hide (docs/review-round-4.md, MAJOR 5): a flush
+/// dies before its `blocks` insert, a gap heal tombstones the core
+/// children and dies before writing its `reorgs` row - and then a module
+/// backfill over the same block range writes a COMPLETED row with a higher
+/// tombstone version. The heal detector saw every core orphan as settled
+/// and skipped the repair, so the tombstoned rows stayed in the aggregates
+/// AND were counted a second time when the range was streamed again. A
+/// module purge's repair window is the timestamp span of its own rows,
+/// which can be far narrower than its block range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_module_purge_does_not_settle_somebody_elses_orphans() {
+    let scenario = Scenario::new("module_settle").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let store =
+        ClickhouseReorgStore::new(scenario.db.clone(), Scope::Chain);
+
+    // A gap heal that tombstoned the core children of blocks [9, 12) and
+    // died before its `reorgs` row: the blocks are gone, the children are
+    // tombstoned, nothing recorded it.
+    let interrupted = next_version();
+    for table in ["logs", "transactions", "blocks"] {
+        let column =
+            if table == "blocks" { "number" } else { "block_number" };
+        scenario
+            .db
+            .db
+            .query(&format!(
+                "INSERT INTO `{table}` SELECT * REPLACE (\
+                 toUInt64({interrupted}) AS _version, \
+                 toUInt8(1) AS is_deleted) FROM (SELECT * FROM `{table}` \
+                 WHERE chain = {CHAIN} AND `{column}` >= 9 \
+                 AND `{column}` < 12 AND is_deleted = 0)"
+            ))
+            .execute()
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        store.has_orphan_children(CHAIN, 9, Some(12)).await.unwrap(),
+        "the debris of an interrupted heal must be found"
+    );
+
+    // Now the operator re-decodes one module over the SAME block range.
+    let dex = ALL_MODULES.iter().find(|s| s.name == "dex").unwrap();
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Module(dex),
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    purger
+        .purge_range(CHAIN, 9, Some(12), PurgeReason::Redecode)
+        .await
+        .unwrap();
+
+    let redecodes: u64 = scenario
+        .count(
+            "SELECT toUInt64(count()) FROM reorgs WHERE completed = 1 \
+             AND reason = 'redecode'",
+        )
+        .await;
+    assert_eq!(redecodes, 1);
+
+    assert!(
+        store.has_orphan_children(CHAIN, 9, Some(12)).await.unwrap(),
+        "a module purge repaired only its own tables: the core orphans \
+         are still there and must still be healed"
+    );
+
+    // And the heal really does repair them.
+    let chain_purger = Purger::new(
+        Arc::new(store.clone()),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    chain_purger
+        .purge_range(CHAIN, 9, Some(12), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert!(
+        !store.has_orphan_children(CHAIN, 9, Some(12)).await.unwrap(),
+        "a finished chain purge settles its own debris"
+    );
+
+    scenario.index_until(&chain, 12, &[]).await;
+    scenario.assert_consistent().await;
+}
+
 // ------------------------------------------------------ side tables
 
 /// Tombstones reach the read-path side tables only through their

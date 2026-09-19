@@ -31,6 +31,10 @@ struct MemoryStore {
     blocks: Arc<Mutex<BTreeMap<u64, B256>>>,
     flushes: Arc<Mutex<Vec<usize>>>,
     fail: Arc<AtomicBool>,
+    /// A purge that fails half way: the transient database error of
+    /// `purge_stale_flushes`.
+    fail_purge: Arc<AtomicBool>,
+    purged: Arc<Mutex<Vec<(u64, Option<u64>)>>>,
 }
 
 impl MemoryStore {
@@ -158,10 +162,16 @@ impl ReorgStore for MemoryStore {
     fn timestamp_span(
         &self,
         _: u64,
-        _: u64,
-        _: Option<u64>,
+        from: u64,
+        to: Option<u64>,
     ) -> BoxFuture<'_, Result<Option<(u32, u32)>>> {
-        Box::pin(async { Ok(None) })
+        Box::pin(async move {
+            if self.fail_purge.load(Ordering::SeqCst) {
+                bail!("database is down");
+            }
+            self.purged.lock().unwrap().push((from, to));
+            Ok(None)
+        })
     }
 
     fn live_children(
@@ -674,4 +684,39 @@ async fn a_dead_writer_is_fatal_even_when_the_stream_failed_too() {
     let error = indexer.sync().await.unwrap_err();
     assert!(WriterStopped::is_cause_of(&error));
     assert_eq!(source.requested().len(), 1);
+}
+
+/// The queue of flushes that raced another process's purge is the ONLY
+/// record that those blocks have to be indexed again - their rows are
+/// stored, so no gap query ever asks for them. A purge that fails must
+/// therefore leave the queue alone (docs/review-round-4.md, MAJOR 3): the
+/// old code drained it into a local `Vec` and lost the failed span AND
+/// every span after it on the first transient error.
+#[tokio::test(start_paused = true)]
+async fn a_failed_purge_keeps_the_stale_flush_spans() {
+    let source = MockSource::new(&[1_000]);
+    let store = MemoryStore::with_blocks(0..50);
+
+    let mut indexer =
+        indexer(source.clone(), store.clone(), settings(0, 50)).await;
+
+    let queued =
+        vec![BlockRange::new(10, 20), BlockRange::new(30, 40)];
+    *indexer.stale.lock().unwrap() = queued.clone();
+
+    // The first purge fails: nothing may be forgotten.
+    store.fail_purge.store(true, Ordering::SeqCst);
+    assert!(indexer.purge_stale_flushes().await.is_err());
+    assert_eq!(*indexer.stale.lock().unwrap(), queued);
+
+    // The database comes back: both spans are purged, and only then are
+    // they taken out of the queue.
+    store.fail_purge.store(false, Ordering::SeqCst);
+    assert_eq!(indexer.purge_stale_flushes().await.unwrap(), Some(10));
+    assert!(indexer.stale.lock().unwrap().is_empty());
+
+    let mut purged: Vec<(u64, Option<u64>)> =
+        store.purged.lock().unwrap().clone();
+    purged.dedup();
+    assert_eq!(purged, vec![(10, Some(20)), (30, Some(40))]);
 }

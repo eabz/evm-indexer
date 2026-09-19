@@ -94,6 +94,11 @@ pub fn seed_version(stored: u64) {
     LAST_VERSION.fetch_max(stored, Ordering::Relaxed);
 }
 
+/// How many repair windows [`Database::stale_flush_ranges`] looks at on a
+/// start. Newest epoch first: an older purge's window was either repaired
+/// long ago or is covered by a newer one.
+const MAX_STALE_SCAN_PURGES: usize = 64;
+
 /// Attempts per table insert before the flush is reported as failed.
 const INSERT_ATTEMPTS: u32 = 6;
 const INSERT_BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -568,6 +573,96 @@ impl Database {
         };
 
         Ok(assemble_missing_ranges(range, stats, &gaps, MAX_GAPS_PER_PASS))
+    }
+
+    /// Block spans that were flushed under an epoch a purge of ANOTHER
+    /// process had already superseded, re-derived from what is stored.
+    ///
+    /// A running indexer notices this itself (`pipeline::ClickhouseSink`
+    /// re-reads the epoch after every flush and queues the span), but
+    /// that queue lives in memory. This is the same question asked of the
+    /// database, so a restart - or a crash while the queue was not empty
+    /// - does not lose the spans (docs/review-round-4.md, MAJOR 3).
+    ///
+    /// The rule: a purge rebuilt every aggregate of `[from_ts, to_ts)`
+    /// from what was live when it ran, and armed the validity rule so
+    /// that only contributions of its own epoch (or newer) count there.
+    /// `tombstone_version` is the `_version` it stamped before the
+    /// rebuild, so a base row in that time window carrying a LOWER epoch
+    /// and a HIGHER `_version` was written after the rebuild had read its
+    /// input: its aggregate contributions are hidden and no repair
+    /// covered them. Those blocks have to be purged and indexed again.
+    ///
+    /// Conservative on purpose: `_version` is only approximately ordered
+    /// across processes, so a span may be listed that did not need it. A
+    /// purge is idempotent and the range is streamed again, so the only
+    /// cost is work. It converges - the rows come back stamped with the
+    /// newest epoch, which no `reorgs` row is above.
+    pub async fn stale_flush_ranges(&self) -> Result<Vec<BlockRange>> {
+        #[derive(Row, serde::Deserialize)]
+        struct PurgeWindow {
+            epoch: u32,
+            from_ts: u32,
+            to_ts: u32,
+            tombstone_version: u64,
+        }
+
+        let purges: Vec<PurgeWindow> = self
+            .db
+            .query(&format!(
+                "SELECT epoch, toUInt32(from_ts) AS from_ts, \
+                 toUInt32(to_ts) AS to_ts, tombstone_version \
+                 FROM reorgs WHERE chain = {} AND tombstone_version > 0 \
+                 AND to_ts > from_ts ORDER BY epoch DESC LIMIT {}",
+                self.chain_id, MAX_STALE_SCAN_PURGES
+            ))
+            .fetch_all()
+            .await
+            .context("read the repair windows of this chain")?;
+
+        if purges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Bounds the scan to the monthly partitions the repairs touched.
+        let low = purges.iter().map(|p| p.from_ts).min().unwrap_or(0);
+        let high = purges.iter().map(|p| p.to_ts).max().unwrap_or(0);
+
+        let windows: Vec<String> = purges
+            .iter()
+            .map(|p| {
+                format!(
+                    "(toUInt32({}), toUInt32({}), toUInt32({}), \
+                     toUInt64({}))",
+                    p.from_ts, p.to_ts, p.epoch, p.tombstone_version
+                )
+            })
+            .collect();
+
+        // One hull per stale epoch: a flush that raced a purge is a
+        // handful of adjacent blocks, so this is tight in practice.
+        let hulls: Vec<(u64, u64)> = self
+            .db
+            .query(&format!(
+                "SELECT toUInt64(min(number)), toUInt64(max(number)) \
+                 FROM blocks FINAL WHERE chain = {} AND is_deleted = 0 \
+                 AND timestamp >= toDateTime({low}) \
+                 AND timestamp < toDateTime({high}) \
+                 AND arrayExists(w -> toUInt32(timestamp) >= w.1 \
+                 AND toUInt32(timestamp) < w.2 AND epoch < w.3 \
+                 AND `_version` > w.4, [{}]) \
+                 GROUP BY epoch ORDER BY min(number) ASC",
+                self.chain_id,
+                windows.join(", ")
+            ))
+            .fetch_all()
+            .await
+            .context("look for flushes that raced another purge")?;
+
+        Ok(hulls
+            .into_iter()
+            .map(|(from, to)| BlockRange::new(from, to.saturating_add(1)))
+            .collect())
     }
 
     /// Collapses runs of contiguous live `checkpoints` of this chain into
