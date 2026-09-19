@@ -32,11 +32,12 @@ use crate::{
             run_with, SlotPage, SlotSource, SolanaRuntime, Tripwire,
             FIRST_SERVED_SLOT,
         },
-        solana_store::{SolanaReorgStore, SOL_CANDLE_VIEWS},
+        solana_store::SolanaReorgStore,
         solana_verify,
         solana_writer::{store_children, SvmBatch},
     },
     reorg::ReorgStore,
+    svm::derived::SOL_CANDLE_VIEWS,
     svm::{self, fixtures, models::SOLANA_CHAIN, SvmSlotBatch},
 };
 use anyhow::Result;

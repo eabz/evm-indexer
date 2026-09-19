@@ -15,6 +15,7 @@
 //! (on-curve test), `fixtures.rs`, `integration_tests.rs`.
 
 pub mod decode;
+pub mod derived;
 pub mod events;
 pub mod fixtures;
 pub mod launchpads;
@@ -41,6 +42,8 @@ mod profile;
 /// Ignored, network bound proof against mainnet and the public Solana RPC.
 #[cfg(test)]
 mod live_tests;
+
+pub use self::derived::SOL_DERIVED;
 
 use decode::{Diagnostics, SvmTransaction};
 use launchpads::SolLaunchpadRows;
