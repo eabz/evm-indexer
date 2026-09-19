@@ -7,7 +7,7 @@ use super::{
         config, desired, fleet, settings, until, Behaviour, FakeRunner,
         MemoryStore,
     },
-    supervisor::{restart_backoff, CommandError, Supervisor},
+    supervisor::{self, restart_backoff, CommandError, Supervisor},
 };
 use crate::{
     configs::Desired, fleet::chains::ForeignChain,
@@ -372,6 +372,49 @@ async fn the_memory_cap_is_split_over_the_chains_that_run() {
     }
 
     supervisor.shutdown().await;
+}
+
+/// Review MINOR 9: a signed-in session could add chains until the process
+/// ran out of memory.
+#[tokio::test]
+async fn a_fleet_will_not_hold_more_chains_than_its_cap() {
+    let (supervisor, runner, _) = fleet(&[]);
+    supervisor.load_and_start().await.unwrap();
+
+    for chain in 1..=(supervisor::MAX_CHAINS as u64) {
+        supervisor
+            .add(chain, Default::default())
+            .await
+            .unwrap_or_else(|e| panic!("chain {chain}: {e}"));
+    }
+
+    let refused = supervisor.add(9_999, Default::default()).await;
+    assert!(
+        matches!(refused, Err(CommandError::TooMany(_))),
+        "{refused:?}"
+    );
+    assert_eq!(runner.starts(9_999), 0);
+
+    supervisor.shutdown().await;
+}
+
+/// Review MINOR 9: `shutdown` awaited every chain with no deadline, so one
+/// chain that never returned hung the process for ever.
+#[tokio::test(start_paused = true)]
+async fn shutdown_gives_up_on_a_chain_that_will_not_stop() {
+    let (supervisor, runner, _) = fleet(&[1]);
+    runner.behave(1, Behaviour::NeverStops);
+    supervisor.load_and_start().await.unwrap();
+    until("running", || runner.is_live(1)).await;
+
+    // Without a deadline this never returns.
+    let stopping = tokio::time::timeout(
+        supervisor::SHUTDOWN_DEADLINE * 3,
+        supervisor.shutdown(),
+    )
+    .await;
+
+    assert!(stopping.is_ok(), "the fleet hung on one stuck chain");
 }
 
 #[tokio::test]

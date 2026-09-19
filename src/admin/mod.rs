@@ -65,8 +65,22 @@ use std::{net::SocketAddr, sync::Arc};
 /// process allocate.
 const MAX_BODY_BYTES: usize = 16 * 1024;
 
-/// The cookie the session lives in.
+/// The cookie the session lives in when the panel is on plain HTTP.
 const COOKIE: &str = "session";
+
+/// The cookie the session lives in behind TLS.
+///
+/// The `__Host-` prefix is not decoration: a browser only accepts a cookie
+/// with it when it is `Secure`, `Path=/` and HOST-ONLY - no `Domain`. That
+/// last part is the point. Without it, a sibling subdomain (the panel on
+/// `panel.example.com`, anything at all on `blog.example.com`) can set a
+/// `Domain=example.com` cookie called `session` and shadow the real one,
+/// forcing the owner's browser into a session of the attacker's choosing
+/// (review MINOR 3). A `__Host-` cookie cannot be set that way.
+///
+/// It needs `Secure`, so it is used only when the panel knows it is behind
+/// TLS; on plain loopback HTTP the browser would refuse it.
+const HOST_COOKIE: &str = "__Host-session";
 
 pub struct Admin {
     supervisor: Arc<Supervisor>,
@@ -164,6 +178,7 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/api/chains/{chain}/stop", post(stop_chain))
         .route("/api/chains/{chain}/restart", post(restart_chain))
         .route("/api/chains/{chain}/events", get(chain_events))
+        .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         // BEFORE any route: which server does this browser think it is
         // talking to? (`auth::AllowedHosts`, review MAJOR 3.)
@@ -171,7 +186,56 @@ pub fn router(admin: Arc<Admin>) -> Router {
             admin.clone(),
             known_host,
         ))
+        // OUTERMOST, so it also covers what never reaches a handler: a
+        // path segment that will not parse, a method a route does not
+        // have, a body over the cap, and the fallback (review MINOR 1).
+        .layer(axum::middleware::from_fn_with_state(
+            admin.clone(),
+            add_security_headers,
+        ))
         .with_state(admin)
+}
+
+/// The security headers, on EVERY response.
+///
+/// They used to be applied inside each handler, which left out everything
+/// axum answers before a handler runs: a 400 from a path extractor, a 405,
+/// a 413 and the 404 fallback all went out bare, and the 400 echoed the
+/// offending path segment back (review MINOR 1). A response-mapping layer
+/// cannot be forgotten by a route that does not exist yet.
+async fn add_security_headers(
+    State(admin): State<Arc<Admin>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let response = next.run(request).await;
+    secured(&admin, response)
+}
+
+/// The chain id out of a path segment, with OUR message when it is not one.
+///
+/// Taking the segment as a `String` and parsing it here rather than letting
+/// axum's `Path<u64>` do it keeps the rejection body ours: axum's reflects
+/// the segment back ("Cannot parse `<script>...` to a `u64`"), which is not
+/// exploitable with `nosniff` and a `text/plain` type but is still an echo
+/// of attacker input, and echoes have a way of ending up somewhere that
+/// does render them (review MINOR 1).
+fn chain_id(segment: &str) -> Result<u64, Box<Response>> {
+    segment.parse::<u64>().map_err(|_| {
+        Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            "That is not a chain id. A chain id is a whole number.",
+        ))
+    })
+}
+
+/// A path the panel does not serve. The same shape as every other refusal:
+/// one sentence, and no echo of what was asked for.
+async fn not_found() -> Response {
+    json_error(
+        StatusCode::NOT_FOUND,
+        "The control panel does not serve that address.",
+    )
 }
 
 /// Refuses a request whose `Host` is not one this panel answers to, on
@@ -205,12 +269,9 @@ async fn known_host(
             admin.hosts.known().join(", ")
         );
 
-        return secured(
-            &admin,
-            json_error(
-                StatusCode::MISDIRECTED_REQUEST,
-                "This is not a name the control panel answers to.",
-            ),
+        return json_error(
+            StatusCode::MISDIRECTED_REQUEST,
+            "This is not a name the control panel answers to.",
         );
     }
 
@@ -266,14 +327,57 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
 
 // ------------------------------------------------------------- the guard
 
-/// The cookie value, if the request carries one.
-fn cookie_token(headers: &HeaderMap) -> Option<String> {
-    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+/// The session cookie this response should set, given whether the panel is
+/// behind TLS.
+fn cookie_name(secure: bool) -> &'static str {
+    if secure {
+        HOST_COOKIE
+    } else {
+        COOKIE
+    }
+}
 
-    cookies.split(';').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name.trim() == COOKIE).then(|| value.trim().to_string())
-    })
+/// The session token the request carries.
+///
+/// Two rules, both from review MINOR 3:
+///
+/// * the `__Host-` cookie wins whenever it is present, because it is the
+///   one a sibling subdomain cannot have set;
+/// * a name that appears MORE THAN ONCE is refused outright rather than
+///   resolved by taking the first. Shadowing is exactly what the attack
+///   looks like, and "the first one wins" is a rule an attacker can play.
+fn cookie_token(headers: &HeaderMap) -> Option<String> {
+    let mut all: Vec<(&str, &str)> = Vec::new();
+
+    for header in headers.get_all(header::COOKIE) {
+        let Ok(text) = header.to_str() else { continue };
+        for pair in text.split(';') {
+            if let Some((name, value)) = pair.split_once('=') {
+                all.push((name.trim(), value.trim()));
+            }
+        }
+    }
+
+    for name in [HOST_COOKIE, COOKIE] {
+        let mut found =
+            all.iter().filter(|(key, _)| *key == name).map(|(_, v)| *v);
+
+        match (found.next(), found.next()) {
+            (Some(value), None) => return Some(value.to_string()),
+            // Shadowed: refuse rather than pick.
+            (Some(_), Some(_)) => {
+                warn!(
+                    "Control panel: a request carried {name} more than \
+                     once. Refusing it rather than guessing which one is \
+                     the owner's."
+                );
+                return None;
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// The origin this server answers on, as a browser would write it.
@@ -379,12 +483,9 @@ fn unauthorized() -> Response {
 /// The page itself needs no session: it IS the login form, and it holds no
 /// data about any chain - every number on it arrives later, from `/api`,
 /// which does need one.
-async fn serve_page(State(admin): State<Arc<Admin>>) -> Response {
-    let response =
-        ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page::HTML)
-            .into_response();
-
-    secured(&admin, response)
+async fn serve_page() -> Response {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page::HTML)
+        .into_response()
 }
 
 /// Is this request from the panel's own page? Used by the two routes that
@@ -427,7 +528,7 @@ async fn login(
     // Logging in is state-changing too: without this check another site
     // could silently sign the browser into an attacker's session.
     if let Some(denied) = from_our_page(&admin, &headers) {
-        return secured(&admin, denied);
+        return denied;
     }
 
     // Behind a proxy every client shares one TCP address, so one
@@ -445,26 +546,23 @@ async fn login(
     // The throttle is checked BEFORE the password is even looked at, so a
     // locked-out address cannot use the comparison as an oracle.
     if let Allowed::Wait(left) = admin.limiter.check(address) {
-        return secured(
-            &admin,
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(LoginRefused {
-                    error: format!(
-                        "Too many attempts. Try again in {}.",
-                        crate::fleet::status::human_duration(left)
-                    ),
-                    retry_after_seconds: Some(left.as_secs().max(1)),
-                }),
-            )
-                .into_response(),
-        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(LoginRefused {
+                error: format!(
+                    "Too many attempts. Try again in {}.",
+                    crate::fleet::status::human_duration(left)
+                ),
+                retry_after_seconds: Some(left.as_secs().max(1)),
+            }),
+        )
+            .into_response();
     }
 
     let Ok(Json(body)) = body else {
-        return secured(
-            &admin,
-            json_error(StatusCode::BAD_REQUEST, "Expected a password."),
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Expected a password.",
         );
     };
 
@@ -472,42 +570,38 @@ async fn login(
         let lockout = admin.limiter.failed(address);
         warn!("Control panel: a sign-in from {address} was refused.");
 
-        return secured(
-            &admin,
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(LoginRefused {
-                    error: match lockout {
-                        Some(wait) => format!(
-                            "Wrong password. Too many attempts: try again \
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(LoginRefused {
+                error: match lockout {
+                    Some(wait) => format!(
+                        "Wrong password. Too many attempts: try again \
                              in {}.",
-                            crate::fleet::status::human_duration(wait)
-                        ),
-                        None => "Wrong password.".to_string(),
-                    },
-                    retry_after_seconds: lockout.map(|w| w.as_secs()),
-                }),
-            )
-                .into_response(),
-        );
+                        crate::fleet::status::human_duration(wait)
+                    ),
+                    None => "Wrong password.".to_string(),
+                },
+                retry_after_seconds: lockout.map(|w| w.as_secs()),
+            }),
+        )
+            .into_response();
     }
 
     admin.limiter.succeeded(address);
 
     let Ok(token) = auth::random_token() else {
-        return secured(
-            &admin,
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not create a session.",
-            ),
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not create a session.",
         );
     };
     admin.sessions.create(&token);
 
+    let secure = scheme(&admin, &headers) == "https";
     let cookie = format!(
-        "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/{}",
-        if scheme(&admin, &headers) == "https" { "; Secure" } else { "" }
+        "{}={token}; HttpOnly; SameSite=Strict; Path=/{}",
+        cookie_name(secure),
+        if secure { "; Secure" } else { "" }
     );
 
     let mut response =
@@ -518,7 +612,7 @@ async fn login(
     }
 
     info!("Control panel: signed in from {address}.");
-    secured(&admin, response)
+    response
 }
 
 /// Signing out needs no live session (an expired cookie must still be
@@ -528,25 +622,44 @@ async fn logout(
     State(admin): State<Arc<Admin>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(denied) = from_our_page(&admin, &headers) {
-        return secured(&admin, denied);
+    // A cross-site request must not be able to end the owner's session, so
+    // the SERVER side is only cleared when the request came from this page.
+    // The BROWSER's cookie is cleared either way: a browser or extension
+    // that strips `Origin` used to leave the owner unable to sign out at
+    // all (review MINOR 4).
+    let from_here = from_our_page(&admin, &headers).is_none();
+
+    if from_here {
+        if let Some(token) = cookie_token(&headers) {
+            admin.sessions.remove(&token);
+        }
+    } else {
+        warn!(
+            "Control panel: a sign-out arrived without this page's origin. \
+             The browser's cookie is cleared, but the session itself is \
+             left alone - only a request from the panel can end it."
+        );
     }
 
-    if let Some(token) = cookie_token(&headers) {
-        admin.sessions.remove(&token);
+    let mut response = Json(serde_json::json!({
+        "authenticated": false,
+        "session_ended": from_here,
+    }))
+    .into_response();
+
+    // Max-Age=0 removes it in the browser. Both names, because which one
+    // was set depends on whether the panel is behind TLS.
+    let secure = scheme(&admin, &headers) == "https";
+    for name in [COOKIE, HOST_COOKIE] {
+        if let Ok(value) = HeaderValue::from_str(&format!(
+            "{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+            if secure || name == HOST_COOKIE { "; Secure" } else { "" }
+        )) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
 
-    let mut response = Json(serde_json::json!({ "authenticated": false }))
-        .into_response();
-
-    // Max-Age=0 removes it in the browser too.
-    if let Ok(value) = HeaderValue::from_str(&format!(
-        "{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
-    )) {
-        response.headers_mut().insert(header::SET_COOKIE, value);
-    }
-
-    secured(&admin, response)
+    response
 }
 
 // ------------------------------------------------------------- the API
@@ -577,7 +690,7 @@ async fn list_chains(
     headers: HeaderMap,
 ) -> Response {
     if let Some(denied) = guard_read(&admin, &headers) {
-        return secured(&admin, denied);
+        return denied;
     }
 
     let body = ChainsBody {
@@ -599,7 +712,7 @@ async fn list_chains(
         process: ProcessView::of(admin.supervisor.config()),
     };
 
-    secured(&admin, Json(body).into_response())
+    Json(body).into_response()
 }
 
 #[derive(Deserialize)]
@@ -616,16 +729,13 @@ async fn add_chain(
     body: Result<Json<AddBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Some(denied) = guard(&admin, &headers, true) {
-        return secured(&admin, denied);
+        return denied;
     }
 
     let Ok(Json(body)) = body else {
-        return secured(
-            &admin,
-            json_error(
-                StatusCode::BAD_REQUEST,
-                "Expected a chain and its settings.",
-            ),
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Expected a chain and its settings.",
         );
     };
 
@@ -634,16 +744,13 @@ async fn add_chain(
     let chain = match crate::configs::parse_chain_argument(&body.chain) {
         Ok(chain) => chain,
         Err(message) => {
-            return secured(
-                &admin,
-                json_error(StatusCode::BAD_REQUEST, message),
-            )
+            return json_error(StatusCode::BAD_REQUEST, message)
         }
     };
 
     match admin.supervisor.add(chain, body.settings).await {
-        Ok(()) => secured(&admin, ok()),
-        Err(e) => secured(&admin, command_error(e)),
+        Ok(()) => ok(),
+        Err(e) => command_error(e),
     }
 }
 
@@ -654,7 +761,7 @@ struct SettingsBody {
 
 async fn patch_chain(
     State(admin): State<Arc<Admin>>,
-    Path(chain): Path<u64>,
+    Path(chain): Path<String>,
     headers: HeaderMap,
     body: Result<
         Json<SettingsBody>,
@@ -662,25 +769,27 @@ async fn patch_chain(
     >,
 ) -> Response {
     if let Some(denied) = guard(&admin, &headers, true) {
-        return secured(&admin, denied);
+        return denied;
     }
 
+    let chain = match chain_id(&chain) {
+        Ok(chain) => chain,
+        Err(refused) => return *refused,
+    };
+
     let Ok(Json(body)) = body else {
-        return secured(
-            &admin,
-            json_error(StatusCode::BAD_REQUEST, "Expected settings."),
-        );
+        return json_error(StatusCode::BAD_REQUEST, "Expected settings.");
     };
 
     match admin.supervisor.update_settings(chain, body.settings).await {
-        Ok(()) => secured(&admin, ok()),
-        Err(e) => secured(&admin, command_error(e)),
+        Ok(()) => ok(),
+        Err(e) => command_error(e),
     }
 }
 
 async fn start_chain(
     State(admin): State<Arc<Admin>>,
-    Path(chain): Path<u64>,
+    Path(chain): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     command(admin, chain, headers, Verb::Start).await
@@ -688,7 +797,7 @@ async fn start_chain(
 
 async fn stop_chain(
     State(admin): State<Arc<Admin>>,
-    Path(chain): Path<u64>,
+    Path(chain): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     command(admin, chain, headers, Verb::Stop).await
@@ -696,7 +805,7 @@ async fn stop_chain(
 
 async fn restart_chain(
     State(admin): State<Arc<Admin>>,
-    Path(chain): Path<u64>,
+    Path(chain): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     command(admin, chain, headers, Verb::Restart).await
@@ -712,13 +821,18 @@ enum Verb {
 
 async fn command(
     admin: Arc<Admin>,
-    chain: u64,
+    chain: String,
     headers: HeaderMap,
     verb: Verb,
 ) -> Response {
     if let Some(denied) = guard(&admin, &headers, true) {
-        return secured(&admin, denied);
+        return denied;
     }
+
+    let chain = match chain_id(&chain) {
+        Ok(chain) => chain,
+        Err(refused) => return *refused,
+    };
 
     let result = match verb {
         Verb::Start => admin.supervisor.start(chain).await,
@@ -727,8 +841,8 @@ async fn command(
     };
 
     match result {
-        Ok(()) => secured(&admin, ok()),
-        Err(e) => secured(&admin, command_error(e)),
+        Ok(()) => ok(),
+        Err(e) => command_error(e),
     }
 }
 
@@ -736,24 +850,25 @@ async fn command(
 /// one chain.
 async fn chain_events(
     State(admin): State<Arc<Admin>>,
-    Path(chain): Path<u64>,
+    Path(chain): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(denied) = guard_read(&admin, &headers) {
-        return secured(&admin, denied);
+        return denied;
     }
 
+    let chain = match chain_id(&chain) {
+        Ok(chain) => chain,
+        Err(refused) => return *refused,
+    };
+
     match admin.supervisor.events(chain) {
-        Some(events) => secured(
-            &admin,
-            Json(serde_json::json!({ "events": events })).into_response(),
-        ),
-        None => secured(
-            &admin,
-            json_error(
-                StatusCode::NOT_FOUND,
-                format!("Chain {chain} is not in this fleet."),
-            ),
+        Some(events) => {
+            Json(serde_json::json!({ "events": events })).into_response()
+        }
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            format!("Chain {chain} is not in this fleet."),
         ),
     }
 }
@@ -766,6 +881,7 @@ fn command_error(error: CommandError) -> Response {
     let status = match error {
         CommandError::NoSuchChain(_) => StatusCode::NOT_FOUND,
         CommandError::AlreadyThere(_) => StatusCode::CONFLICT,
+        CommandError::TooMany(_) => StatusCode::CONFLICT,
         CommandError::Settings(_) => StatusCode::BAD_REQUEST,
     };
 

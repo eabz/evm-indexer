@@ -31,6 +31,16 @@ use subtle::ConstantTimeEq;
 /// (docs/design.md section 15).
 pub const IDLE_EXPIRY: Duration = Duration::from_secs(12 * 60 * 60);
 
+/// A session is gone this long after it was CREATED, however busy it has
+/// been.
+///
+/// Idle expiry alone let a token that was touched inside every 12 hour
+/// window live for ever (review MINOR 4), so a stolen cookie that is being
+/// used stays good indefinitely. An absolute lifetime bounds that: the
+/// owner signs in again once a week.
+pub const ABSOLUTE_EXPIRY: Duration =
+    Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Failed logins allowed per address before the lock-out starts.
 pub const ATTEMPTS_PER_WINDOW: u32 = 5;
 
@@ -194,8 +204,10 @@ impl Password {
 /// log line) hands out nothing that can be replayed: an attacker would have
 /// to invert SHA-256 to get the cookie value back.
 pub struct Sessions {
-    live: Mutex<HashMap<[u8; 32], Instant>>,
+    /// Token hash -> (created, last used).
+    live: Mutex<HashMap<[u8; 32], (Instant, Instant)>>,
     idle_expiry: Duration,
+    absolute_expiry: Duration,
 }
 
 impl Default for Sessions {
@@ -206,12 +218,24 @@ impl Default for Sessions {
 
 impl Sessions {
     pub fn new(idle_expiry: Duration) -> Self {
-        Self { live: Mutex::new(HashMap::new()), idle_expiry }
+        Self {
+            live: Mutex::new(HashMap::new()),
+            idle_expiry,
+            absolute_expiry: ABSOLUTE_EXPIRY,
+        }
     }
 
+    /// For the test that has to watch a whole lifetime go by.
+    pub fn with_absolute_expiry(mut self, absolute: Duration) -> Self {
+        self.absolute_expiry = absolute;
+        self
+    }
+
+    #[allow(clippy::type_complexity)]
     fn lock(
         &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Instant>> {
+    ) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], (Instant, Instant)>>
+    {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -223,8 +247,9 @@ impl Sessions {
 
     fn create_at(&self, token: &str, now: Instant) {
         let mut live = self.lock();
-        live.retain(|_, last| {
+        live.retain(|_, (created, last)| {
             now.duration_since(*last) < self.idle_expiry
+                && now.duration_since(*created) < self.absolute_expiry
         });
 
         // Still full after pruning: someone is logging in in a loop. Drop
@@ -232,7 +257,7 @@ impl Sessions {
         while live.len() >= MAX_SESSIONS {
             let Some(oldest) = live
                 .iter()
-                .min_by_key(|(_, last)| **last)
+                .min_by_key(|(_, (_, last))| *last)
                 .map(|(key, _)| *key)
             else {
                 break;
@@ -240,7 +265,7 @@ impl Sessions {
             live.remove(&oldest);
         }
 
-        live.insert(sha256(&[token.as_bytes()]), now);
+        live.insert(sha256(&[token.as_bytes()]), (now, now));
     }
 
     /// Is this cookie value a live session? Touches it, so the 12 hours are
@@ -253,16 +278,20 @@ impl Sessions {
         let key = sha256(&[token.as_bytes()]);
         let mut live = self.lock();
 
-        let Some(last) = live.get(&key).copied() else {
+        let Some((created, last)) = live.get(&key).copied() else {
             return false;
         };
 
-        if now.duration_since(last) >= self.idle_expiry {
+        // Idle for too long, or simply old enough. Both are removals, so a
+        // dead session never lingers in the table either.
+        if now.duration_since(last) >= self.idle_expiry
+            || now.duration_since(created) >= self.absolute_expiry
+        {
             live.remove(&key);
             return false;
         }
 
-        live.insert(key, now);
+        live.insert(key, (created, now));
         true
     }
 
@@ -675,6 +704,33 @@ mod tests {
         let much_later = later + Duration::from_secs(10_000);
         assert!(!sessions.touch_at(&token, much_later));
         assert!(sessions.is_empty());
+    }
+
+    /// Review MINOR 4: a token touched inside every idle window used to
+    /// live for ever.
+    #[test]
+    fn a_session_also_ends_when_it_is_simply_old() {
+        let sessions = Sessions::new(Duration::from_secs(3_600))
+            .with_absolute_expiry(Duration::from_secs(10_000));
+        let start = Instant::now();
+        let token = random_token().unwrap();
+
+        sessions.create_at(&token, start);
+
+        // Used often enough that the idle clock never runs out ...
+        let mut at = start;
+        for _ in 0..3 {
+            at += Duration::from_secs(3_000);
+            assert!(
+                sessions.touch_at(&token, at),
+                "died too early at {at:?}"
+            );
+        }
+
+        // ... and it still ends, because it is old.
+        at += Duration::from_secs(3_000);
+        assert!(!sessions.touch_at(&token, at));
+        assert!(sessions.is_empty(), "the dead session was left behind");
     }
 
     #[test]

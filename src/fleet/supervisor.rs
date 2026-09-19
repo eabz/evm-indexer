@@ -60,6 +60,23 @@ pub const FIRST_RESTART_BACKOFF: Duration = Duration::from_secs(2);
 /// Cap of the wait between restarts (docs/design.md section 15).
 pub const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(300);
 
+/// Chains one process will hold at once.
+///
+/// A signed-in session could add chains until the process ran out of memory
+/// (review MINOR 9). It is post-authentication, so this is a guard rail and
+/// not a lock: fifty chains in one process is already more than the design
+/// contemplates, and the number is here to be seen rather than to be
+/// tuned.
+pub const MAX_CHAINS: usize = 256;
+
+/// How long `shutdown` waits for a chain to stop before giving up on it.
+///
+/// It used to await every chain task with no deadline, so one chain that
+/// never returned hung the whole process's shutdown for ever (review
+/// MINOR 9). A chain that has not finished flushing by now is not going to:
+/// its lease expires on its own and the next start takes over.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
+
 /// How often a chain whose lease another process holds looks again. A
 /// fixed, unhurried interval, NOT a growing backoff: this is a state to
 /// wait out, and the moment the other process stops we want to take over
@@ -452,6 +469,10 @@ impl Supervisor {
             return Err(CommandError::AlreadyThere(chain));
         }
 
+        if self.lock().len() >= MAX_CHAINS {
+            return Err(CommandError::TooMany(MAX_CHAINS));
+        }
+
         let stored = self.insert(chain, Desired::Running, settings);
         self.remember(stored).await;
 
@@ -720,8 +741,24 @@ impl Supervisor {
                 .collect()
         };
 
-        for task in tasks {
-            let _ = task.await;
+        // With a deadline: one chain that never returns must not hang the
+        // whole process (review MINOR 9). The lease of a chain that is
+        // abandoned here expires on its own, so the next start takes over
+        // after one ttl rather than never.
+        let waited = tokio::time::timeout(SHUTDOWN_DEADLINE, async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        })
+        .await;
+
+        if waited.is_err() {
+            warn!(
+                "Some chains did not stop within {}; going down anyway. \
+                 Their leases expire on their own, so the next start of \
+                 this process takes them over.",
+                human_duration(SHUTDOWN_DEADLINE)
+            );
         }
     }
 }
@@ -862,6 +899,8 @@ pub struct ChainView {
 pub enum CommandError {
     NoSuchChain(u64),
     AlreadyThere(u64),
+    /// The process already holds [`MAX_CHAINS`].
+    TooMany(usize),
     Settings(SettingError),
 }
 
@@ -881,6 +920,12 @@ impl std::fmt::Display for CommandError {
             Self::AlreadyThere(chain) => {
                 write!(f, "chain {chain} is already in this fleet.")
             }
+            Self::TooMany(limit) => write!(
+                f,
+                "this process already indexes {limit} chains, which is \
+                 the most it will hold. Start a second fleet process for \
+                 more."
+            ),
             Self::Settings(error) => write!(f, "{error}"),
         }
     }

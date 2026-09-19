@@ -838,6 +838,121 @@ async fn an_expired_session_is_refused_like_no_session_at_all() {
     panel.stop().await;
 }
 
+/// Review MINOR 3. `Cookie: session=deadbeef; session=<real>` used to be
+/// resolved by taking the first, so a sibling subdomain that sets a
+/// `Domain=...` cookie called `session` could force the owner's browser
+/// into a session of its choosing. Shadowing is refused, not resolved.
+#[tokio::test]
+async fn a_shadowed_session_cookie_is_refused_rather_than_guessed() {
+    let panel = Panel::start(&[1]).await;
+    let real = sign_in(&panel).await;
+    let value = real.trim_start_matches("session=");
+
+    for shadowed in [
+        format!("session=deadbeef; {real}"),
+        format!("{real}; session=deadbeef"),
+        format!("session={value}; session={value}"),
+    ] {
+        let reply = request(
+            panel.addr,
+            "GET",
+            "/api/chains",
+            &[("Cookie", shadowed.as_str())],
+            None,
+        )
+        .await;
+
+        assert_eq!(reply.status, 401, "{shadowed}: {reply:?}");
+    }
+
+    // On its own it still works.
+    let reply = request(
+        panel.addr,
+        "GET",
+        "/api/chains",
+        &[("Cookie", real.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+
+    panel.stop().await;
+}
+
+/// Behind TLS the cookie gets the `__Host-` prefix, which a browser accepts
+/// only host-only, `Secure` and `Path=/` - so no sibling subdomain can set
+/// one at all.
+#[tokio::test]
+async fn behind_tls_the_cookie_carries_the_host_prefix() {
+    let panel =
+        Panel::start_with(&[], |admin| admin.secure_cookie = true).await;
+
+    let reply = request(
+        panel.addr,
+        "POST",
+        "/api/login",
+        &[("Origin", &format!("https://{}", panel.addr))],
+        Some(&format!("{{\"password\":\"{PASSWORD}\"}}")),
+    )
+    .await;
+
+    let cookie = reply.header("set-cookie").unwrap();
+    assert!(cookie.starts_with("__Host-session="), "{cookie}");
+    assert!(cookie.contains("Secure"), "{cookie}");
+    assert!(cookie.contains("Path=/"), "{cookie}");
+    // A `__Host-` cookie may not carry a Domain; that is the whole point.
+    assert!(!cookie.to_lowercase().contains("domain="), "{cookie}");
+
+    panel.stop().await;
+}
+
+/// Review MINOR 1: a response axum produces BEFORE a handler runs used to
+/// go out bare, and the 400 echoed the offending path segment back.
+#[tokio::test]
+async fn even_a_rejected_request_carries_the_security_headers() {
+    let panel = Panel::start(&[1]).await;
+
+    for (method, path) in [
+        // The path extractor cannot parse this.
+        ("POST", "/api/chains/not-a-number/stop"),
+        // Percent-encoded, because a raw `<` is not a legal request
+        // target and hyper rejects the message before we see it.
+        ("POST", "/api/chains/%3Cscript%3Ealert(1)%3C%2Fscript%3E/stop"),
+        // No such route.
+        ("GET", "/nope"),
+        // Wrong method for a route that exists.
+        ("DELETE", "/api/chains/1"),
+    ] {
+        let reply = request(panel.addr, method, path, &[], None).await;
+
+        assert!(reply.status >= 400, "{method} {path}: {reply:?}");
+        assert_eq!(
+            reply.header("x-content-type-options"),
+            Some("nosniff"),
+            "{method} {path}"
+        );
+        assert_eq!(
+            reply.header("cache-control"),
+            Some("no-store"),
+            "{method} {path}"
+        );
+        assert_eq!(
+            reply.header("x-frame-options"),
+            Some("DENY"),
+            "{method} {path}"
+        );
+        assert!(
+            reply.header("content-security-policy").is_some(),
+            "{method} {path}"
+        );
+        // And nothing of what was asked for is echoed back.
+        assert!(!reply.body.contains("<script>"), "{}", reply.body);
+        assert!(!reply.body.contains("script"), "{}", reply.body);
+    }
+
+    panel.stop().await;
+}
+
 #[tokio::test]
 async fn a_made_up_cookie_is_refused() {
     let panel = Panel::start(&[1]).await;
@@ -1216,7 +1331,18 @@ async fn another_page_can_not_sign_the_owner_out() {
         let reply =
             request(panel.addr, "POST", "/api/logout", &headers, None)
                 .await;
-        assert_eq!(reply.status, 403, "{reply:?}");
+
+        // The browser's cookie is cleared regardless - a browser or
+        // extension that strips `Origin` must still be able to sign out
+        // (review MINOR 4) - but the SESSION is not ended.
+        assert_eq!(reply.status, 200, "{reply:?}");
+        assert_eq!(reply.json()["session_ended"], false, "{reply:?}");
+        assert!(
+            reply
+                .header("set-cookie")
+                .is_some_and(|value| value.contains("Max-Age=0")),
+            "{reply:?}"
+        );
     }
 
     // The session is still good.

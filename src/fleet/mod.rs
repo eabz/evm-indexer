@@ -299,7 +299,18 @@ pub fn describe(config: &FleetConfig) -> String {
         ),
     }
 
-    if std::env::var_os(crate::configs::ADMIN_PASSWORD_ENV).is_some() {
+    // The same test `admin::start` applies a moment later. Without it the
+    // banner announced a panel that a blank or too-short password had
+    // switched off (review MINOR 5).
+    let password_set =
+        std::env::var_os(crate::configs::ADMIN_PASSWORD_ENV)
+            .and_then(|value| value.to_str().map(str::to_string))
+            .is_some_and(|value| {
+                !value.trim().is_empty()
+                    && crate::admin::auth::check_strength(&value).is_ok()
+            });
+
+    if password_set {
         lines.push(format!(
             "Control panel: http://{}/ (password from {})",
             config.admin_addr,

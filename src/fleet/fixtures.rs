@@ -36,6 +36,9 @@ pub enum Behaviour {
     LeaseHeldElsewhere,
     /// Returns `Ok` at once, as `--end-block` would.
     Finishes,
+    /// Ignores its cancellation handle for ever: the chain that hangs the
+    /// process's shutdown (review MINOR 9).
+    NeverStops,
 }
 
 #[derive(Default)]
@@ -171,6 +174,10 @@ impl ChainRunner for FakeRunner {
                     .into())
                 }
                 Behaviour::Finishes => Ok(()),
+                Behaviour::NeverStops => {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                }
                 // The graceful path: run until the supervisor's
                 // cancellation handle resolves, exactly as the real
                 // pipeline does on ctrl-c.
