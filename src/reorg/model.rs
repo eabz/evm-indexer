@@ -309,10 +309,13 @@ impl Agg {
 /// `(count, sum)` per `(aggregate, bucket)`.
 pub type AggView = BTreeMap<(Agg, u32), (u64, u64)>;
 
+/// Every stored version of the rows of one child table, by `(block, position)`.
+pub type ChildRows = BTreeMap<(u64, u32), Vec<Row<u64>>>;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChainData {
     pub blocks: BTreeMap<u64, Vec<Row<B256>>>,
-    pub children: [BTreeMap<(u64, u32), Vec<Row<u64>>>; CHILD_TABLES],
+    pub children: [ChildRows; CHILD_TABLES],
     pub checkpoints: BTreeMap<(u64, u64), Vec<Row<()>>>,
     pub reorgs: Vec<ReorgRecord>,
     /// `(aggregate, bucket, epoch)` -> `(count, sum)`.
