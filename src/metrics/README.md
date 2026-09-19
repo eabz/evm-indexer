@@ -21,6 +21,21 @@ outage makes every indexer not ready and a restart loop would only add
 load; a flush that fails for good already ends the process by itself. Use
 `/healthz` for liveness.
 
+## One endpoint, or one per chain
+
+`indexer run` serves its own chain. `indexer fleet` serves EVERY chain in
+the process from one endpoint: each chain keeps its own `Metrics` handle,
+which already stamps its own `chain` label on every sample, and
+`fleet::metrics::merge` folds the expositions together with one `# HELP` /
+`# TYPE` pair per family. The series are identical either way, so a
+dashboard built for one shape works for the other.
+
+The seam is the `Exposition` trait (`render` + `readiness`): the HTTP
+responder below is the same code in both cases, and `indexer run`'s output
+is byte for byte what it always was. The fleet's `/readyz` is ready when
+every chain that is SUPPOSED to be running is ready - a chain the owner
+stopped on purpose does not make the process look broken.
+
 ## Metric reference
 
 Every series is prefixed `evm_indexer_` and carries the constant label

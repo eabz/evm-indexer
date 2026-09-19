@@ -104,6 +104,44 @@ fn infrastructure_owns_no_dataset_and_there_is_no_by_layer_bucket() {
     }
 }
 
+/// The two modules section 15 adds. Neither is a DATA MODULE - they own no
+/// table of chain data - so the standard file set above does not apply, but
+/// they are part of the one layout and document themselves like everything
+/// else.
+#[test]
+fn fleet_mode_and_the_control_panel_are_their_own_modules() {
+    for module in ["fleet", "admin"] {
+        let directory = src(module);
+        assert!(
+            directory.is_dir(),
+            "src/{module}/ is missing: section 15 lists it"
+        );
+        assert!(
+            directory.join("mod.rs").is_file(),
+            "src/{module}/mod.rs is missing"
+        );
+        assert!(
+            directory.join("README.md").is_file(),
+            "src/{module}/README.md is missing"
+        );
+    }
+
+    // The panel is ONE embedded page, no build step and no bundler
+    // (docs/design.md section 15).
+    assert!(
+        src("admin").join("page.html").is_file(),
+        "src/admin/page.html is missing"
+    );
+
+    // The supervisor must not become a dataset: no row models, no
+    // migrations of its own beyond the one the design names.
+    assert!(
+        !src("fleet").join("models.rs").exists(),
+        "src/fleet owns no table of chain data; a row model there means \
+         the supervisor grew a dataset"
+    );
+}
+
 #[test]
 fn every_source_is_one_file_per_chain_family() {
     for file in ["mod.rs", "evm.rs", "solana.rs"] {

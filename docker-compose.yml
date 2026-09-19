@@ -1,9 +1,14 @@
 # Configuration comes from `.env` (copy `.env.example` to `.env` first).
 # `ENVIO_API_TOKEN` is the only value without a default.
 #
-# One ClickHouse database holds every chain; there is ONE indexer process per
-# chain. `x-indexer` below is the shared definition, `indexer` is the first
-# chain and `indexer-base` (commented out) shows how to add another one.
+# One ClickHouse database holds every chain. Two ways to run it:
+#
+#   * ONE indexer process per chain - `x-indexer` below is the shared
+#     definition, `indexer` is the first chain and `indexer-base` (commented
+#     out) shows how to add another one;
+#   * ONE process for every chain (`indexer fleet`) with a web control
+#     panel - the `fleet` service at the bottom, also commented out. Use one
+#     or the other, not both on the same chains.
 
 # Shared by every indexer service (YAML merge key: `<<: *indexer`).
 x-indexer: &indexer
@@ -139,6 +144,47 @@ services:
   #     HYPERSYNC_URL: ""
   #   ports:
   #     - "127.0.0.1:9102:9090"
+
+  # ------------------------------------------------------------------
+  # Fleet mode: ONE process for every chain, with the control panel.
+  # Uncomment this and comment out `indexer` above - the two must not index
+  # the same chain at the same time (the lease would refuse the second one
+  # anyway, and it would show as "running elsewhere" in the panel).
+  #
+  # Set ADMIN_PASSWORD in `.env`. Without it the panel is off and its port
+  # is not bound.
+  #
+  # The panel is published on 127.0.0.1 only. It speaks plain HTTP: to reach
+  # it from another machine use an SSH tunnel
+  # (`ssh -N -L 8090:127.0.0.1:8090 you@host`) or a TLS reverse proxy, see
+  # the README.
+  #
+  # fleet:
+  #   <<: *indexer
+  #   container_name: evm-indexer-fleet
+  #   environment:
+  #     <<: *indexer-environment
+  #     # Read by the panel itself, never by the command line: it must not
+  #     # be visible in `ps`.
+  #     ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env to switch the control panel on}
+  #     # Inside the container; published on the host below.
+  #     ADMIN_ADDR: 0.0.0.0:8090
+  #     # Chain settings come from the fleet_chains table and the panel, NOT
+  #     # from .env: leave CHAIN_ID, START_BLOCK and friends out here.
+  #   command:
+  #     - fleet
+  #     # Only needed the first time, for a database whose fleet_chains
+  #     # table is still empty. After that the panel adds chains.
+  #     - --chain
+  #     - "1"
+  #     - --chain
+  #     - "8453"
+  #     # The panel is behind Compose's port mapping, not on localhost
+  #     # inside the container, so it has to be allowed to bind 0.0.0.0.
+  #     - --admin-allow-remote
+  #   ports:
+  #     - "127.0.0.1:${METRICS_PORT:-9101}:9090" # every chain, one endpoint
+  #     - "127.0.0.1:${ADMIN_PORT:-8090}:8090"   # the control panel
 
 volumes:
   clickhouse_data:
