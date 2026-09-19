@@ -1563,6 +1563,140 @@ async fn hostile_amounts_do_not_wrap_aggregates() {
     database.drop().await;
 }
 
+/// Review F, NEW-3.
+///
+/// A prediction price is `collateral / shares`, bounded to [0, 1] by the
+/// price bound - and the two ENDPOINTS are what a probability chart is
+/// read for. One raw unit of collateral against one raw unit of shares
+/// prints 1.0, certainty, for a millionth of a cent; zero against one
+/// prints 0.0. The dust floor the DEX, Solana and launchpad candles got in
+/// round 4 (MAJOR 13) reaches this fourth family too.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn a_dust_print_does_not_set_the_prediction_candle() {
+    let database = TestDb::create().await;
+    // One minute, so both prints land in the same 1m bucket.
+    let traded_at = now() - 600;
+
+    let exchange = Address::repeat_byte(0xe2);
+    let registry = Address::repeat_byte(0xc8);
+    let taker = Address::repeat_byte(0x7b);
+    let token = U256::from(91u8);
+
+    let place = |block: u64, transaction: u8, log_index| Place {
+        chain: CHAIN,
+        block_number: block,
+        log_index,
+        timestamp: traded_at,
+        transaction_hash: B256::repeat_byte(transaction),
+    };
+
+    // CONSTRUCTED. The dust print is FIRST - the earlier position, so it
+    // would be the candle's open - and prices the outcome at certainty
+    // for one raw unit against one raw unit.
+    let dust_maker = Address::repeat_byte(0xa6);
+    let dust = [
+        fixtures::constructed_transfer(
+            place(10, 1, 0),
+            registry,
+            exchange,
+            dust_maker,
+            taker,
+            token,
+            U256::from(1u8),
+        ),
+        fixtures::constructed_v2_fill(
+            place(10, 1, 1),
+            exchange,
+            B256::repeat_byte(0xd1),
+            dust_maker,
+            taker,
+            true,
+            token,
+            U256::from(1u8),
+            U256::from(1u8),
+            U256::ZERO,
+        ),
+    ];
+
+    // The real trade: 1,000,000 raw shares for 500,000 raw collateral, a
+    // price of 0.5.
+    let maker = Address::repeat_byte(0xa7);
+    let real = [
+        fixtures::constructed_transfer(
+            place(11, 2, 0),
+            registry,
+            exchange,
+            maker,
+            taker,
+            token,
+            U256::from(1_000_000u64),
+        ),
+        fixtures::constructed_v2_fill(
+            place(11, 2, 1),
+            exchange,
+            B256::repeat_byte(0xd2),
+            maker,
+            taker,
+            true,
+            token,
+            U256::from(1_000_000u64),
+            U256::from(500_000u64),
+            U256::ZERO,
+        ),
+    ];
+
+    let mut rows =
+        decode(CHAIN, &[dust.as_slice(), real.as_slice()].concat());
+    assert_eq!(rows.trades.len(), 2);
+    // Both fills are PROVEN - the registry really moved the shares - so
+    // what keeps the dust one off the chart is the floor alone.
+    assert!(rows.trades.iter().all(|trade| trade.verified == 1));
+    rows.set_version(crate::db::next_version());
+    database.insert(&rows).await;
+
+    for table in [
+        "prediction_candles_1m",
+        "prediction_candles_1h",
+        "prediction_candles_1d",
+    ] {
+        let sql = format!(
+            "SELECT toUInt64(sum(trades)), \
+             toFloat64(argMinMerge(open)), toFloat64(max(high)), \
+             toFloat64(min(low)), toFloat64(argMaxMerge(close)) \
+             FROM {table} WHERE chain = {CHAIN}"
+        );
+        let (trades, open, high, low, close): (u64, f64, f64, f64, f64) =
+            settle(
+                || database.rows::<(u64, f64, f64, f64, f64)>(&sql),
+                |seen: &Vec<(u64, f64, f64, f64, f64)>| {
+                    seen.first().is_some_and(|row| row.0 >= 1)
+                },
+            )
+            .await[0];
+
+        // The dust print is not counted and, above all, is not the price.
+        assert_eq!(
+            trades, 1,
+            "{table}: the dust print reached the candle"
+        );
+        for (what, value) in [
+            ("open", open),
+            ("high", high),
+            ("low", low),
+            ("close", close),
+        ] {
+            assert!(
+                (value - 0.5).abs() < 1e-9,
+                "{table}: {what} is {value} rather than 0.5 - one raw unit \
+                 against one raw unit priced the market"
+            );
+        }
+    }
+
+    database.drop().await;
+}
+
 // ---------------------------------------------------------- chain neutral
 
 /// A chain that is not EVM: the reserved Solana id (docs/design.md §14).

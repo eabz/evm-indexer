@@ -213,6 +213,27 @@ fn role_of(instance: &str) -> &str {
     instance.split_once('|').map_or(ROLE_RUN, |(role, _)| role)
 }
 
+/// The SQL that picks the rows of ONE role, matching [`role_of`].
+///
+/// An instance id written by an earlier build of this branch carries no
+/// `|` at all, and `role_of` reads such an id as [`ROLE_RUN`]. The SQL has
+/// to agree, or an `indexer run` started while an old-build indexer is
+/// still alive would not see it and would happily start a second writer on
+/// the chain (review F, MINOR 6). Every other role matches by prefix only:
+/// an id with no `|` is never a backfill.
+fn same_role_sql(role: &str) -> String {
+    let prefixed = format!(
+        "startsWith(instance, {})",
+        sql_string(&format!("{role}|"))
+    );
+
+    if role == ROLE_RUN {
+        format!("({prefixed} OR position(instance, '|') = 0)")
+    } else {
+        prefixed
+    }
+}
+
 async fn others_alive(
     db: &Database,
     instance: &str,
@@ -225,13 +246,13 @@ async fn others_alive(
              toUnixTimestamp64Milli(max(heartbeat)) AS heartbeat_ms \
              FROM indexer_instances \
              WHERE chain = {} AND instance != {} \
-             AND startsWith(instance, {}) \
+             AND {} \
              GROUP BY instance \
              HAVING argMax(released, heartbeat) = 0 \
              AND max(heartbeat) > now64(3) - toIntervalMillisecond({})",
             db.chain_id,
             sql_string(instance),
-            sql_string(&format!("{}|", role_of(instance))),
+            same_role_sql(role_of(instance)),
             ttl.as_millis()
         ))
         .fetch_all::<Other>()
@@ -550,6 +571,29 @@ mod tests {
             started_ms,
             heartbeat_ms: started_ms + 1,
         }
+    }
+
+    /// The role filter of the SQL says the same thing [`role_of`] says,
+    /// including about an instance id from a build that had no roles
+    /// (review F, MINOR 6): such an id IS the run role, so a new
+    /// `indexer run` has to see an old-build indexer that is still alive.
+    #[test]
+    fn an_id_from_before_the_roles_is_seen_as_the_run_role() {
+        assert_eq!(role_of("0123abcd"), ROLE_RUN);
+        assert_eq!(role_of("run|0123abcd"), ROLE_RUN);
+        assert_eq!(role_of("backfill:dex|0123abcd"), "backfill:dex");
+
+        let run = same_role_sql(ROLE_RUN);
+        assert!(run.contains("startsWith(instance, 'run|')"), "{run}");
+        assert!(run.contains("position(instance, '|') = 0"), "{run}");
+
+        // Every other role is a prefix match and nothing else: an id with
+        // no '|' is never a backfill.
+        let backfill = same_role_sql("backfill:dex");
+        assert_eq!(
+            backfill, "startsWith(instance, 'backfill:dex|')",
+            "{backfill}"
+        );
     }
 
     #[test]

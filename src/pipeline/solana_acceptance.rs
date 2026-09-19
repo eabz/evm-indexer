@@ -570,6 +570,71 @@ impl Scenario {
 
         panic!("the unclaimed range [{from}, {to}) never became a hole");
     }
+
+    /// Adds ONE swap whose pool the decoder could not name: the newest
+    /// stored swap below `before` that is at or after `not_before`,
+    /// copied with an empty `pool_id` and a free ordinal.
+    ///
+    /// Such rows are ordinary on Solana - five of the ten venues publish
+    /// no pool key of their own, and the decoder now stores the trade with
+    /// an empty key rather than the program-wide vault authority it used
+    /// to invent (review round 4, B3). Nothing in the recorded fixtures
+    /// produces one, so the scenarios that need one make it here, exactly
+    /// as the decoder would: same trade, no pool.
+    ///
+    /// Returns the slot it copied.
+    async fn add_unnamed_pool_swap(
+        &self,
+        not_before: u32,
+        before: u64,
+    ) -> u64 {
+        let slot: u64 = self
+            .count(&format!(
+                "SELECT toUInt64(max(block_number)) FROM sol_dex_swaps \
+                 FINAL WHERE chain = {CHAIN} AND block_number < {before} \
+                 AND timestamp >= toDateTime({not_before})"
+            ))
+            .await;
+        assert!(slot > 0, "no stored swap to copy");
+
+        // The row keeps the flush `_version` it was copied from: it lands
+        // on a sorting key of its own (a free `ordinal`), so it replaces
+        // nothing. The `REPLACE` sits OUTSIDE the subquery on purpose -
+        // its aliases are visible to a `WHERE` next to it, and a
+        // `pool_id != ''` there would then filter out the very row it
+        // just emptied.
+        self.db
+            .db
+            .query(&format!(
+                "INSERT INTO sol_dex_swaps SELECT * REPLACE ( \
+                   toFixedString('', 32) AS pool_id, \
+                   toUInt64(4095) AS ordinal) \
+                 FROM (SELECT * FROM sol_dex_swaps FINAL \
+                   WHERE chain = {CHAIN} AND block_number = {slot} \
+                   AND pool_id != toFixedString('', 32) LIMIT 1)"
+            ))
+            .execute()
+            .await
+            .unwrap();
+
+        // No read-your-writes: the run that follows must see the row, or
+        // the test would pass without ever exercising it.
+        for _ in 0..200 {
+            let live = self
+                .count(&format!(
+                    "SELECT toUInt64(count()) FROM sol_dex_swaps FINAL \
+                     WHERE chain = {CHAIN} AND pool_id = \
+                     toFixedString('', 32) AND is_deleted = 0"
+                ))
+                .await;
+            if live == 1 {
+                return slot;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("the unnamed-pool swap never became visible");
+    }
 }
 
 /// Quick heartbeats, but a ttl that survives a saturated test machine.
@@ -2148,4 +2213,216 @@ async fn a_slot_without_a_block_time_does_not_start_the_repair_window() {
         .await
         .unwrap();
     assert_eq!(only_zero, Some((0, 0)));
+}
+
+// ---------------------------------------------- (j) re-review F findings
+
+/// Review F, NEW-1.
+///
+/// Five of the ten Solana venues publish no pool key, so the decoder
+/// stores those trades with an EMPTY `pool_id` and the three candle
+/// materialized views skip them: one shared key per venue would merge
+/// USDC/SOL prices with memecoin prices into a single series.
+///
+/// A purge does not use the materialized views. It re-runs
+/// `DerivedTable::rebuild_statements`, which is supposed to BE the view's
+/// own SELECT - and that copy had no pool guard. So every purge (a tip
+/// reorg, a gap heal, a module backfill) gave the repaired days one junk
+/// series per venue, and a repaired index stopped equalling a clean one,
+/// which is the property docs/design.md §2 exists to guarantee.
+///
+/// The scenario is the lost-checkpoint heal, with one unnamed-pool swap
+/// stored in a day the repair rebuilds and OUTSIDE the range it purges -
+/// i.e. a row the rebuild reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_purge_and_a_rebuild_equal_a_clean_index_with_an_unnamed_pool() {
+    let chain = chain(40);
+
+    // The hole that is purged and streamed again, and the first UTC day
+    // `complete_days` considers whole.
+    let hole_from = chain.slot_at(15);
+    let hole_to = chain.slot_at(25);
+    let day_one = BASE_TIMESTAMP + 86_400;
+
+    let clean = clean_index("j_unnamed_clean", &chain, chain.head).await;
+    let copied = clean.add_unnamed_pool_swap(day_one, hole_from).await;
+
+    let scenario = Scenario::new("j_unnamed_purged").await;
+    scenario.index_until(&chain, chain.head).await.unwrap();
+    assert_eq!(
+        scenario.add_unnamed_pool_swap(day_one, hole_from).await,
+        copied,
+        "the two indexes must hold the SAME unnamed-pool row"
+    );
+
+    let swaps = scenario.rows("sol_dex_swaps").await;
+
+    // The crash: the checkpoint of a middle window never became live,
+    // while every row it covered did. The heal purges that range and
+    // streams it again - and rebuilds the candles of the days it touched,
+    // which is where the unnamed-pool row is read.
+    scenario.unclaim(hole_from, hole_to).await;
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    assert_eq!(scenario.rows("sol_dex_swaps").await, swaps);
+
+    // No candle may be keyed on the empty pool: that series is the merged
+    // one, and a clean index has none.
+    for view in SOL_CANDLE_VIEWS {
+        let junk = scenario
+            .count(&format!(
+                "SELECT toUInt64(count()) FROM `{view}` \
+                 WHERE chain = {CHAIN} AND pool_id = toFixedString('', 32)"
+            ))
+            .await;
+        assert_eq!(
+            junk, 0,
+            "{view}: the rebuild re-created the merged price series of \
+             the pools it cannot name"
+        );
+    }
+
+    scenario.assert_consistent().await;
+    assert_same(
+        "after a heal with an unnamed-pool swap in the rebuilt days",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+}
+
+/// Review F, NEW-5.
+///
+/// The queue of flushes that raced another process's purge is drained by
+/// `pass()`, and `pass()` only runs when `target > cursor`. On a bounded
+/// run whose range is already tiled the cursor starts AT the resume point,
+/// so `pass()` was never entered and the queue - which startup had just
+/// filled from the database, announcing in capitals that those spans are
+/// "purged and indexed again before anything else" - was carried to the
+/// exit untouched. Nothing else ever asks for them: their rows are stored,
+/// so the tiling shows no hole, and they stay hidden from every aggregate
+/// until somebody runs an unbounded `indexer run`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_bounded_run_over_a_tiled_range_still_drains_the_stale_queue() {
+    let chain = chain(40);
+    let clean = clean_index("j_drain_clean", &chain, chain.head).await;
+    let scenario = Scenario::new("j_drain").await;
+
+    // The whole range, indexed and tiled: a second bounded run over it has
+    // nothing to stream.
+    scenario.index_until(&chain, chain.head).await.unwrap();
+    scenario.assert_consistent().await;
+
+    // Another process purged and rebuilt the third UTC day under epoch 1,
+    // and this flush of three slots raced it: identical rows, stamped with
+    // the epoch that was in force when the flush started. Nothing but the
+    // stamps distinguishes them - no hole, no orphan.
+    let tombstoned = next_version();
+    let day = BASE_TIMESTAMP + 2 * 86_400;
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+               fork_block, to_block, old_head, depth, rows_tombstoned, \
+               reason, tombstone_version, completed) \
+             VALUES ({CHAIN}, 1, {day}, {}, {}, {}, 0, 0, 0, \
+               'redecode', {tombstoned}, 1)",
+            day + 86_400,
+            chain.slot_at(24),
+            chain.slot_at(31),
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    let (from, to) = (chain.slot_at(25), chain.slot_at(27) + 1);
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO `{COMMIT_MARKER}` (chain, block_number, \
+               blockhash, parent_slot, parent_blockhash, block_height, \
+               timestamp, epoch, _version, is_deleted) \
+             SELECT chain, block_number, blockhash, parent_slot, \
+               parent_blockhash, block_height, timestamp, 0 AS epoch, \
+               {} AS `_version`, 0 AS is_deleted \
+             FROM `{COMMIT_MARKER}` FINAL WHERE chain = {CHAIN} \
+               AND block_number >= {from} AND block_number < {to}",
+            next_version()
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // No read-your-writes: the run must be able to SEE the span at
+    // startup, or the test would pass for the wrong reason.
+    for _ in 0..200 {
+        let found = scenario
+            .db
+            .stale_flush_ranges_in(COMMIT_MARKER, "block_number")
+            .await
+            .unwrap();
+        if found == vec![BlockRange::new(from, to)] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE BOUNDED RUN, over the very range that is already complete.
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    let healed: u64 = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM reorgs WHERE chain = {CHAIN} \
+             AND reason = 'gap_heal' AND fork_block = {from} \
+             AND to_block = {to} AND completed = 1"
+        ))
+        .await;
+    assert_eq!(
+        healed, 1,
+        "the bounded run exited without purging the span its own startup \
+         said it would purge before anything else"
+    );
+
+    // And it did not just purge: the slots came back under an epoch the
+    // validity rule counts, so the index equals a clean one again.
+    assert_eq!(scenario.rows(COMMIT_MARKER).await, chain.produced_slots());
+    scenario.assert_consistent().await;
+    assert_same(
+        "after a bounded run drained the stale queue",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+}
+
+/// Review F, NEW-2.
+///
+/// `indexer verify --chain solana` compares `sum(swaps)` of
+/// `sol_dex_candles_1d_v` with `count()` over `sol_dex_swaps`, per UTC
+/// day. The view skips the swaps whose pool has no name; the base side
+/// counted them, so every day holding one - a perfectly healthy day -
+/// printed PROBLEMS FOUND. The operator's own health check is the only
+/// thing that can find a doubled aggregate, so crying wolf is expensive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_swap_with_no_pool_name_is_not_an_inconsistency() {
+    let chain = chain(40);
+    let scenario = Scenario::new("j_unnamed_verify").await;
+
+    scenario.index_until(&chain, chain.head).await.unwrap();
+    scenario.assert_consistent().await;
+
+    // One unnamed-pool swap, in a day `verify` checks completely.
+    let day_one = BASE_TIMESTAMP + 86_400;
+    scenario.add_unnamed_pool_swap(day_one, chain.slot_at(30)).await;
+
+    let report = scenario.verify().await;
+    assert!(
+        report.candles.is_empty(),
+        "a swap whose pool has no name is counted on one side only:\n\
+         {report}"
+    );
+    assert!(report.is_consistent(), "{report}");
 }

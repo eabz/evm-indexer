@@ -21,6 +21,11 @@ use tokio::sync::mpsc;
 /// `(from, exclusive to)` of a range the purger was asked to remove.
 type PurgedRange = (u64, Option<u64>);
 
+/// The block time every stored block gets: a real one, so the repair
+/// window of a purge is a real day rather than 1970 (review round 4,
+/// MAJOR 6).
+const BLOCK_TIME: u32 = 1_700_000_000;
+
 fn hash_of(number: u64) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash[..8].copy_from_slice(&number.to_be_bytes());
@@ -162,6 +167,10 @@ impl ReorgStore for MemoryStore {
         Box::pin(async { Ok(0) })
     }
 
+    /// The block times of the rows the purge is about to tombstone. A
+    /// range that holds none is a purge with nothing to do - and the real
+    /// store answers `None` for exactly that case, which is why this one
+    /// looks at what it stores rather than always saying `None`.
     fn timestamp_span(
         &self,
         _: u64,
@@ -173,7 +182,15 @@ impl ReorgStore for MemoryStore {
                 bail!("database is down");
             }
             self.purged.lock().unwrap().push((from, to));
-            Ok(None)
+
+            let stored = self
+                .blocks
+                .lock()
+                .unwrap()
+                .range(from..to.unwrap_or(u64::MAX))
+                .count();
+
+            Ok((stored > 0).then_some((BLOCK_TIME, BLOCK_TIME)))
         })
     }
 
@@ -243,14 +260,27 @@ impl ReorgStore for MemoryStore {
         Box::pin(async { Ok(()) })
     }
 
+    /// A purge really removes what it purged: the gap query of the next
+    /// pass must report the range as missing again, which is the whole
+    /// point of purging it.
     fn tombstone_blocks(
         &self,
         _: u64,
-        _: u64,
-        _: Option<u64>,
+        from: u64,
+        to: Option<u64>,
         _: u64,
     ) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(async { Ok(0) })
+        Box::pin(async move {
+            let mut blocks = self.blocks.lock().unwrap();
+            let removed: Vec<u64> = blocks
+                .range(from..to.unwrap_or(u64::MAX))
+                .map(|(number, _)| *number)
+                .collect();
+            for number in &removed {
+                blocks.remove(number);
+            }
+            Ok(removed.len() as u64)
+        })
     }
 }
 
@@ -689,6 +719,54 @@ async fn a_dead_writer_is_fatal_even_when_the_stream_failed_too() {
     let error = indexer.sync().await.unwrap_err();
     assert!(WriterStopped::is_cause_of(&error));
     assert_eq!(source.requested().len(), 1);
+}
+
+/// Review F, NEW-5.
+///
+/// The queue is drained by `pass()`, and `pass()` only runs when
+/// `target > cursor`. A bounded run over a range that is already stored
+/// therefore exited having drained nothing - while startup had announced,
+/// in capitals, that those spans are "purged and indexed again before
+/// anything else". Nothing else ever asks for them: their rows ARE stored,
+/// so no gap query reports them, and they stay hidden from every aggregate
+/// until somebody runs an unbounded `indexer run`.
+#[tokio::test(start_paused = true)]
+async fn a_bounded_run_over_a_stored_range_still_drains_the_stale_queue() {
+    let source = MockSource::new(&[50]);
+    let store = MemoryStore::with_blocks(0..50);
+
+    // `--new-blocks-only --end-block 50` at head 50: the cursor starts at
+    // the head and the target is the head, so there is nothing to sync.
+    let mut indexer = indexer(
+        source.clone(),
+        store.clone(),
+        SyncSettings { new_blocks_only: true, ..settings(0, 50) },
+    )
+    .await;
+
+    *indexer.stale.lock().unwrap() = vec![BlockRange::new(10, 20)];
+
+    indexer.sync().await.unwrap();
+    indexer.writer.shutdown().await.unwrap();
+
+    // The span was purged, and taken out of the queue only then. (The
+    // purge looks at the range's timestamps twice, before and after
+    // tombstoning its children, so one purge is two entries.)
+    let mut purged: Vec<PurgedRange> =
+        store.purged.lock().unwrap().clone();
+    purged.dedup();
+    assert_eq!(
+        purged,
+        vec![(10, Some(20))],
+        "the run exited without purging the span it said it would"
+    );
+    assert!(indexer.stale.lock().unwrap().is_empty());
+
+    // ... and it was indexed again rather than left hidden: the purge
+    // pulls the cursor back to the bottom of the span, and the same
+    // bounded run streams what the purge removed.
+    assert_eq!(source.requested(), vec![BlockRange::new(10, 20)]);
+    assert_eq!(store.numbers(), (0..50).collect::<Vec<_>>());
 }
 
 /// The queue of flushes that raced another process's purge is the ONLY

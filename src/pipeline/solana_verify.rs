@@ -31,6 +31,7 @@ use crate::{
         solana_store::{child_tables, SolanaReorgStore, COMMIT_MARKER},
     },
     reorg::ReorgStore,
+    svm::derived::SOL_CANDLE_FILTER,
 };
 use anyhow::{Context, Result};
 use clickhouse::Row;
@@ -526,6 +527,14 @@ async fn complete_days(
 /// The 1d view is the one whose grouping PARTITIONS the base rows: every
 /// swap contributes to exactly one `(pool_id, venue_program, day)` bucket,
 /// and the bucket is a day, so the comparison needs no bucket arithmetic.
+///
+/// **Both sides count the same rows.** The base side applies
+/// [`SOL_CANDLE_FILTER`], the very text the materialized views and the
+/// rebuild apply, because the view does not count a swap whose pool the
+/// decoder could not name. Counting those on the base side only made
+/// `verify` print PROBLEMS FOUND for every UTC day that held one -
+/// perfectly healthy days (review F, NEW-2). The EVM twin does this with
+/// `AggregateCheck::filter` (`pipeline::verify`).
 async fn check_candles(
     db: &Database,
     range: BlockRange,
@@ -550,7 +559,7 @@ async fn check_candles(
              SELECT intDiv(toUInt32(timestamp), 86400) * 86400 AS day, \
                     toInt64(0) AS agg, toInt64(count()) AS base \
              FROM sol_dex_swaps FINAL \
-             WHERE chain = {chain} AND is_deleted = 0 \
+             WHERE chain = {chain} AND {SOL_CANDLE_FILTER} \
                AND timestamp >= toDateTime({first_day}) \
                AND timestamp < toDateTime({last_day}) \
                AND block_number >= {from} AND block_number < {to} \

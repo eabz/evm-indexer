@@ -797,6 +797,29 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
         loop {
             let target = target_block(head, confirmations, end_block);
 
+            // BEFORE the loop decides there is nothing to do. The stale
+            // queue is drained inside `pass()`, and `pass()` is skipped
+            // when `target <= cursor` - so a bounded run over a range that
+            // is already stored exited without ever draining it, although
+            // startup announced in capitals that those spans would be
+            // "purged and indexed again before anything else" (review F,
+            // NEW-5). Nothing else ever asks for them: their rows ARE
+            // stored, so no gap query reports them.
+            if target <= cursor {
+                match self.purge_stale_flushes().await {
+                    Ok(Some(from)) => cursor = cursor.min(from),
+                    Ok(None) => {}
+                    Err(e) if is_fatal(&e) => return Err(e),
+                    // Transient: the next turn of the loop tries again,
+                    // and the queue still holds every span.
+                    Err(e) => warn!(
+                        "Chain {}: could not purge the flushes that raced \
+                         another process: {e:#}",
+                        self.settings.chain_id
+                    ),
+                }
+            }
+
             let at_tip = target.saturating_sub(cursor) <= TIP_PASS_BLOCKS;
             let paced = at_tip
                 && end_block == 0

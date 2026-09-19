@@ -521,6 +521,31 @@ mod tests {
         .is_empty());
     }
 
+    /// The sweep cannot get stuck on a page of rows that all start at the
+    /// same block (review F, MINOR 7).
+    ///
+    /// `Database::compact_checkpoints` takes the next cursor from the last
+    /// row of the page it read, so a FULL page sharing one `from_block`
+    /// would leave the cursor where it was. It cannot: rows sharing a
+    /// `from_block` overlap by definition, so they are one run and the
+    /// pass collapses them into a single row - the next pass reads a
+    /// different page. (The cursor is additionally floored at `cursor + 1`
+    /// in `compact_checkpoints`, as insurance rather than as the fix.)
+    #[test]
+    fn a_page_of_rows_that_all_start_together_is_collapsed() {
+        let live: Vec<DatabaseCheckpoint> =
+            (1..=50).map(|to| checkpoint(100, 100 + to)).collect();
+
+        let (written, after) = writes(&live);
+
+        assert_eq!(after, vec![(100, 150)], "{written:?}");
+        assert_eq!(
+            written.iter().filter(|w| w.2 == 1).count(),
+            live.len() - 1,
+            "every row but the cover is tombstoned"
+        );
+    }
+
     /// Running it again on the result writes nothing: a pass that died
     /// after the insert must not make the next one rewrite everything.
     #[test]

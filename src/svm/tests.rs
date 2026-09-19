@@ -1303,6 +1303,45 @@ fn a_two_hop_instruction_becomes_one_row_per_hop() {
     assert!(first.ordinal < second.ordinal);
 }
 
+/// Review F, NEW-4. M5 named two venues that run two fills from one
+/// instruction: Orca's `two_hop_swap` and Raydium CLMM's
+/// `swap_router_base_in`. The ROW SPLITTING covered both; the ENRICHMENT
+/// covered Orca only - `enrich_raydium_clmm` still read
+/// `data_log_of(.., 0)`, so hop 1 was validated against hop 0's
+/// `SwapEvent`.
+///
+/// Usually that just fails the agreement check and costs the row its
+/// `decoded` confidence. When the two hops move equal amounts - which is
+/// what this fixture does - the check PASSES and hop 0's `pool_state` is
+/// written onto hop 1: a wrong pool key on a real row, feeding the candle
+/// series of a pool that trade never touched.
+#[test]
+fn each_hop_of_a_clmm_router_swap_is_enriched_from_its_own_event() {
+    let registry = Registry::with_venues(&Venue::ALL);
+    let tx = build::raydium_clmm_router_two_hop();
+    let outcome = decode_transaction_with(CHAIN, 1, &tx, &registry);
+
+    assert_eq!(
+        outcome.swaps.len(),
+        2,
+        "a router swap over two pools must be two fills"
+    );
+
+    let (first, second) = (&outcome.swaps[0], &outcome.swaps[1]);
+
+    // Both hops were enriched - the events agree with the movements - and
+    // each carries the pool ITS OWN event names.
+    assert_eq!(first.confidence, "decoded", "{first:?}");
+    assert_eq!(second.confidence, "decoded", "{second:?}");
+    assert_ne!(
+        first.pool_id, second.pool_id,
+        "hop 1 was enriched from hop 0's event: both rows now name the \
+         same pool"
+    );
+    assert_eq!(first.pool_id, build::off_curve(0xc1));
+    assert_eq!(second.pool_id, build::off_curve(0xd1));
+}
+
 /// M8. Every transfer in the subtree that was not a leg went into
 /// `fee_amount`, whatever its mint - and a System transfer of LAMPORTS
 /// becomes a WSOL movement, so the column could hold lamports added to
@@ -1341,6 +1380,32 @@ mod build {
             SPL_TOKEN_B58,
         },
     };
+
+    /// Standard base64 (RFC 4648), the encoder for the decoder
+    /// `SvmLog::event_bytes` already has: a log line carries its event
+    /// body base64 encoded, so a constructed event has to be encoded the
+    /// same way a validator encodes a real one.
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                                      abcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+        for chunk in bytes.chunks(3) {
+            let triple = u32::from(chunk[0]) << 16
+                | u32::from(chunk.get(1).copied().unwrap_or(0)) << 8
+                | u32::from(chunk.get(2).copied().unwrap_or(0));
+            let at = |shift: u32| {
+                ALPHABET[(triple >> shift) as usize & 63] as char
+            };
+
+            out.push(at(18));
+            out.push(at(12));
+            out.push(if chunk.len() > 1 { at(6) } else { '=' });
+            out.push(if chunk.len() > 2 { at(0) } else { '=' });
+        }
+
+        out
+    }
 
     /// A key no private key can exist for, like every pool authority.
     pub fn off_curve(seed: u8) -> Pubkey {
@@ -1431,6 +1496,22 @@ mod build {
             );
         }
 
+        /// One `Program data:` line, i.e. an Anchor `emit!`, attributed to
+        /// the instruction at `path` exactly as HyperSync attributes it.
+        pub fn data_log(
+            &mut self,
+            path: &[u32],
+            program: Pubkey,
+            event: &[u8],
+        ) {
+            self.tx.logs.push(crate::svm::decode::SvmLog {
+                path: path.to_vec(),
+                program,
+                is_data: true,
+                message: base64(event),
+            });
+        }
+
         /// A System transfer of lamports. The movement layer records it as
         /// a WSOL movement, which is right - and is also how a fee paid in
         /// lamports used to be added to a fee paid in token base units.
@@ -1515,6 +1596,72 @@ mod build {
         build.transfer(&[0, 2], mint_b, 900, taker, pool_two);
         build.transfer(&[0, 3], mint_c, 800, pool_two, taker);
         build.tx
+    }
+
+    /// Raydium CLMM's `swap_router_base_in`: ONE instruction, two pools,
+    /// four transfers and TWO `SwapEvent` log lines - the CLMM twin of
+    /// [`orca_two_hop`], which is the shape M5 named and only half fixed.
+    ///
+    /// The two hops move the SAME amounts on purpose. That is the case in
+    /// which reading hop 0's event for hop 1 does not fail the agreement
+    /// check and writes hop 0's `pool_state` onto hop 1 instead: a wrong
+    /// pool key on a real row, with `decoded` confidence (review F,
+    /// NEW-4).
+    pub fn raydium_clmm_router_two_hop() -> SvmTransaction {
+        let mut build = Builder::new();
+        let pool_one = off_curve(0xc1);
+        let pool_two = off_curve(0xd1);
+        let taker = wallet(0xe1);
+        let (mint_a, mint_b, mint_c) =
+            ([0xa4u8; 32], [0xb4u8; 32], [0xc4u8; 32]);
+
+        build.venue(
+            &[0],
+            Venue::RaydiumClmm,
+            "swap_router_base_in",
+            vec![pool_one, pool_two],
+        );
+        build.transfer(&[0, 0], mint_a, 1_000, taker, pool_one);
+        build.transfer(&[0, 1], mint_b, 1_000, pool_one, taker);
+        build.transfer(&[0, 2], mint_b, 1_000, taker, pool_two);
+        build.transfer(&[0, 3], mint_c, 1_000, pool_two, taker);
+
+        // One `SwapEvent` per hop, in emission order, both attributed to
+        // the router instruction - which is exactly what makes `nth`
+        // necessary.
+        for pool in [pool_one, pool_two] {
+            build.data_log(
+                &[0],
+                pubkey(Venue::RaydiumClmm.program_b58()),
+                &clmm_swap_event(pool, taker, 1_000, 1_000),
+            );
+        }
+
+        build.tx
+    }
+
+    /// A Raydium CLMM `SwapEvent` body: the 8 byte discriminator and the
+    /// 213 bytes `RaydiumClmmSwap::parse` reads, at the offsets it reads
+    /// them at.
+    fn clmm_swap_event(
+        pool_state: Pubkey,
+        sender: Pubkey,
+        amount_0: u64,
+        amount_1: u64,
+    ) -> Vec<u8> {
+        let mut body = vec![0u8; 8 + 213];
+        body[..8].copy_from_slice(
+            &crate::svm::programs::DISC_RAYDIUM_SWAP_EVENT,
+        );
+        body[8..40].copy_from_slice(&pool_state);
+        body[40..72].copy_from_slice(&sender);
+        // 72..136 are the two vault token accounts, which the movement
+        // layer has already found for itself.
+        body[136..144].copy_from_slice(&amount_0.to_le_bytes());
+        body[152..160].copy_from_slice(&amount_1.to_le_bytes());
+        // `zero_for_one`: token 0 went into the pool.
+        body[168] = 1;
+        body
     }
 
     /// A swap that pays two fees in two different units: 50 of the output

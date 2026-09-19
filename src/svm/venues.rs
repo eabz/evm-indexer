@@ -843,14 +843,24 @@ pub fn enrich_raydium_cpmm(
 /// the fee and the pool account survive into the current row shape; the
 /// state fields are decoded and checked here so that adding the columns
 /// later is a schema change and not a decoder change.
+///
+/// `nth` selects between the `SwapEvent` lines a `swap_router_base_in`
+/// emits from ONE instruction, exactly as it does for Orca's
+/// `two_hop_swap`. Reading hop 0's event for hop 1 usually just fails
+/// `amounts_agree` and costs the row its `decoded` confidence - but when
+/// the two hops happen to move equal amounts it wrote hop 0's
+/// `pool_state` onto hop 1, i.e. a wrong pool key on a real row, feeding
+/// the candle series of a pool that trade never touched (review F,
+/// NEW-4).
 pub fn enrich_raydium_clmm(
     tx: &SvmTransaction,
     instruction: &SvmInstruction,
     swap: &MovementSwap,
     row: &mut SvmSwap,
+    nth: usize,
 ) -> Enrichment {
     let Some(log) =
-        data_log_of(tx, instruction, DISC_RAYDIUM_SWAP_EVENT, 0)
+        data_log_of(tx, instruction, DISC_RAYDIUM_SWAP_EVENT, nth)
     else {
         return Enrichment::None;
     };
@@ -1387,7 +1397,7 @@ pub fn enrich(
             enrich_raydium_cpmm(tx, instruction, swap, row)
         }
         Venue::RaydiumClmm => {
-            enrich_raydium_clmm(tx, instruction, swap, row)
+            enrich_raydium_clmm(tx, instruction, swap, row, nth)
         }
         Venue::OrcaWhirlpool => {
             enrich_orca(tx, instruction, swap, row, nth)

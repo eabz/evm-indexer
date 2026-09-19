@@ -757,11 +757,20 @@ impl Database {
 
         // Where the next pass picks up. A full page means there is more
         // above it; anything else has been swept.
+        //
+        // `max(cursor + 1, ..)`: repeated purge splits of one range can
+        // leave a whole page of rows sharing one `from_block`, and taking
+        // that value as the next cursor would re-read the same page for
+        // ever (review F, MINOR 7). One row of that run is then skipped
+        // by the next pass, which costs nothing: a pass only ever MERGES
+        // contiguous rows, and the row is read again on the next wrap.
         self.compact_from.store(
             if live.len() < MAX_CHECKPOINTS_PER_COMPACTION {
                 0
             } else {
-                live.last().map(|row| row.from_block).unwrap_or(0)
+                live.last()
+                    .map(|row| row.from_block.max(cursor + 1))
+                    .unwrap_or(0)
             },
             Ordering::Relaxed,
         );

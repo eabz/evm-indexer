@@ -15,6 +15,17 @@
 //! unit test redoes the substitutions and compares, and the ClickHouse
 //! integration tests check that a repaired index equals a clean one.
 //!
+//! The candles carry the DUST FLOOR of `dex::derived::DUST_FLOOR_RAW`
+//! (1000 raw units on both sides of `collateral / shares`), like every
+//! other candle family; `dex::derived::every_candle_family_uses_the_same_
+//! dust_floor` holds all four families to the same number. A prediction
+//! price is bounded to `[0, 1]`, which is what makes the floor MORE
+//! important here and not less: the two endpoints are what a probability
+//! chart is read for, and one raw unit against one raw unit prints 1.0 -
+//! certainty - for a millionth of a cent. Migration 0021 carries the
+//! reasoning in full, including why the guard sits in the `WHERE` here
+//! and in an `argMinIf` on the DEX side.
+//!
 //! Placeholders: `{chain}` = chain id, `{from_ts}` = unix seconds of the
 //! first bucket to rebuild (a multiple of `bucket_seconds`; the start of
 //! the UTC day recorded in `reorgs` always is), `{to_ts}` = the exclusive
@@ -71,7 +82,9 @@ pub const PREDICTION_CANDLES_1M: DerivedTable = DerivedTable {
         " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
         " AND timestamp < toDateTime({to_ts}) AND NOT (block_number >= {purge_from} AND",
         " block_number < {purge_to}) AND is_deleted = 0 AND verified = 1 AND share_amount != 0",
-        " ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain, registry,",
+        " ) WHERE tupleElement(print, 2) <= share_amount AND",
+        " abs(toFloat64(tupleElement(print, 2))) >= 1000 AND",
+        " abs(toFloat64(share_amount)) >= 1000 GROUP BY chain, registry,",
         " outcome_token_id, bucket, epoch",
     ),
 };
@@ -97,7 +110,9 @@ pub const PREDICTION_CANDLES_1H: DerivedTable = DerivedTable {
         " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
         " AND timestamp < toDateTime({to_ts}) AND NOT (block_number >= {purge_from} AND",
         " block_number < {purge_to}) AND is_deleted = 0 AND verified = 1 AND share_amount != 0",
-        " ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain, registry,",
+        " ) WHERE tupleElement(print, 2) <= share_amount AND",
+        " abs(toFloat64(tupleElement(print, 2))) >= 1000 AND",
+        " abs(toFloat64(share_amount)) >= 1000 GROUP BY chain, registry,",
         " outcome_token_id, bucket, epoch",
     ),
 };
@@ -123,7 +138,9 @@ pub const PREDICTION_CANDLES_1D: DerivedTable = DerivedTable {
         " prediction_trades FINAL WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
         " AND timestamp < toDateTime({to_ts}) AND NOT (block_number >= {purge_from} AND",
         " block_number < {purge_to}) AND is_deleted = 0 AND verified = 1 AND share_amount != 0",
-        " ) WHERE tupleElement(print, 2) <= share_amount GROUP BY chain, registry,",
+        " ) WHERE tupleElement(print, 2) <= share_amount AND",
+        " abs(toFloat64(tupleElement(print, 2))) >= 1000 AND",
+        " abs(toFloat64(share_amount)) >= 1000 GROUP BY chain, registry,",
         " outcome_token_id, bucket, epoch",
     ),
 };

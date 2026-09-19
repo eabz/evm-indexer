@@ -1107,6 +1107,28 @@ impl<S: SlotSource> SolanaIndexer<S> {
         loop {
             let target = target_slot(head, end_slot);
 
+            // BEFORE the loop decides there is nothing to do. The stale
+            // queue is drained inside `pass()`, and `pass()` is skipped
+            // when `target <= cursor` - so a bounded run whose range is
+            // already tiled exited without ever draining it, although
+            // startup announced in capitals that those spans would be
+            // "purged and indexed again before anything else" (review F,
+            // NEW-5). Nothing else ever asks for them: their rows ARE
+            // stored, so no hole appears in the tiling.
+            if target <= cursor {
+                match self.purge_stale_flushes().await {
+                    Ok(Some(from)) => cursor = cursor.min(from),
+                    Ok(None) => {}
+                    Err(e) if is_fatal(&e) => return Err(e),
+                    // Transient: the next turn of the loop tries again,
+                    // and the queue still holds every span.
+                    Err(e) => warn!(
+                        "Chain {chain}: could not purge the flushes that \
+                         raced another process: {e:#}"
+                    ),
+                }
+            }
+
             let behind = target.saturating_sub(cursor);
 
             // Wait a cadence only when we are ACTUALLY CAUGHT UP, i.e. the
