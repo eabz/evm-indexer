@@ -199,7 +199,10 @@ CREATE TABLE IF NOT EXISTS sol_token_balances (
   balance UInt256,
   block_number UInt64 CODEC(Delta, ZSTD),
   tx_index UInt32,
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  -- UTC, because the partition key is the month of it: on a server in
+  -- another timezone toYYYYMM would cut the months somewhere else than
+  -- the flush does (round 4, MINOR 18).
+  timestamp DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32 DEFAULT 0,
   _version UInt64,
   is_deleted UInt8 DEFAULT 0,
