@@ -763,8 +763,7 @@ fn a_clmm_swap_crossing_ticks_decodes_and_reports_its_price_move() {
         } else {
             (event.post_sqrt_price, event.pre_sqrt_price)
         };
-        low > 0
-            && (high.saturating_sub(low) as f64 / low as f64) > 0.00005
+        low > 0 && (high.saturating_sub(low) as f64 / low as f64) > 0.00005
     });
     assert!(
         crossed,

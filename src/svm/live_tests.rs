@@ -282,7 +282,9 @@ async fn live_explain_disagreements() {
             .logs
             .iter()
             .filter(|log| {
-                log.is_data && log.path == path && log.program == instruction.program
+                log.is_data
+                    && log.path == path
+                    && log.program == instruction.program
             })
             .find_map(|log| {
                 let bytes = log.event_bytes()?;
@@ -544,14 +546,13 @@ fn token_deltas(meta: &Value) -> BTreeMap<(String, String), i128> {
 /// else's parser.
 fn transfer_amounts(result: &Value) -> Vec<i128> {
     fn collect(instructions: &Value, out: &mut Vec<i128>) {
-        for instruction in
-            instructions.as_array().into_iter().flatten()
-        {
+        for instruction in instructions.as_array().into_iter().flatten() {
             let Some(parsed) = instruction.get("parsed") else {
                 continue;
             };
             let kind = parsed.get("type").and_then(|v| v.as_str());
-            if !matches!(kind, Some("transfer") | Some("transferChecked")) {
+            if !matches!(kind, Some("transfer") | Some("transferChecked"))
+            {
                 continue;
             }
             let Some(info) = parsed.get("info") else { continue };
@@ -1062,8 +1063,7 @@ async fn record_phase2_fixtures() {
 
         for slot in &batch.batches {
             for tx in &slot.transactions {
-                let signature =
-                    bs58::encode(tx.signature).into_string();
+                let signature = bs58::encode(tx.signature).into_string();
                 if used.contains(&signature) {
                     continue;
                 }
@@ -1148,11 +1148,13 @@ async fn record_phase2_fixtures() {
                         let Some(bytes) = log.event_bytes() else {
                             return false;
                         };
-                        if let Some(event) = RaydiumCpmmSwap::parse(&bytes) {
+                        if let Some(event) = RaydiumCpmmSwap::parse(&bytes)
+                        {
                             return event.input_transfer_fee > 0
                                 || event.output_transfer_fee > 0;
                         }
-                        if let Some(event) = RaydiumClmmSwap::parse(&bytes) {
+                        if let Some(event) = RaydiumClmmSwap::parse(&bytes)
+                        {
                             return event.transfer_fee_0 > 0
                                 || event.transfer_fee_1 > 0;
                         }
@@ -1193,11 +1195,15 @@ async fn record_phase2_fixtures() {
                                 let (low, high) = if event.pre_sqrt_price
                                     < event.post_sqrt_price
                                 {
-                                    (event.pre_sqrt_price,
-                                     event.post_sqrt_price)
+                                    (
+                                        event.pre_sqrt_price,
+                                        event.post_sqrt_price,
+                                    )
                                 } else {
-                                    (event.post_sqrt_price,
-                                     event.pre_sqrt_price)
+                                    (
+                                        event.post_sqrt_price,
+                                        event.pre_sqrt_price,
+                                    )
                                 };
                                 low > 0
                                     && high.saturating_sub(low) as f64
@@ -1206,10 +1212,9 @@ async fn record_phase2_fixtures() {
                             })
                             .unwrap_or(false)
                     });
-                    let orca = outcome
-                        .swaps
-                        .iter()
-                        .any(|s| s.protocol == Venue::OrcaWhirlpool.as_str());
+                    let orca = outcome.swaps.iter().any(|s| {
+                        s.protocol == Venue::OrcaWhirlpool.as_str()
+                    });
                     if crossed && orca {
                         found.insert(
                             "clmm_tick_crossing",

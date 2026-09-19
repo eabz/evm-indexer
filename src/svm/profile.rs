@@ -18,7 +18,9 @@
 
 use std::time::Instant;
 
-use crate::svm::{decode::decode_transaction, fixtures, models::SOLANA_CHAIN};
+use crate::svm::{
+    decode::decode_transaction, fixtures, models::SOLANA_CHAIN,
+};
 
 /// How many times the fixture corpus is replayed. Sized so a run takes a few
 /// seconds in release mode.

@@ -47,9 +47,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 
 use crate::svm::{
-    decode::{
-        SvmAccountActivity, SvmInstruction, SvmLog, SvmTransaction,
-    },
+    decode::{SvmAccountActivity, SvmInstruction, SvmLog, SvmTransaction},
     models::{Pubkey, SigBytes},
     programs::{
         registry, Venue, IX_SYSTEM_TRANSFER, IX_TRANSFER,
@@ -452,8 +450,8 @@ impl SolanaSource {
         let (tx, rx) = mpsc::channel(1);
 
         tokio::spawn(async move {
-            let mut responses =
-                client.stream_arrow(build_query(from, to), stream_config());
+            let mut responses = client
+                .stream_arrow(build_query(from, to), stream_config());
 
             while let Some(response) = responses.recv().await {
                 let message = match response {
@@ -858,7 +856,9 @@ mod tests {
             "a floor below ~16 slots lets the auto-tuner shrink the batch \
              back towards one slot"
         );
-        assert!(config.response_bytes_ceiling > config.response_bytes_floor);
+        assert!(
+            config.response_bytes_ceiling > config.response_bytes_floor
+        );
     }
 
     /// Raydium and Orca publish their swap events as LOG LINES and nothing

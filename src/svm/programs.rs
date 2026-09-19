@@ -320,10 +320,10 @@ pub const DISC_PUMPFUN_TRADE_EVENT: [u8; 8] =
 /// `ray_log`, which is why the decoder dispatches on the LOG and treats the
 /// tag only as a cross-check.
 pub const RAYDIUM_V4_IX: &[(u8, IxKind)] = &[
-    (9, IxKind::Swap),   // SwapBaseIn
-    (11, IxKind::Swap),  // SwapBaseOut
-    (16, IxKind::Swap),  // SwapBaseInV2
-    (17, IxKind::Swap),  // SwapBaseOutV2
+    (9, IxKind::Swap),  // SwapBaseIn
+    (11, IxKind::Swap), // SwapBaseOut
+    (16, IxKind::Swap), // SwapBaseInV2
+    (17, IxKind::Swap), // SwapBaseOutV2
     (3, IxKind::Liquidity),
     (4, IxKind::Liquidity),
     (1, IxKind::Admin), // Initialize2
@@ -452,7 +452,9 @@ const METEORA_DAMM2_IX: &[(&str, IxKind)] = &[
 impl Venue {
     /// Anchor instruction names of this venue, and what each one does.
     /// Empty for the programs that are not Anchor programs.
-    const fn anchor_instructions(&self) -> &'static [(&'static str, IxKind)] {
+    const fn anchor_instructions(
+        &self,
+    ) -> &'static [(&'static str, IxKind)] {
         match self {
             Venue::RaydiumCpmm => RAYDIUM_CPMM_IX,
             Venue::RaydiumClmm => RAYDIUM_CLMM_IX,

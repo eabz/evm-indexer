@@ -19,9 +19,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 use crate::svm::{
-    decode::{
-        SvmAccountActivity, SvmInstruction, SvmLog, SvmTransaction,
-    },
+    decode::{SvmAccountActivity, SvmInstruction, SvmLog, SvmTransaction},
     models::{Pubkey, SigBytes},
     programs::pubkey,
 };
@@ -54,6 +52,9 @@ struct RawFixture {
     transaction: RawTransaction,
     instruction_calls: Vec<RawInstruction>,
     account_activity: Vec<RawActivity>,
+    /// Why this transaction was recorded, written down by the recorder at
+    /// the moment it matched. A fixture whose reason for existing is not
+    /// stated tends to become a fixture nobody dares change.
     #[serde(default)]
     why: Option<String>,
     /// Phase 2. Absent from the phase 1 recordings, which is why it
@@ -134,6 +135,9 @@ struct RawActivity {
 /// One recorded transaction, decoded into the shapes the decoder takes.
 pub struct Fixture {
     pub name: String,
+    /// What this recording is FOR, as the recorder stated it. Empty for the
+    /// phase 1 corpus, whose rationale lives in this module's doc comment.
+    pub why: String,
     pub slot: u64,
     pub block_time: i64,
     pub blockhash: Pubkey,
@@ -226,6 +230,7 @@ fn parse() -> Vec<Fixture> {
 
             Fixture {
                 name: fixture.name,
+                why: fixture.why.unwrap_or_default(),
                 slot: fixture.slot,
                 block_time: fixture.block_time,
                 blockhash: pubkey(&fixture.blockhash),
@@ -323,6 +328,15 @@ mod tests {
             assert!(
                 fixture.transaction.success,
                 "{} should be a committed transaction",
+                fixture.name
+            );
+            // A phase 2 recording states, in the file, what it is for.
+            if fixture.transaction.logs.is_empty() {
+                continue;
+            }
+            assert!(
+                fixture.why.len() > 20,
+                "{} does not say why it was recorded",
                 fixture.name
             );
             // Every instruction path must be packable into an ordinal.

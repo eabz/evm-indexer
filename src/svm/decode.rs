@@ -205,7 +205,8 @@ impl SvmLog {
 /// is not an event.
 pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     /// `byte -> 6-bit value`, 0xff where the byte is not a base64 digit.
-    static TABLE: std::sync::OnceLock<[u8; 256]> = std::sync::OnceLock::new();
+    static TABLE: std::sync::OnceLock<[u8; 256]> =
+        std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| {
         let mut table = [0xffu8; 256];
         let alphabet =
@@ -217,9 +218,9 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     });
 
     let bytes = input.as_bytes();
-    let body = bytes.strip_suffix(b"==").unwrap_or_else(|| {
-        bytes.strip_suffix(b"=").unwrap_or(bytes)
-    });
+    let body = bytes
+        .strip_suffix(b"==")
+        .unwrap_or_else(|| bytes.strip_suffix(b"=").unwrap_or(bytes));
     // 4 base64 digits carry 3 bytes; a final group of 2 or 3 digits carries
     // 1 or 2. A remainder of exactly 1 digit cannot encode anything.
     if body.len() % 4 == 1 {

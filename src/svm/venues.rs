@@ -578,8 +578,14 @@ impl MeteoraDamm2Swap {
             compounding_fee: u64_at(data, CPI_BODY + 116)?,
             referral_fee: u64_at(data, CPI_BODY + 124)?,
             included_transfer_fee_amount_in: u64_at(data, CPI_BODY + 132)?,
-            included_transfer_fee_amount_out: u64_at(data, CPI_BODY + 140)?,
-            excluded_transfer_fee_amount_out: u64_at(data, CPI_BODY + 148)?,
+            included_transfer_fee_amount_out: u64_at(
+                data,
+                CPI_BODY + 140,
+            )?,
+            excluded_transfer_fee_amount_out: u64_at(
+                data,
+                CPI_BODY + 148,
+            )?,
             reserve_a_amount: u64_at(data, CPI_BODY + 164)?,
             reserve_b_amount: u64_at(data, CPI_BODY + 172)?,
         })
@@ -764,7 +770,8 @@ pub fn enrich_raydium_cpmm(
     swap: &MovementSwap,
     row: &mut SvmSwap,
 ) -> Enrichment {
-    let Some(log) = data_log_of(tx, instruction, DISC_RAYDIUM_SWAP_EVENT, 0)
+    let Some(log) =
+        data_log_of(tx, instruction, DISC_RAYDIUM_SWAP_EVENT, 0)
     else {
         return Enrichment::None;
     };
@@ -818,7 +825,8 @@ pub fn enrich_raydium_clmm(
     swap: &MovementSwap,
     row: &mut SvmSwap,
 ) -> Enrichment {
-    let Some(log) = data_log_of(tx, instruction, DISC_RAYDIUM_SWAP_EVENT, 0)
+    let Some(log) =
+        data_log_of(tx, instruction, DISC_RAYDIUM_SWAP_EVENT, 0)
     else {
         return Enrichment::None;
     };
@@ -935,8 +943,11 @@ pub fn enrich_meteora_dlmm(
     // movement layer measured is short by the fee.
     let fees_on_input =
         second.as_ref().map(|two| two.fees_on_input).unwrap_or(false);
-    let expected_in =
-        if fees_on_input { amount_in.saturating_sub(fee) } else { amount_in };
+    let expected_in = if fees_on_input {
+        amount_in.saturating_sub(fee)
+    } else {
+        amount_in
+    };
     if expected_in != swap.amount_in && amount_in != swap.amount_in {
         return Enrichment::Disagreed;
     }
