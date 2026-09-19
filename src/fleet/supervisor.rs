@@ -747,23 +747,41 @@ fn chain_name(chain: u64) -> Option<&'static str> {
     (chain == crate::pipeline::solana::SOLANA_CHAIN_ID).then_some("solana")
 }
 
+/// What a value is replaced by when the browser may know THAT it is set
+/// but not what it is.
+pub const SET_MARKER: &str = "<set>";
+
 /// What the browser is allowed to see of a chain's settings.
 ///
-/// A HyperSync url or an RPC url routinely carries an API key in its path
-/// or query. The panel still has to SHOW that a setting is set, so the
-/// value is replaced by what `tokens::redact` makes of it - never by the
-/// value itself (docs/design.md section 15).
+/// No endpoint and no secret is editable from the panel any anymore
+/// (review MAJOR 4), so in normal operation there is nothing here to hide.
+/// The guard stays for two cases, and it hides rather than redacts:
+///
+/// * a setting this build does not know - a row written by an older
+///   version, which can still name the HyperSync endpoint or the RPC urls;
+/// * any setting a future edit marks `secret`.
+///
+/// It replaces the value with a fixed marker instead of running
+/// `redact_urls` over it, because `redact_urls` only matches
+/// `scheme://...`: a QuickNode- or Alchemy-style key pasted WITHOUT the
+/// scheme (`host.example/TOKEN-abcdef/`) went to the browser in clear
+/// (review MINOR 2). A marker cannot leak by omission.
 pub fn redact_settings(settings: &ChainSettings) -> ChainSettings {
     settings
         .iter()
         .map(|(key, value)| {
-            let secret = crate::configs::CHAIN_SETTINGS
+            let known = crate::configs::CHAIN_SETTINGS
                 .iter()
-                .find(|setting| setting.name == key)
-                .is_some_and(|setting| setting.secret);
+                .find(|setting| setting.name == key);
 
-            let value = if secret && !value.trim().is_empty() {
-                crate::tokens::redact::redact_urls(value)
+            let hide = match known {
+                Some(setting) => setting.secret,
+                // Unknown to this build: assume the worst about it.
+                None => true,
+            };
+
+            let value = if hide && !value.trim().is_empty() {
+                SET_MARKER.to_string()
             } else {
                 value.clone()
             };
@@ -771,6 +789,53 @@ pub fn redact_settings(settings: &ChainSettings) -> ChainSettings {
             (key.clone(), value)
         })
         .collect()
+}
+
+/// The process-wide settings, as the panel is allowed to see them: whether
+/// each one is set, and never what it is.
+///
+/// These are the endpoints and credentials the review's MAJOR 4 was about.
+/// They come from the fleet process's own flags and environment and the
+/// panel cannot change any of them; it shows them so the owner can see how
+/// the process was started without having to read a compose file.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessView {
+    /// `<set>` - never the url, which carries a password.
+    pub database: &'static str,
+    /// `<set>` or `not set`.
+    pub hypersync_token: &'static str,
+    pub rpc: &'static str,
+    pub redis: &'static str,
+    pub metrics_addr: Option<String>,
+    /// Megabytes the whole fleet may buffer before writing.
+    pub max_inflight_mb: u64,
+    /// Metered Solana queries a minute, shared by every Solana chain.
+    pub solana_queries_per_minute: u32,
+    /// Always true, so the page can say so plainly.
+    pub read_only: bool,
+}
+
+fn shown(value: Option<&str>) -> &'static str {
+    match value {
+        Some(value) if !value.trim().is_empty() => SET_MARKER,
+        _ => "not set",
+    }
+}
+
+impl ProcessView {
+    pub fn of(config: &FleetConfig) -> Self {
+        Self {
+            database: shown(Some(&config.database_url)),
+            hypersync_token: shown(Some(&config.hypersync_token)),
+            rpc: shown(config.rpc_url.as_deref()),
+            redis: shown(config.redis_url.as_deref()),
+            // An ip:port is not a secret and is useful to see.
+            metrics_addr: config.metrics_addr.map(|addr| addr.to_string()),
+            max_inflight_mb: config.max_inflight_mb,
+            solana_queries_per_minute: config.solana_queries_per_minute,
+            read_only: true,
+        }
+    }
 }
 
 /// One row of `GET /api/chains`.
@@ -848,11 +913,17 @@ mod backoff_tests {
         assert!(LEASE_RECHECK < MAX_RESTART_BACKOFF);
     }
 
+    /// Review MINOR 2: a key pasted WITHOUT a scheme used to slip through,
+    /// because the url redactor only matched `scheme://...`. A fixed marker
+    /// cannot leak by omission.
     #[test]
-    fn secrets_in_settings_never_leave_the_process() {
+    fn a_value_the_browser_may_not_see_is_replaced_wholesale() {
         let settings: ChainSettings = [
-            ("rpc", "https://eth.example/v2/hunter2-key"),
-            ("start-block", "100"),
+            // Not a setting this build knows: a row from an older version.
+            ("rpc", "eth-mainnet.example/v2/hunter2-key"),
+            ("hypersync-url", "host.example/TOKEN-abcdef123456/"),
+            // One it does.
+            ("confirmations", "12"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -860,7 +931,14 @@ mod backoff_tests {
 
         let shown = redact_settings(&settings);
 
-        assert!(!shown["rpc"].contains("hunter2-key"), "{:?}", shown);
-        assert_eq!(shown["start-block"], "100");
+        assert_eq!(shown["rpc"], SET_MARKER);
+        assert_eq!(shown["hypersync-url"], SET_MARKER);
+        for value in shown.values() {
+            assert!(!value.contains("hunter2-key"), "{shown:?}");
+            assert!(!value.contains("TOKEN-abcdef123456"), "{shown:?}");
+        }
+
+        // What the owner IS allowed to see is untouched.
+        assert_eq!(shown["confirmations"], "12");
     }
 }

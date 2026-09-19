@@ -91,30 +91,43 @@ pub struct ChainSetting {
     pub secret: bool,
 }
 
-/// Everything the panel may change about a chain, and nothing else.
+/// Everything the panel may change about a chain - an ALLOW-LIST, and a
+/// short one.
 ///
-/// Deliberately NOT the whole of `indexer run`: the database url, the
-/// HyperSync token, the Redis url, `--metrics-addr`, `--no-migrate` and
-/// `--debug` belong to the PROCESS, are the same for every chain and are
-/// not editable from a web page.
+/// # Why this list is short, and what it deliberately leaves out
+///
+/// The security review's MAJOR 4. Two of these used to be editable from the
+/// web page: the HyperSync endpoint and the RPC endpoints. The HyperSync
+/// token is process-wide and is attached to whatever URL a chain is
+/// configured with, so one `PATCH` plus one `restart` sent the owner's
+/// Envio token, in clear, to any host the panel user named - the reviewer's
+/// fake server received `Authorization: Bearer <the real token>`. The same
+/// boxes accepted `127.0.0.1`, RFC1918 addresses and the cloud metadata
+/// address, making the panel a general outbound-request primitive from the
+/// indexer host, and an endpoint that simply errors on `/chain_id` could
+/// then serve fabricated blocks under a real chain's id.
+///
+/// So the rule is now structural rather than careful:
+///
+/// * **An endpoint or a secret is never editable from a web page.** The
+///   HyperSync endpoint and token, the RPC endpoints, the database url and
+///   the Redis url come from the process's own flags and environment, and
+///   the panel shows them read-only and redacted.
+/// * **What the chain reads is never editable from a web page.** The start
+///   block, the end block and `--new-blocks-only` decide the coverage floor,
+///   which design section 16 fixes on a chain's first start and never moves
+///   silently afterwards. A chain that needs a different floor is added on
+///   the command line.
+/// * **What is left is how the chain behaves while it runs**, which is what
+///   an owner watching a dashboard actually needs to change: how far behind
+///   the head to stay, how deep a rollback may go, how big and how frequent
+///   the writes are, and which decoders are on.
+///
+/// [`every_run_flag_is_classified`](tests::every_run_flag_is_classified)
+/// walks every option of `indexer run` and fails if a new one is neither
+/// here nor in [`NOT_PANEL_EDITABLE`], so nothing becomes editable from a
+/// web page by accident.
 pub const CHAIN_SETTINGS: &[ChainSetting] = &[
-    ChainSetting {
-        name: "start-block",
-        kind: SettingKind::Number,
-        label: "Start block",
-        help:
-            "First block (on Solana: first slot) to index. Takes effect \
-               the next time the chain starts.",
-        secret: false,
-    },
-    ChainSetting {
-        name: "end-block",
-        kind: SettingKind::Number,
-        label: "Stop at block",
-        help: "Stop when this block is reached (it is not indexed). 0 \
-               follows the chain head for ever.",
-        secret: false,
-    },
     ChainSetting {
         name: "confirmations",
         kind: SettingKind::Number,
@@ -130,14 +143,6 @@ pub const CHAIN_SETTINGS: &[ChainSetting] = &[
         label: "Deepest automatic rollback",
         help: "A chain reorganization deeper than this stops the chain \
                instead of being rolled back automatically.",
-        secret: false,
-    },
-    ChainSetting {
-        name: "new-blocks-only",
-        kind: SettingKind::Flag,
-        label: "Only new blocks",
-        help: "Start at the current chain height instead of the start \
-               block: no history is filled in.",
         secret: false,
     },
     ChainSetting {
@@ -177,22 +182,45 @@ pub const CHAIN_SETTINGS: &[ChainSetting] = &[
         help: "Do not decode token launchpad events.",
         secret: false,
     },
-    ChainSetting {
-        name: "hypersync-url",
-        kind: SettingKind::Text,
-        label: "HyperSync endpoint",
-        help: "Leave empty for the public endpoint of this chain id.",
-        secret: true,
-    },
-    ChainSetting {
-        name: "rpc",
-        kind: SettingKind::Text,
-        label: "RPC endpoints",
-        help: "Comma separated JSON-RPC endpoints for token and pool \
-               metadata. Empty or `auto` discovers public ones, `none` \
-               switches the feature off.",
-        secret: true,
-    },
+];
+
+/// Why each `indexer run` option that the panel may NOT change is out of
+/// reach. Every option is in exactly one of this list and
+/// [`CHAIN_SETTINGS`], and a test proves it - so adding a flag to the CLI
+/// forces a decision about the web page instead of quietly granting one.
+pub const NOT_PANEL_EDITABLE: &[(&str, &str)] = &[
+    ("chain", "a chain is added or not; it is not a setting"),
+    ("database", "process-wide, and it is a credential"),
+    ("hypersync-token", "a secret. It is never shown and never editable"),
+    (
+        "hypersync-url",
+        "an endpoint. The process-wide token is sent to whatever URL a \
+         chain names, so a web page that could change it could send the \
+         token anywhere, reach the host's private network, and feed the \
+         indexer fabricated blocks (review MAJOR 4)",
+    ),
+    (
+        "rpc",
+        "an endpoint, and it routinely carries an API key in its path",
+    ),
+    ("redis", "an endpoint, and it may carry a password"),
+    (
+        "start-block",
+        "the coverage floor (design section 16) is fixed on a chain's \
+         first start and never moves silently afterwards",
+    ),
+    (
+        "end-block",
+        "it decides what is read, like the start block; a chain that \
+         should stop somewhere is started that way",
+    ),
+    (
+        "new-blocks-only",
+        "it skips history, which is a coverage-floor decision",
+    ),
+    ("metrics-addr", "process-wide: one endpoint serves every chain"),
+    ("no-migrate", "process-wide, and it is a deployment decision"),
+    ("debug", "process-wide"),
 ];
 
 /// The setting names, in the order the panel shows them.
@@ -482,10 +510,16 @@ mod tests {
         }
     }
 
-    /// The process-wide options must not be editable from a web page.
+    /// Review MAJOR 4. An endpoint or a secret must never be editable from
+    /// a web page: the process-wide HyperSync token is attached to whatever
+    /// URL a chain names, so a panel that could change the URL could send
+    /// the token to any host, reach the indexer host's private network, and
+    /// feed the indexer fabricated blocks.
     #[test]
-    fn process_wide_options_are_not_chain_settings() {
+    fn no_endpoint_and_no_secret_is_editable_from_a_web_page() {
         for forbidden in [
+            "hypersync-url",
+            "rpc",
             "database",
             "hypersync-token",
             "redis",
@@ -493,11 +527,62 @@ mod tests {
             "no-migrate",
             "debug",
             "chain",
+            // The coverage floor (design section 16) never moves silently.
+            "start-block",
+            "end-block",
+            "new-blocks-only",
         ] {
             assert!(
                 setting(forbidden).is_none(),
                 "--{forbidden} must not be a per-chain setting"
             );
+        }
+
+        // Nothing marked secret is left in the editable set at all: the
+        // whole class is closed by construction rather than by redaction.
+        assert!(
+            CHAIN_SETTINGS.iter().all(|setting| !setting.secret),
+            "a secret setting is editable from the panel"
+        );
+    }
+
+    /// The guard that keeps MAJOR 4 closed as the CLI grows: every option
+    /// of `indexer run` is either deliberately panel-editable or
+    /// deliberately not, and a new one is neither until someone says so.
+    #[test]
+    fn every_run_flag_is_classified() {
+        let command = IndexerArgs::command();
+
+        for arg in command.get_arguments() {
+            let Some(flag) = arg.get_long() else { continue };
+            if flag == "help" || flag == "version" {
+                continue;
+            }
+
+            let editable = setting(flag).is_some();
+            let refused =
+                NOT_PANEL_EDITABLE.iter().any(|(name, _)| *name == flag);
+
+            assert!(
+                editable != refused,
+                "--{flag} is {} of the panel's allow-list and the list of \
+                 options it may not change. Add it to exactly one: \
+                 CHAIN_SETTINGS if a web page may change it, \
+                 NOT_PANEL_EDITABLE with the reason if it may not.",
+                if editable { "in BOTH" } else { "in NEITHER" }
+            );
+        }
+
+        // And the other way round: nothing in either list has been renamed
+        // out of existence.
+        for (flag, reason) in NOT_PANEL_EDITABLE {
+            assert!(
+                command
+                    .get_arguments()
+                    .any(|arg| arg.get_long() == Some(flag)),
+                "--{flag} is not an option of `indexer run` any more"
+            );
+            assert!(!reason.is_empty(), "--{flag} has no reason");
         }
     }
 
@@ -522,24 +607,19 @@ mod tests {
             .chain_config(
                 1,
                 &settings(&[
-                    ("start-block", "18000000"),
                     ("confirmations", "12"),
+                    ("max-reorg-depth", "64"),
                     ("no-predictions", "true"),
                     ("no-dex", "false"),
-                    ("rpc", "https://mine.example,auto"),
                 ]),
             )
             .unwrap();
 
-        assert_eq!(config.start_block, 18_000_000);
         assert_eq!(config.confirmations, 12);
+        assert_eq!(config.max_reorg_depth, 64);
         assert!(!config.predictions);
         // `false` means the flag is simply not passed.
         assert!(config.dex);
-        assert_eq!(
-            config.rpc_url.as_deref(),
-            Some("https://mine.example,auto")
-        );
     }
 
     #[test]
@@ -547,12 +627,12 @@ mod tests {
         let config = base()
             .chain_config(
                 1,
-                &settings(&[("start-block", "  "), ("rpc", "")]),
+                &settings(&[("confirmations", "  "), ("flush-rows", "")]),
             )
             .unwrap();
 
-        assert_eq!(config.start_block, 0);
-        assert_eq!(config.rpc_url, None);
+        assert_eq!(config.confirmations, 0);
+        assert_eq!(config.flush_rows, 100_000);
     }
 
     #[test]
@@ -564,10 +644,10 @@ mod tests {
         };
 
         // Not a number.
-        assert!(refused(&[("start-block", "soon")])
+        assert!(refused(&[("confirmations", "soon")])
             .message
             .to_lowercase()
-            .contains("start-block"));
+            .contains("confirmations"));
         // Not a boolean spelling the CLI knows.
         let error = refused(&[("no-dex", "maybe")]);
         assert_eq!(error.key.as_deref(), Some("no-dex"));
@@ -575,25 +655,34 @@ mod tests {
         let error = refused(&[("delete-everything", "yes")]);
         assert_eq!(error.key.as_deref(), Some("delete-everything"));
         assert!(error.message.contains("unknown setting"));
-        // A value that would smuggle in another flag.
-        let error = refused(&[("rpc", "--database")]);
+        // An endpoint is not a setting at all any more (review MAJOR 4).
+        let error = refused(&[("rpc", "http://attacker.example")]);
         assert_eq!(error.key.as_deref(), Some("rpc"));
+        let error =
+            refused(&[("hypersync-url", "http://attacker.example")]);
+        assert_eq!(error.key.as_deref(), Some("hypersync-url"));
+
+        // A value that would smuggle in another flag.
+        let error = refused(&[("max-reorg-depth", "--database")]);
+        assert_eq!(error.key.as_deref(), Some("max-reorg-depth"));
     }
 
-    /// A refusal is shown in a browser: it must not echo an API key back.
+    /// A refusal is shown in a browser: it must not echo a url back, even
+    /// though no url-shaped setting is editable any more.
     #[test]
     fn a_refusal_never_repeats_a_url_that_could_hold_a_key() {
         let error = base()
             .chain_config(
                 1,
-                &settings(&[
-                    ("hypersync-url", "https://x.example/hunter2secret"),
-                    ("start-block", "nope"),
-                ]),
+                &settings(&[(
+                    "hypersync-url",
+                    "https://x.example/hunter2secret",
+                )]),
             )
             .unwrap_err();
 
         assert!(!error.message.contains("hunter2secret"), "{error}");
+        assert!(error.message.contains("unknown setting"), "{error}");
     }
 
     /// A fleet is configured once, at start. A `START_BLOCK` left in a

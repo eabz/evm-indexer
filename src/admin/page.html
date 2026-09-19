@@ -127,6 +127,15 @@ form.login { max-width: 360px; margin: 10vh auto; }
 
   <div id="chains"></div>
 
+  <div class="card" id="process">
+    <h2>How this process was started</h2>
+    <p class="muted">Endpoints and passwords are set when the indexer is
+      started and cannot be changed from this page. That is deliberate: a
+      web page that could redirect an endpoint could send your API token
+      somewhere else.</p>
+    <div class="grid" id="process-grid"></div>
+  </div>
+
   <div class="card hidden" id="editor">
     <h2 id="editor-title">Add a chain</h2>
     <p class="muted" id="editor-note"></p>
@@ -321,6 +330,19 @@ form.login { max-width: 360px; margin: 10vh auto; }
       list.appendChild(chainCard(chain));
     });
 
+    var process = body.process || {};
+    var grid = $("process-grid");
+    grid.textContent = "";
+    metric(grid, "Database", process.database || "-");
+    metric(grid, "HyperSync token", process.hypersync_token || "-");
+    metric(grid, "RPC endpoints", process.rpc || "-");
+    metric(grid, "Metadata cache", process.redis || "-");
+    metric(grid, "Metrics", process.metrics_addr || "off");
+    metric(grid, "Memory for writes",
+           (process.max_inflight_mb || 0) + " MB (shared)");
+    metric(grid, "Solana queries", (process.solana_queries_per_minute || 0) +
+           " a minute (shared)");
+
     var running = chains.filter(function (c) {
       return c.state === "following" || c.state === "backfilling";
     }).length;
@@ -397,14 +419,8 @@ form.login { max-width: 360px; margin: 10vh auto; }
         input = document.createElement("input");
         input.type = setting.kind === "number" ? "number" : "text";
         input.value = current === undefined ? "" : current;
-        if (setting.secret && current) {
-          input.placeholder = current + " (hidden; type a new value to " +
-            "replace it)";
-          input.value = "";
-        }
       }
       input.setAttribute("data-name", setting.name);
-      input.setAttribute("data-secret", setting.secret ? "1" : "");
       label.appendChild(input);
       label.appendChild(text("span", "k", setting.help));
       fields.appendChild(label);
@@ -419,14 +435,6 @@ form.login { max-width: 360px; margin: 10vh auto; }
     var inputs = $("settings-fields").querySelectorAll("[data-name]");
     Array.prototype.forEach.call(inputs, function (input) {
       var value = input.value.trim();
-      // A secret left blank keeps whatever is stored: the page was never
-      // shown the real value, so it must not send the redacted one back.
-      if (value === "" && input.getAttribute("data-secret")) {
-        if (editing && editing.settings &&
-            editing.settings[input.getAttribute("data-name")]) {
-          return;
-        }
-      }
       if (value !== "") {
         settings[input.getAttribute("data-name")] = value;
       }

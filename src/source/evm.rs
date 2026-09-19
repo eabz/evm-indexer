@@ -19,7 +19,7 @@ use hypersync_client::{
     },
     Client, StreamConfig,
 };
-use log::{info, warn};
+use log::info;
 use tokio::sync::mpsc::{self, Receiver};
 
 // Field selection (docs/design.md, section 8): HyperSync is asked for
@@ -154,6 +154,15 @@ impl Source {
 
     /// Guards against pointing `--hypersync-url` at another chain, which
     /// would silently index the wrong data under this chain id.
+    ///
+    /// **An endpoint that fails the question is refused, not excused.**
+    /// It used to warn and carry on, on the theory that not every
+    /// deployment exposes `/chain_id`. But the guard exists precisely for
+    /// an endpoint nobody vetted, and "it errored" is exactly what a
+    /// hostile one does to get past a check: it could then serve arbitrary
+    /// blocks and logs under the real chain's id (review MAJOR 4). An
+    /// operator whose private endpoint genuinely cannot answer sets no
+    /// `--hypersync-url` at all, or fixes the endpoint.
     pub async fn verify_chain_id(&self, expected: u64) -> Result<()> {
         match self.client.get_chain_id().await {
             Ok(actual) if actual == expected => Ok(()),
@@ -161,11 +170,15 @@ impl Source {
                 "HyperSync endpoint serves chain {actual} but --chain is \
                  {expected}"
             ),
-            Err(e) => {
-                // Not every deployment exposes the endpoint; not fatal.
-                warn!("Could not verify the HyperSync chain id: {e:#}");
-                Ok(())
-            }
+            Err(e) => bail!(
+                "the HyperSync endpoint given for chain {expected} could \
+                 not say which chain it serves ({e:#}). An endpoint that \
+                 cannot be checked is refused: an attacker-controlled one \
+                 would answer exactly like this and could then feed this \
+                 indexer fabricated blocks under chain {expected}. Remove \
+                 --hypersync-url to use the default endpoint for this \
+                 chain, or fix the endpoint."
+            ),
         }
     }
 }

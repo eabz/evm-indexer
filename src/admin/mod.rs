@@ -40,7 +40,9 @@ mod tests;
 
 use crate::{
     configs::{ChainSettings, CHAIN_SETTINGS},
-    fleet::supervisor::{ChainView, CommandError, Supervisor},
+    fleet::supervisor::{
+        ChainView, CommandError, ProcessView, Supervisor,
+    },
 };
 use anyhow::Result;
 use auth::{
@@ -564,6 +566,10 @@ struct ChainsBody {
     /// What the settings form is built from, so the page and the command
     /// line can never disagree about which options exist.
     settings: Vec<SettingSchema>,
+    /// The endpoints and credentials the process was started with, shown
+    /// as "set" or "not set" and never as values. Read-only by
+    /// construction: there is no endpoint that changes any of them.
+    process: ProcessView,
 }
 
 async fn list_chains(
@@ -590,6 +596,7 @@ async fn list_chains(
                 secret: setting.secret,
             })
             .collect(),
+        process: ProcessView::of(admin.supervisor.config()),
     };
 
     secured(&admin, Json(body).into_response())

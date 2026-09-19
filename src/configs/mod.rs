@@ -3,7 +3,7 @@ mod fleet;
 pub use fleet::{
     apply_chain_settings, chain_setting_keys, ChainSetting, ChainSettings,
     Desired, FleetConfig, SettingError, SettingKind, ADMIN_PASSWORD_ENV,
-    CHAIN_SETTINGS,
+    CHAIN_SETTINGS, NOT_PANEL_EDITABLE,
 };
 
 /// `--chain` as the command line parses it: a chain id, or a name the CLI

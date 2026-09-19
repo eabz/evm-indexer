@@ -920,7 +920,14 @@ async fn a_signed_in_owner_sees_the_chains_and_the_settings_form() {
     assert_eq!(settings.len(), crate::configs::CHAIN_SETTINGS.len());
     assert!(settings
         .iter()
-        .any(|setting| setting["name"] == "start-block"));
+        .any(|setting| setting["name"] == "confirmations"));
+
+    // And the process's own endpoints are shown, read-only, as "set" or
+    // "not set" - never as values (review MAJOR 4).
+    let process = &body["process"];
+    assert_eq!(process["read_only"], true);
+    assert_eq!(process["database"], "<set>");
+    assert!(!reply.body.contains("8123"), "{}", reply.body);
 
     panel.stop().await;
 }
@@ -1060,25 +1067,67 @@ async fn a_setting_the_command_line_refuses_is_refused_here_too() {
     panel.stop().await;
 }
 
+/// Review MAJOR 4. The panel could point a chain at any HyperSync or RPC
+/// endpoint; the process-wide Envio token is attached to whatever URL the
+/// chain names, so one PATCH plus one restart sent the owner's token to the
+/// attacker's host in clear - and that endpoint could then serve fabricated
+/// blocks under a real chain's id. The whole class is closed by
+/// construction: an endpoint is not a setting a web page can name.
 #[tokio::test]
-async fn a_secret_setting_is_shown_redacted_and_never_in_full() {
+async fn the_panel_can_not_point_a_chain_at_another_endpoint() {
     let panel = Panel::start(&[1]).await;
     let cookie = sign_in(&panel).await;
     let origin = panel.origin();
     let headers =
         [("Cookie", cookie.as_str()), ("Origin", origin.as_str())];
 
+    for body in [
+        "{\"settings\":{\"hypersync-url\":\"http://attacker.example/steal\"}}",
+        "{\"settings\":{\"rpc\":\"http://127.0.0.1:1/rpc\"}}",
+        "{\"settings\":{\"rpc\":\"http://169.254.169.254/latest/meta-data/\"}}",
+        "{\"settings\":{\"database\":\"http://attacker.example/db\"}}",
+        "{\"settings\":{\"hypersync-token\":\"stolen\"}}",
+        "{\"settings\":{\"redis\":\"redis://attacker.example\"}}",
+        // The coverage floor is not a web-page decision either
+        // (design section 16).
+        "{\"settings\":{\"start-block\":\"0\"}}",
+        "{\"settings\":{\"end-block\":\"1\"}}",
+        "{\"settings\":{\"new-blocks-only\":\"true\"}}",
+    ] {
+        let reply = request(
+            panel.addr,
+            "PATCH",
+            "/api/chains/1",
+            &headers,
+            Some(body),
+        )
+        .await;
+
+        assert_eq!(reply.status, 400, "{body}: {reply:?}");
+    }
+
+    // Adding a chain is the same door, so it is the same lock.
     let reply = request(
         panel.addr,
-        "PATCH",
-        "/api/chains/1",
+        "POST",
+        "/api/chains",
         &headers,
         Some(
-            "{\"settings\":{\"rpc\":\"https://eth.example/v2/hunter2secret\"}}",
+            "{\"chain\":\"10\",\"settings\":{\"hypersync-url\":\"http://attacker.example\"}}",
         ),
     )
     .await;
-    assert_eq!(reply.status, 200, "{reply:?}");
+    assert_eq!(reply.status, 400, "{reply:?}");
+    assert!(!panel.supervisor.knows(10), "the chain was added anyway");
+
+    panel.stop().await;
+}
+
+/// Nothing secret reaches the browser, from any route.
+#[tokio::test]
+async fn no_endpoint_or_credential_is_ever_sent_to_the_browser() {
+    let panel = Panel::start(&[1]).await;
+    let cookie = sign_in(&panel).await;
 
     let reply = request(
         panel.addr,
@@ -1089,16 +1138,18 @@ async fn a_secret_setting_is_shown_redacted_and_never_in_full() {
     )
     .await;
 
-    assert!(
-        !reply.body.contains("hunter2secret"),
-        "the API sent an API key to the browser: {}",
-        reply.body
-    );
-    // The database url and the HyperSync token are never in a response at
-    // all.
+    // The database url (with its port and password) and the HyperSync
+    // token are never part of a response at all.
     assert!(!reply.body.contains("8123"), "{}", reply.body);
+    assert!(!reply.body.contains("localhost"), "{}", reply.body);
     assert!(
         !reply.body.contains("00000000-0000-0000-0000-000000000000"),
+        "{}",
+        reply.body
+    );
+    // What it does say is only whether they are set.
+    assert!(
+        reply.body.contains("\"database\":\"<set>\""),
         "{}",
         reply.body
     );

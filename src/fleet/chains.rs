@@ -64,11 +64,38 @@ pub async fn load(db: &Database) -> Result<Vec<DesiredChain>> {
 
 fn parse_row(row: StoredRow) -> Option<DesiredChain> {
     match serde_json::from_str::<ChainSettings>(&row.settings) {
-        Ok(settings) => Some(DesiredChain {
-            chain: row.chain,
-            desired: Desired::parse(&row.desired),
-            settings,
-        }),
+        Ok(mut settings) => {
+            // A row written by an older build can name a setting this one
+            // no longer lets a web page change - the HyperSync endpoint and
+            // the RPC endpoints were editable before the security review
+            // (MAJOR 4). Dropping them is the safe reading of "an endpoint
+            // never comes from the panel": the chain starts with the values
+            // the fleet process itself was given instead of refusing to
+            // start at all, and the owner is told.
+            settings.retain(|key, _| {
+                let known = crate::configs::CHAIN_SETTINGS
+                    .iter()
+                    .any(|setting| setting.name == key);
+
+                if !known {
+                    warn!(
+                        "fleet_chains: chain {} has a stored setting \
+                         '{key}' that the control panel is no longer \
+                         allowed to set. It is ignored; the value the \
+                         fleet process itself was given is used instead.",
+                        row.chain
+                    );
+                }
+
+                known
+            });
+
+            Some(DesiredChain {
+                chain: row.chain,
+                desired: Desired::parse(&row.desired),
+                settings,
+            })
+        }
         Err(e) => {
             warn!(
                 "fleet_chains: the settings of chain {} are not a JSON \
@@ -169,17 +196,17 @@ mod tests {
         let good = parse_row(StoredRow {
             chain: 1,
             desired: "running".to_string(),
-            settings: "{\"start-block\":\"10\"}".to_string(),
+            settings: "{\"confirmations\":\"10\"}".to_string(),
         })
         .unwrap();
         assert_eq!(good.desired, Desired::Running);
-        assert_eq!(good.settings["start-block"], "10");
+        assert_eq!(good.settings["confirmations"], "10");
 
         // Not an object of strings.
         assert!(parse_row(StoredRow {
             chain: 2,
             desired: "running".to_string(),
-            settings: "{\"start-block\":10}".to_string(),
+            settings: "{\"confirmations\":10}".to_string(),
         })
         .is_none());
 
@@ -190,6 +217,25 @@ mod tests {
             settings: "oops".to_string(),
         })
         .is_none());
+    }
+
+    /// Review MAJOR 4: a row written before the endpoints stopped being
+    /// panel-editable must not stop the chain from starting, and must not
+    /// resurrect the setting either.
+    #[test]
+    fn a_stored_setting_the_panel_may_no_longer_set_is_dropped() {
+        let row = parse_row(StoredRow {
+            chain: 1,
+            desired: "running".to_string(),
+            settings: "{\"rpc\":\"x\",\"hypersync-url\":\"y\",\"confirmations\":\"12\"}"
+                .to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(row.settings.len(), 1, "{:?}", row.settings);
+        assert_eq!(row.settings["confirmations"], "12");
+        assert!(!row.settings.contains_key("rpc"));
+        assert!(!row.settings.contains_key("hypersync-url"));
     }
 
     #[test]
