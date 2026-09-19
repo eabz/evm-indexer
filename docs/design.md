@@ -231,3 +231,15 @@ clonable handle; no metrics crate lock-in leaking into other modules.
 
 Request from HyperSync only what a column stores. Dropping `logs_bloom` etc. from the
 schema drops them from the query.
+
+## 9. Traces and contracts (scope decision)
+
+DEX analytics need neither traces nor deployer data: pools come from factory events,
+tokens from transfers, liquidity providers from `dex_liquidity.tx_from` (the event
+`sender` is usually a router, never use it for attribution). Therefore:
+
+- `--traces` stays off by default; `full` traces are for explorer/forensic deployments.
+- `contracts` always holds **directly deployed** contracts (receipt `contractAddress`,
+  free). Factory-created contracts only appear when `--traces` is on. Document as such.
+- Not built, possible later: a `creates`-only trace mode (`TraceFilter::and_type(["create"])`)
+  would complete `contracts` without storing the trace firehose.
