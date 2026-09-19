@@ -6,6 +6,9 @@ pub const AGGREGATES_SQL: &str =
     include_str!("../../migrations/0031_launchpad_aggregates.sql");
 pub const VIEWS_SQL: &str =
     include_str!("../../migrations/0032_launchpad_views.sql");
+/// Only `ALTER TABLE ... MODIFY SETTING` statements, see the file header.
+pub const DEDUP_SQL: &str =
+    include_str!("../../migrations/0033_launchpad_dedup_windows.sql");
 
 /// (file name, contents) in application order.
 pub const MIGRATIONS: &[(&str, &str)] = &[
@@ -13,6 +16,11 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0031_launchpad_aggregates.sql", AGGREGATES_SQL),
     ("0032_launchpad_views.sql", VIEWS_SQL),
 ];
+
+/// The settings migration, kept out of [`MIGRATIONS`]: it holds no DDL,
+/// only `ALTER TABLE ... MODIFY SETTING`.
+pub const SETTINGS_MIGRATION: (&str, &str) =
+    ("0033_launchpad_dedup_windows.sql", DEDUP_SQL);
 
 /// Statements of a migration without `--` comments. The launchpad
 /// migrations keep `;` out of comments and strings (asserted by a test),

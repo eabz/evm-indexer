@@ -50,10 +50,10 @@ CREATE VIEW IF NOT EXISTS launchpad_candles_1m_v AS
 SELECT
   a.chain AS chain, a.token AS token, a.emitter AS emitter,
   a.bucket AS bucket,
-  argMinMerge(a.open) AS open_raw,
+  if(sum(a.priced_trades) > 0, argMinIfMerge(a.open), NULL) AS open_raw,
   toFloat64(max(a.high)) AS high_raw,
   toFloat64(min(a.low)) AS low_raw,
-  argMaxMerge(a.close) AS close_raw,
+  if(sum(a.priced_trades) > 0, argMaxIfMerge(a.close), NULL) AS close_raw,
   toUInt64(sum(a.trades)) AS trades,
   toUInt64(sum(a.priced_trades)) AS priced_trades,
   toUInt64(sum(a.buys)) AS buys,
@@ -71,10 +71,10 @@ CREATE VIEW IF NOT EXISTS launchpad_candles_1h_v AS
 SELECT
   a.chain AS chain, a.token AS token, a.emitter AS emitter,
   a.bucket AS bucket,
-  argMinMerge(a.open) AS open_raw,
+  if(sum(a.priced_trades) > 0, argMinIfMerge(a.open), NULL) AS open_raw,
   toFloat64(max(a.high)) AS high_raw,
   toFloat64(min(a.low)) AS low_raw,
-  argMaxMerge(a.close) AS close_raw,
+  if(sum(a.priced_trades) > 0, argMaxIfMerge(a.close), NULL) AS close_raw,
   toUInt64(sum(a.trades)) AS trades,
   toUInt64(sum(a.priced_trades)) AS priced_trades,
   toUInt64(sum(a.buys)) AS buys,
@@ -154,8 +154,8 @@ SELECT
   toFloat64(l.graduation_threshold) AS graduation_threshold_raw,
   l.pool_id AS launch_pool_id, l.transaction_hash AS launch_tx,
   l.emitter IN (
-    SELECT emitter FROM launchpad_trusted_emitters FINAL
-    WHERE chain = {chain:UInt64} AND family != '') AS trusted,
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64}) AS trusted,
   c.open_raw AS initial_price_raw,
   c.close_raw AS first_minute_price_raw,
   ifNull(c.trades, 0) AS first_minute_trades,
@@ -167,12 +167,15 @@ LEFT JOIN launchpad_candles_1m_v AS c
   ON c.chain = l.chain AND c.token = l.token AND c.emitter = l.curve
  AND c.bucket = toDateTime(intDiv(toUInt32(l.timestamp), 60) * 60, 'UTC')
 WHERE l.chain = {chain:UInt64} AND l.is_deleted = 0
-  AND l.timestamp >= {since:DateTime}
+  AND l.timestamp >= toDateTime({since:UInt32})
 ORDER BY l.timestamp DESC;
 
 CREATE VIEW IF NOT EXISTS launchpad_new_launches_v AS
-SELECT *
-FROM launchpad_new_launches_all_v(chain = {chain:UInt64}, since = {since:DateTime})
+SELECT * FROM
+(
+  SELECT * FROM launchpad_new_launches_all_v(
+    chain = {chain:UInt64}, since = {since:UInt32})
+)
 WHERE trusted = 1;
 
 -- --------------------------------------------------- screen: token page
@@ -186,14 +189,18 @@ WHERE trusted = 1;
 -- that graduated, see README section 4).
 CREATE VIEW IF NOT EXISTS launchpad_token_v AS
 SELECT
-  l.chain AS chain, l.token AS token, l.family AS family,
-  l.emitter AS emitter, l.curve AS curve, l.creator AS creator,
-  l.name AS name, l.symbol AS symbol, l.metadata_uri AS metadata_uri,
-  l.quote_token AS quote_token, l.launch_block AS launch_block,
+  l.launch_chain AS chain, l.launch_token AS token,
+  l.first_family AS family, l.first_emitter AS emitter,
+  l.first_curve AS curve, l.first_creator AS creator,
+  l.first_name AS name, l.first_symbol AS symbol,
+  l.first_metadata_uri AS metadata_uri,
+  l.first_quote_token AS quote_token, l.launch_block AS launch_block,
   l.launch_time AS launch_time, l.launch_tx AS launch_tx,
   l.initial_supply_raw AS initial_supply_raw,
   l.graduation_threshold_raw AS graduation_threshold_raw,
-  l.trusted AS trusted,
+  l.first_emitter IN (
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64}) AS trusted,
   t.trades AS trades, t.buys AS buys, t.unique_traders AS unique_traders,
   t.volume_quote_raw AS volume_quote_raw,
   t.volume_quote_verified_raw AS volume_quote_verified_raw,
@@ -207,29 +214,26 @@ SELECT
       least(t.raised_raw / l.graduation_threshold_raw, 1.),
     t.last_progress_wad > 0, t.last_progress_wad / 1e18,
     NULL) AS curve_progress,
-  g.graduated AS graduated, g.pool_id AS pool_id,
-  g.pool_kind AS pool_kind, g.graduation_time AS graduation_time,
+  g.graduated AS graduated, g.last_pool_id AS pool_id,
+  g.last_pool_kind AS pool_kind, g.graduation_time AS graduation_time,
   g.graduation_block AS graduation_block
 FROM
 (
   SELECT
-    chain, token,
-    argMin(family, (block_number, tx_index, ordinal)) AS family,
-    argMin(emitter, (block_number, tx_index, ordinal)) AS emitter,
-    argMin(curve, (block_number, tx_index, ordinal)) AS curve,
-    argMin(creator, (block_number, tx_index, ordinal)) AS creator,
-    argMin(name, (block_number, tx_index, ordinal)) AS name,
-    argMin(symbol, (block_number, tx_index, ordinal)) AS symbol,
-    argMin(metadata_uri, (block_number, tx_index, ordinal)) AS metadata_uri,
-    argMin(quote_token, (block_number, tx_index, ordinal)) AS quote_token,
+    chain AS launch_chain, token AS launch_token,
+    argMin(family, (block_number, tx_index, ordinal)) AS first_family,
+    argMin(emitter, (block_number, tx_index, ordinal)) AS first_emitter,
+    argMin(curve, (block_number, tx_index, ordinal)) AS first_curve,
+    argMin(creator, (block_number, tx_index, ordinal)) AS first_creator,
+    argMin(name, (block_number, tx_index, ordinal)) AS first_name,
+    argMin(symbol, (block_number, tx_index, ordinal)) AS first_symbol,
+    argMin(metadata_uri, (block_number, tx_index, ordinal)) AS first_metadata_uri,
+    argMin(quote_token, (block_number, tx_index, ordinal)) AS first_quote_token,
     min(block_number) AS launch_block,
     argMin(timestamp, (block_number, tx_index, ordinal)) AS launch_time,
     argMin(transaction_hash, (block_number, tx_index, ordinal)) AS launch_tx,
     argMin(toFloat64(initial_supply), (block_number, tx_index, ordinal)) AS initial_supply_raw,
-    argMin(toFloat64(graduation_threshold), (block_number, tx_index, ordinal)) AS graduation_threshold_raw,
-    argMin(emitter, (block_number, tx_index, ordinal)) IN (
-      SELECT emitter FROM launchpad_trusted_emitters FINAL
-      WHERE chain = {chain:UInt64} AND family != '') AS trusted
+    argMin(toFloat64(graduation_threshold), (block_number, tx_index, ordinal)) AS graduation_threshold_raw
   FROM launchpad_tokens FINAL
   WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
     AND is_deleted = 0
@@ -262,8 +266,8 @@ CROSS JOIN
 (
   SELECT
     toUInt8(count() > 0) AS graduated,
-    argMax(pool_id, (block_number, tx_index, ordinal)) AS pool_id,
-    argMax(pool_kind, (block_number, tx_index, ordinal)) AS pool_kind,
+    argMax(pool_id, (block_number, tx_index, ordinal)) AS last_pool_id,
+    argMax(pool_kind, (block_number, tx_index, ordinal)) AS last_pool_kind,
     max(timestamp) AS graduation_time,
     max(block_number) AS graduation_block
   FROM launchpad_graduations FINAL
@@ -349,32 +353,35 @@ SELECT
   toFloat64(g.position_id) AS position_id,
   g.transaction_hash AS graduation_tx,
   g.emitter IN (
-    SELECT emitter FROM launchpad_trusted_emitters FINAL
-    WHERE chain = {chain:UInt64} AND family != '') AS trusted,
-  ifNull(p.status, '') AS pool_status,
-  ifNull(p.trusted, 0) AS pool_trusted,
-  ifNull(p.protocol, '') AS pool_protocol,
-  ifNull(p.pool_emitter, toFixedString('', 20)) AS pool_emitter
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64}) AS trusted,
+  ifNull(p.best_status, '') AS pool_status,
+  ifNull(p.best_trusted, 0) AS pool_trusted,
+  ifNull(p.best_protocol, '') AS pool_protocol,
+  ifNull(p.best_emitter, toFixedString('', 20)) AS pool_emitter
 FROM launchpad_graduations AS g FINAL
 LEFT JOIN
 (
   SELECT
-    chain, pool_id,
-    argMax(status, trusted) AS status,
-    max(trusted) AS trusted,
-    argMax(protocol, trusted) AS protocol,
-    argMax(emitter, trusted) AS pool_emitter
+    chain AS pool_chain, pool_id AS joined_pool_id,
+    argMax(status, trusted) AS best_status,
+    max(trusted) AS best_trusted,
+    argMax(protocol, trusted) AS best_protocol,
+    argMax(emitter, trusted) AS best_emitter
   FROM dex_pool_current_v
   WHERE chain = {chain:UInt64}
   GROUP BY chain, pool_id
-) AS p ON p.chain = g.chain AND p.pool_id = g.pool_id
+) AS p ON p.pool_chain = g.chain AND p.joined_pool_id = g.pool_id
 WHERE g.chain = {chain:UInt64} AND g.is_deleted = 0
-  AND g.timestamp >= {since:DateTime}
+  AND g.timestamp >= toDateTime({since:UInt32})
 ORDER BY g.timestamp DESC;
 
 CREATE VIEW IF NOT EXISTS launchpad_graduations_v AS
-SELECT *
-FROM launchpad_graduations_all_v(chain = {chain:UInt64}, since = {since:DateTime})
+SELECT * FROM
+(
+  SELECT * FROM launchpad_graduations_all_v(
+    chain = {chain:UInt64}, since = {since:UInt32})
+)
 WHERE trusted = 1;
 
 -- ------------------------------------------------- screen: creator page
@@ -389,32 +396,34 @@ SELECT
   l.name AS name, l.symbol AS symbol, l.timestamp AS launch_time,
   l.block_number AS launch_block, l.transaction_hash AS launch_tx,
   toFloat64(l.graduation_threshold) AS graduation_threshold_raw,
-  toUInt8(g.token != toFixedString('', 32)) AS graduated,
-  g.pool_id AS pool_id, g.graduation_time AS graduation_time,
-  ifNull(t.trades, 0) AS trades,
-  ifNull(t.volume_quote_raw, 0.) AS volume_quote_raw,
-  ifNull(t.last_trade_time, l.timestamp) AS last_trade_time,
-  toUInt8(g.token = toFixedString('', 32)
-    AND ifNull(t.last_trade_time, l.timestamp)
-        < {as_of:DateTime} - {dead_after:UInt32}) AS died
+  toUInt8(g.g_token != toFixedString('', 32)) AS graduated,
+  g.g_pool_id AS pool_id, g.g_time AS graduation_time,
+  ifNull(t.t_trades, 0) AS trades,
+  ifNull(t.t_volume_quote_raw, 0.) AS volume_quote_raw,
+  ifNull(t.t_last_trade_time, l.timestamp) AS last_trade_time,
+  toUInt8(g.g_token = toFixedString('', 32)
+    AND ifNull(t.t_last_trade_time, l.timestamp)
+        < toDateTime({as_of:UInt32}) - {dead_after:UInt32}) AS died
 FROM launchpad_launches_by_creator AS l FINAL
 LEFT JOIN
 (
-  SELECT chain, token, argMax(pool_id, block_number) AS pool_id,
-         max(timestamp) AS graduation_time
+  SELECT chain AS g_chain, token AS g_token,
+         argMax(pool_id, block_number) AS g_pool_id,
+         max(timestamp) AS g_time
   FROM launchpad_graduations FINAL
   WHERE chain = {chain:UInt64} AND is_deleted = 0
   GROUP BY chain, token
-) AS g ON g.chain = l.chain AND g.token = l.token
+) AS g ON g.g_chain = l.chain AND g.g_token = l.token
 LEFT JOIN
 (
-  SELECT chain, token, toUInt64(count()) AS trades,
-         sum(toFloat64(quote_amount)) AS volume_quote_raw,
-         max(timestamp) AS last_trade_time
+  SELECT chain AS t_chain, token AS t_token,
+         toUInt64(count()) AS t_trades,
+         sum(toFloat64(quote_amount)) AS t_volume_quote_raw,
+         max(timestamp) AS t_last_trade_time
   FROM launchpad_trades_by_token FINAL
   WHERE chain = {chain:UInt64} AND is_deleted = 0
   GROUP BY chain, token
-) AS t ON t.chain = l.chain AND t.token = l.token
+) AS t ON t.t_chain = l.chain AND t.t_token = l.token
 WHERE l.chain = {chain:UInt64} AND l.creator = {creator:FixedString(32)}
   AND l.is_deleted = 0
 ORDER BY l.timestamp DESC;
@@ -440,7 +449,7 @@ FROM
     sum(volume_quote_raw) AS volume_quote_raw
   FROM launchpad_creator_tokens_v(
     chain = {chain:UInt64}, creator = {creator:FixedString(32)},
-    as_of = {as_of:DateTime}, dead_after = {dead_after:UInt32})
+    as_of = {as_of:UInt32}, dead_after = {dead_after:UInt32})
 ) AS c
 CROSS JOIN
 (
@@ -467,9 +476,9 @@ SELECT
   b.token_amount_raw AS token_amount_raw,
   b.quote_amount_raw AS quote_amount_raw,
   b.token_amount_raw / greatest(l.initial_supply_raw, 1.) AS share_of_initial_supply,
-  b.tx_from AS funder,
+  b.funder_of AS funder,
   b.bundle_size AS bundle_size,
-  toUInt8(b.trader = l.creator) AS is_creator
+  toUInt8(b.trader = l.launch_creator) AS is_creator
 FROM
 (
   SELECT
@@ -478,7 +487,7 @@ FROM
     toUInt64(count()) AS buys,
     sum(toFloat64(token_amount)) AS token_amount_raw,
     sum(toFloat64(quote_amount)) AS quote_amount_raw,
-    argMin(tx_from, (block_number, tx_index, ordinal)) AS tx_from,
+    argMin(tx_from, (block_number, tx_index, ordinal)) AS funder_of,
     max(bundle) AS bundle_size
   FROM
   (
@@ -501,7 +510,7 @@ CROSS JOIN
 (
   SELECT
     min(block_number) AS launch_block,
-    argMin(creator, (block_number, tx_index, ordinal)) AS creator,
+    argMin(creator, (block_number, tx_index, ordinal)) AS launch_creator,
     argMin(toFloat64(initial_supply), (block_number, tx_index, ordinal)) AS initial_supply_raw
   FROM launchpad_tokens FINAL
   WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
@@ -519,48 +528,136 @@ ORDER BY token_amount_raw DESC;
 CREATE VIEW IF NOT EXISTS launchpad_venues_1d_all_v AS
 SELECT
   chain, family, emitter, bucket,
-  sum(launches) AS launches,
-  sum(graduations) AS graduations,
-  if(sum(launches) > 0, sum(graduations) / sum(launches), NULL) AS graduation_rate,
-  sum(trades) AS trades,
-  sum(buys) AS buys,
-  sum(volume_quote_raw) AS volume_quote_raw,
-  sum(volume_quote_verified_raw) AS volume_quote_verified_raw,
-  sum(fees_raw) AS fees_raw,
-  sum(graduated_quote_raw) AS graduated_quote_raw,
-  max(unique_traders) AS unique_traders,
-  max(unique_tokens_traded) AS unique_tokens_traded,
-  max(unique_creators) AS unique_creators,
+  sum(p_launches) AS launches,
+  sum(p_graduations) AS graduations,
+  if(sum(p_launches) > 0, sum(p_graduations) / sum(p_launches), NULL) AS graduation_rate,
+  sum(p_trades) AS trades,
+  sum(p_buys) AS buys,
+  sum(p_volume) AS volume_quote_raw,
+  sum(p_volume_verified) AS volume_quote_verified_raw,
+  sum(p_fees) AS fees_raw,
+  sum(p_graduated_quote) AS graduated_quote_raw,
+  max(p_traders) AS unique_traders,
+  max(p_tokens_traded) AS unique_tokens_traded,
+  max(p_creators) AS unique_creators,
   emitter IN (
-    SELECT emitter FROM launchpad_trusted_emitters FINAL
-    WHERE chain = {chain:UInt64} AND family != '') AS trusted
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64}) AS trusted
 FROM
 (
   SELECT chain, family, emitter, bucket,
-         0 AS launches, 0 AS graduations, trades, buys, volume_quote_raw,
-         volume_quote_verified_raw, fees_raw, 0. AS graduated_quote_raw,
-         unique_traders, unique_tokens AS unique_tokens_traded,
-         0 AS unique_creators
+         toUInt64(0) AS p_launches, toUInt64(0) AS p_graduations,
+         trades AS p_trades, buys AS p_buys,
+         volume_quote_raw AS p_volume,
+         volume_quote_verified_raw AS p_volume_verified,
+         fees_raw AS p_fees, 0. AS p_graduated_quote,
+         unique_traders AS p_traders,
+         unique_tokens AS p_tokens_traded,
+         toUInt64(0) AS p_creators
   FROM launchpad_venue_trades_1d_v WHERE chain = {chain:UInt64}
   UNION ALL
   SELECT chain, family, emitter, bucket,
-         sum(launches) AS launches, 0, 0, 0, 0., 0., 0., 0.,
-         0, 0, uniqExact(creator) AS unique_creators
+         sum(launches) AS p_launches, toUInt64(0) AS p_graduations,
+         toUInt64(0) AS p_trades, toUInt64(0) AS p_buys,
+         0. AS p_volume, 0. AS p_volume_verified, 0. AS p_fees,
+         0. AS p_graduated_quote, toUInt64(0) AS p_traders,
+         toUInt64(0) AS p_tokens_traded,
+         uniqExact(creator) AS p_creators
   FROM launchpad_launches_1d_v WHERE chain = {chain:UInt64}
   GROUP BY chain, family, emitter, bucket
   UNION ALL
   SELECT chain, family, emitter, bucket,
-         0, graduations, 0, 0, 0., 0., 0., quote_in_raw AS graduated_quote_raw,
-         0, 0, 0
+         toUInt64(0) AS p_launches, graduations AS p_graduations,
+         toUInt64(0) AS p_trades, toUInt64(0) AS p_buys,
+         0. AS p_volume, 0. AS p_volume_verified, 0. AS p_fees,
+         quote_in_raw AS p_graduated_quote, toUInt64(0) AS p_traders,
+         toUInt64(0) AS p_tokens_traded, toUInt64(0) AS p_creators
   FROM launchpad_graduations_1d_v WHERE chain = {chain:UInt64}
 )
 GROUP BY chain, family, emitter, bucket
 ORDER BY bucket DESC, volume_quote_raw DESC;
 
 CREATE VIEW IF NOT EXISTS launchpad_venues_1d_v AS
-SELECT *
-FROM launchpad_venues_1d_all_v(chain = {chain:UInt64})
-WHERE trusted = 1;
+SELECT
+  k.chain AS chain, k.family AS family, k.bucket AS bucket,
+  ifNull(l.launches, 0) AS launches,
+  ifNull(g.graduations, 0) AS graduations,
+  if(ifNull(l.launches, 0) > 0,
+     ifNull(g.graduations, 0) / l.launches, NULL) AS graduation_rate,
+  ifNull(t.trades, 0) AS trades,
+  ifNull(t.buys, 0) AS buys,
+  ifNull(t.volume_quote_raw, 0.) AS volume_quote_raw,
+  ifNull(t.volume_quote_verified_raw, 0.) AS volume_quote_verified_raw,
+  ifNull(t.fees_raw, 0.) AS fees_raw,
+  ifNull(g.graduated_quote_raw, 0.) AS graduated_quote_raw,
+  ifNull(t.unique_traders, 0) AS unique_traders,
+  ifNull(t.unique_tokens_traded, 0) AS unique_tokens_traded,
+  ifNull(l.unique_creators, 0) AS unique_creators,
+  ifNull(t.emitters, 0) AS emitters
+FROM
+(
+  SELECT DISTINCT chain, family, bucket FROM
+  (
+    SELECT chain, family, bucket FROM launchpad_venue_trades_1d
+    WHERE chain = {chain:UInt64}
+    UNION ALL
+    SELECT chain, family, bucket FROM launchpad_launches_1d
+    WHERE chain = {chain:UInt64}
+    UNION ALL
+    SELECT chain, family, bucket FROM launchpad_graduations_1d
+    WHERE chain = {chain:UInt64}
+  )
+) AS k
+LEFT JOIN
+(
+  SELECT
+    a.family AS t_family, a.bucket AS t_bucket,
+    toUInt64(sum(a.trades)) AS trades,
+    toUInt64(sum(a.buys)) AS buys,
+    sum(a.volume_quote) AS volume_quote_raw,
+    sum(a.volume_quote_verified) AS volume_quote_verified_raw,
+    sum(a.fees) AS fees_raw,
+    uniqMerge(a.traders) AS unique_traders,
+    uniqMerge(a.tokens) AS unique_tokens_traded,
+    uniqExact(a.emitter) AS emitters
+  FROM launchpad_venue_trades_1d AS a
+  ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+  WHERE a.chain = {chain:UInt64} AND a.epoch >= ifNull(f.epoch_floor, 0)
+    AND a.emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+  GROUP BY t_family, t_bucket
+) AS t ON t.t_family = k.family AND t.t_bucket = k.bucket
+LEFT JOIN
+(
+  SELECT
+    a.family AS l_family, a.bucket AS l_bucket,
+    toUInt64(sum(a.launches)) AS launches,
+    uniqExact(a.creator) AS unique_creators
+  FROM launchpad_launches_1d AS a
+  ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+  WHERE a.chain = {chain:UInt64} AND a.epoch >= ifNull(f.epoch_floor, 0)
+    AND a.emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+  GROUP BY l_family, l_bucket
+) AS l ON l.l_family = k.family AND l.l_bucket = k.bucket
+LEFT JOIN
+(
+  SELECT
+    a.family AS g_family, a.bucket AS g_bucket,
+    toUInt64(sum(a.graduations)) AS graduations,
+    sum(a.quote_in) AS graduated_quote_raw
+  FROM launchpad_graduations_1d AS a
+  ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+  WHERE a.chain = {chain:UInt64} AND a.epoch >= ifNull(f.epoch_floor, 0)
+    AND a.emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+  GROUP BY g_family, g_bucket
+) AS g ON g.g_family = k.family AND g.g_bucket = k.bucket
+WHERE trades > 0 OR launches > 0 OR graduations > 0
+ORDER BY bucket DESC, volume_quote_raw DESC;
 
 -- ------------------------------------------- screen: front ends
 --
@@ -583,7 +680,7 @@ LEFT JOIN launchpad_frontends AS fc FINAL
 LEFT JOIN launchpad_frontends AS ft FINAL
   ON ft.chain = t.chain AND ft.address = t.tx_to
 WHERE t.chain = {chain:UInt64} AND t.is_deleted = 0
-  AND t.timestamp >= {since:DateTime}
+  AND t.timestamp >= toDateTime({since:UInt32})
   AND t.emitter IN (
     SELECT curve FROM launchpad_trusted_curves_v WHERE chain = {chain:UInt64})
 GROUP BY family, emitter, frontend

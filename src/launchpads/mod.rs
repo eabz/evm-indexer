@@ -266,7 +266,9 @@ impl LaunchpadRows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::launchpads::sql::{normalize, statements, MIGRATIONS};
+    use crate::launchpads::sql::{
+        normalize, statements, MIGRATIONS, SETTINGS_MIGRATION,
+    };
 
     fn all_rows() -> LaunchpadRows {
         let mut rows = LaunchpadRows::default();
@@ -478,6 +480,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `0033` only turns the deduplication log on, for every table a
+    /// flush writes and every target of a materialized view (0090 did it
+    /// for the modules that existed when it was written, and an applied
+    /// migration never changes).
+    #[test]
+    fn the_settings_migration_only_sets_the_deduplication_window() {
+        let (name, sql) = SETTINGS_MIGRATION;
+        assert!(name.starts_with("0033"));
+
+        let mut altered: Vec<String> = Vec::new();
+        for statement in statements(sql) {
+            let statement = normalize(&statement);
+            let rest = statement
+                .strip_prefix("ALTER TABLE ")
+                .unwrap_or_else(|| panic!("{statement}"));
+            let (table, setting) = rest.split_once(' ').unwrap();
+            assert_eq!(
+                setting,
+                "MODIFY SETTING non_replicated_deduplication_window = 50000"
+            );
+            altered.push(table.to_owned());
+        }
+        altered.sort();
+
+        let mut expected: Vec<String> = BLOCK_SCOPED_TABLES
+            .iter()
+            .map(|table| table.to_string())
+            .chain(
+                LAUNCHPADS_DERIVED
+                    .iter()
+                    .map(|table| table.name.to_string()),
+            )
+            .collect();
+        expected.sort();
+
+        assert_eq!(altered, expected);
     }
 
     #[test]

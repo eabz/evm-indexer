@@ -127,7 +127,7 @@ LIMIT 100",
 pub const VENUES: Recipe = Recipe {
     screen: "Venue stats",
     sql: "\
-SELECT family, emitter, bucket, launches, graduations, graduation_rate,
+SELECT family, bucket, launches, graduations, graduation_rate,
        trades, volume_quote_raw, volume_quote_verified_raw, fees_raw,
        unique_traders, unique_creators
 FROM launchpad_venues_1d_v(chain = {chain})

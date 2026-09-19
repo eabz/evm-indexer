@@ -10,7 +10,7 @@ use alloy::primitives::{Address, Bytes, B256, U256};
 use crate::db::models::log::{test_support::log_with, DatabaseLog};
 
 pub use super::fixtures_data::*;
-use super::{events, models::id_of, TxOrigin};
+use super::{events, TxOrigin};
 
 pub struct RawLog {
     pub address: &'static str,
@@ -209,9 +209,4 @@ pub fn constructed_transfer(
         &[events::ERC20_TRANSFER.topic0, from.into_word(), to.into_word()],
         word(amount).to_vec(),
     )
-}
-
-/// The 32 byte identity of an EVM address, as the tables store it.
-pub fn id(hex: &str) -> super::Id {
-    id_of(address(hex))
 }
