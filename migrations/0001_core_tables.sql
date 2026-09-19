@@ -7,9 +7,23 @@
 --   * byte blobs        String            raw bytes, never hex
 --   * enumerations      LowCardinality(String)
 --   * Nullable only where NULL means something else than the default
---   * ReplacingMergeTree(_version), _version = unix ms of the flush
 --   * positional sorting keys, so a re-inserted block replaces itself
 --   * readers query with FINAL and format with concat('0x', lower(hex(x)))
+--
+-- Reorgs are insert only (docs/design.md, section 2): the indexer never
+-- issues DELETE, ALTER ... DELETE or DROP PARTITION. Every block scoped
+-- table is a ReplacingMergeTree with a version and a deleted flag:
+--   * _version    unix ms of the flush, strictly increasing per process
+--   * is_deleted  0 for data. A rollback inserts a copy of the row with a
+--                 newer _version and is_deleted = 1 (a tombstone), FINAL then
+--                 hides the row. Never sent by the insert path.
+--   * epoch       the chain's purge generation when the row was written,
+--                 which is what keeps the aggregates of 0003 correct
+--
+-- The target is 50+ chains in one database, so the tables are partitioned
+-- by month ONLY (never by chain: chains x months partitions). chain is the
+-- first sorting key column, that is what prunes reads. A tombstone copies
+-- the timestamp of its row, so it always lands in the partition of the row.
 --
 -- The database comes from the connection, never from the DDL.
 
@@ -40,10 +54,12 @@ CREATE TABLE IF NOT EXISTS blocks (
   uncles Array(FixedString(32)),
   -- Zero bytes before Shanghai.
   withdrawals_root FixedString(32),
-  _version UInt64 CODEC(Delta, ZSTD)
+  epoch UInt32 DEFAULT 0,
+  _version UInt64 CODEC(Delta, ZSTD),
+  is_deleted UInt8 DEFAULT 0
 )
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, number)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
@@ -79,10 +95,12 @@ CREATE TABLE IF NOT EXISTS transactions (
   -- Copied from the block for join free fee math, NULL before London.
   base_fee_per_gas Nullable(UInt256),
   access_list Array(Tuple(FixedString(20), Array(FixedString(32)))),
-  _version UInt64 CODEC(Delta, ZSTD)
+  epoch UInt32 DEFAULT 0,
+  _version UInt64 CODEC(Delta, ZSTD),
+  is_deleted UInt8 DEFAULT 0
 )
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, transaction_index)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
@@ -101,63 +119,13 @@ CREATE TABLE IF NOT EXISTS logs (
   topic2 FixedString(32),
   topic3 FixedString(32),
   data String CODEC(ZSTD(3)),
-  _version UInt64 CODEC(Delta, ZSTD)
+  epoch UInt32 DEFAULT 0,
+  _version UInt64 CODEC(Delta, ZSTD),
+  is_deleted UInt8 DEFAULT 0
 )
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, log_index)
-SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
-
-CREATE TABLE IF NOT EXISTS traces (
-  chain UInt64,
-  block_number UInt64 CODEC(Delta, ZSTD),
-  -- 4294967295 for block / uncle reward traces (no transaction).
-  transaction_position UInt32 CODEC(Delta, ZSTD),
-  trace_address Array(UInt32),
-  -- Zero bytes for reward traces.
-  transaction_hash FixedString(32),
-  block_hash FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
-  -- 'call' | 'create' | 'suicide' | 'reward'
-  action_type LowCardinality(String),
-  subtraces UInt32,
-  -- Empty when the trace did not fail.
-  error String,
-  -- The columns below are NULL when they do not apply to the action type.
-  `from` Nullable(FixedString(20)),
-  `to` Nullable(FixedString(20)),
-  value Nullable(UInt256),
-  gas Nullable(UInt64),
-  gas_used Nullable(UInt64),
-  call_type LowCardinality(Nullable(String)),
-  input Nullable(String) CODEC(ZSTD(3)),
-  output Nullable(String) CODEC(ZSTD(3)),
-  init Nullable(String) CODEC(ZSTD(3)),
-  code Nullable(String) CODEC(ZSTD(3)),
-  address Nullable(FixedString(20)),
-  refund_address Nullable(FixedString(20)),
-  balance Nullable(UInt256),
-  author Nullable(FixedString(20)),
-  reward_type LowCardinality(Nullable(String)),
-  _version UInt64 CODEC(Delta, ZSTD)
-)
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
-ORDER BY (chain, block_number, transaction_position, trace_address)
-SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
-
-CREATE TABLE IF NOT EXISTS contracts (
-  chain UInt64,
-  block_number UInt64 CODEC(Delta, ZSTD),
-  contract_address FixedString(20),
-  creator FixedString(20),
-  transaction_hash FixedString(32),
-  timestamp DateTime CODEC(DoubleDelta, ZSTD),
-  _version UInt64 CODEC(Delta, ZSTD)
-)
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
-ORDER BY (chain, block_number, contract_address)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
 CREATE TABLE IF NOT EXISTS withdrawals (
@@ -168,10 +136,12 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   address FixedString(20),
   amount UInt256,
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
-  _version UInt64 CODEC(Delta, ZSTD)
+  epoch UInt32 DEFAULT 0,
+  _version UInt64 CODEC(Delta, ZSTD),
+  is_deleted UInt8 DEFAULT 0
 )
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, withdrawal_index)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
@@ -186,10 +156,12 @@ CREATE TABLE IF NOT EXISTS erc20_transfers (
   `from` FixedString(20),
   `to` FixedString(20),
   amount UInt256,
-  _version UInt64 CODEC(Delta, ZSTD)
+  epoch UInt32 DEFAULT 0,
+  _version UInt64 CODEC(Delta, ZSTD),
+  is_deleted UInt8 DEFAULT 0
 )
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, log_index)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
@@ -204,10 +176,12 @@ CREATE TABLE IF NOT EXISTS erc721_transfers (
   `from` FixedString(20),
   `to` FixedString(20),
   id UInt256,
-  _version UInt64 CODEC(Delta, ZSTD)
+  epoch UInt32 DEFAULT 0,
+  _version UInt64 CODEC(Delta, ZSTD),
+  is_deleted UInt8 DEFAULT 0
 )
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, log_index)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
@@ -225,12 +199,30 @@ CREATE TABLE IF NOT EXISTS erc1155_transfers (
   -- TransferSingle is stored as one element arrays. Same length, always.
   ids Array(UInt256),
   amounts Array(UInt256),
-  _version UInt64 CODEC(Delta, ZSTD)
+  epoch UInt32 DEFAULT 0,
+  _version UInt64 CODEC(Delta, ZSTD),
+  is_deleted UInt8 DEFAULT 0
 )
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY (chain, toYYYYMM(timestamp))
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
 ORDER BY (chain, block_number, log_index)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
+
+-- Contracts deployed DIRECTLY by a transaction (docs/design.md, section
+-- 9). A view: nothing to insert, roll back or keep consistent. Contracts
+-- created by other contracts (factories) are out of scope by design, so do
+-- not build statistics on top of this. Query it with a chain and a block or
+-- time range: `transactions FINAL` is what is being read.
+CREATE VIEW IF NOT EXISTS contracts AS
+SELECT
+  chain,
+  block_number,
+  timestamp,
+  contract_created AS contract_address,
+  `from` AS creator,
+  hash AS transaction_hash
+FROM transactions FINAL
+WHERE contract_created != toFixedString('', 20) AND status = 'success';
 
 -- Token metadata is not block scoped (a name does not change with the
 -- fork) and is written by the token worker, outside of the block flushes:

@@ -1,0 +1,530 @@
+-- Prediction markets: base and read path tables (docs/design.md, section 10).
+-- Rust side: src/predictions (models.rs mirrors every table written here).
+--
+-- Designed backwards from the screens of a trading UI - see
+-- src/predictions/README.md for the screen -> query cookbook.
+--
+-- Storage rules (docs/design.md, sections 1 and 2): binary FixedString /
+-- UInt256 columns, no hex. Every block scoped table is
+-- ReplacingMergeTree(_version, is_deleted) and carries epoch (the purge
+-- generation of its chain). Nothing is ever deleted: a purge INSERTs
+-- tombstones (the row again, newer _version, is_deleted = 1), FINAL hides
+-- them. Tables written in block order are partitioned by month only (50+
+-- chains share the database, chain is the first sorting key column),
+-- lookup / side tables by chain. Side tables are fed by materialized views
+-- that pass _version, is_deleted and epoch through, so a tombstone on a
+-- base table tombstones its side table rows by itself.
+--
+-- Identity: market_id = the CTF conditionId, registry = the ERC-1155
+-- contract holding the positions (a forged registry never collides with
+-- the real one), outcome_token_id = the ERC-1155 id of one outcome.
+
+-- One row per ConditionPreparation (source 'event'). Keyed by identity
+-- first - a condition can be prepared once per registry - then by
+-- position, so a re-inserted block replaces itself and a reorged-out
+-- preparation is tombstoned by block_number.
+CREATE TABLE IF NOT EXISTS prediction_markets (
+  chain UInt64,
+  market_id FixedString(32),
+  registry FixedString(20),
+  -- event family, 'ctf'
+  protocol LowCardinality(String),
+  oracle FixedString(20),
+  question_id FixedString(32),
+  outcome_count UInt16,
+  block_number UInt64 CODEC(Delta, ZSTD),
+  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  transaction_hash FixedString(32),
+  log_index UInt32,
+  tx_from FixedString(20),
+  -- 'event' | 'rpc'
+  source LowCardinality(String),
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY chain
+ORDER BY (chain, market_id, registry, block_number, log_index)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- One row per ConditionResolution: the payout vector.
+CREATE TABLE IF NOT EXISTS prediction_resolutions (
+  chain UInt64,
+  market_id FixedString(32),
+  registry FixedString(20),
+  oracle FixedString(20),
+  question_id FixedString(32),
+  outcome_count UInt16,
+  -- one numerator per outcome. [1, 0] = outcome 0 won, [1, 1] = 50 / 50
+  payout_numerators Array(UInt256),
+  payout_denominator UInt256,
+  block_number UInt64 CODEC(Delta, ZSTD),
+  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  transaction_hash FixedString(32),
+  log_index UInt32,
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY chain
+ORDER BY (chain, market_id, registry, block_number, log_index)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- What the chain says ABOUT a market: titles and outcome labels (UMA
+-- ancillary data, NegRisk payloads), the event a market belongs to,
+-- disputes. A row describes the market whose question_id it carries when
+-- its emitter is the market's oracle.
+--   kind: 'uma_question' | 'uma_reset' | 'uma_flagged' |
+--         'neg_risk_event' (question_id = event_id) | 'neg_risk_question'
+CREATE TABLE IF NOT EXISTS prediction_questions (
+  chain UInt64,
+  question_id FixedString(32),
+  emitter FixedString(20),
+  kind LowCardinality(String),
+  protocol LowCardinality(String),
+  -- groups the markets of one multi outcome event, zero bytes when none
+  event_id FixedString(32),
+  question_index UInt32,
+  title String,
+  description String CODEC(ZSTD(3)),
+  -- labels by outcome index, empty when the text does not name them
+  outcomes Array(String),
+  -- the raw payload
+  data String CODEC(ZSTD(3)),
+  creator FixedString(20),
+  oracle FixedString(20),
+  reward_token FixedString(20),
+  reward UInt256,
+  proposal_bond UInt256,
+  fee_bips UInt32,
+  block_number UInt64 CODEC(Delta, ZSTD),
+  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  transaction_hash FixedString(32),
+  log_index UInt32,
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY chain
+ORDER BY (chain, question_id, emitter, kind, block_number, log_index)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- Outcome index <-> ERC-1155 token id. NOT block scoped: the id is
+-- keccak(collateral, collection(condition, 1 << index)), arithmetic no
+-- reorg can change. Rows are COMPUTED by the decoder from every split /
+-- merge / redemption, the earliest sighting has the highest _version.
+CREATE TABLE IF NOT EXISTS prediction_outcome_tokens (
+  chain UInt64,
+  registry FixedString(20),
+  outcome_token_id UInt256,
+  market_id FixedString(32),
+  outcome_index UInt16,
+  collateral_token FixedString(20),
+  first_seen_block UInt64,
+  first_seen_timestamp DateTime,
+  _version UInt64
+)
+ENGINE = ReplacingMergeTree(_version)
+PARTITION BY chain
+ORDER BY (chain, registry, outcome_token_id)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- The same map from the market's side.
+CREATE TABLE IF NOT EXISTS prediction_outcome_tokens_by_market (
+  chain UInt64,
+  market_id FixedString(32),
+  registry FixedString(20),
+  collateral_token FixedString(20),
+  outcome_index UInt16,
+  outcome_token_id UInt256,
+  first_seen_block UInt64,
+  first_seen_timestamp DateTime,
+  _version UInt64
+)
+ENGINE = ReplacingMergeTree(_version)
+PARTITION BY chain
+ORDER BY (chain, market_id, registry, collateral_token, outcome_index)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS prediction_outcome_tokens_by_market_mv
+TO prediction_outcome_tokens_by_market AS
+SELECT
+  chain, market_id, registry, collateral_token, outcome_index,
+  outcome_token_id, first_seen_block, first_seen_timestamp, _version
+FROM prediction_outcome_tokens;
+
+-- THE canonical trade: one row per filled MAKER order, told from the
+-- TAKER's point of view. The taker order's own OrderFilled and
+-- OrdersMatched are never rows (they describe the same shares again).
+--   price of the taker's token  = collateral_amount / share_amount
+--   price of the maker's token  = maker_collateral_amount / share_amount
+--   match_type 'complementary' | 'direct' | 'amm': one token, one price
+--   match_type 'mint' | 'merge': two tokens, the prices add up to 1
+CREATE TABLE IF NOT EXISTS prediction_trades (
+  chain UInt64,
+  block_number UInt64 CODEC(Delta, ZSTD),
+  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  transaction_hash FixedString(32),
+  transaction_index UInt32,
+  log_index UInt32,
+  -- event family: 'ctf_exchange' | 'ctf_exchange_v2' | 'fpmm'
+  protocol LowCardinality(String),
+  -- emitter: the exchange or the AMM pool
+  exchange FixedString(20),
+  -- the ERC-1155 contract that moved the token in the same transaction
+  registry FixedString(20),
+  order_hash FixedString(32),
+  maker FixedString(20),
+  taker FixedString(20),
+  tx_from FixedString(20),
+  tx_to FixedString(20),
+  outcome_token_id UInt256,
+  -- the TAKER's side: 'buy' | 'sell'
+  side LowCardinality(String),
+  share_amount UInt256,
+  -- collateral of the taker for share_amount, fees excluded
+  collateral_amount UInt256,
+  match_type LowCardinality(String),
+  maker_outcome_token_id UInt256,
+  maker_side LowCardinality(String),
+  maker_collateral_amount UInt256,
+  maker_fee_amount UInt256,
+  -- 'collateral' | 'shares'
+  maker_fee_unit LowCardinality(String),
+  taker_fee_amount UInt256,
+  taker_fee_unit LowCardinality(String),
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (chain, block_number, log_index)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- Collateral entering / leaving a market.
+--   protocol 'ctf': the registry itself - the source of open interest
+--   protocol 'ctf_adapter' | 'neg_risk': an adapter naming the real user
+--     (attribution only, never added to open interest again)
+--   kind: 'split' | 'merge' | 'redeem' | 'convert'
+CREATE TABLE IF NOT EXISTS prediction_position_events (
+  chain UInt64,
+  block_number UInt64 CODEC(Delta, ZSTD),
+  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  transaction_hash FixedString(32),
+  log_index UInt32,
+  protocol LowCardinality(String),
+  emitter FixedString(20),
+  kind LowCardinality(String),
+  stakeholder FixedString(20),
+  -- conditionId, for 'convert' the NegRisk event id
+  market_id FixedString(32),
+  collateral_token FixedString(20),
+  parent_collection_id FixedString(32),
+  index_sets Array(UInt256),
+  -- collateral: split / merged amount, payout of a redemption
+  amount UInt256,
+  tx_from FixedString(20),
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (chain, block_number, log_index)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- One row per ERC-1155 id moved. from_reason / to_reason say why the two
+-- accounts' balances changed:
+--   'split' | 'merge' | 'redeem' | 'trade' | 'transfer'
+CREATE TABLE IF NOT EXISTS prediction_transfers (
+  chain UInt64,
+  block_number UInt64 CODEC(Delta, ZSTD),
+  timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  transaction_hash FixedString(32),
+  log_index UInt32,
+  -- position inside a TransferBatch
+  batch_index UInt32,
+  registry FixedString(20),
+  operator FixedString(20),
+  `from` FixedString(20),
+  `to` FixedString(20),
+  outcome_token_id UInt256,
+  amount UInt256,
+  from_reason LowCardinality(String),
+  to_reason LowCardinality(String),
+  -- cost basis convention of a split / merge leg: amount / outcomes of
+  -- the partition (a full set costs exactly amount). Zero otherwise.
+  priced_collateral UInt256,
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (chain, block_number, log_index, batch_index)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- What only the contract can tell about an exchange / pool: the token it
+-- is paid in. Written by the background resolver (never on the commit
+-- path), not block scoped. source: 'rpc' | 'unresolved'.
+CREATE TABLE IF NOT EXISTS prediction_venues (
+  chain UInt64,
+  exchange FixedString(20),
+  protocol LowCardinality(String),
+  collateral_token FixedString(20),
+  registry FixedString(20),
+  source LowCardinality(String),
+  _version UInt64
+)
+ENGINE = ReplacingMergeTree(_version)
+PARTITION BY chain
+ORDER BY (chain, exchange)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- USER POPULATED: brand names. The indexer decodes by event family and
+-- ships no address list. A label on a registry names every market of it,
+-- a label on an exchange names the trades and excludes the exchange
+-- contract from the leaderboard.
+--   INSERT INTO prediction_venue_labels (chain, address, venue) VALUES
+--     (137, unhex('4D97DCd97eC945f40cF65F87097ACe5EA0476045'), 'polymarket')
+CREATE TABLE IF NOT EXISTS prediction_venue_labels (
+  chain UInt64,
+  address FixedString(20),
+  venue String,
+  _version UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))
+)
+ENGINE = ReplacingMergeTree(_version)
+PARTITION BY chain
+ORDER BY (chain, address)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- FILLED BY AN EXTERNAL ENRICHER, never by the indexer: what is not on
+-- chain (Polymarket Gamma API: slug, category, tags, image, end date,
+-- outcome labels of markets whose text is off chain). prediction_markets_v
+-- LEFT JOINs it, so the UI query does not change when a row appears. Every
+-- column is NULL / empty until then.
+CREATE TABLE IF NOT EXISTS prediction_market_metadata (
+  chain UInt64,
+  market_id FixedString(32),
+  title Nullable(String),
+  description Nullable(String),
+  slug Nullable(String),
+  category Nullable(String),
+  tags Array(String),
+  image_url Nullable(String),
+  outcomes Array(String),
+  end_date Nullable(DateTime('UTC')),
+  event_title Nullable(String),
+  event_slug Nullable(String),
+  -- who wrote the row: 'gamma' ...
+  source LowCardinality(String),
+  _version UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))
+)
+ENGINE = ReplacingMergeTree(_version)
+PARTITION BY chain
+ORDER BY (chain, market_id)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- Trades tape: the trades of one outcome token, newest last. A market's
+-- tape is the union of its (two) tokens.
+CREATE TABLE IF NOT EXISTS prediction_trades_by_token (
+  chain UInt64,
+  registry FixedString(20),
+  outcome_token_id UInt256,
+  block_number UInt64,
+  log_index UInt32,
+  timestamp DateTime,
+  transaction_hash FixedString(32),
+  protocol LowCardinality(String),
+  exchange FixedString(20),
+  maker FixedString(20),
+  taker FixedString(20),
+  tx_from FixedString(20),
+  side LowCardinality(String),
+  share_amount UInt256,
+  collateral_amount UInt256,
+  match_type LowCardinality(String),
+  taker_fee_amount UInt256,
+  taker_fee_unit LowCardinality(String),
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
+  INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY chain
+ORDER BY (chain, registry, outcome_token_id, block_number, log_index)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS prediction_trades_by_token_mv
+TO prediction_trades_by_token AS
+SELECT
+  chain, registry, outcome_token_id, block_number, log_index, timestamp,
+  transaction_hash, protocol, exchange, maker, taker, tx_from, side,
+  share_amount, collateral_amount, match_type, taker_fee_amount,
+  taker_fee_unit, epoch, _version, is_deleted
+FROM prediction_trades;
+
+-- The ledger of an account: everything that changed a balance (transfer
+-- legs, share_delta != 0) and everything that has a price (trade legs,
+-- share_delta = 0: the shares of a trade move in its transfer legs).
+--   reason: 'split' | 'merge' | 'redeem' | 'trade' | 'transfer' (transfer
+--           legs), 'buy' | 'sell' (trade legs)
+--   leg: 0 = sender / maker, 1 = receiver / taker
+-- Balances are exact: sum(share_delta) per (registry, token, holder).
+CREATE TABLE IF NOT EXISTS prediction_ledger_by_holder (
+  chain UInt64,
+  holder FixedString(20),
+  registry FixedString(20),
+  outcome_token_id UInt256,
+  block_number UInt64,
+  log_index UInt32,
+  sub_index UInt32,
+  leg UInt8,
+  timestamp DateTime,
+  transaction_hash FixedString(32),
+  reason LowCardinality(String),
+  share_delta Int256,
+  shares UInt256,
+  -- priced legs only (buy / sell / split / merge), else 0
+  collateral UInt256,
+  fee UInt256,
+  fee_unit LowCardinality(String),
+  counterparty FixedString(20),
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
+  INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY chain
+ORDER BY (chain, holder, registry, outcome_token_id, block_number, log_index, sub_index, leg)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- The same ledger by token: holders of an outcome.
+CREATE TABLE IF NOT EXISTS prediction_ledger_by_token (
+  chain UInt64,
+  registry FixedString(20),
+  outcome_token_id UInt256,
+  holder FixedString(20),
+  block_number UInt64,
+  log_index UInt32,
+  sub_index UInt32,
+  leg UInt8,
+  timestamp DateTime,
+  transaction_hash FixedString(32),
+  reason LowCardinality(String),
+  share_delta Int256,
+  shares UInt256,
+  collateral UInt256,
+  fee UInt256,
+  fee_unit LowCardinality(String),
+  counterparty FixedString(20),
+  epoch UInt32 DEFAULT 0,
+  _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
+  INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY chain
+ORDER BY (chain, registry, outcome_token_id, holder, block_number, log_index, sub_index, leg)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS prediction_ledger_by_holder_transfers_mv
+TO prediction_ledger_by_holder AS
+SELECT
+  chain, tupleElement(entry, 1) AS holder, registry, outcome_token_id,
+  block_number, log_index, batch_index AS sub_index,
+  tupleElement(entry, 2) AS leg, timestamp, transaction_hash,
+  tupleElement(entry, 3) AS reason,
+  tupleElement(entry, 4) AS share_delta,
+  amount AS shares,
+  tupleElement(entry, 5) AS collateral,
+  toUInt256(0) AS fee, 'collateral' AS fee_unit,
+  tupleElement(entry, 6) AS counterparty,
+  epoch, _version, is_deleted
+FROM
+(
+  SELECT *, arrayJoin([
+    (`from`, toUInt8(0), toString(from_reason), negate(toInt256(amount)), if(from_reason = 'merge', priced_collateral, toUInt256(0)), `to`),
+    (`to`, toUInt8(1), toString(to_reason), toInt256(amount), if(to_reason = 'split', priced_collateral, toUInt256(0)), `from`)
+  ]) AS entry
+  FROM prediction_transfers
+)
+WHERE tupleElement(entry, 1) != toFixedString('', 20);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS prediction_ledger_by_token_transfers_mv
+TO prediction_ledger_by_token AS
+SELECT
+  chain, registry, outcome_token_id, tupleElement(entry, 1) AS holder,
+  block_number, log_index, batch_index AS sub_index,
+  tupleElement(entry, 2) AS leg, timestamp, transaction_hash,
+  tupleElement(entry, 3) AS reason,
+  tupleElement(entry, 4) AS share_delta,
+  amount AS shares,
+  tupleElement(entry, 5) AS collateral,
+  toUInt256(0) AS fee, 'collateral' AS fee_unit,
+  tupleElement(entry, 6) AS counterparty,
+  epoch, _version, is_deleted
+FROM
+(
+  SELECT *, arrayJoin([
+    (`from`, toUInt8(0), toString(from_reason), negate(toInt256(amount)), if(from_reason = 'merge', priced_collateral, toUInt256(0)), `to`),
+    (`to`, toUInt8(1), toString(to_reason), toInt256(amount), if(to_reason = 'split', priced_collateral, toUInt256(0)), `from`)
+  ]) AS entry
+  FROM prediction_transfers
+)
+WHERE tupleElement(entry, 1) != toFixedString('', 20);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS prediction_ledger_by_holder_trades_mv
+TO prediction_ledger_by_holder AS
+SELECT
+  chain, tupleElement(entry, 1) AS holder, registry,
+  tupleElement(entry, 4) AS outcome_token_id,
+  block_number, log_index, toUInt32(0) AS sub_index,
+  tupleElement(entry, 2) AS leg, timestamp, transaction_hash,
+  tupleElement(entry, 3) AS reason,
+  toInt256(0) AS share_delta,
+  share_amount AS shares,
+  tupleElement(entry, 5) AS collateral,
+  tupleElement(entry, 6) AS fee,
+  tupleElement(entry, 7) AS fee_unit,
+  tupleElement(entry, 8) AS counterparty,
+  epoch, _version, is_deleted
+FROM
+(
+  SELECT *, arrayJoin([
+    (maker, toUInt8(0), toString(maker_side), maker_outcome_token_id, maker_collateral_amount, maker_fee_amount, toString(maker_fee_unit), taker),
+    (taker, toUInt8(1), toString(side), outcome_token_id, collateral_amount, taker_fee_amount, toString(taker_fee_unit), maker)
+  ]) AS entry
+  FROM prediction_trades
+);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS prediction_ledger_by_token_trades_mv
+TO prediction_ledger_by_token AS
+SELECT
+  chain, registry,
+  tupleElement(entry, 4) AS outcome_token_id,
+  tupleElement(entry, 1) AS holder,
+  block_number, log_index, toUInt32(0) AS sub_index,
+  tupleElement(entry, 2) AS leg, timestamp, transaction_hash,
+  tupleElement(entry, 3) AS reason,
+  toInt256(0) AS share_delta,
+  share_amount AS shares,
+  tupleElement(entry, 5) AS collateral,
+  tupleElement(entry, 6) AS fee,
+  tupleElement(entry, 7) AS fee_unit,
+  tupleElement(entry, 8) AS counterparty,
+  epoch, _version, is_deleted
+FROM
+(
+  SELECT *, arrayJoin([
+    (maker, toUInt8(0), toString(maker_side), maker_outcome_token_id, maker_collateral_amount, maker_fee_amount, toString(maker_fee_unit), taker),
+    (taker, toUInt8(1), toString(side), outcome_token_id, collateral_amount, taker_fee_amount, toString(taker_fee_unit), maker)
+  ]) AS entry
+  FROM prediction_trades
+);

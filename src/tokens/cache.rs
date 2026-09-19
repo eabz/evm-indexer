@@ -104,6 +104,28 @@ pub trait TokenCache: Send + Sync + 'static {
         &'a self,
         tokens: &'a [DatabaseToken],
     ) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    /// [`store_many`](Self::store_many) where blank rows (see
+    /// [`is_blank`]) expire after `blank_ttl`: "nothing there" is never
+    /// believed forever, it is verified again. Rows with metadata never
+    /// expire. The default ignores the TTL.
+    fn store_many_expiring<'a>(
+        &'a self,
+        tokens: &'a [DatabaseToken],
+        blank_ttl: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        let _ = blank_ttl;
+        self.store_many(tokens)
+    }
+}
+
+/// A row without any metadata: what is stored for a contract that
+/// answers nothing (reverts, garbage, no code). Also exactly what a
+/// stale or lying node makes of a perfectly good token, which is why
+/// these rows are verified again later (`tokens` is a
+/// `ReplacingMergeTree`: a later row with metadata replaces the blank).
+pub fn is_blank(token: &DatabaseToken) -> bool {
+    token.name.is_empty() && token.symbol.is_empty() && token.decimals == 0
 }
 
 /// Redis / Dragonfly implementation of [`TokenCache`].
@@ -289,15 +311,43 @@ impl TokenCache for RedisTokenCache {
         &'a self,
         tokens: &'a [DatabaseToken],
     ) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.store(tokens, None)
+    }
+
+    fn store_many_expiring<'a>(
+        &'a self,
+        tokens: &'a [DatabaseToken],
+        blank_ttl: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        self.store(tokens, Some(blank_ttl))
+    }
+}
+
+impl RedisTokenCache {
+    fn store<'a>(
+        &'a self,
+        tokens: &'a [DatabaseToken],
+        blank_ttl: Option<Duration>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             for chunk in tokens.chunks(REDIS_PIPELINE_CHUNK) {
                 let mut pipe = redis::pipe();
                 for token in chunk {
                     let value = CachedToken::from(token).to_json()?;
-                    pipe.cmd("SET")
+                    let command = pipe
+                        .cmd("SET")
                         .arg(redis_key(token.chain, &token.address))
-                        .arg(value)
-                        .ignore();
+                        .arg(value);
+
+                    // A plain SET also clears the TTL of a blank that
+                    // turned out to be a token after all.
+                    match blank_ttl {
+                        Some(ttl) if is_blank(token) => {
+                            command.arg("EX").arg(ttl.as_secs().max(1))
+                        }
+                        _ => command,
+                    }
+                    .ignore();
                 }
 
                 let mut conn = self.connection.clone();
@@ -324,7 +374,10 @@ impl TokenCache for RedisTokenCache {
 ///
 /// Purely synchronous; callers wrap it in a mutex.
 pub struct KnownTokens {
-    known: LruCache<Address, ()>,
+    /// Stored tokens and when that was learned.
+    known: LruCache<Address, Instant>,
+    /// Blank rows and when they are due to be verified again.
+    blank_until: LruCache<Address, Instant>,
     in_flight: HashMap<Address, Instant>,
     in_flight_ttl: Duration,
     prune_at: usize,
@@ -347,6 +400,7 @@ impl KnownTokens {
 
         Self {
             known: LruCache::new(capacity),
+            blank_until: LruCache::new(capacity),
             in_flight: HashMap::new(),
             in_flight_ttl,
             prune_at: MIN_PRUNE_AT,
@@ -475,12 +529,74 @@ impl KnownTokens {
     where
         I: IntoIterator<Item = &'a Address>,
     {
+        self.confirm_at(addresses, Instant::now());
+    }
+
+    /// [`confirm`](Self::confirm) at an explicit time.
+    pub fn confirm_at<'a, I>(&mut self, addresses: I, now: Instant)
+    where
+        I: IntoIterator<Item = &'a Address>,
+    {
         for address in addresses {
             self.in_flight.remove(address);
             self.empty.pop(address);
             self.empty_strikes.pop(address);
-            self.known.put(*address, ());
+            self.known.put(*address, now);
         }
+    }
+
+    /// When the token was learned to be stored.
+    pub fn confirmed_at(&self, address: &Address) -> Option<Instant> {
+        self.known.peek(address).copied()
+    }
+
+    /// The database reported `address` as having no row, in a query that
+    /// started at `query_started`. Whether that is worth acting on:
+    /// not while somebody works on it, not while it is known to have no
+    /// code, and not when it was stored so recently (less than `margin`
+    /// before the query) that the query may simply not have seen it.
+    /// Anything else is missing, whatever the caches believe.
+    pub fn missing_in_database(
+        &mut self,
+        address: &Address,
+        now: Instant,
+        query_started: Instant,
+        margin: Duration,
+    ) -> bool {
+        if self.in_flight.get(address).is_some_and(|since| {
+            now.saturating_duration_since(*since) < self.in_flight_ttl
+        }) {
+            return false;
+        }
+
+        if self.empty.peek(address).is_some_and(|since| {
+            now.saturating_duration_since(*since) < self.empty_ttl
+        }) {
+            return false;
+        }
+
+        match self.known.peek(address) {
+            Some(confirmed) => *confirmed + margin <= query_started,
+            None => true,
+        }
+    }
+
+    /// Remembers until when a blank row needs no second look.
+    pub fn set_blank_until(&mut self, address: Address, until: Instant) {
+        self.blank_until.put(address, until);
+    }
+
+    pub fn clear_blank(&mut self, address: &Address) {
+        self.blank_until.pop(address);
+    }
+
+    /// `false` while a blank row is known not to be due yet.
+    pub fn blank_recheck_due(
+        &self,
+        address: &Address,
+        now: Instant,
+    ) -> bool {
+        self.blank_until.peek(address).is_none_or(|until| *until <= now)
     }
 
     /// Records addresses that had no code when fetched: the claim is
@@ -746,6 +862,8 @@ mod tests {
 
         #[derive(Default)]
         pub struct State {
+            /// key -> `EX` seconds of the last SET (`None`: no expiry).
+            pub expiries: Mutex<HashMap<String, Option<u64>>>,
             pub entries: Mutex<HashMap<String, String>>,
             /// Number of socket reads that carried at least one command:
             /// a pipeline of N commands must count once, not N times.
@@ -852,6 +970,16 @@ mod tests {
                     }
                     "SET" => {
                         state.commands.fetch_add(1, Ordering::SeqCst);
+                        let expiry = command
+                            .iter()
+                            .position(|arg| arg.eq_ignore_ascii_case("EX"))
+                            .and_then(|at| command.get(at + 1))
+                            .and_then(|seconds| seconds.parse().ok());
+                        state
+                            .expiries
+                            .lock()
+                            .unwrap()
+                            .insert(command[1].clone(), expiry);
                         state.entries.lock().unwrap().insert(
                             command[1].clone(),
                             command[2].clone(),
@@ -906,6 +1034,55 @@ mod tests {
             entries[&redis_key(5, &addr(7))],
             r#"{"name":"Token 7","symbol":"TKN","decimals":18,"type":"ERC20"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn blank_rows_expire_in_redis_and_rows_with_metadata_do_not() {
+        let server =
+            resp_server::Server::start(Default::default(), 0).await;
+        let cache =
+            RedisTokenCache::connect(5, &server.url).await.unwrap();
+
+        let blank = DatabaseToken {
+            name: String::new(),
+            symbol: String::new(),
+            decimals: 0,
+            ..token(1, 5)
+        };
+        // No name and no symbol, but decimals: that is an answer.
+        let nameless = DatabaseToken {
+            name: String::new(),
+            symbol: String::new(),
+            ..token(2, 5)
+        };
+        assert!(is_blank(&blank));
+        assert!(!is_blank(&nameless));
+        assert!(!is_blank(&token(3, 5)));
+
+        let day = Duration::from_secs(24 * 3_600);
+        cache
+            .store_many_expiring(
+                &[blank.clone(), nameless, token(3, 5)],
+                day,
+            )
+            .await
+            .unwrap();
+
+        let expiry = |n: u64| {
+            server.state.expiries.lock().unwrap()[&redis_key(5, &addr(n))]
+        };
+        assert_eq!(expiry(1), Some(86_400));
+        assert_eq!(expiry(2), None);
+        assert_eq!(expiry(3), None);
+
+        // Verified again and still blank: vouched for longer.
+        cache.store_many_expiring(&[blank], day * 7).await.unwrap();
+        assert_eq!(expiry(1), Some(604_800));
+
+        // It turned out to be a token after all: the plain SET also
+        // clears the expiry.
+        cache.store_many_expiring(&[token(1, 5)], day).await.unwrap();
+        assert_eq!(expiry(1), None);
     }
 
     #[tokio::test]

@@ -21,6 +21,9 @@ pub struct DatabaseWithdrawal {
     #[serde_as(as = "SerU256")]
     pub amount: U256,
     pub timestamp: u32,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
     /// Stamped once per flush, see `RowBatch::set_version`.
     pub _version: u64,
 }
@@ -56,6 +59,7 @@ impl DatabaseWithdrawal {
                 .as_ref()
                 .map(quantity_to_u64)
                 .unwrap_or_default(),
+            epoch: 0,
             _version: 0,
         }
     }

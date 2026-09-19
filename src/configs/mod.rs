@@ -2,8 +2,8 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 use std::ffi::OsString;
 
 /// Boolean flags are driven from the environment by docker-compose, which
-/// passes every variable even when blank. So `TRACES=false`, `TRACES=0` and
-/// `TRACES=` must all mean "off" instead of failing to parse.
+/// passes every variable even when blank. So `DEBUG=false`, `DEBUG=0` and
+/// `DEBUG=` must all mean "off" instead of failing to parse.
 fn parse_flag(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "0" | "false" | "f" | "no" | "n" | "off" => Ok(false),
@@ -203,15 +203,6 @@ pub struct IndexerArgs {
 
     #[arg(
         long,
-        env = "TRACES",
-        action = ArgAction::SetTrue,
-        value_parser = parse_flag,
-        help = "Index traces (and contracts created through traces)."
-    )]
-    pub traces: bool,
-
-    #[arg(
-        long,
         env = "FLUSH_ROWS",
         help = "Flush to the database once this many rows are buffered.",
         default_value_t = 100_000
@@ -259,7 +250,6 @@ pub struct Config {
     /// Blocks to stay behind the chain head.
     pub confirmations: u64,
     pub new_blocks_only: bool,
-    pub traces: bool,
     pub flush_rows: usize,
     pub flush_interval_ms: u64,
     /// Skip the schema migrations at startup.
@@ -313,7 +303,6 @@ impl From<IndexerArgs> for Config {
             end_block: args.end_block,
             confirmations: args.confirmations,
             new_blocks_only: args.new_blocks_only,
-            traces: args.traces,
             flush_rows: args.flush_rows.max(1),
             flush_interval_ms: args.flush_interval_ms.max(1),
             no_migrate: args.no_migrate,
@@ -355,7 +344,7 @@ impl From<Cli> for Command {
 }
 
 /// Environment variables read by the CLI.
-const ENV_VARS: [&str; 15] = [
+const ENV_VARS: [&str; 14] = [
     "CHAIN_ID",
     "DATABASE_URL",
     "HYPERSYNC_URL",
@@ -366,7 +355,6 @@ const ENV_VARS: [&str; 15] = [
     "END_BLOCK",
     "CONFIRMATIONS",
     "NEW_BLOCKS_ONLY",
-    "TRACES",
     "FLUSH_ROWS",
     "FLUSH_INTERVAL_MS",
     "NO_MIGRATE",
@@ -516,7 +504,6 @@ mod tests {
         assert_eq!(config.end_block, 0);
         assert_eq!(config.confirmations, 0);
         assert!(!config.new_blocks_only);
-        assert!(!config.traces);
         assert!(!config.debug);
         assert_eq!(config.flush_rows, 100_000);
         assert_eq!(config.flush_interval_ms, 2_000);
@@ -548,7 +535,6 @@ mod tests {
                 ("END_BLOCK", "200"),
                 ("CONFIRMATIONS", "12"),
                 ("NEW_BLOCKS_ONLY", "true"),
-                ("TRACES", "1"),
                 ("FLUSH_ROWS", "5000"),
                 ("FLUSH_INTERVAL_MS", "250"),
                 ("DEBUG", "yes"),
@@ -571,7 +557,6 @@ mod tests {
         assert_eq!(config.end_block, 200);
         assert_eq!(config.confirmations, 12);
         assert!(config.new_blocks_only);
-        assert!(config.traces);
         assert!(config.debug);
         assert_eq!(config.flush_rows, 5000);
         assert_eq!(config.flush_interval_ms, 250);
@@ -581,35 +566,41 @@ mod tests {
     fn false_and_blank_flags_from_env_mean_false() {
         for value in ["false", "False", "0", "no", "off", ""] {
             let config = parse_with_env(
-                &[
-                    ("TRACES", value),
-                    ("DEBUG", value),
-                    ("NEW_BLOCKS_ONLY", value),
-                ],
+                &[("DEBUG", value), ("NEW_BLOCKS_ONLY", value)],
                 &REQUIRED,
             )
             .unwrap_or_else(|e| panic!("value '{value}' failed: {e}"));
 
-            assert!(!config.traces, "TRACES={value}");
             assert!(!config.debug, "DEBUG={value}");
             assert!(!config.new_blocks_only, "NEW_BLOCKS_ONLY={value}");
         }
     }
 
     #[test]
+    fn traces_can_not_be_requested() {
+        // Traces are out of scope (docs/design.md, section 9): the flag is
+        // gone, asking for it is an error instead of a silent no-op.
+        let mut args = REQUIRED.to_vec();
+        args.push("--traces");
+        assert!(parse_with_env(&[], &args).is_err());
+
+        // A leftover TRACES variable in an old .env is simply ignored.
+        assert!(parse_with_env(&[("TRACES", "true")], &REQUIRED).is_ok());
+    }
+
+    #[test]
     fn garbage_flag_value_is_rejected() {
-        assert!(parse_with_env(&[("TRACES", "maybe")], &REQUIRED).is_err());
+        assert!(parse_with_env(&[("DEBUG", "maybe")], &REQUIRED).is_err());
     }
 
     #[test]
     fn command_line_flag_wins_over_false_env() {
         let mut args = REQUIRED.to_vec();
-        args.push("--traces");
+        args.push("--debug");
 
-        let config =
-            parse_with_env(&[("TRACES", "false")], &args).unwrap();
+        let config = parse_with_env(&[("DEBUG", "false")], &args).unwrap();
 
-        assert!(config.traces);
+        assert!(config.debug);
     }
 
     #[test]
@@ -718,12 +709,12 @@ mod tests {
             ["indexer", "run", "--chain", "1"]
         );
         assert_eq!(
-            rewrite(&["indexer", "--traces"]),
-            ["indexer", "run", "--traces"]
+            rewrite(&["indexer", "--new-blocks-only"]),
+            ["indexer", "run", "--new-blocks-only"]
         );
 
         for untouched in [
-            &["indexer", "run", "--traces"][..],
+            &["indexer", "run", "--new-blocks-only"][..],
             &["indexer", "migrate", "--dry-run"],
             &["indexer", "verify"],
             &["indexer", "help", "run"],
@@ -741,7 +732,13 @@ mod tests {
     #[test]
     fn no_subcommand_and_explicit_run_are_the_same() {
         let mut bare = REQUIRED.to_vec();
-        bare.extend(["--chain", "10", "--traces", "--start-block", "7"]);
+        bare.extend([
+            "--chain",
+            "10",
+            "--new-blocks-only",
+            "--start-block",
+            "7",
+        ]);
 
         let mut explicit = vec!["run"];
         explicit.extend(&bare);
@@ -752,7 +749,7 @@ mod tests {
         assert_eq!(format!("{bare:?}"), format!("{explicit:?}"));
         assert_eq!(explicit.chain_id, 10);
         assert_eq!(explicit.start_block, 7);
-        assert!(explicit.traces);
+        assert!(explicit.new_blocks_only);
         assert!(!explicit.no_migrate);
     }
 
@@ -849,7 +846,7 @@ mod tests {
                 ("DATABASE_URL", DATABASE),
                 ("ENVIO_API_TOKEN", "token"),
                 ("CHAIN_ID", "8453"),
-                ("TRACES", "true"),
+                ("NEW_BLOCKS_ONLY", "true"),
                 ("START_BLOCK", ""),
                 ("RPC_URL", ""),
                 ("DEBUG", ""),
@@ -865,7 +862,7 @@ mod tests {
     fn migrate_rejects_run_options() {
         assert!(parse_command(
             &[],
-            &["migrate", "--database", DATABASE, "--traces"],
+            &["migrate", "--database", DATABASE, "--new-blocks-only"],
             false
         )
         .is_err());
@@ -922,8 +919,12 @@ mod tests {
         assert!(
             parse_command(&FULL_ENV, &["run", "bogus"], false).is_err()
         );
-        assert!(parse_command(&FULL_ENV, &["--traces", "migrate"], false)
-            .is_err());
+        assert!(parse_command(
+            &FULL_ENV,
+            &["--new-blocks-only", "migrate"],
+            false
+        )
+        .is_err());
     }
 
     #[test]

@@ -36,6 +36,9 @@ pub struct DatabaseERC1155Transfer {
     pub ids: Vec<U256>,
     #[serde_as(as = "Vec<SerU256>")]
     pub amounts: Vec<U256>,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
     /// Stamped once per flush, see `RowBatch::set_version`.
     pub _version: u64,
 }
@@ -115,6 +118,7 @@ impl DatabaseERC1155Transfer {
             to: Address::from_word(topic3),
             ids,
             amounts,
+            epoch: 0,
             _version: 0,
         })
     }

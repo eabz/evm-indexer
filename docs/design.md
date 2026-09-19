@@ -191,6 +191,15 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
    the abandoned partial epoch invisible.
 
+**No read-your-writes (ClickHouse 25.12, observed on the macOS build).** Right after an
+`INSERT` returns, the next query can miss the new part for a few milliseconds when
+several writers are active (44-137 misses per 3,200 in the schema engineer's repro; it
+heals on the next try). So: (1) before purging, make sure the last flush is visible;
+(2) a tombstone `INSERT .. SELECT` can miss freshly flushed rows: re-issue
+`tombstone_sql` until `live_rows_sql` returns 0 (idempotent, lock-free), bounded, fatal
+if it never converges; (3) a rebuild never depends on seeing tombstones (it excludes the
+purged range itself). The same caution applies to any read that decides what to write.
+
 **Disk hygiene (operator note).** Tombstones and the rows they hide stay on disk until
 ClickHouse merges them away; the indexer never issues `OPTIMIZE ... FINAL CLEANUP`.
 Volume is negligible (only reorged/orphaned rows). An operator may run a cleanup during
@@ -361,3 +370,31 @@ multi-outcome / negative-risk groupings are first class (an "event" groups marke
 everything is source-agnostic (`venue`, `protocol` columns) so a non-EVM venue could be
 fed by an API adapter later. What is NOT on chain (order book depth, off-chain titles)
 is explicitly out of scope — record what would be needed and where it lives; never fake it.
+
+## 11. Token launchpads (EVM)
+
+Basis: `docs/launchpads-research.md` (73% of 30d launchpad fees are on EVM chains
+HyperSync serves; two verified event families cover ~86% of that). Module
+`src/launchpads/`, ON by default (`--no-launchpads`), same shape and storage rules as
+`src/dex/` and `src/predictions/`. Migrations `0030`–`0039`.
+
+- **Families first:** `pons_v2` and `flap_portal` (verified source; same ABI on several
+  chains). Then **launch attribution only** for venues that launch straight into
+  Uniswap V3/V4 pools the spot decoders already capture (Pons V1, Clanker, NOXA, ...):
+  one launch event each, no curve decoder.
+- **Tables are chain neutral from day one** so a non-EVM pipeline could fill them later:
+  `launchpad_tokens` (token, creator, venue/family, name/symbol when the event carries
+  them, curve parameters, launch tx), `launchpad_trades` (trader, side, token amount,
+  quote amount, price, fee, curve progress), `launchpad_graduations` (destination DEX +
+  pool id — the join key into `dex_pools`/`dex_swaps`/candles), `launchpad_creator_fees`.
+- **Display-first, like §10.** Screens: new-launch feed; token page (curve progress,
+  price chart, trades tape, holders); graduation feed; creator page (history, how many
+  of their launches graduated / died — serial-rugger signal); sniper view (buys in the
+  launch block, bundled buys, dev holdings, top-holder concentration at graduation —
+  only what is computable from events + ERC-20 transfers); post-graduation performance
+  via the existing DEX candles. One cheap query per screen, cookbook in the module README.
+- **Front ends are not venues.** fomo, GMGN, Axiom etc. have no contracts of their own;
+  attribution is by fee-recipient/router address in a user-populated
+  `launchpad_frontends` table. Never add front-end volume to venue volume.
+- Forgery rules from the DEX review apply: curve trades are valued only when
+  corroborated by the token/quote ERC-20 (or native value) movement in the same tx.

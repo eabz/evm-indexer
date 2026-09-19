@@ -1,7 +1,6 @@
 //! HyperSync data source: the only place that talks to HyperSync.
 //!
-//! One generic query (every block, transaction and log, plus traces when
-//! enabled) streamed over a bounded block range. No chain specific logic:
+//! One generic query (every block, transaction and log) streamed over a bounded block range. No chain specific logic:
 //! the endpoint is derived from the chain id unless a url is given.
 
 use crate::{
@@ -11,8 +10,8 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use hypersync_client::{
     net_types::{
-        BlockField, LogField, LogFilter, Query, TraceField, TraceFilter,
-        TransactionField, TransactionFilter,
+        BlockField, LogField, LogFilter, Query, TransactionField,
+        TransactionFilter,
     },
     Client, StreamConfig,
 };
@@ -86,36 +85,10 @@ const LOG_FIELDS: [LogField; 10] = [
     LogField::Topic3,
 ];
 
-const TRACE_FIELDS: [TraceField; 24] = [
-    TraceField::From,
-    TraceField::To,
-    TraceField::CallType,
-    TraceField::Gas,
-    TraceField::Input,
-    TraceField::Init,
-    TraceField::Value,
-    TraceField::Author,
-    TraceField::RewardType,
-    TraceField::BlockHash,
-    TraceField::BlockNumber,
-    TraceField::Address,
-    TraceField::Code,
-    TraceField::GasUsed,
-    TraceField::Output,
-    TraceField::Subtraces,
-    TraceField::TraceAddress,
-    TraceField::TransactionHash,
-    TraceField::TransactionPosition,
-    TraceField::Type,
-    TraceField::Error,
-    TraceField::ActionAddress,
-    TraceField::Balance,
-    TraceField::RefundAddress,
-];
-
 /// Builds the query for `[range.from, range.to)`.
-pub fn build_query(range: BlockRange, traces: bool) -> Query {
-    let mut query = Query::new()
+pub fn build_query(range: BlockRange) -> Query {
+    // No traces, by design (docs/design.md, section 9).
+    Query::new()
         .from_block(range.from)
         .to_block_excl(range.to)
         // Blocks without transactions must be returned too: the block row
@@ -125,21 +98,12 @@ pub fn build_query(range: BlockRange, traces: bool) -> Query {
         .where_logs(LogFilter::all())
         .select_block_fields(BLOCK_FIELDS)
         .select_transaction_fields(TRANSACTION_FIELDS)
-        .select_log_fields(LOG_FIELDS);
-
-    if traces {
-        query = query
-            .where_traces(TraceFilter::all())
-            .select_trace_fields(TRACE_FIELDS);
-    }
-
-    query
+        .select_log_fields(LOG_FIELDS)
 }
 
 #[derive(Clone)]
 pub struct Source {
     client: Client,
-    traces: bool,
 }
 
 impl Source {
@@ -147,7 +111,6 @@ impl Source {
         chain_id: u64,
         url: Option<&str>,
         api_token: &str,
-        traces: bool,
     ) -> Result<Self> {
         let builder = match url {
             Some(url) => Client::builder().url(url),
@@ -161,7 +124,7 @@ impl Source {
 
         info!("Using HyperSync endpoint {}.", client.url());
 
-        Ok(Self { client, traces })
+        Ok(Self { client })
     }
 
     /// Guards against pointing `--hypersync-url` at another chain, which
@@ -202,10 +165,7 @@ impl BlockSource for Source {
     ) -> Result<Receiver<Result<SourceResponse>>> {
         let mut responses = self
             .client
-            .stream(
-                build_query(range, self.traces),
-                StreamConfig::default(),
-            )
+            .stream(build_query(range), StreamConfig::default())
             .await
             .with_context(|| {
                 format!("start HyperSync stream for {range}")
@@ -223,7 +183,6 @@ impl BlockSource for Source {
                         blocks: response.data.blocks,
                         transactions: response.data.transactions,
                         logs: response.data.logs,
-                        traces: response.data.traces,
                     },
                     rollback_guard: response.rollback_guard,
                 });
@@ -250,18 +209,19 @@ mod tests {
             Nonce, Quantity, TransactionStatus, TransactionType, UInt,
             Withdrawal,
         },
-        simple_types::{Block, Log, Trace, Transaction},
+        simple_types::{Block, Log, Transaction},
     };
 
     #[test]
     fn query_covers_everything_in_a_bounded_range() {
-        let query = build_query(BlockRange::new(100, 200), false);
+        let query = build_query(BlockRange::new(100, 200));
 
         assert_eq!(query.from_block, 100);
         assert_eq!(query.to_block, Some(200));
         assert!(query.include_all_blocks);
         assert_eq!(query.transactions.len(), 1);
         assert_eq!(query.logs.len(), 1);
+        // Traces are never requested (docs/design.md, section 9).
         assert!(query.traces.is_empty());
         assert!(query.field_selection.trace.is_empty());
         assert_eq!(query.field_selection.block.len(), BLOCK_FIELDS.len());
@@ -273,21 +233,13 @@ mod tests {
     }
 
     #[test]
-    fn traces_are_only_requested_when_enabled() {
-        let query = build_query(BlockRange::new(0, 10), true);
-
-        assert_eq!(query.traces.len(), 1);
-        assert_eq!(query.field_selection.trace.len(), TRACE_FIELDS.len());
-    }
-
-    #[test]
     fn dropped_columns_are_not_requested() {
         assert!(!BLOCK_FIELDS.contains(&BlockField::LogsBloom));
     }
 
     #[test]
     fn malformed_token_is_an_error_not_a_panic() {
-        assert!(Source::new(1, None, "not-a-uuid", false).is_err());
+        assert!(Source::new(1, None, "not-a-uuid").is_err());
     }
 
     // ---- selection <-> models ------------------------------------------
@@ -533,123 +485,12 @@ mod tests {
         log
     }
 
-    /// One trace per action type, together they populate every field.
-    fn full_traces() -> Vec<Trace> {
-        let base = |type_: &str, path: u64| Trace {
-            block_hash: Some(Hash::from([0xb1; 32])),
-            block_number: Some(BLOCK),
-            subtraces: Some(2),
-            trace_address: Some(vec![path]),
-            // Not a transaction of the response: the position can not be
-            // recovered from it, it has to come from the trace.
-            transaction_hash: Some(Hash::from([0x25; 32])),
-            transaction_position: Some(3),
-            type_: Some(type_.to_string()),
-            ..Default::default()
-        };
-
-        vec![
-            Trace {
-                from: Some(HsAddress::from([0x51; 20])),
-                to: Some(HsAddress::from([0x52; 20])),
-                call_type: Some("delegatecall".to_string()),
-                gas: Some(Quantity::from(53u64)),
-                input: Some(Data::from(vec![0x54])),
-                value: Some(Quantity::from(55u64)),
-                gas_used: Some(Quantity::from(56u64)),
-                output: Some(Data::from(vec![0x57])),
-                error: Some("Reverted".to_string()),
-                ..base("call", 0)
-            },
-            Trace {
-                from: Some(HsAddress::from([0x51; 20])),
-                init: Some(Data::from(vec![0x58])),
-                address: Some(HsAddress::from([0x59; 20])),
-                code: Some(Data::from(vec![0x5a])),
-                ..base("create", 1)
-            },
-            Trace {
-                action_address: Some(HsAddress::from([0x5b; 20])),
-                balance: Some(Quantity::from(0x5cu64)),
-                refund_address: Some(HsAddress::from([0x5d; 20])),
-                ..base("suicide", 2)
-            },
-            Trace {
-                author: Some(HsAddress::from([0x5e; 20])),
-                reward_type: Some("block".to_string()),
-                value: Some(Quantity::from(0x5fu64)),
-                transaction_hash: None,
-                transaction_position: None,
-                ..base("reward", 3)
-            },
-        ]
-    }
-
-    fn project_trace(full: &Trace, fields: &[TraceField]) -> Trace {
-        let mut trace = Trace::default();
-        for field in fields {
-            match field {
-                TraceField::From => trace.from = full.from.clone(),
-                TraceField::To => trace.to = full.to.clone(),
-                TraceField::CallType => {
-                    trace.call_type = full.call_type.clone()
-                }
-                TraceField::Gas => trace.gas = full.gas.clone(),
-                TraceField::Input => trace.input = full.input.clone(),
-                TraceField::Init => trace.init = full.init.clone(),
-                TraceField::Value => trace.value = full.value.clone(),
-                TraceField::Author => trace.author = full.author.clone(),
-                TraceField::RewardType => {
-                    trace.reward_type = full.reward_type.clone()
-                }
-                TraceField::BlockHash => {
-                    trace.block_hash = full.block_hash.clone()
-                }
-                TraceField::BlockNumber => {
-                    trace.block_number = full.block_number
-                }
-                TraceField::Address => {
-                    trace.address = full.address.clone()
-                }
-                TraceField::Code => trace.code = full.code.clone(),
-                TraceField::GasUsed => {
-                    trace.gas_used = full.gas_used.clone()
-                }
-                TraceField::Output => trace.output = full.output.clone(),
-                TraceField::Subtraces => trace.subtraces = full.subtraces,
-                TraceField::TraceAddress => {
-                    trace.trace_address = full.trace_address.clone()
-                }
-                TraceField::TransactionHash => {
-                    trace.transaction_hash = full.transaction_hash.clone()
-                }
-                TraceField::TransactionPosition => {
-                    trace.transaction_position = full.transaction_position
-                }
-                TraceField::Type => trace.type_ = full.type_.clone(),
-                TraceField::Error => trace.error = full.error.clone(),
-                TraceField::ActionAddress => {
-                    trace.action_address = full.action_address.clone()
-                }
-                TraceField::Balance => {
-                    trace.balance = full.balance.clone()
-                }
-                TraceField::RefundAddress => {
-                    trace.refund_address = full.refund_address.clone()
-                }
-                other => panic!("add {other:?} to project_trace"),
-            }
-        }
-        trace
-    }
-
     /// Rows produced from a response reduced to the given selection, as a
     /// comparable string (`Err` included: a missing identity field fails).
     fn rows_for(
         blocks: &[BlockField],
         transactions: &[TransactionField],
         logs: &[LogField],
-        traces: &[TraceField],
     ) -> String {
         let data = ResponseRows {
             blocks: vec![vec![project_block(&full_block(), blocks)]],
@@ -658,10 +499,6 @@ mod tests {
                 transactions,
             )]],
             logs: vec![vec![project_log(&full_log(), logs)]],
-            traces: vec![full_traces()
-                .iter()
-                .map(|trace| project_trace(trace, traces))
-                .collect()],
         };
 
         match transform(1, &data, BlockRange::new(BLOCK, BLOCK + 1)) {
@@ -680,7 +517,6 @@ mod tests {
             blocks: vec![vec![full_block()]],
             transactions: vec![vec![full_transaction()]],
             logs: vec![vec![full_log()]],
-            traces: vec![full_traces()],
         };
         let expected = format!(
             "{:?}",
@@ -690,12 +526,8 @@ mod tests {
         );
 
         // 1. Everything the models read is selected.
-        let selected = rows_for(
-            &BLOCK_FIELDS,
-            &TRANSACTION_FIELDS,
-            &LOG_FIELDS,
-            &TRACE_FIELDS,
-        );
+        let selected =
+            rows_for(&BLOCK_FIELDS, &TRANSACTION_FIELDS, &LOG_FIELDS);
         assert!(
             selected == expected,
             "a field the models read is missing"
@@ -707,7 +539,6 @@ mod tests {
                 &without(&BLOCK_FIELDS, field),
                 &TRANSACTION_FIELDS,
                 &LOG_FIELDS,
-                &TRACE_FIELDS,
             );
             assert!(rows != expected, "{field:?} is selected but unused");
         }
@@ -716,7 +547,6 @@ mod tests {
                 &BLOCK_FIELDS,
                 &without(&TRANSACTION_FIELDS, field),
                 &LOG_FIELDS,
-                &TRACE_FIELDS,
             );
             assert!(rows != expected, "{field:?} is selected but unused");
         }
@@ -725,16 +555,6 @@ mod tests {
                 &BLOCK_FIELDS,
                 &TRANSACTION_FIELDS,
                 &without(&LOG_FIELDS, field),
-                &TRACE_FIELDS,
-            );
-            assert!(rows != expected, "{field:?} is selected but unused");
-        }
-        for field in TRACE_FIELDS {
-            let rows = rows_for(
-                &BLOCK_FIELDS,
-                &TRANSACTION_FIELDS,
-                &LOG_FIELDS,
-                &without(&TRACE_FIELDS, field),
             );
             assert!(rows != expected, "{field:?} is selected but unused");
         }

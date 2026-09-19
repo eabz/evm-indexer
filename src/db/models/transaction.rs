@@ -67,6 +67,9 @@ pub struct DatabaseTransaction {
     pub base_fee_per_gas: Option<U256>,
     #[serde_as(as = "Vec<(SerAddress, Vec<SerB256>)>")]
     pub access_list: Vec<(Address, Vec<B256>)>,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
     /// Stamped once per flush, see `RowBatch::set_version`.
     pub _version: u64,
 }
@@ -232,6 +235,7 @@ impl DatabaseTransaction {
             max_priority_fee_per_gas,
             base_fee_per_gas,
             access_list,
+            epoch: 0,
             _version: 0,
         })
     }

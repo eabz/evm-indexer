@@ -28,6 +28,9 @@ pub struct DatabaseERC721Transfer {
     pub to: Address,
     #[serde_as(as = "SerU256")]
     pub id: U256,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
     /// Stamped once per flush, see `RowBatch::set_version`.
     pub _version: u64,
 }
@@ -55,6 +58,7 @@ impl DatabaseERC721Transfer {
             from: Address::from_word(topic1),
             to: Address::from_word(topic2),
             id: U256::from_be_bytes(topic3.0),
+            epoch: 0,
             _version: 0,
         })
     }
