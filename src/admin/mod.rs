@@ -320,13 +320,39 @@ fn unauthorized() -> Response {
 
 // ------------------------------------------------------------- the page
 
+/// The page itself needs no session: it IS the login form, and it holds no
+/// data about any chain - every number on it arrives later, from `/api`,
+/// which does need one.
 async fn serve_page(State(admin): State<Arc<Admin>>) -> Response {
-    let mut response =
+    let response =
         ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page::HTML)
             .into_response();
 
-    response = secured(&admin, response);
-    response
+    secured(&admin, response)
+}
+
+/// Is this request from the panel's own page? Used by the two routes that
+/// change something WITHOUT needing a live session first (`login`, which
+/// creates one, and `logout`, which destroys one).
+fn from_our_page(admin: &Admin, headers: &HeaderMap) -> Option<Response> {
+    let Some(expected) = expected_origin(admin, headers) else {
+        return Some(json_error(
+            StatusCode::FORBIDDEN,
+            "This request did not say which page it came from.",
+        ));
+    };
+
+    let origin =
+        headers.get(header::ORIGIN).and_then(|value| value.to_str().ok());
+
+    if !auth::same_origin(origin, &expected) {
+        return Some(json_error(
+            StatusCode::FORBIDDEN,
+            "This request came from another page.",
+        ));
+    }
+
+    None
 }
 
 // -------------------------------------------------------------- sign in
@@ -342,29 +368,10 @@ async fn login(
     headers: HeaderMap,
     body: Result<Json<LoginBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    // Logging in is state-changing too: without this, another site could
-    // silently sign the browser into an attacker's session.
-    let Some(expected) = expected_origin(&admin, &headers) else {
-        return secured(
-            &admin,
-            json_error(
-                StatusCode::FORBIDDEN,
-                "This request did not say which page it came from.",
-            ),
-        );
-    };
-
-    let origin =
-        headers.get(header::ORIGIN).and_then(|value| value.to_str().ok());
-
-    if !auth::same_origin(origin, &expected) {
-        return secured(
-            &admin,
-            json_error(
-                StatusCode::FORBIDDEN,
-                "This request came from another page.",
-            ),
-        );
+    // Logging in is state-changing too: without this check another site
+    // could silently sign the browser into an attacker's session.
+    if let Some(denied) = from_our_page(&admin, &headers) {
+        return secured(&admin, denied);
     }
 
     let address = peer.ip();
@@ -448,10 +455,17 @@ async fn login(
     secured(&admin, response)
 }
 
+/// Signing out needs no live session (an expired cookie must still be
+/// cleared), but it does need to come from this page: otherwise any site
+/// could sign the owner out whenever they visited it.
 async fn logout(
     State(admin): State<Arc<Admin>>,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(denied) = from_our_page(&admin, &headers) {
+        return secured(&admin, denied);
+    }
+
     if let Some(token) = cookie_token(&headers) {
         admin.sessions.remove(&token);
     }

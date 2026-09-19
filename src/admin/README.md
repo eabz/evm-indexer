@@ -59,7 +59,7 @@ destructive shape anyone might add and expects nothing to answer.
 | a stolen token replayed for ever | 12 hours of idleness expires a session |
 | a leaked session table replayed | sessions are stored as the HASH of the token |
 | JavaScript on another page reads the cookie | `HttpOnly` |
-| another site makes the browser act | `SameSite=Strict`, **and** an `Origin` check on every state-changing request. A request with no `Origin` is refused, not trusted |
+| another site makes the browser act | `SameSite=Strict`, **and** an `Origin` check on every state-changing request - including sign in (login CSRF) and sign out. A request with no `Origin` is refused, not trusted |
 | the cookie in clear text | `Secure` when `--admin-secure-cookie`, or when a trusted proxy says `X-Forwarded-Proto: https` (`--admin-trust-forwarded-proto`, off by default: a header any client can set must not decide this) |
 | brute force | 5 attempts a minute per address, then a lock-out doubling from 30 s to 15 min. Checked BEFORE the password is looked at, so a lucky guess at the end of a run buys nothing |
 | memory filled with sessions or addresses | both tables are pruned and capped |

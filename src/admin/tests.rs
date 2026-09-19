@@ -776,6 +776,41 @@ async fn the_events_of_a_chain_are_readable_and_scoped() {
     panel.stop().await;
 }
 
+/// Signing out is state-changing, so it is refused from another page: a
+/// site the owner happens to visit must not be able to sign them out.
+#[tokio::test]
+async fn another_page_can_not_sign_the_owner_out() {
+    let panel = Panel::start(&[1]).await;
+    let cookie = sign_in(&panel).await;
+
+    for headers in [
+        vec![
+            ("Cookie", cookie.as_str()),
+            ("Origin", "https://evil.example"),
+        ],
+        // No Origin at all.
+        vec![("Cookie", cookie.as_str())],
+    ] {
+        let reply =
+            request(panel.addr, "POST", "/api/logout", &headers, None)
+                .await;
+        assert_eq!(reply.status, 403, "{reply:?}");
+    }
+
+    // The session is still good.
+    let reply = request(
+        panel.addr,
+        "GET",
+        "/api/chains",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+
+    panel.stop().await;
+}
+
 #[tokio::test]
 async fn a_huge_body_is_refused_instead_of_being_buffered() {
     let panel = Panel::start(&[1]).await;
