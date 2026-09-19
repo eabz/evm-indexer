@@ -38,7 +38,7 @@ Deferred (NOT in scope): F1 Arrow passthrough.
   non-null columns defaulting to 32 zero bytes. Everything else non-null with a default.
 - Dead columns are removed: `log_type`, `removed`, the duplicated `address` on transfer
   tables (keep `token_address`), `is_uncle`, `blocks.logs_bloom`. `logs.transaction_log_index`
-  becomes `transaction_index`. `contracts` and `traces` get `timestamp`.
+  becomes `transaction_index`. Traces do not exist and `contracts` is a view (§9).
 - Every block-scoped table: `ENGINE = ReplacingMergeTree(_version, is_deleted)`,
   `_version UInt64` (strictly increasing per process, unix-ms based), `is_deleted UInt8
   DEFAULT 0`, plus `epoch UInt32` (§2). **Target scale is 50+ chains in one database**, so
@@ -54,9 +54,8 @@ Deferred (NOT in scope): F1 Arrow passthrough.
 | blocks | (chain, number) |
 | transactions | (chain, block_number, transaction_index) |
 | logs, erc20/721/1155_transfers | (chain, block_number, log_index) |
-| traces | (chain, block_number, transaction_position, trace_address) — `transaction_position = 4294967295` for reward traces |
 | withdrawals | (chain, block_number, withdrawal_index) |
-| contracts | (chain, block_number, contract_address) |
+| contracts | — a VIEW over `transactions` (§9) |
 | tokens | (chain, address) — not block scoped |
 
 - Codecs: `ZSTD(3)` on large byte columns (not 9); `Delta`/`DoubleDelta` + `ZSTD` on
@@ -78,7 +77,6 @@ through, so it follows rollbacks automatically:
 | `logs_by_address` (slim: keys + topic0) | logs | (chain, address, topic0, block_number, log_index) |
 | `erc20_transfers_by_account` (2 rows/transfer, signed direction) | erc20_transfers | (chain, account, token_address, block_number, log_index, direction) |
 | `nft_transfers_by_account` | erc721 + erc1155 | same shape |
-| `traces_by_tx` | traces | (chain, transaction_hash, trace_address) |
 
 Only skip index allowed: `bloom_filter GRANULARITY 1` on a unique-ish hash column when a
 lookup table would be overkill.
@@ -95,12 +93,22 @@ pub struct DerivedTable {
     pub name: &'static str,          // target table
     pub bucket_seconds: u32,         // 60, 3600, 86400
     pub bucket_column: &'static str, // DateTime column holding the bucket start
-    /// `INSERT INTO <name> SELECT ... FROM <base> FINAL WHERE chain = {chain}
-    ///  AND timestamp >= {from_ts} GROUP BY ...` — must produce exactly what the MV produces.
+    /// `INSERT INTO <name> SELECT ..., toUInt32({epoch}) AS epoch FROM <base> FINAL
+    ///  WHERE chain = {chain} AND timestamp >= {from_ts} GROUP BY ...` — must produce
+    ///  exactly what the MV produces. Blocks-sourced aggregates also use
+    ///  {purge_from}/{purge_to} (§2). There is no delete SQL.
     pub rebuild_sql: &'static str,
 }
 pub const CORE_DERIVED: &[DerivedTable] = &[ /* daily block / transaction / erc20-transfer stats */ ];
 ```
+
+Aggregate tables are `PARTITION BY toYYYYMM(<bucket column>)` in every module (never by
+chain or year), with `epoch` as the LAST sorting-key column. All modules apply the
+validity rule with the same pattern: a per-chain running-max "epoch floor" view over
+`reorgs` + `ASOF LEFT JOIN ... ON f.chain = a.chain AND f.from_ts <= a.bucket WHERE
+a.epoch >= f.epoch_floor`, applied BEFORE aggregate states are merged (so a stale epoch
+can never leak an open/close). The shared view is `epoch_floor_v`, created in migration
+0004 next to `reorgs`.
 
 Distinct counts use `uniqState`/`uniqMerge` (never `uniqExact` in a Summing table).
 `status` comparisons use the real stored values. Provide plain SQL `VIEW`s on top that
@@ -173,6 +181,13 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
      `blocks` still sees the orphaned blocks. Such `rebuild_sql` takes
      `{purge_from}`/`{purge_to}` and excludes that block range; child-sourced aggregates
      (transactions, transfers, swaps, trades) do not need it.
+   Accepted trade-offs: (1) the `reorgs` row lands before the rebuild, so readers
+   briefly UNDER-count the repaired buckets (the opposite order would double count;
+   neither is atomic across aggregates, and under-counting for a moment is the safe
+   side). (2) The rule is open ended (`from_ts` only), so a rebuild re-aggregates the
+   chain from `from_ts` to now: trivial for tip reorgs (today's bucket), expensive only
+   for a purge deep in history, which needs a crash mid-flush during a backfill of old
+   blocks. Kept for simplicity; bound it with a `to_ts` if it ever hurts.
    A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
    the abandoned partial epoch invisible.
 
