@@ -34,6 +34,9 @@ use crate::{
 const CHAIN: u64 = SOLANA_CHAIN;
 const WSOL: &str = "So11111111111111111111111111111111111111112";
 
+/// Live swap rows, used to wait out ClickHouse's lack of read-your-writes.
+const SWAP_COUNT: &str = "SELECT count() FROM sol_dex_swaps FINAL";
+
 struct TestDb {
     admin: Client,
     url: String,
@@ -103,6 +106,26 @@ impl TestDb {
             .fetch_one::<u64>()
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    /// Waits until `sql` returns `expected`.
+    ///
+    /// ClickHouse 25.12 gives NO read-your-writes guarantee: right after an
+    /// INSERT returns, the next query can miss the new part for a few
+    /// milliseconds (docs/design.md section 2 records the same observation,
+    /// and `purge_range` re-issues its tombstones for exactly this reason).
+    /// Without this the tests are flaky under load rather than wrong.
+    async fn settle(&self, sql: &str, expected: u64) {
+        for _ in 0..100 {
+            if self.count(sql).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "`{sql}` never reached {expected} (last {})",
+            self.count(sql).await
+        );
     }
 
     async fn drop(self) {
@@ -273,9 +296,7 @@ async fn decoded_rows_round_trip_through_the_binary_insert_path() {
     let rows = all_rows();
     assert!(rows.swaps.len() >= 4, "fixtures should decode to swaps");
     store(&database, &rows).await;
-
-    let stored = db.count("SELECT count() FROM sol_dex_swaps FINAL").await;
-    assert_eq!(stored as usize, rows.swaps.len());
+    db.settle(SWAP_COUNT, rows.swaps.len() as u64).await;
 
     // A pubkey comes back as the SAME 32 bytes, and base58Encode is what a
     // reader uses to print it (no hex strings are stored anywhere).
@@ -347,6 +368,7 @@ async fn a_256_bit_amount_round_trips() {
         U256::from(2u8).pow(U256::from(200u8)) + U256::from(12345u64);
     rows.swaps[0].amount_in = huge;
     store(&database, &rows).await;
+    db.settle(SWAP_COUNT, rows.swaps.len() as u64).await;
 
     let stored = db
         .scalar(&format!(
@@ -375,11 +397,13 @@ async fn the_two_opposite_swaps_stay_two_rows_after_replacement() {
     let database = db.database().await;
     let rows = all_rows();
     store(&database, &rows).await;
+    db.settle(SWAP_COUNT, rows.swaps.len() as u64).await;
     // Insert the same rows again with a newer version: a re-streamed slot
     // must replace itself, not duplicate.
     let mut again = all_rows();
     again.set_version(next_version());
     store(&database, &again).await;
+    db.settle(SWAP_COUNT, rows.swaps.len() as u64).await;
 
     let stored = db
         .count(
@@ -407,9 +431,7 @@ async fn a_purge_tombstones_solana_rows_without_a_delete() {
     let database = db.database().await;
     let rows = all_rows();
     store(&database, &rows).await;
-
-    let before = db.count("SELECT count() FROM sol_dex_swaps FINAL").await;
-    assert!(before > 0);
+    db.settle(SWAP_COUNT, rows.swaps.len() as u64).await;
 
     // Exactly what `purge_range` issues: the rows again, with a newer
     // version and is_deleted = 1. No DELETE anywhere.
@@ -428,13 +450,15 @@ async fn a_purge_tombstones_solana_rows_without_a_delete() {
         db.client().query(&sql).execute().await.expect("tombstone");
     }
 
-    let after = db
-        .count(
-            "SELECT count() FROM sol_dex_swaps FINAL \
-             WHERE block_number >= 448258000 AND block_number < 448259000",
-        )
-        .await;
-    assert_eq!(after, 0, "purged slots must be hidden by FINAL");
+    // Same caution as production: a tombstone INSERT is subject to the very
+    // same read-your-writes gap, which is why `purge_range` re-issues its
+    // statements until `live_rows_sql` returns 0.
+    db.settle(
+        "SELECT count() FROM sol_dex_swaps FINAL \
+         WHERE block_number >= 448258000 AND block_number < 448259000",
+        0,
+    )
+    .await;
 
     // The slots above the purge are untouched.
     let kept = db
@@ -462,6 +486,7 @@ async fn a_candle_query_over_solana_swaps_works() {
     let database = db.database().await;
     let rows = all_rows();
     store(&database, &rows).await;
+    db.settle(SWAP_COUNT, rows.swaps.len() as u64).await;
 
     #[derive(clickhouse::Row, serde::Deserialize, Debug)]
     #[allow(dead_code)]
