@@ -191,6 +191,26 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
    the abandoned partial epoch invisible.
 
+**Corrections found by the reorg-core proof (implemented in `src/reorg/`, binding for the pipeline):**
+   - Checkpoints are tombstoned FIRST, not last: with "after blocks" a crash leaves a
+     checkpoint claiming dead blocks (the crash matrix fails). This supersedes step 5's
+     wording and section 3.
+   - Gap heal is only crash safe if `has_orphan_children` counts tombstoned rows too (no
+     `FINAL`): once orphans are tombstoned nothing else marks the unfinished heal.
+   - `from_ts` includes `blocks` rows: a reorged range of EMPTY blocks has no child row,
+     yet `daily_block_stats` needs repair.
+   - The writer adopts the new epoch right after the `reorgs` row is written and re-reads
+     it after any failed purge; otherwise a surviving process writes rows the validity
+     rule hides.
+   - No read-your-writes also bites: the epoch read (keep the epoch in memory; back-to-back
+     purges must never reuse one), the detector seed read (a stale "not stored" would skip
+     the parent check for ever: read it several times, and lookup ERRORS are errors, never
+     "not stored"), `min_timestamp`, and `missing_ranges` after a barrier.
+   - **Epochs and the validity rule are per CHAIN, not per module.** Anything that writes
+     a `reorgs` row - including `indexer backfill --module X` - must rebuild EVERY derived
+     table of every module for the affected buckets, or it silently zeroes the others.
+     Two indexer processes on the same chain are unsupported (refuse at startup).
+
 **No read-your-writes (ClickHouse 25.12, observed on the macOS build).** Right after an
 `INSERT` returns, the next query can miss the new part for a few milliseconds when
 several writers are active (44-137 misses per 3,200 in the schema engineer's repro; it
