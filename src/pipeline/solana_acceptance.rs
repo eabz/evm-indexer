@@ -501,6 +501,25 @@ impl Scenario {
         assert!(report.is_consistent(), "{report}");
     }
 
+    /// Writes the coverage floor a real start would write, for the one
+    /// scenario that builds its database by hand instead of running the
+    /// pipeline. Every check reads the floor now (docs/design.md section
+    /// 16), so a database without one is not a database this indexer ever
+    /// produces.
+    async fn set_floor(&self, slot: u64) {
+        crate::coverage::store::set_if_absent(
+            &self.db,
+            &crate::pipeline::lease::Fence::open(),
+            crate::coverage::store::Floor {
+                block: slot,
+                timestamp: 0,
+                reason: crate::coverage::store::Reason::StartBlock,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     /// Removes `[from, to)` from the live checkpoint tiling WITHOUT
     /// touching a single row of data: every overlapping checkpoint is
     /// tombstoned and the parts of it outside the range are re-inserted.
@@ -1193,6 +1212,12 @@ async fn a_purge_corrects_a_holder_balance() {
 async fn a_retried_flush_counts_once() {
     let scenario = Scenario::new("c_retried").await;
     let chain = chain(20);
+
+    // This scenario writes its rows by hand rather than running the loop,
+    // so the floor a real start would have written has to be written here
+    // too: `verify` starts at the floor, and a Solana database without one
+    // reads as "every slot since 0 was never asked for".
+    scenario.set_floor(FIRST_SLOT).await;
 
     // No `index_until` here: a retry means the SAME flush sent twice, and
     // "the same flush" is the same `_version`. So the whole scenario is
