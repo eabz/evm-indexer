@@ -58,8 +58,9 @@
 //! INSERT returned can miss the new rows for a few milliseconds. So every
 //! read that decides what to write is either repeated until it is proven
 //! complete (steps 2, 3 and 6 re-issue their idempotent tombstone statement
-//! until a count of the live rows says 0, a bounded number of times), made
-//! independent of fresh writes (the rebuild leaves the purged range out
+//! until a count of the live rows says 0 twice in a row, a bounded number
+//! of times), made independent of fresh writes (the rebuild leaves the
+//! purged range out
 //! instead of relying on tombstones; the epoch is also remembered in
 //! memory), or taken twice (the `[from_ts, to_ts)` window: before anything
 //! is written and again after the tombstones converged; the wider window
@@ -69,6 +70,7 @@ use super::{
     end_of_day, start_of_day, DiscoveryCache, PurgeReason, ReorgError,
     ReorgMetrics, ReorgRecord, ReorgStore, WriterControl,
 };
+use crate::db::ranges::BlockRange;
 use alloy::primitives::B256;
 use log::{info, warn};
 use std::{
@@ -276,6 +278,50 @@ impl Purger {
         reason: PurgeReason,
     ) -> Result<PurgeReport, ReorgError> {
         self.purge(chain, from, to, reason, false).await
+    }
+
+    /// Purges every span a pipeline queued, NON-DESTRUCTIVELY, and returns
+    /// the lowest block purged (`None`: the queue was empty). `purged` is
+    /// called with each span as it is taken out of the queue.
+    ///
+    /// Both families queue the spans of flushes that raced another
+    /// process's purge, and for those spans the queue is the ONLY record
+    /// that they have to be indexed again: their rows are stored, so no
+    /// gap query ever asks for them. A span therefore leaves the queue
+    /// only after ITS purge succeeded - a transient ClickHouse error, a
+    /// lost lease or `TombstonesNotConverging` leaves it, and everything
+    /// after it, for the next pass to retry. Draining the whole `Vec` into
+    /// a local one and returning `Err` half way through it dropped the
+    /// rest for ever (docs/review-round-4.md, MAJOR 3).
+    ///
+    /// The entry is looked up again instead of being popped by index: the
+    /// writer task pushes into the same queue while this runs.
+    pub async fn purge_queued(
+        &self,
+        chain: u64,
+        queue: &Mutex<Vec<BlockRange>>,
+        reason: PurgeReason,
+        mut purged: impl FnMut(BlockRange),
+    ) -> Result<Option<u64>, ReorgError> {
+        let mut lowest: Option<u64> = None;
+
+        loop {
+            let Some(range) = queue.lock().unwrap().first().copied()
+            else {
+                return Ok(lowest);
+            };
+
+            self.purge_range(chain, range.from, Some(range.to), reason)
+                .await?;
+
+            // Only now is the span repaired.
+            queue.lock().unwrap().retain(|queued| *queued != range);
+            purged(range);
+
+            lowest = Some(
+                lowest.map_or(range.from, |low: u64| low.min(range.from)),
+            );
+        }
     }
 
     /// `rows_expected`: the caller SAW rows in the range (orphaned blocks,

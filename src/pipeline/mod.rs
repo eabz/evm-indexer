@@ -1093,42 +1093,30 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
 
     /// See [`ClickhouseSink::stale`]. Returns the lowest purged block.
     ///
-    /// The queue is the ONLY record that these blocks have to be indexed
-    /// again: their rows are stored, so no gap query ever asks for them.
-    /// So an entry is taken out only after its purge succeeded - a
-    /// transient ClickHouse error, a lost lease or `TombstonesNotConverging`
-    /// leaves it (and everything after it) in the queue and the next pass
-    /// tries again (docs/review-round-4.md, MAJOR 3). Draining the whole
-    /// `Vec` into a local one and returning `Err` half way through it
-    /// dropped the rest for ever.
+    /// The non-destructive drain itself is [`Purger::purge_queued`], which
+    /// the Solana loop uses too (docs/review-round-4.md, MAJOR 3).
     async fn purge_stale_flushes(&mut self) -> Result<Option<u64>> {
-        let mut lowest = None;
+        let purger = self.purger.clone();
+        let stale = self.stale.clone();
+        let mut forgotten: Vec<BlockRange> = Vec::new();
 
-        loop {
-            let Some(range) = self.stale.lock().unwrap().first().copied()
-            else {
-                return Ok(lowest);
-            };
+        let lowest = purger
+            .purge_queued(
+                self.settings.chain_id,
+                &stale,
+                PurgeReason::GapHeal,
+                |range| forgotten.push(range),
+            )
+            .await;
 
-            self.purger
-                .purge_range(
-                    self.settings.chain_id,
-                    range.from,
-                    Some(range.to),
-                    PurgeReason::GapHeal,
-                )
-                .await?;
-
-            // Only now is the span repaired. The sink pushes into the
-            // same queue from the writer task, so the entry is looked up
-            // again instead of being popped by index.
-            self.stale.lock().unwrap().retain(|queued| *queued != range);
-
+        // Also after a failure part way through: the spans that WERE
+        // purged must not stay in `committed`, or the pass would treat
+        // them as stored and never stream them again.
+        for range in forgotten {
             self.forget_committed(range.from, Some(range.to));
-            lowest = Some(
-                lowest.map_or(range.from, |low: u64| low.min(range.from)),
-            );
         }
+
+        Ok(lowest?)
     }
 }
 

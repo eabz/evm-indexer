@@ -739,8 +739,10 @@ mod tests {
     #[test]
     fn a_skipped_candle_check_says_not_fully_checked() {
         let skipped = SolanaVerifyReport {
-            candles_skipped: Some("the range holds less than one \
-                                   complete UTC day"),
+            candles_skipped: Some(
+                "the range holds less than one \
+                                   complete UTC day",
+            ),
             ..report()
         };
 

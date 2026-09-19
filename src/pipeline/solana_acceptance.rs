@@ -1705,6 +1705,123 @@ async fn the_program_registry_is_read_again_not_only_at_startup() {
     panic!("the registry read never saw the operator's new row");
 }
 
+/// A flush that landed while ANOTHER process's purge was rebuilding the
+/// same days carries an epoch the validity rule now hides, and nothing
+/// else will ever ask for those slots again: their rows ARE stored, so no
+/// hole appears in the tiling and no gap query reports them. The running
+/// indexer queues them in memory; a restart used to lose the queue, and
+/// the Solana loop never asked the database the same question the way the
+/// EVM one does (docs/review-round-4.md, MAJOR 3).
+///
+/// Here the queue is EMPTY at the start of the run and everything comes
+/// from what is stored: the loop finds the span by itself, purges it
+/// before anything else, and streams it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart()
+{
+    let chain = chain(40);
+    let clean = clean_index("i_clean", &chain, chain.head).await;
+    let scenario = Scenario::new("i_raced_purge").await;
+
+    // Index the first part normally, then stop (the process ends).
+    scenario.index_until(&chain, chain.slot_at(31)).await.unwrap();
+
+    // Another process purged and rebuilt every bucket of the third UTC
+    // day of this chain under epoch 1. `tombstone_version` is what it
+    // stamped BEFORE its rebuild read its input.
+    let tombstoned = next_version();
+    let day = BASE_TIMESTAMP + 2 * 86_400;
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+               fork_block, to_block, old_head, depth, rows_tombstoned, \
+               reason, tombstone_version, completed) \
+             VALUES ({CHAIN}, 1, {day}, {}, {}, {}, 0, 0, 0, \
+               'redecode', {tombstoned}, 1)",
+            day + 86_400,
+            chain.slot_at(24),
+            chain.slot_at(31),
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // ... and this is the flush that raced it: the very same three slots,
+    // written again AFTER that rebuild had read its input and still
+    // stamped with the epoch in force when the flush started. Identical
+    // content, so only the stamps differ - which is the whole point: no
+    // hole, no orphan, nothing else to notice them by.
+    let (from, to) = (chain.slot_at(25), chain.slot_at(27) + 1);
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO `{COMMIT_MARKER}` (chain, block_number, \
+               blockhash, parent_slot, parent_blockhash, block_height, \
+               timestamp, epoch, _version, is_deleted) \
+             SELECT chain, block_number, blockhash, parent_slot, \
+               parent_blockhash, block_height, timestamp, 0 AS epoch, \
+               {} AS `_version`, 0 AS is_deleted \
+             FROM `{COMMIT_MARKER}` FINAL WHERE chain = {CHAIN} \
+               AND block_number >= {from} AND block_number < {to}",
+            next_version()
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // No read-your-writes: wait until the question really answers itself
+    // before restarting, so a pass cannot succeed for the wrong reason.
+    let mut found = Vec::new();
+    for _ in 0..200 {
+        found = scenario
+            .db
+            .stale_flush_ranges_in(COMMIT_MARKER, "block_number")
+            .await
+            .unwrap();
+        if !found.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        found,
+        vec![BlockRange::new(from, to)],
+        "the slots flushed under the superseded epoch have to be purged \
+         and indexed again"
+    );
+
+    // The restart: a brand new process, an empty in-memory queue.
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    // It purged exactly that span before streaming anything ...
+    let healed: u64 = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM reorgs WHERE chain = {CHAIN} \
+             AND reason = 'gap_heal' AND fork_block = {from} \
+             AND to_block = {to} AND completed = 1"
+        ))
+        .await;
+    assert_eq!(
+        healed, 1,
+        "the restart did not purge the span that raced the other \
+         process's purge"
+    );
+
+    // ... and what is stored is a clean index again: the span came back
+    // under an epoch the validity rule counts, and nothing is doubled.
+    assert_eq!(scenario.rows(COMMIT_MARKER).await, chain.produced_slots());
+    scenario.assert_consistent().await;
+    assert_same(
+        "after a restart that found the raced flush",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+}
+
 /// One slot whose `blockTime` the node did not report is stored with
 /// `timestamp` 0 (`src/source/solana.rs` maps `None` to the default), and
 /// 0 is NOT a block time. Taking it as the start of a repair window arms

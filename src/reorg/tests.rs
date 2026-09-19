@@ -1037,6 +1037,62 @@ async fn a_module_purge_repairs_only_its_own_side_tables() {
 
 // ---------------------------------------------------------- re-decoding
 
+/// The queue of flush spans that raced another process's purge is the
+/// ONLY record that those blocks have to be indexed again - their rows
+/// are stored, so no gap query reports them. A purge that fails must
+/// therefore leave the queue alone (docs/review-round-4.md, MAJOR 3).
+///
+/// This is the drain BOTH pipelines use (`pipeline::mod` for EVM,
+/// `pipeline::solana` for Solana), so the rule is proven once here rather
+/// than written twice: the Solana loop used to take the whole `Vec` and
+/// lose the failed span, and every span after it, on the first transient
+/// error.
+#[tokio::test]
+async fn a_failed_purge_keeps_every_queued_flush_span() {
+    let node = indexed(40, NodeOptions::new(CHAIN)).await;
+
+    let purger = Purger::new(
+        node.store.clone(),
+        node.writer.clone(),
+        node.recorder.clone(),
+        node.recorder.clone(),
+    )
+    .with_options(PurgeOptions {
+        tombstone_attempts: 4,
+        retry_delay: Duration::ZERO,
+    });
+
+    let queued = vec![
+        crate::db::ranges::BlockRange::new(10, 20),
+        crate::db::ranges::BlockRange::new(30, 40),
+    ];
+    let queue = std::sync::Mutex::new(queued.clone());
+    let mut purged = Vec::new();
+
+    // The first purge fails: nothing may be forgotten.
+    node.store.fail_at(CHAIN, PurgeStep::TombstoneChildren, false);
+    assert!(purger
+        .purge_queued(CHAIN, &queue, PurgeReason::GapHeal, |range| purged
+            .push(range))
+        .await
+        .is_err());
+    assert_eq!(*queue.lock().unwrap(), queued);
+    assert!(purged.is_empty());
+
+    // The database comes back: both spans are purged, and only then are
+    // they taken out of the queue.
+    let lowest = purger
+        .purge_queued(CHAIN, &queue, PurgeReason::GapHeal, |range| {
+            purged.push(range)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(lowest, Some(10));
+    assert!(queue.lock().unwrap().is_empty());
+    assert_eq!(purged, queued);
+}
+
 /// ClickHouse gives no read-your-writes (docs/design.md §2): right after
 /// an INSERT the next query can miss the new part, measured at ~3%. The
 /// tombstone loop stopped on the FIRST attempt whose live count was 0, so
