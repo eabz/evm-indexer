@@ -950,9 +950,11 @@ mod tests {
         let back: Ids = serde_json::from_str(&json).unwrap();
         assert_eq!(back, sample);
 
-        for address in
-            [Address::ZERO, Address::repeat_byte(1), Address::repeat_byte(0xff)]
-        {
+        for address in [
+            Address::ZERO,
+            Address::repeat_byte(1),
+            Address::repeat_byte(0xff),
+        ] {
             assert_eq!(address_of_id32(id32(address)), Some(address));
         }
 

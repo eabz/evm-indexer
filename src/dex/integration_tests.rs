@@ -993,7 +993,8 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
              ifNull(amount_usd, -1) FROM dex_swaps_usd_v \
              WHERE chain = {CHAIN} ORDER BY block_number, ordinal"
         ))
-        .fetch_all::<(u64, u64, String, String, String, u8, u8, f64, f64)>()
+        .fetch_all::<(u64, u64, String, String, String, u8, u8, f64, f64)>(
+        )
         .await
         .unwrap();
 
@@ -2628,6 +2629,620 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
     check(&database).await;
     let after = visible_state(&database, CHAIN).await;
     assert_same_state(&after, &before, "after the rebuild");
+
+    database.drop().await;
+}
+
+// ------------------------------------------- chain neutrality (design §13)
+
+/// Chain id reserved for Solana (docs/design.md §14).
+const SVM_CHAIN: u64 = 1_399_811_149;
+
+/// 32 bytes that are NOT an EVM address. Every one of them has a non-zero
+/// byte among the first 12 (so `substring(id, 13)` would lose information)
+/// AND a trailing zero byte (so `toString(FixedString)`, and the implicit
+/// conversion `base58Encode(id)` performs, would silently shorten it). A
+/// Solana pubkey looks exactly like this.
+fn svm_id(tag: u8) -> B256 {
+    let mut id = [0u8; 32];
+    for (index, byte) in id.iter_mut().enumerate() {
+        *byte = tag.wrapping_add(index as u8).wrapping_mul(7) | 0x11;
+    }
+    id[0] = tag;
+    id[11] = 0xc6;
+    id[31] = 0x00;
+    B256::from(id)
+}
+
+/// The hex a view must return for [`svm_id`], lower case, all 32 bytes.
+fn svm_hex(tag: u8) -> String {
+    hex::encode(svm_id(tag))
+}
+
+/// Start of the current UTC day, so the trailing-30-days views have data.
+fn today() -> u32 {
+    let now =
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+            as u32;
+    now - now % 86_400
+}
+
+/// A 64 byte transaction id: the length of a Solana signature, which is why
+/// `tx_id` is a `String` column and never part of a sorting key.
+fn svm_tx(tag: u8) -> String {
+    bytes(&[tag; 64])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn svm_swap_sql(
+    block: u64,
+    timestamp: u32,
+    tx_index: u32,
+    ordinal: u64,
+    amount0: &str,
+    amount1: &str,
+    amount_in: &str,
+    amount_out: &str,
+    verified_in: Option<u8>,
+    verified_out: Option<u8>,
+    version: u64,
+) -> String {
+    let zero = "toFixedString('', 32)".to_string();
+    let leg = |tag: Option<u8>| {
+        tag.map_or_else(
+            || zero.clone(),
+            |tag| bytes(svm_id(tag).as_slice()),
+        )
+    };
+
+    format!(
+        "({SVM_CHAIN}, {block}, {timestamp}, {}, {tx_index}, {ordinal}, {}, \
+         {}, 'uniswap_v2', {}, {}, {}, {}, {}, toInt256('{amount0}'), \
+         toInt256('{amount1}'), {zero}, {zero}, toUInt256('{amount_in}'), \
+         toUInt256('{amount_out}'), {}, {}, toUInt256('7000000000'), \
+         toUInt256('9000000'), 0, 0, false, toUInt256('0'), toUInt256('0'), \
+         0, 0, 0, {version})",
+        svm_tx(tx_index as u8),
+        bytes(svm_id(0xa1).as_slice()),
+        bytes(svm_id(0xe1).as_slice()),
+        bytes(svm_id(0x11).as_slice()),
+        bytes(svm_id(0x22).as_slice()),
+        bytes(svm_id(0x33).as_slice()),
+        bytes(svm_id(0x44).as_slice()),
+        bytes(svm_id(0x33).as_slice()),
+        leg(verified_in),
+        leg(verified_out),
+    )
+}
+
+/// A 32 byte id that is not an EVM address survives every `dex_*` table,
+/// materialized view, aggregate and analyst view byte for byte - nothing
+/// truncates it to 20 bytes, and nothing matches it against an EVM address
+/// that shares its last 20 bytes.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_non_evm_id_survives_every_table_and_view() {
+    let database = TestDb::create().await;
+
+    let hour0 = today();
+    let hour1 = hour0 + 3_600;
+
+    database
+        .execute(&format!(
+            "INSERT INTO chains (chain, name, family) VALUES \
+             ({SVM_CHAIN}, 'solana', 'svm'), ({CHAIN}, 'ethereum', 'evm')"
+        ))
+        .await;
+
+    // native = svm_id(0x71) with 9 decimals, stable = svm_id(0x51) with 6.
+    database
+        .execute(&format!(
+            "INSERT INTO quote_tokens (chain, token, kind, decimals, \
+             symbol, _version) VALUES ({SVM_CHAIN}, {}, 'native', 9, \
+             'SOL', 1), ({SVM_CHAIN}, {}, 'stable', 6, 'USDC', 1)",
+            bytes(svm_id(0x71).as_slice()),
+            bytes(svm_id(0x51).as_slice()),
+        ))
+        .await;
+
+    // THE trap: an EVM `tokens` row whose 20 byte address is exactly the
+    // last 20 bytes of the Solana stable token. A view that truncated the
+    // analytics side with substring(token, 13) would join these two.
+    let tail_hex = svm_hex(0x51)[24..].to_string();
+    database
+        .execute(&format!(
+            "INSERT INTO tokens (chain, address, name, symbol, decimals, \
+             type, _version) VALUES ({SVM_CHAIN}, unhex('{tail_hex}'), \
+             'Impostor', 'FAKE', 18, 'ERC20', 1)"
+        ))
+        .await;
+
+    // A resolved pool: trusted, so the metadata dependent views run too.
+    database
+        .execute(&format!(
+            "INSERT INTO dex_pools ({POOL_COLUMNS}) VALUES \
+             ({SVM_CHAIN}, {pool}, {emitter}, {factory}, 'uniswap_v2', \
+             {native}, {stable}, [{native}, {stable}], [], 0, 0, \
+             toFixedString('', 32), false, 0, 0, '', 0, 0, 'rpc', 0, 0, 1)",
+            pool = bytes(svm_id(0xa1).as_slice()),
+            emitter = bytes(svm_id(0xe1).as_slice()),
+            factory = bytes(svm_id(0xf1).as_slice()),
+            native = bytes(svm_id(0x71).as_slice()),
+            stable = bytes(svm_id(0x51).as_slice()),
+        ))
+        .await;
+
+    database
+        .execute(&format!(
+            "INSERT INTO dex_liquidity (chain, block_number, timestamp, \
+             tx_id, tx_index, ordinal, pool_id, emitter, protocol, kind, \
+             sender, owner, tx_from, tx_to, amount0, amount1, reserve0, \
+             reserve1, liquidity_delta, tick_lower, tick_upper, epoch, \
+             _version) VALUES ({SVM_CHAIN}, 10, {hour0}, {}, 1, 5, {}, {}, \
+             'uniswap_v2', 'mint', {}, {}, {}, {}, toInt256('5'), \
+             toInt256('7'), toUInt256('0'), toUInt256('0'), toInt256('0'), \
+             0, 0, 0, {})",
+            svm_tx(1),
+            bytes(svm_id(0xa1).as_slice()),
+            bytes(svm_id(0xe1).as_slice()),
+            bytes(svm_id(0x11).as_slice()),
+            bytes(svm_id(0x55).as_slice()),
+            bytes(svm_id(0x33).as_slice()),
+            bytes(svm_id(0x44).as_slice()),
+            next_version(),
+        ))
+        .await;
+
+    // hour0: 2.0 native for 4000 stable -> the hour's native price is 2000.
+    // hour1: 1.0 native for 2000 stable, valued by its stable leg, plus one
+    // swap whose in leg is NOT verified (the 32 zero bytes id).
+    let version = next_version();
+    database
+        .execute(&format!(
+            "INSERT INTO dex_swaps ({SWAP_COLUMNS}) VALUES {}, {}, {}",
+            svm_swap_sql(
+                10,
+                hour0,
+                1,
+                7,
+                "2000000000",
+                "-4000000000",
+                "2000000000",
+                "4000000000",
+                Some(0x71),
+                Some(0x51),
+                version,
+            ),
+            svm_swap_sql(
+                20,
+                hour1,
+                2,
+                3,
+                "1000000000",
+                "-2000000000",
+                "1000000000",
+                "2000000000",
+                Some(0x71),
+                Some(0x51),
+                version,
+            ),
+            svm_swap_sql(
+                20,
+                hour1,
+                2,
+                9,
+                "3000",
+                "-6000",
+                "3000",
+                "6000",
+                None,
+                Some(0x51),
+                version,
+            ),
+        ))
+        .await;
+
+    // ---- base tables and the side tables their materialized views feed.
+    assert_eq!(
+        database
+            .lines(&format!(
+                "SELECT lower(hex(pool_id)) FROM dex_pools FINAL \
+                 WHERE chain = {SVM_CHAIN}"
+            ))
+            .await,
+        vec![svm_hex(0xa1)]
+    );
+
+    for (table, column, tag) in [
+        ("dex_swaps", "emitter", 0xe1u8),
+        ("dex_swaps", "trader", 0x33),
+        ("dex_swaps", "sender", 0x11),
+        ("dex_swaps", "recipient", 0x22),
+        ("dex_swaps", "tx_from", 0x33),
+        ("dex_swaps", "tx_to", 0x44),
+        ("dex_liquidity", "owner", 0x55),
+        ("dex_swaps_by_pool", "verified_out", 0x51),
+        ("dex_swaps_by_trader", "trader", 0x33),
+        ("dex_pools_by_token", "emitter", 0xe1),
+    ] {
+        let seen = database
+            .lines(&format!(
+                "SELECT DISTINCT lower(hex({column})) AS id FROM {table} \
+                 FINAL WHERE chain = {SVM_CHAIN} ORDER BY id"
+            ))
+            .await;
+        assert!(
+            seen.contains(&svm_hex(tag)),
+            "{table}.{column}: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|value| value.len() == 64),
+            "{table}.{column} was truncated: {seen:?}"
+        );
+    }
+
+    // Both tokens of the pool reached dex_pools_by_token, whole.
+    let mut tokens = database
+        .lines(&format!(
+            "SELECT lower(hex(token)) AS id FROM dex_pools_by_token FINAL \
+             WHERE chain = {SVM_CHAIN} ORDER BY id"
+        ))
+        .await;
+    tokens.sort();
+    let mut both = vec![svm_hex(0x51), svm_hex(0x71)];
+    both.sort();
+    assert_eq!(tokens, both);
+
+    // A 64 byte transaction id round trips, and the position columns too.
+    let position = database
+        .client
+        .query(&format!(
+            "SELECT toUInt64(length(tx_id)), lower(hex(tx_id)), tx_index, \
+             ordinal FROM dex_swaps FINAL WHERE chain = {SVM_CHAIN} \
+             AND block_number = 10"
+        ))
+        .fetch_one::<(u64, String, u32, u64)>()
+        .await
+        .unwrap();
+    assert_eq!((position.0, position.2, position.3), (64, 1, 7));
+    assert_eq!(position.1, "01".repeat(64));
+
+    // ---- the impostor must NOT be joined: padding, never truncation.
+    let info = database
+        .client
+        .query(&format!(
+            "SELECT symbol, ifNull(decimals, 255), kind FROM \
+             dex_token_info_v WHERE chain = {SVM_CHAIN} AND token = {}",
+            bytes(svm_id(0x51).as_slice())
+        ))
+        .fetch_one::<(String, u8, String)>()
+        .await
+        .unwrap();
+    assert_eq!(info, ("USDC".to_string(), 6, "stable".to_string()));
+
+    // The EVM row is still there, under its own PADDED 32 byte id.
+    let impostor = database
+        .client
+        .query(&format!(
+            "SELECT symbol FROM dex_token_info_v WHERE chain = \
+             {SVM_CHAIN} AND token = unhex('{}')",
+            id_hex(&tail_hex)
+        ))
+        .fetch_one::<String>()
+        .await
+        .unwrap();
+    assert_eq!(impostor, "FAKE");
+
+    // ---- pools, candles, volumes, USD: ids intact and numbers right.
+    let pool = database
+        .client
+        .query(&format!(
+            "SELECT status, toUInt8(trusted), lower(hex(pool_id)), \
+             lower(hex(emitter)), lower(hex(factory)), lower(hex(token0)), \
+             lower(hex(token1)) FROM dex_pools_v WHERE chain = {SVM_CHAIN}"
+        ))
+        .fetch_one::<(String, u8, String, String, String, String, String)>()
+        .await
+        .unwrap();
+    assert_eq!((pool.0.as_str(), pool.1), ("verified", 1));
+    assert_eq!(pool.2, svm_hex(0xa1));
+    assert_eq!(pool.3, svm_hex(0xe1));
+    assert_eq!(pool.4, svm_hex(0xf1));
+    assert_eq!(pool.5, svm_hex(0x71));
+    assert_eq!(pool.6, svm_hex(0x51));
+
+    let shown = database
+        .client
+        .query(&format!(
+            "SELECT symbol0, symbol1, pool FROM dex_pools_v \
+             WHERE chain = {SVM_CHAIN}"
+        ))
+        .fetch_one::<(String, String, String)>()
+        .await
+        .unwrap();
+    assert_eq!((shown.0.as_str(), shown.1.as_str()), ("SOL", "USDC"));
+    // A pool id is not an address: all 32 bytes are printed.
+    assert_eq!(shown.2, format!("0x{}", svm_hex(0xa1)));
+
+    let candles = database
+        .client
+        .query(&format!(
+            "SELECT lower(hex(pool_id)), lower(hex(emitter)), \
+             toUInt64(trades), toUInt64(swaps), toUInt64(traders) \
+             FROM dex_candles_1d_v WHERE chain = {SVM_CHAIN}"
+        ))
+        .fetch_one::<(String, String, u64, u64, u64)>()
+        .await
+        .unwrap();
+    assert_eq!(candles.0, svm_hex(0xa1));
+    assert_eq!(candles.1, svm_hex(0xe1));
+    assert_eq!((candles.2, candles.3, candles.4), (3, 3, 1));
+
+    let volume = database
+        .client
+        .query(&format!(
+            "SELECT lower(hex(token_in)), lower(hex(token_out)), \
+             toUInt64(swaps) FROM dex_pool_volume_1h_v WHERE chain = \
+             {SVM_CHAIN} ORDER BY token_in, bucket"
+        ))
+        .fetch_all::<(String, String, u64)>()
+        .await
+        .unwrap();
+    // The unverified in leg is the 32 ZERO bytes, not 20.
+    assert_eq!(
+        volume,
+        vec![
+            ("00".repeat(32), svm_hex(0x51), 1),
+            (svm_hex(0x71), svm_hex(0x51), 1),
+            (svm_hex(0x71), svm_hex(0x51), 1),
+        ]
+    );
+
+    let price = database
+        .client
+        .query(&format!(
+            "SELECT toUInt64(bucket), ifNull(price, -1), toUInt64(pools) \
+             FROM dex_native_price_1h_v WHERE chain = {SVM_CHAIN} \
+             ORDER BY bucket"
+        ))
+        .fetch_all::<(u64, f64, u64)>()
+        .await
+        .unwrap();
+    assert_eq!(price[0].0, u64::from(hour0));
+    assert!(close(price[0].1, 2000.0), "{price:?}");
+
+    let usd = database
+        .client
+        .query(&format!(
+            "SELECT toUInt64(block_number), tx_index, ordinal, \
+             lower(hex(token_in)), lower(hex(token_out)), \
+             toUInt8(token_in_verified), ifNull(amount_usd, -1) \
+             FROM dex_swaps_usd_v WHERE chain = {SVM_CHAIN} \
+             ORDER BY block_number, tx_index, ordinal"
+        ))
+        .fetch_all::<(u64, u32, u64, String, String, u8, f64)>()
+        .await
+        .unwrap();
+    assert_eq!(usd.len(), 3);
+    assert_eq!((usd[0].0, usd[0].1, usd[0].2), (10, 1, 7));
+    assert_eq!(usd[0].3, svm_hex(0x71));
+    assert_eq!(usd[0].4, svm_hex(0x51));
+    assert!(close(usd[0].6, 4000.0), "{usd:?}");
+    // The unverified leg falls back to the TRUSTED pool's token0.
+    assert_eq!((usd[2].0, usd[2].1, usd[2].2), (20, 2, 9));
+    assert_eq!(usd[2].3, svm_hex(0x71));
+    assert_eq!(usd[2].5, 0);
+
+    let daily = database
+        .client
+        .query(&format!(
+            "SELECT lower(hex(pool_id)), ifNull(volume_usd, -1), \
+             toUInt64(swaps) FROM dex_pool_volume_usd_1d_v \
+             WHERE chain = {SVM_CHAIN}"
+        ))
+        .fetch_one::<(String, f64, u64)>()
+        .await
+        .unwrap();
+    assert_eq!(daily.0, svm_hex(0xa1));
+    assert_eq!(daily.2, 3);
+    assert!(close(daily.1, 4000.0 + 2000.0 + 0.006), "{daily:?}");
+
+    let by_token = database
+        .client
+        .query(&format!(
+            "SELECT lower(hex(token)) AS id, symbol, toUInt64(swaps) FROM \
+             dex_token_volume_1d_v WHERE chain = {SVM_CHAIN} ORDER BY id"
+        ))
+        .fetch_all::<(String, String, u64)>()
+        .await
+        .unwrap();
+    let mut seen: Vec<String> =
+        by_token.iter().map(|row| row.0.clone()).collect();
+    seen.sort();
+    assert_eq!(seen, both);
+
+    let prices = database
+        .client
+        .query(&format!(
+            "SELECT lower(hex(pool_id)), lower(hex(token0)), \
+             lower(hex(token1)), price_source FROM dex_pool_prices_1h_v \
+             WHERE chain = {SVM_CHAIN} ORDER BY bucket"
+        ))
+        .fetch_all::<(String, String, String, String)>()
+        .await
+        .unwrap();
+    assert!(!prices.is_empty());
+    for row in &prices {
+        assert_eq!(row.0, svm_hex(0xa1));
+        assert_eq!(row.1, svm_hex(0x71));
+        assert_eq!(row.2, svm_hex(0x51));
+    }
+
+    let top = database
+        .client
+        .query(&format!(
+            "SELECT lower(hex(pool_id)), pool, symbol0, symbol1 FROM \
+             dex_top_pools_v WHERE chain = {SVM_CHAIN}"
+        ))
+        .fetch_one::<(String, String, String, String)>()
+        .await
+        .unwrap();
+    assert_eq!(top.0, svm_hex(0xa1));
+    assert_eq!(top.1, format!("0x{}", svm_hex(0xa1)));
+    assert_eq!((top.2.as_str(), top.3.as_str()), ("SOL", "USDC"));
+
+    let protocols = database
+        .client
+        .query(&format!(
+            "SELECT protocol, toUInt64(swaps), toUInt64(pools) FROM \
+             dex_protocol_stats_1d_v WHERE chain = {SVM_CHAIN}"
+        ))
+        .fetch_one::<(String, u64, u64)>()
+        .await
+        .unwrap();
+    assert_eq!(protocols, ("uniswap_v2".to_string(), 3, 1));
+
+    // ---- the documented per family formatting, from migration 0006.
+    let printed = database
+        .lines(&format!(
+            "SELECT if(c.family = 'svm', \
+             base58Encode(substring(s.emitter, 1, 32)), \
+             concat('0x', lower(hex(substring(s.emitter, 13))))) AS text \
+             FROM dex_swaps AS s FINAL \
+             LEFT JOIN chains_v AS c ON c.chain = s.chain \
+             WHERE s.chain = {SVM_CHAIN} GROUP BY text"
+        ))
+        .await;
+    assert_eq!(printed.len(), 1, "{printed:?}");
+    // base58 of the WHOLE 32 bytes: decoding gives every byte back. The
+    // shape solana-research sketched, base58Encode(id), would not.
+    assert_eq!(
+        database
+            .lines(&format!(
+                "SELECT lower(hex(base58Decode('{}'))) AS id",
+                printed[0]
+            ))
+            .await,
+        vec![svm_hex(0xe1)]
+    );
+    assert_ne!(
+        database
+            .lines(&format!(
+                "SELECT base58Encode(toString(emitter)) AS id FROM \
+                 dex_swaps FINAL WHERE chain = {SVM_CHAIN} GROUP BY id"
+            ))
+            .await,
+        printed,
+        "toString(FixedString) must be shown to lose the trailing zero"
+    );
+
+    database.drop().await;
+}
+
+/// Two chains of different families may hold ids that agree on their last
+/// 20 bytes. Nothing joins, aggregates or purges them together.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn an_evm_address_and_a_pubkey_sharing_20_bytes_never_collide() {
+    let database = TestDb::create().await;
+
+    let hour = today();
+
+    // EVM addresses that are the tails of the Solana emitter and trader:
+    // the ids agree on 20 bytes and differ only in the padding.
+    let tail = Address::from_slice(&svm_id(0xe1).as_slice()[12..]);
+    let tail_trader = Address::from_slice(&svm_id(0x33).as_slice()[12..]);
+    assert_eq!(pool_id_of(tail).as_slice()[12..], svm_id(0xe1)[12..]);
+    assert_ne!(pool_id_of(tail), svm_id(0xe1));
+
+    database
+        .execute(&format!(
+            "INSERT INTO dex_swaps ({SWAP_COLUMNS}) VALUES {}",
+            svm_swap_sql(
+                10,
+                hour,
+                1,
+                7,
+                "2000000000",
+                "-4000000000",
+                "2000000000",
+                "4000000000",
+                Some(0x71),
+                Some(0x51),
+                next_version(),
+            ),
+        ))
+        .await;
+
+    let mut evm = DexRows::default();
+    let mut swap =
+        decode(CHAIN, &[fixtures::V2_SWAP.log()]).swaps.remove(0);
+    swap.emitter = tail;
+    swap.trader = tail_trader;
+    swap.timestamp = hour;
+    evm.swaps.push(swap);
+    evm.set_version(next_version());
+    database.insert(&evm).await;
+
+    // Each chain sees exactly its own row, under its own 32 byte id.
+    for (chain, emitter) in [
+        (SVM_CHAIN, svm_hex(0xe1)),
+        (CHAIN, hex::encode(pool_id_of(tail))),
+    ] {
+        assert_eq!(
+            database
+                .count(&format!(
+                    "SELECT count() FROM dex_swaps FINAL WHERE chain = \
+                     {chain} AND lower(hex(emitter)) = '{emitter}'"
+                ))
+                .await,
+            1,
+            "chain {chain}"
+        );
+    }
+
+    // The two ids differ in the padding alone, and the id-keyed side table
+    // keeps them apart.
+    let traders = database
+        .lines(
+            "SELECT DISTINCT lower(hex(trader)) AS id \
+             FROM dex_swaps_by_trader FINAL ORDER BY id",
+        )
+        .await;
+    assert_eq!(traders.len(), 2, "{traders:?}");
+    assert!(traders.contains(&svm_hex(0x33)), "{traders:?}");
+    assert!(
+        traders.contains(&hex::encode(pool_id_of(tail_trader))),
+        "{traders:?}"
+    );
+
+    // A purge of one chain leaves the other alone.
+    database
+        .execute(&tombstone_sql(
+            "dex_swaps",
+            CHAIN,
+            0,
+            None,
+            next_version(),
+        ))
+        .await;
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_swaps FINAL WHERE chain = \
+                 {SVM_CHAIN}"
+            ))
+            .await,
+        1
+    );
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_swaps FINAL WHERE chain = {CHAIN}"
+            ))
+            .await,
+        0
+    );
 
     database.drop().await;
 }

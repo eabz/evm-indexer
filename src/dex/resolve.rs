@@ -809,7 +809,10 @@ mod tests {
         let row = unresolved_pool(1, &candidate(addr(1), Protocol::Curve));
 
         assert_eq!(row.source, PoolSource::Unresolved);
-        assert_eq!((row.created_block, row.tx_index, row.ordinal), (0, 0, 0));
+        assert_eq!(
+            (row.created_block, row.tx_index, row.ordinal),
+            (0, 0, 0)
+        );
         assert!(row.tokens.is_empty());
     }
 
