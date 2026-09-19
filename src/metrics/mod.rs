@@ -55,6 +55,38 @@ const FLUSH_BUCKETS: &[f64] = &[
 const PURGE_BUCKETS: &[f64] =
     &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0];
 
+/// The Solana-only series (`indexer run --chain solana`), as plain
+/// numbers. Everything an EVM chain also has - head, indexed height, lag
+/// in heights AND in seconds, rows per table, flush latency - comes from
+/// the shared gauges above and is NOT repeated here.
+///
+/// **Lag is published in seconds as well as in heights, and the seconds
+/// are the number to look at.** A Solana slot is 0.27 s and an Ethereum
+/// block is 12 s, so one `lag_blocks` panel across both families is
+/// meaningless and would be read wrong on the first bad day
+/// (docs/solana-research.md §11.5). `lag_seconds` already exists for every
+/// chain; the Solana loop feeds it from the `block_time` of the last
+/// committed slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SolanaStats {
+    /// Metered HyperSync queries sent in the last 60 seconds. The free
+    /// budget is 30 per 60 s per endpoint and the follower aims at 25, so
+    /// this is the number that says how much room is left.
+    pub queries_last_minute: u64,
+    /// Metered queries since the process started.
+    pub queries_total: u64,
+    /// Requests the server's own `x-ratelimit-*` headers last said were
+    /// left in the window (`remaining / cost`, because `remaining` counts
+    /// budget units). `None` until a response carried them.
+    pub ratelimit_requests_left: Option<u64>,
+    /// Swaps decoded and handed to the writer since the process started.
+    pub swaps_stored: u64,
+    /// Slots inside served windows that produced no block. NORMAL on
+    /// Solana; worth watching because every rows/day estimate assumes the
+    /// rate stays near zero.
+    pub skipped_slots: u64,
+}
+
 /// State of a background resolver (token metadata, DEX pools), as plain
 /// numbers. The pipeline maps the workers' own statistics into this, so
 /// neither side depends on the other.
@@ -260,6 +292,10 @@ struct Inner {
     tokens: WorkerStats,
     pools: WorkerStats,
     venues: WorkerStats,
+
+    /// `indexer run --chain solana` only; absent from the exposition
+    /// until the Solana loop reports once.
+    solana: Mutex<Option<SolanaStats>>,
 }
 
 fn unix_ms() -> u64 {
@@ -321,6 +357,7 @@ impl Metrics {
                 tokens: WorkerStats::default(),
                 pools: WorkerStats::default(),
                 venues: WorkerStats::default(),
+                solana: Mutex::new(None),
             })),
         }
     }
@@ -487,6 +524,16 @@ impl Metrics {
         let Some(inner) = &self.inner else { return };
 
         inner.venues.set(stats);
+    }
+
+    /// The Solana-only series. Called by `pipeline::solana` once per loop
+    /// turn; ignored on every other chain, which is why the series are
+    /// absent from the exposition rather than zero there.
+    pub fn set_solana_stats(&self, stats: SolanaStats) {
+        let Some(inner) = &self.inner else { return };
+
+        *inner.solana.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(stats);
     }
 
     /// Startup (migrations, gap healing, first head poll) is complete.
@@ -790,9 +837,55 @@ impl Metrics {
         );
 
         render_workers(&mut e, inner);
+        render_solana(&mut e, inner);
 
         e.finish()
     }
+}
+
+/// The Solana-only series, absent until the Solana loop reported once.
+fn render_solana(e: &mut Encoder, inner: &Inner) {
+    let Some(stats) =
+        *inner.solana.lock().unwrap_or_else(|e| e.into_inner())
+    else {
+        return;
+    };
+
+    e.scalar(
+        "hypersync_queries_last_minute",
+        "Metered HyperSync queries sent in the last 60 seconds. The free \
+         Solana budget is 30 per 60 seconds per endpoint.",
+        Kind::Gauge,
+        stats.queries_last_minute,
+    );
+    e.scalar(
+        "hypersync_queries_total",
+        "Metered HyperSync queries sent since the process started.",
+        Kind::Counter,
+        stats.queries_total,
+    );
+    if let Some(left) = stats.ratelimit_requests_left {
+        e.scalar(
+            "hypersync_ratelimit_requests_left",
+            "Requests the server's x-ratelimit headers said were left in \
+             the current window (remaining budget units divided by cost).",
+            Kind::Gauge,
+            left,
+        );
+    }
+    e.scalar(
+        "solana_swaps_total",
+        "Swaps decoded and handed to the writer.",
+        Kind::Counter,
+        stats.swaps_stored,
+    );
+    e.scalar(
+        "solana_skipped_slots_total",
+        "Slots inside served windows that produced no block. Normal on \
+         Solana; every rows-per-day estimate assumes it stays near zero.",
+        Kind::Counter,
+        stats.skipped_slots,
+    );
 }
 
 /// One family per field, one series per worker that reported.

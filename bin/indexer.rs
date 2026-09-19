@@ -64,9 +64,27 @@ fn execute(command: Command) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Is this chain the Solana one? The only family switch in the binary.
+///
+/// One id, compared once, rather than a `chains` lookup: the registry row
+/// is written BY the run that is starting, so it can not be the thing that
+/// decides which pipeline to start.
+fn is_solana(chain_id: u64) -> bool {
+    chain_id == pipeline::solana::SOLANA_CHAIN_ID
+}
+
 async fn run(config: Config) -> Result<()> {
+    let solana = is_solana(config.chain_id);
+
     info!("Starting EVM Indexer.");
-    info!("Syncing chain id {}.", config.chain_id);
+    if solana {
+        info!(
+            "Syncing Solana (chain id {}): slots, not blocks.",
+            config.chain_id
+        );
+    } else {
+        info!("Syncing chain id {}.", config.chain_id);
+    }
 
     // Before the pipeline connects: the database itself may not exist yet.
     if config.no_migrate {
@@ -77,23 +95,43 @@ async fn run(config: Config) -> Result<()> {
             .context("apply schema migrations")?;
     }
 
-    pipeline::run(config).await
+    if solana {
+        pipeline::solana::run(config).await
+    } else {
+        pipeline::run(config).await
+    }
 }
 
 /// Read only. Exit code 0 = consistent, 1 = problems found.
+///
+/// Solana gets its own checks: "every block number has a row" would report
+/// every skipped slot as a gap for ever (`pipeline::solana_verify`).
 async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
     let db = Database::new(&config.database_url, config.chain_id).await?;
 
-    let report = pipeline::verify::verify(
-        &db,
-        config.start_block,
-        config.end_block,
-    )
-    .await?;
+    let consistent = if is_solana(config.chain_id) {
+        let report = pipeline::solana::verify(
+            &db,
+            config.start_block,
+            config.end_block,
+        )
+        .await?;
 
-    println!("{report}");
+        println!("{report}");
+        report.is_consistent()
+    } else {
+        let report = pipeline::verify::verify(
+            &db,
+            config.start_block,
+            config.end_block,
+        )
+        .await?;
 
-    Ok(if report.is_consistent() {
+        println!("{report}");
+        report.is_consistent()
+    };
+
+    Ok(if consistent {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(EXIT_PROBLEMS_FOUND)
