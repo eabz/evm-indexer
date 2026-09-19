@@ -59,6 +59,28 @@ pub const LOUD_FAILURES: u32 = ATTEMPTS_PER_WINDOW * 4;
 /// their own panel for ever (review MAJOR 2).
 pub const DECAY_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// Shortest password the panel will run behind.
+///
+/// Not a style rule: the panel is the start/stop control of every chain in
+/// the process, and [`RateLimiter`] allows five guesses a minute, which is
+/// enough to walk a PIN or a short word (review MAJOR 5).
+pub const MIN_PASSWORD_CHARS: usize = 12;
+
+/// Is this password long enough to run a control plane behind? The message
+/// completes the sentence "`ADMIN_PASSWORD` ...".
+pub fn check_strength(password: &str) -> Result<(), String> {
+    let length = password.chars().count();
+
+    if length < MIN_PASSWORD_CHARS {
+        return Err(format!(
+            "is {length} characters long and the minimum is \
+             {MIN_PASSWORD_CHARS}."
+        ));
+    }
+
+    Ok(())
+}
+
 /// Sessions kept at once. The owner is one person on a handful of devices;
 /// anything beyond this is someone filling memory.
 const MAX_SESSIONS: usize = 64;
@@ -108,24 +130,45 @@ pub struct Password {
 }
 
 impl Password {
-    /// The password from the environment, or `None` when it is unset or
-    /// blank - in which case the panel is not served at all.
+    /// The password from the environment, or `None` when it is unset,
+    /// blank or too short - in which case the panel is not served at all.
     ///
     /// Environment only, and deliberately not a clap argument: a flag is
     /// visible to every user on the host through `ps`, ends up in shell
     /// history, and would be printed by `--help` as a default.
+    ///
+    /// **Too short is refused, loudly.** It used to accept anything that
+    /// was not blank, so `ADMIN_PASSWORD=x` started a panel that any guess
+    /// opened (review MAJOR 5). At five tries a minute a four-digit PIN
+    /// falls in a day and a single character falls at once. The panel is
+    /// the start/stop control of every chain this process indexes, so a
+    /// password under [`MIN_PASSWORD_CHARS`] characters is treated as not
+    /// having set one - the port is not bound, and the log says why.
     pub fn from_env() -> Result<Option<Self>, getrandom::Error> {
-        let Some(value) =
-            std::env::var_os(crate::configs::ADMIN_PASSWORD_ENV)
-        else {
+        let name = crate::configs::ADMIN_PASSWORD_ENV;
+
+        let Some(value) = std::env::var_os(name) else {
             return Ok(None);
         };
 
         let Some(password) = value.to_str() else {
+            log::error!(
+                "{name} is not valid text, so the control panel is off."
+            );
             return Ok(None);
         };
 
         if password.trim().is_empty() {
+            return Ok(None);
+        }
+
+        if let Err(why) = check_strength(password) {
+            log::error!(
+                "The control panel is OFF: {name} {why} The panel can \
+                 start and stop the indexing of every chain in this \
+                 process, so it will not run behind a password that can be \
+                 guessed. Set a longer one and start the process again."
+            );
             return Ok(None);
         }
 
@@ -563,6 +606,33 @@ mod tests {
         assert!(!password.matches("hunter3"));
         assert!(!password.matches(""));
         assert!(!password.matches("hunter2 "));
+    }
+
+    /// Review MAJOR 5: `ADMIN_PASSWORD=x` used to start a panel that any
+    /// guess opened, with no warning at all.
+    #[test]
+    fn a_password_short_enough_to_guess_is_refused() {
+        for weak in ["x", "1234", "hunter2", "admin", "0123456789 "] {
+            assert!(
+                check_strength(weak).is_err(),
+                "{weak:?} was accepted as a password"
+            );
+        }
+
+        // The message says what is wrong and what to do.
+        let why = check_strength("short").unwrap_err();
+        assert!(why.contains("12"), "{why}");
+        assert!(why.contains("minimum"), "{why}");
+
+        for good in [
+            "a-very-good-password",
+            "correct horse battery staple",
+            "123456789012",
+        ] {
+            check_strength(good).unwrap_or_else(|why| {
+                panic!("{good:?} was refused: {why}")
+            });
+        }
     }
 
     #[test]
