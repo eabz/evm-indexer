@@ -376,11 +376,9 @@ impl Scenario {
         names.extend(
             crate::launchpads::SIDE_TABLES.iter().map(|t| (*t, true)),
         );
-        // NOT `sol_token_balances`: it is a latest-value projection whose
-        // `_version` is the position, so a purge never touches it and a
-        // healed index legitimately holds observations a clean one made in
-        // a different order. `the_holder_projection_is_re_observed` checks
-        // the property it DOES have.
+        // `sol_token_balances` comes in through `svm::BASE_TABLES`: since
+        // round 4 it is an append log of observations, purged like every
+        // other child, so a healed index must match a clean one here too.
 
         names.extend(SOL_CANDLE_VIEWS.iter().map(|view| (*view, false)));
         names.extend(LAUNCHPAD_VIEWS.iter().map(|view| (*view, false)));
@@ -891,15 +889,15 @@ async fn sol_tokens_program_is_best_effort_but_decimals_are_not() {
     );
 }
 
-/// The holder projection is corrected by RE-OBSERVING, not by a purge.
+/// A heal leaves the holder log exactly as a clean index has it.
 ///
-/// `sol_token_balances` is keyed on `(chain, mint, owner, account)` with
-/// the POSITION as `_version`, so it is a latest-value table: a heal does
-/// not tombstone it, the re-stream simply writes the same observations
-/// again and the newest one wins. What must hold is that after a heal
-/// every balance is the one the highest position saw - never a stale one
-/// resurrected by a purge, and never a row the re-stream failed to bring
-/// back.
+/// `sol_token_balances` is an append log of observations keyed on
+/// `(chain, mint, owner, account, block_number, tx_index)`: the heal
+/// tombstones the orphaned observations like any other child's rows and
+/// the re-stream writes them again, so a healed index must hold the same
+/// live observations as a clean one - none lost, none resurrected. (Until
+/// round 4 it was a latest-value projection no purge could touch; the
+/// snapshot comparison in `Scenario::snapshot` now covers it too.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs TEST_DATABASE_URL"]
 async fn the_holder_projection_is_re_observed_after_a_heal() {
@@ -955,6 +953,139 @@ async fn the_holder_projection_is_re_observed_after_a_heal() {
         balances(&scenario).await,
         balances(&clean).await,
         "the healed index has different holder balances"
+    );
+}
+
+/// A purge can CORRECT a holder balance.
+///
+/// The heal path re-streams what it purged, so re-observing is enough
+/// there. A purge happens for other reasons too: the operator re-indexes
+/// the range differently or with `--no-launchpads`, or the reason for the
+/// purge is that the SOURCE data was wrong. `sol_token_balances` used to
+/// be a latest-value projection whose `_version` was the POSITION, and no
+/// statement in the codebase could remove a row of it: the wrong balance
+/// stayed live for ever (review round 4, MAJOR 12). It is now an append
+/// log of observations, tombstoned by the ordinary purge like every other
+/// child table, and the holder view falls back to the newest surviving
+/// observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_purge_corrects_a_holder_balance() {
+    use crate::{
+        metrics::Metrics,
+        pipeline::backfill::EpochOnly,
+        reorg::{NoHooks, PurgeReason, Purger},
+    };
+
+    let scenario = Scenario::new("b_bal_purged").await;
+    let chain = chain(40);
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    // One observed holder of one launchpad mint.
+    let (mint, owner, account, newest): (String, String, String, u64) =
+        scenario
+            .db
+            .db
+            .query(&format!(
+                "SELECT hex(mint), hex(owner), hex(account), \
+                 toUInt64(block_number) FROM sol_token_balances \
+                 WHERE chain = {CHAIN} AND is_deleted = 0 \
+                 AND balance > 0 ORDER BY block_number DESC LIMIT 1"
+            ))
+            .fetch_one()
+            .await
+            .expect("a stored holder balance");
+    assert!(newest > FIRST_SLOT);
+
+    // An EARLIER observation of the same token account, as an earlier
+    // flush would have written it. Two observations of one account is
+    // what the old projection could not hold at all.
+    const EARLIER: f64 = 4_242.0;
+    let unhex32 = |text: &str| -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hex::decode(text).expect("32 hex bytes"));
+        out
+    };
+    scenario
+        .db
+        .insert_rows(
+            "sol_token_balances",
+            &[crate::svm::launchpads::SolTokenBalance {
+                chain: CHAIN,
+                mint: unhex32(&mint),
+                owner: unhex32(&owner),
+                account: unhex32(&account),
+                balance: alloy::primitives::U256::from(EARLIER as u64),
+                block_number: FIRST_SLOT,
+                tx_index: 0,
+                timestamp: BASE_TIMESTAMP,
+                epoch: scenario.db.epoch(),
+                _version: next_version(),
+                is_deleted: 0,
+            }],
+        )
+        .await
+        .expect("insert the earlier observation");
+    let before = FIRST_SLOT;
+
+    let holding = |as_of: u64| {
+        let db = scenario.db.db.clone();
+        let (mint, owner) = (mint.clone(), owner.clone());
+        async move {
+            // `max()` over no rows is 0.0, which is a balance: -1 is how
+            // "this wallet is not in the list at all" comes back.
+            db.query(&format!(
+                "SELECT if(count() = 0, -1., toFloat64(max(balance_raw))) \
+                 FROM sol_launchpad_token_holders_v(chain = {CHAIN}, \
+                 token = '{mint}', as_of_block = {as_of}) \
+                 WHERE account = unhex('{owner}')"
+            ))
+            .fetch_one::<f64>()
+            .await
+            .unwrap()
+        }
+    };
+
+    let at_newest = holding(u64::MAX).await;
+    assert_ne!(at_newest, EARLIER, "the two observations must differ");
+    assert_eq!(
+        holding(before).await,
+        EARLIER,
+        "the holder list of a past block does not read that block"
+    );
+
+    // The purge of everything from the newest observation up, WITHOUT a
+    // re-stream: the operator's "this range was wrong" case.
+    let purger = Purger::new(
+        Arc::new(SolanaReorgStore::new(scenario.db.clone())),
+        Arc::new(EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoHooks),
+        Arc::new(Metrics::disabled()),
+    );
+    purger
+        .purge_range(CHAIN, newest, Some(chain.head), PurgeReason::GapHeal)
+        .await
+        .expect("the purge must be able to remove balance observations");
+
+    // The purged observation is gone from the table ...
+    assert_eq!(
+        scenario
+            .count(&format!(
+                "SELECT toUInt64(count()) FROM sol_token_balances FINAL \
+                 WHERE chain = {CHAIN} AND block_number >= {newest}"
+            ))
+            .await,
+        0,
+        "a purge still cannot remove a balance observation"
+    );
+    // ... and the holder list reads the one before it, not the purged
+    // one and not nothing.
+    let after = holding(u64::MAX).await;
+    assert_ne!(after, -1.0, "the wallet fell out of the holder list");
+    assert_eq!(
+        after, EARLIER,
+        "the holder list did not fall back to the surviving observation \
+         (it read {after}, the purged one was {at_newest})"
     );
 }
 

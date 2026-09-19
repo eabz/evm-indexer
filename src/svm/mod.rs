@@ -57,8 +57,17 @@ use registry::ProgramNames;
 ///
 /// `sol_tokens` is NOT here: a mint's decimals are chain state, not part of
 /// a slot, exactly like the EVM `tokens` table.
-pub const BASE_TABLES: &[&str] =
-    &["sol_dex_swaps", "sol_transactions", "sol_slots"];
+///
+/// `sol_token_balances` (migration 0043) IS here although the launchpad
+/// decoder is what fills it: it is a `sol_*` table of observations at a
+/// slot, and since round 4 it is tombstoned by a purge like every other
+/// child (see `pipeline::solana_store::SOL_TOKEN_BALANCES`).
+pub const BASE_TABLES: &[&str] = &[
+    "sol_dex_swaps",
+    "sol_transactions",
+    "sol_token_balances",
+    "sol_slots",
+];
 
 /// Block scoped SHARED tables this module also writes, children first.
 ///

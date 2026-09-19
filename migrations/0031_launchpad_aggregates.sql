@@ -55,7 +55,7 @@ ORDER BY (chain, token, emitter, bucket, epoch);
 CREATE MATERIALIZED VIEW IF NOT EXISTS launchpad_candles_1m_mv
 TO launchpad_candles_1m AS
 WITH
-  token_amount != 0 AND quote_amount != 0 AS priced,
+  token_amount != 0 AND quote_amount != 0 AND abs(toFloat64(token_amount)) >= 1000 AND abs(toFloat64(quote_amount)) >= 1000 AS priced,
   toFloat64(quote_amount) / toFloat64(token_amount) AS price,
   (block_number, tx_index, ordinal) AS position
 SELECT
@@ -104,7 +104,7 @@ ORDER BY (chain, token, emitter, bucket, epoch);
 CREATE MATERIALIZED VIEW IF NOT EXISTS launchpad_candles_1h_mv
 TO launchpad_candles_1h AS
 WITH
-  token_amount != 0 AND quote_amount != 0 AS priced,
+  token_amount != 0 AND quote_amount != 0 AND abs(toFloat64(token_amount)) >= 1000 AND abs(toFloat64(quote_amount)) >= 1000 AS priced,
   toFloat64(quote_amount) / toFloat64(token_amount) AS price,
   (block_number, tx_index, ordinal) AS position
 SELECT

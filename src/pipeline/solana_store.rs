@@ -43,37 +43,26 @@ use serde::{Deserialize, Serialize};
 /// The commit marker: Solana's `blocks`.
 pub const COMMIT_MARKER: &str = "sol_slots";
 
-/// `sol_token_balances` is written by the Solana flush and is deliberately
-/// NEITHER a purge child NOR a seeded version table. Both would be wrong,
-/// for the same reason.
+/// `sol_token_balances` is an ORDINARY block scoped child of the Solana
+/// flush: it is tombstoned by a purge and it seeds the version counter,
+/// like `sol_dex_swaps` or `launchpad_trades`.
 ///
-/// Its `_version` is **the POSITION** - `(slot, tx_index)` packed - not the
-/// flush's clock. `SolLaunchpadRows::set_version` skips it on purpose, so
-/// that "the newest observation of an account wins a merge on its own and a
-/// replayed range cannot move a balance backwards". It is a latest-value
-/// projection keyed on `(chain, mint, owner, account)`, not an append log.
+/// It was neither, because its `_version` used to be the POSITION -
+/// `(slot, tx_index)` packed - of a latest-value projection, which a
+/// tombstone (a unix-millisecond clock, ~1.8e12, against a position
+/// ~1.7e18) could never outrank, and which would have pushed the global
+/// version counter to the position had it seeded it. Review round 4
+/// (MAJOR 12) showed what that cost: a purge could not correct a wrong
+/// balance at all, and the suggested repair - a tombstone in position
+/// space - cannot work either, because the re-stream that follows a gap
+/// heal writes the same observations at the same positions and would be
+/// outranked by that very tombstone
+/// (`a_position_space_tombstone_cannot_survive_the_re_stream`).
 ///
-/// Two consequences, both found by
-/// `a_flush_killed_before_the_commit_marker_is_healed_on_restart` on a real
-/// ClickHouse:
-///
-/// * **It cannot be tombstoned.** A tombstone carries `db::next_version()`,
-///   a unix-millisecond clock around 1.8e12; a position is around 1.7e18.
-///   The tombstone loses the `ReplacingMergeTree` merge every time, so
-///   `tombstone_children` would never see zero live rows and the purge
-///   would fail with `TombstonesNotConverging`.
-/// * **It must not seed the version counter.** `Database::seed_version`
-///   takes `max(_version)` over the tables it is given to stop a host whose
-///   clock stepped back from undercutting stored rows. Fed a POSITION it
-///   pushes the global counter to ~1.7e18, and every later purge then
-///   stamps tombstones that outrank the positions of the rows the
-///   re-stream writes - which is exactly how the healed index came out
-///   missing its newest balances.
-///
-/// Nothing is lost by leaving it out: the range is always re-streamed after
-/// a gap heal, and re-observing an account's balance is precisely how this
-/// table is meant to be corrected. See the note to `solana-launchpads` in
-/// the final report.
+/// The table is now an append log of observations whose sorting key ends
+/// in the position, so the flush clock is free to be the version and
+/// everything here is the default path. The constant is kept because the
+/// acceptance suite names the table.
 pub const SOL_TOKEN_BALANCES: &str = "sol_token_balances";
 
 /// Every block scoped table a Solana flush writes EXCEPT the commit
@@ -91,9 +80,9 @@ pub const SOL_TOKEN_BALANCES: &str = "sol_token_balances";
 ///
 /// `sol_tokens`, `sol_launchpad_configs` and `sol_dex_programs` are NOT
 /// here: they are chain state, exactly like the EVM `tokens` table. A
-/// mint's decimals and a curve config do not change with a fork. Neither
-/// is `sol_token_balances`, for a sharper reason - see the note on
-/// [`SOL_TOKEN_BALANCES`].
+/// mint's decimals and a curve config do not change with a fork.
+/// `sol_token_balances` IS here, through `svm::BASE_TABLES` - it used not
+/// to be, see the note on [`SOL_TOKEN_BALANCES`].
 pub fn child_tables() -> Vec<&'static str> {
     let mut tables: Vec<&'static str> = svm::SHARED_BASE_TABLES.to_vec();
     tables.extend(
@@ -149,9 +138,6 @@ pub fn versioned_tables() -> Vec<&'static str> {
     tables.push("sol_tokens");
     tables.push("sol_launchpad_configs");
     tables.push("checkpoints");
-    // NOT `sol_token_balances`: see the note on [`SOL_TOKEN_BALANCES`].
-    // Its `_version` is a position, and seeding a clock from it poisons
-    // every later purge.
 
     // `sol_dex_programs` is deliberately NOT here although the flush can
     // write it. `Database::seed_version` reads
@@ -1029,6 +1015,7 @@ mod tests {
                 // The sol_* DEX tables, marker excluded.
                 "sol_dex_swaps",
                 "sol_transactions",
+                "sol_token_balances",
             ]
         );
         // Children before the marker, exactly as the purge tombstones and
@@ -1059,11 +1046,12 @@ mod tests {
                 "{table}"
             );
         }
-        // ... but NOT the holder projection, whose `_version` is a
-        // position: a clock-versioned tombstone could never win against
-        // it, and the purge would fail to converge.
-        assert!(!children.contains(&SOL_TOKEN_BALANCES));
-        assert!(!versioned_tables().contains(&SOL_TOKEN_BALANCES));
+        // The holder log included. It was excluded while its `_version`
+        // was a position - a clock-versioned tombstone could never have
+        // won against one - and that is exactly what made a wrong balance
+        // uncorrectable (review round 4, MAJOR 12).
+        assert!(children.contains(&SOL_TOKEN_BALANCES));
+        assert!(versioned_tables().contains(&SOL_TOKEN_BALANCES));
     }
 
     /// The side tables of the SHARED launchpad tables are fed by views

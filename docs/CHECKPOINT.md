@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 10:45 (America/Mexico_City)
+**Last updated:** 2026-09-19 13:40 (America/Mexico_City)
 
 ## Where things are
 
@@ -37,7 +37,9 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 |---|---|---|---|---|
 | module-followups | DONE, merged e49d01c | - | dex flaky test 30/30 after the harness fix; launchpads rebuild excludes the purged range | - |
 | layout | DONE, merged 1271be1 | - | one code layout (feature modules); `tests/layout.rs` enforces it; 737 unit + 106 database tests green | - |
-| fix-a / fix-b / fix-d | Opus | worktrees (`git worktree list`) | review round 4 fixes: A Solana pipeline, B core pipeline, D Solana decoder. Shared rules: scratchpad `handoff/round4-common.md`. fix-c (SQL + Solana flush latency) is QUEUED: launch when the first one finishes (max 3 agents at a time) | commits per milestone + tirith notes |
+| fix-a, fix-b, fix-d | DONE, merged + pushed | - | review round 4: all 3 BLOCKERS + majors 3-10, M4-M9 fixed. Gate on the merged tree: 772 unit, database suites 116/116 (lead script: scratchpad `lead-gate.sh`, URL must be `http://default@host:port/<name>_test`) | - |
+| fix-c | Opus | worktree | SQL majors 11-13 + minors + Solana flush latency (measure first). Task 13d85b82 | commits + tirith notes |
+| fleet | Opus | worktree | design 15: `indexer fleet` + `src/admin` control panel. Tasks 3800c9b6, a03ba984. NEEDS an independent security review of src/admin before merge | commits + tirith notes |
 | review-e | DONE | - | review round 4: 2 BLOCKER + 11 MAJOR + 11 MINOR; full report committed as `docs/review-round-4.md` (paths are PRE-refactor, snapshot 8c23e33) | - |
 
 MAIN TREE IS CLEAN and pushed (HEAD 8c23e33+). EVERYTHING BELOW IS MERGED: HyperSync ingest,
@@ -54,6 +56,8 @@ CI on PR #16 has been green on every completed run since the pipeline wiring lan
 
 ## Still to do, in order
 
+-1. FOLLOW-UP ROUND after fix-c merges (one Opus engineer, Solana pipeline files): (a) `src/pipeline/solana.rs` has the same destructive stale-span drain fix-b fixed for EVM (MAJOR 3 twin) and no restart recovery - reuse `Database::stale_flush_ranges`; (b) `solana_store::timestamp_span` must ignore zero timestamps like the EVM store; (c) LEAD DECISION: `solana_verify` must report a pending repair as a problem, same as EVM verify; (d) `tombstone_until_gone` stopping on the first zero-count attempt (other half of MAJOR 7, src/reorg); (e) a discriminating test for MAJOR 9 (test-only stale-read hook). Then a short re-review (Opus, read-only) of all round 4 fixes.
+
 0. NEW OWNER REQUEST (2026-09-19): one process syncing many chains + a password protected
    HTML control panel. Designed in `docs/design.md` section 15 (`indexer fleet`, `src/admin`).
    Two tirith tasks exist. Build AFTER fix-b merges (both touch `src/pipeline/mod.rs`), Opus,
@@ -68,12 +72,21 @@ CI on PR #16 has been green on every completed run since the pipeline wiring lan
    whole Solana path (`src/svm/**`, `src/source/solana.rs`, `src/pipeline/solana*.rs`),
    the SQL fixes. Route findings to fresh Opus engineers.
 3. Known open items (tirith tasks exist):
-   - Solana flush latency went from ~50 ms to 0.6-5.9 s once launchpad tables + their ten
-     MVs joined the flush; `sol_token_balances` is `PARTITION BY chain` (one partition for
-     all of Solana, merged on every insert) - prime suspect. Fix BEFORE any history backfill.
-   - `sol_token_balances` uses the POSITION as `_version`: it is excluded from tombstoning
-     and from `Database::seed_version` (a clock version can never outrank it). Confirm the
-     design is sound in review round 4.
+   - ~~Solana flush latency~~ MEASURED (fix-c, round 4). `svm::profile::flush_cost_per_table`
+     is the benchmark: fresh ClickHouse, the real insert path, per-table timings, batch size
+     and flush count from `FLUSH_BENCH_COPIES` / `FLUSH_BENCH_FLUSHES`. At the DEFAULT
+     `--flush-rows 100000` a flush costs ~250 ms on an M-series laptop with a local server,
+     flat over 400 consecutive flushes and linear in rows (~2.5 us/row), so the 0.6-5.9 s
+     seen live is that same cost on a loaded host - not a pathology. WHERE it goes:
+     `sol_dex_swaps` 158 ms of the 250 (its three candle MVs are 105 ms of that, measured
+     against a view-free copy of the table), `launchpad_trades` 39 ms (its five views 26 ms),
+     everything else under 15 ms. The PRIME SUSPECT IS WRONG: `sol_token_balances`
+     partitioned by chain and partitioned by month cost the same 14 ms for the same rows.
+     The lever, if the flush ever has to be cheaper, is the candle MVs (chain 1h/1d off the
+     1m table instead of re-reading the swap block three times) or a smaller `--flush-rows`;
+     both are design decisions, neither was taken.
+   - ~~`sol_token_balances` uses the POSITION as `_version`~~ FIXED (round 4, MAJOR 12): it
+     is an append log of observations now, an ordinary purge child and seeded version table.
    - The sink's queue of flush spans that raced another process's purge is in memory only
      (task 5e52af12): persist it or verify the days of the newest `reorgs` rows at startup.
    - Solana history backfill driver (blocked on OWNER DECISION: Envio Starter $70 for one
