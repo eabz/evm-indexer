@@ -411,7 +411,8 @@ pub fn tables_with_columns(sql: &str) -> Vec<(String, Vec<String>)> {
 
 /// Names of the tables created in `sql` that have a block number column
 /// (`block_number`, or `number` for `blocks`), in file order. Every one of
-/// them must be listed in a `BLOCK_SCOPED_TABLES`.
+/// them must be listed in its module's `BASE_TABLES` or `SIDE_TABLES`,
+/// which each module's own unit test asserts.
 pub fn tables_with_block_number(sql: &str) -> Vec<String> {
     tables_with_columns(sql)
         .into_iter()

@@ -11,8 +11,10 @@ thread. Delete it in the end-of-project cleanup.
   (owner authorised pushing freely; push only after a green local gate: build, clippy
   `-D warnings`, fmt, tests). CI is red until the pipeline wiring compiles.
 - Binding design: `docs/design.md` (never call the project "v3"). Code layout decision:
-  feature modules (section 12); the move of `src/db/models` -> `src/core` is a dedicated
-  refactor AFTER the pipeline wiring lands.
+  feature modules (section 12). The refactor is DONE: `src/core` is the core data
+  module, `src/utils` no longer exists, `src/db` is infrastructure only, and
+  `tests/layout.rs` fails if any of that is undone. Section 12 describes the tree as it
+  now is, not as a plan.
 - Coordination board: tirith daemon for this repo on **port 7480**
   (`tirith --url http://127.0.0.1:7480/mcp status | task list | decision list | message list`).
   If it is down: `nohup tirith serve --root <repo> --bind 127.0.0.1:7480 --no-tray &`.
@@ -36,7 +38,7 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
 | module-followups | DONE, merged e49d01c | - | dex flaky test 30/30 after the harness fix; launchpads rebuild excludes the purged range | - |
-| layout | Opus | worktree (see `git worktree list`) | THE layout refactor (design 12): `src/db/models` -> `src/core`, `src/utils` gone, `src/db` infrastructure only; small commits, no behaviour change. NOBODY ELSE MAY EDIT CODE until it is merged | one commit per move + tirith notes |
+| layout | Opus | worktree (see `git worktree list`) | THE layout refactor (design 12): DONE, 10 commits, waiting to be merged. `src/db/models` -> `src/core/models`, `src/utils` gone, `src/db` infrastructure only, `src/source/{evm,solana}.rs`, `tests/layout.rs` pins it. NOBODY ELSE MAY EDIT CODE until it is merged | one commit per move + tirith notes |
 | review-e | Opus | read-only (reads snapshot 8c23e33) | review round 4: bounded validity rule, hardening rounds, whole Solana path, SQL fixes | findings to `lead` on tirith |
 
 MAIN TREE IS CLEAN and pushed (HEAD 8c23e33+). EVERYTHING BELOW IS MERGED: HyperSync ingest,
@@ -53,8 +55,15 @@ CI on PR #16 has been green on every completed run since the pipeline wiring lan
 
 ## Still to do, in order
 
-1. Merge the layout refactor when it reports (validate, real `git merge`, remove worktree).
-   Review round 4 findings will cite PRE-refactor paths (snapshot 8c23e33): map them.
+1. Merge the layout refactor (it has reported; validate, real `git merge`, remove the
+   worktree). Review round 4 findings cite PRE-refactor paths (snapshot 8c23e33): map
+   them with the table in the layout engineer's report - `crate::db::models::` ->
+   `crate::core::models::`, `crate::utils::format::` -> `crate::db::format::`,
+   `crate::utils::{events,convert}::` -> `crate::core::{events,convert}::`,
+   `db::{BASE,SIDE}_TABLES` -> `core::{BASE,SIDE}_TABLES`, `db::derived::CORE_DERIVED`
+   -> `core::CORE_DERIVED`, `db::RowBatch` -> `core::RowBatch`, `Database::store`
+   -> `core::store`, `src/source/mod.rs` -> `src/source/evm.rs`, the Solana candle
+   aggregates -> `src/svm/derived.rs`.
 2. Review round 4 (independent, read-only, Opus): hardening rounds 1+2 (bounded validity
    rule, side-table repair, checkpoint compaction, month-split flush, lease fencing), the
    whole Solana path (`src/svm/**`, `src/source/solana.rs`, `src/pipeline/solana*.rs`),
@@ -73,17 +82,14 @@ CI on PR #16 has been green on every completed run since the pipeline wiring lan
      `sol_tokens.program` overwrite, DBC/LaunchLab graduations name no destination pool.
    - Predictions: market-list cost only partly bounded (needs `market_id` denormalised onto
      `prediction_trades`); four.meme launchpad family not built.
-4. Layout refactor to feature modules (design section 12): `src/db/models` -> `src/core`,
-   `src/utils` gone, `src/db` infrastructure only. Mechanical, no behaviour change, ONE
-   engineer, nobody else editing at the same time. Task 59f32d7e.
-5. Final combined gate: all unit tests + ALL database tests (fresh ClickHouse per suite).
-6. Live end-to-end run of the FINAL binary with zero flags on an EVM chain (DEX rows +
+4. Final combined gate: all unit tests + ALL database tests (fresh ClickHouse per suite).
+5. Live end-to-end run of the FINAL binary with zero flags on an EVM chain (DEX rows +
    token metadata through `--rpc auto`), tune the HyperSync `StreamConfig`; and Solana
    next to it in the same database.
-7. Docs final pass: README (Solana operator section exists from solana-run; check flag
+6. Docs final pass: README (Solana operator section exists from solana-run; check flag
    table vs `src/configs`), compose example with a Solana service, CI integration filter
    should include predictions/launchpads/svm/pipeline acceptance suites.
-8. END cleanup (owner request): delete research docs (`perps-research.md`,
+7. END cleanup (owner request): delete research docs (`perps-research.md`,
    `launchpads-research.md`, `solana-research.md`, `data-model-proposals.md`) and this file
    after folding their DECISIONS into `docs/design.md`; `docs/` keeps decisions only.
 OWNER DECISIONS WAITING (tirith task 115edb17): Envio $70 month for the Solana backfill;
