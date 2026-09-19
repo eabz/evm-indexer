@@ -36,6 +36,7 @@ use crate::{
             pool_id_of, DexLiquidity, DexPool, DexSwap, PoolSource,
             Protocol,
         },
+        block_column, purge_filter,
         sql::{reorg_prerequisites, statements, CHAINS_SQL, MIGRATIONS},
         tombstone_sql, DexRows, BASE_TABLES, DEX_DERIVED, SIDE_TABLES,
     },
@@ -157,6 +158,12 @@ impl TestDb {
                 values.join(", ")
             ))
             .await;
+            self.await_visible(
+                "dex_swaps",
+                rows.swaps[0]._version,
+                rows.swaps.len(),
+            )
+            .await;
         }
 
         if !rows.liquidity.is_empty() {
@@ -166,6 +173,12 @@ impl TestDb {
                 "INSERT INTO dex_liquidity ({LIQUIDITY_COLUMNS}) VALUES {}",
                 values.join(", ")
             ))
+            .await;
+            self.await_visible(
+                "dex_liquidity",
+                rows.liquidity[0]._version,
+                rows.liquidity.len(),
+            )
             .await;
         }
 
@@ -177,6 +190,39 @@ impl TestDb {
                 values.join(", ")
             ))
             .await;
+            self.await_visible(
+                "dex_pools",
+                rows.pools[0]._version,
+                rows.pools.len(),
+            )
+            .await;
+        }
+    }
+
+    /// Waits until the `rows` just written at `version` are all readable.
+    ///
+    /// ClickHouse 25.12 has no read-your-writes ([`SETTLE`]), so a read
+    /// issued right after an acknowledged INSERT can miss the new part.
+    /// Every row batch of this harness carries its own `_version`
+    /// (`next_version` is strictly increasing), which makes the count
+    /// exact and unaffected by what other chains write meanwhile.
+    async fn await_visible(&self, table: &str, version: u64, rows: usize) {
+        let sql = format!(
+            "SELECT count() FROM {table} WHERE _version = {version}"
+        );
+        let started = std::time::Instant::now();
+
+        loop {
+            let seen = self.count(&sql).await;
+            if seen >= rows as u64 {
+                return;
+            }
+            assert!(
+                started.elapsed() < SETTLE,
+                "{table}: only {seen} of {rows} rows of version \
+                 {version} became visible"
+            );
+            tokio::time::sleep(RETRY).await;
         }
     }
 
@@ -1910,6 +1956,69 @@ async fn dust_swaps_do_not_make_prices() {
 /// Exclusive upper bound of every rebuild of the tests.
 const REBUILD_TO: u32 = DAY + 40 * 86_400;
 
+/// How long a read is given to catch up with an acknowledged INSERT.
+///
+/// ClickHouse 25.12 has no read-your-writes: measured on this build, 3 %
+/// of the reads issued right after an acknowledged INSERT miss the new
+/// part, and heal within milliseconds (docs/design.md §2, "No
+/// read-your-writes"). Every read that decides what to write next - and
+/// every final comparison - is therefore repeated until it settles.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Between two attempts of a settling read.
+const RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Tombstones `table` from `fork_block` on, and keeps re-issuing the
+/// tombstone until no live row of the range is left.
+///
+/// One `INSERT .. SELECT` is not enough: the SELECT can miss rows that a
+/// just-acknowledged INSERT wrote, and the survivors would then be
+/// counted by every reader for ever. This is exactly what
+/// `reorg::Purger::tombstone_until_gone` does in production, and what
+/// `db::integration_tests::tombstone` does in its harness.
+async fn tombstone_until_gone(
+    database: &TestDb,
+    table: &str,
+    chain: u64,
+    fork_block: u64,
+) {
+    let column = block_column(table);
+    let mut live = format!(
+        "SELECT count() FROM {table} FINAL \
+         WHERE chain = {chain} AND {column} >= {fork_block}"
+    );
+    // The tombstone carries the same extra predicate, so the count must
+    // too - otherwise a row it deliberately spares never lets it stop.
+    if let Some(filter) = purge_filter(table) {
+        live.push_str(&format!(" AND {filter}"));
+    }
+
+    let started = std::time::Instant::now();
+
+    loop {
+        database
+            .execute(&tombstone_sql(
+                table,
+                chain,
+                fork_block,
+                None,
+                next_version(),
+            ))
+            .await;
+
+        let alive = database.count(&live).await;
+        if alive == 0 {
+            return;
+        }
+
+        assert!(
+            started.elapsed() < SETTLE,
+            "{table}: {alive} rows survive their tombstones"
+        );
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
 /// What `purge_range` does to the DEX tables, in its order (docs/design.md
 /// §2): tombstone the base tables from `fork_block` on, record the reorg,
 /// repair every aggregate under the new epoch (month by month). Only
@@ -1921,14 +2030,8 @@ async fn purge(
     new_epoch: u32,
     from_ts: u32,
 ) {
-    let version = next_version();
-
     for table in BASE_TABLES {
-        database
-            .execute(&tombstone_sql(
-                table, chain, fork_block, None, version,
-            ))
-            .await;
+        tombstone_until_gone(database, table, chain, fork_block).await;
     }
 
     // `to_ts`: the exclusive end of the window this repair covers. It
@@ -1989,6 +2092,56 @@ async fn visible_state(
     }
 
     state
+}
+
+type State = Vec<(String, Vec<String>)>;
+
+/// Reads `chain` out of both databases until the two agree, then asserts
+/// on the last pair read.
+///
+/// Either side can be short for a few milliseconds after the inserts that
+/// filled it ([`SETTLE`]), so a single read of each would fail about one
+/// run in ten with a row count off by one or two. Returns the settled
+/// `(actual, expected)` pair, so a caller that needs either of them does
+/// not read it a third time (and short) right afterwards.
+async fn assert_same_state_eventually(
+    database: &TestDb,
+    clean: &TestDb,
+    chain: u64,
+    what: &str,
+) -> (State, State) {
+    let started = std::time::Instant::now();
+
+    loop {
+        let actual = visible_state(database, chain).await;
+        let expected = visible_state(clean, chain).await;
+
+        if actual == expected || started.elapsed() >= SETTLE {
+            assert_same_state(&actual, &expected, what);
+            return (actual, expected);
+        }
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
+/// The same, against a state read earlier instead of a second database.
+async fn assert_state_settles_to(
+    database: &TestDb,
+    chain: u64,
+    expected: &[(String, Vec<String>)],
+    what: &str,
+) -> State {
+    let started = std::time::Instant::now();
+
+    loop {
+        let actual = visible_state(database, chain).await;
+
+        if actual == expected || started.elapsed() >= SETTLE {
+            assert_same_state(&actual, expected, what);
+            return actual;
+        }
+        tokio::time::sleep(RETRY).await;
+    }
 }
 
 fn assert_same_state(
@@ -2158,10 +2311,13 @@ async fn a_reorg_leaves_exactly_a_clean_index() {
     let canonical = [block_100(), canonical_tail()].concat();
     assert_eq!(insert_logs(&clean, CHAIN, &canonical, 0).await, 6);
 
-    let after = visible_state(&database, CHAIN).await;
-    let expected = visible_state(&clean, CHAIN).await;
-
-    assert_same_state(&after, &expected, "after the reorg");
+    let (after, expected) = assert_same_state_eventually(
+        &database,
+        &clean,
+        CHAIN,
+        "after the reorg",
+    )
+    .await;
     assert!(before != after);
 
     // Spot checks by hand: 101/3 carries the NEW amounts, the day candle
@@ -2208,8 +2364,13 @@ async fn a_reorg_leaves_exactly_a_clean_index() {
         0
     );
     insert_logs(&database, CHAIN, &canonical, 2).await;
-    let again = visible_state(&database, CHAIN).await;
-    assert_same_state(&again, &expected, "after the second reorg");
+    assert_state_settles_to(
+        &database,
+        CHAIN,
+        &expected,
+        "after the second reorg",
+    )
+    .await;
 
     clean.drop().await;
     database.drop().await;
@@ -2473,9 +2634,13 @@ async fn eight_chains_reorg_concurrently_on_the_same_tables() {
     }
 
     for chain in 1..=CONCURRENT_CHAINS {
-        let actual = visible_state(&database, chain).await;
-        let expected = visible_state(&clean, chain).await;
-        assert_same_state(&actual, &expected, &format!("chain {chain}"));
+        assert_same_state_eventually(
+            &database,
+            &clean,
+            chain,
+            &format!("chain {chain}"),
+        )
+        .await;
 
         // By hand: 11 scenario swaps + one canonical swap per round.
         assert_eq!(
@@ -2643,8 +2808,8 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
     let before = visible_state(&database, CHAIN).await;
     purge(&database, CHAIN, 1_000, 1, DAY).await;
     check(&database).await;
-    let after = visible_state(&database, CHAIN).await;
-    assert_same_state(&after, &before, "after the rebuild");
+    assert_state_settles_to(&database, CHAIN, &before, "after the rebuild")
+        .await;
 
     database.drop().await;
 }
