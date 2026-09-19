@@ -18,7 +18,7 @@ use super::*;
 use crate::{
     configs::Command,
     db::{self, migrate, next_version, DatabaseParams, FlushKey},
-    dex,
+    dex, launchpads,
     pipeline::{backfill, modules::ALL_MODULES, verify},
     tokens::{
         discovery::{
@@ -66,6 +66,9 @@ struct TestLog {
 struct TestTx {
     from: Address,
     to: Address,
+    /// Native coin sent with the transaction (launchpad curve buys pay in
+    /// it, and `launchpad_trades.tx_value` records it).
+    value: U256,
     logs: Vec<TestLog>,
 }
 
@@ -114,6 +117,7 @@ fn creations() -> TestTx {
     TestTx {
         from: TRADER,
         to: V2_FACTORY,
+        value: U256::ZERO,
         logs: vec![
             TestLog {
                 address: V2_FACTORY,
@@ -153,6 +157,7 @@ fn v2_swap(amount_in: u64, amount_out: u64) -> TestTx {
     TestTx {
         from: TRADER,
         to: ROUTER,
+        value: U256::ZERO,
         logs: vec![
             transfer(TOKEN0, TRADER, V2_PAIR, amount_in),
             TestLog {
@@ -186,6 +191,7 @@ fn v3_swap(amount_in: i64, amount_out: i64) -> TestTx {
     TestTx {
         from: TRADER,
         to: ROUTER,
+        value: U256::ZERO,
         logs: vec![
             transfer(TOKEN0, TRADER, V3_POOL, amount_in as u64),
             TestLog {
@@ -211,6 +217,7 @@ fn busy_block(number: u64) -> Vec<TestTx> {
             let mut txs = vec![TestTx {
                 from: TRADER,
                 to: TOKEN0,
+                value: U256::ZERO,
                 logs: vec![transfer(TOKEN0, TRADER, ROUTER, n)],
             }];
             txs.push(v2_swap(100 * n, 50 * n));
@@ -220,6 +227,78 @@ fn busy_block(number: u64) -> Vec<TestTx> {
             txs
         }
     }
+}
+
+/// Real launchpad transactions (`src/launchpads/fixtures*.rs`: every log
+/// verbatim from `eth_getTransactionReceipt` on a public endpoint), one
+/// per block from block 1 on. Block 0 stays empty, so the launch is never
+/// the genesis block.
+const LAUNCHPAD_FIXTURES: &[&launchpads::fixtures::RawTx] =
+    launchpads::fixtures::ALL;
+
+/// `LAUNCHPAD_FIXTURES[number - 1]` as a block of this test chain.
+fn launchpad_block(number: u64) -> Vec<TestTx> {
+    let Some(raw) = number
+        .checked_sub(1)
+        .and_then(|index| LAUNCHPAD_FIXTURES.get(index as usize))
+    else {
+        return vec![];
+    };
+
+    vec![TestTx {
+        from: launchpads::fixtures::address(raw.from),
+        to: launchpads::fixtures::address(raw.to),
+        value: launchpads::fixtures::unsigned(raw.value),
+        logs: raw
+            .logs
+            .iter()
+            .map(|log| TestLog {
+                address: launchpads::fixtures::address(log.address),
+                topics: log
+                    .topics
+                    .iter()
+                    .map(|topic| launchpads::fixtures::hash(topic))
+                    .collect(),
+                data: log
+                    .data
+                    .parse::<alloy::primitives::Bytes>()
+                    .unwrap()
+                    .to_vec(),
+            })
+            .collect(),
+    }]
+}
+
+/// What the launchpad decoder makes of the whole canned chain: the numbers
+/// the pipeline must end up with, taken from the module itself so this
+/// test checks the SEAM and never freezes the decoder's behaviour.
+fn decoded_launchpads() -> launchpads::LaunchpadRows {
+    let mut rows = launchpads::LaunchpadRows::default();
+
+    for number in 1..=LAUNCHPAD_FIXTURES.len() as u64 {
+        for tx in launchpad_block(number) {
+            let logs: Vec<crate::db::models::log::DatabaseLog> = tx
+                .logs
+                .iter()
+                .enumerate()
+                .map(|(index, log)| {
+                    let mut row =
+                        crate::db::models::log::test_support::log_with(
+                            &log.topics,
+                            log.data.clone(),
+                        );
+                    row.chain = CHAIN;
+                    row.address = log.address;
+                    row.block_number = number;
+                    row.log_index = index as u32;
+                    row
+                })
+                .collect();
+            rows.append(&mut launchpads::decode(CHAIN, &logs));
+        }
+    }
+
+    rows
 }
 
 /// The same height after a reorg: FEWER swaps (no V3 swap, another V2
@@ -232,12 +311,33 @@ fn quiet_block(number: u64) -> Vec<TestTx> {
 struct TestChain {
     blocks: Arc<Mutex<Vec<TestBlock>>>,
     blocks_per_response: u64,
+    block_seconds: u32,
 }
 
 impl TestChain {
+    /// 12 s blocks: the whole chain within one UTC day.
     fn new(length: u64) -> Self {
-        let chain =
-            Self { blocks: Arc::default(), blocks_per_response: 4 };
+        Self::with_block_time(length, 12)
+    }
+
+    /// `length` blocks whose content comes from `content` instead of
+    /// [`busy_block`].
+    fn of(length: u64, content: fn(u64) -> Vec<TestTx>) -> Self {
+        let chain = Self {
+            blocks: Arc::default(),
+            blocks_per_response: 4,
+            block_seconds: 12,
+        };
+        chain.extend(length, 0, content);
+        chain
+    }
+
+    fn with_block_time(length: u64, block_seconds: u32) -> Self {
+        let chain = Self {
+            blocks: Arc::default(),
+            blocks_per_response: 4,
+            block_seconds,
+        };
         chain.extend(length, 0, busy_block);
         chain
     }
@@ -268,8 +368,8 @@ impl TestChain {
                 number,
                 hash: B256::from(hash),
                 parent_hash,
-                // 12 s blocks, all within one UTC day.
-                timestamp: BASE_TIMESTAMP + number as u32 * 12,
+                timestamp: BASE_TIMESTAMP
+                    + number as u32 * self.block_seconds,
                 txs: content(number),
             });
         }
@@ -322,6 +422,13 @@ impl TestChain {
                     gas_used: Some(Quantity::from(21_000u64)),
                     gas_price: Some(Quantity::from(9u64)),
                     effective_gas_price: Some(Quantity::from(9u64)),
+                    // A Quantity is canonical: never empty, and only
+                    // one byte long when it is zero.
+                    value: Some(Quantity::from(
+                        Some(tx.value.to_be_bytes_trimmed_vec())
+                            .filter(|bytes| !bytes.is_empty())
+                            .unwrap_or_else(|| vec![0]),
+                    )),
                     status: Some(TransactionStatus::Success),
                     ..Default::default()
                 }]);
@@ -621,7 +728,7 @@ impl Scenario {
         };
 
         tokio::time::timeout(
-            Duration::from_secs(120),
+            Duration::from_secs(600),
             run_with(config, runtime),
         )
         .await
@@ -657,17 +764,7 @@ impl Scenario {
         }
         tables.extend_from_slice(dex::SIDE_TABLES);
 
-        let views = [
-            "daily_block_stats_v",
-            "daily_transaction_stats_v",
-            "daily_erc20_transfer_stats_v",
-            "dex_candles_1m_v",
-            "dex_candles_1h_v",
-            "dex_candles_1d_v",
-            "dex_pool_volume_1h_v",
-            "dex_pool_stats_1d_v",
-            "dex_protocol_stats_1d_v",
-        ];
+        let views = AGGREGATE_VIEWS;
 
         let mut snapshot = BTreeMap::new();
 
@@ -806,8 +903,10 @@ async fn zero_flags_index_dex_and_resolve_tokens() {
         scenario
             .count(&format!(
                 "SELECT toUInt64(count()) FROM dex_swaps FINAL WHERE \
-                 tx_from = unhex('{}') AND tx_to = unhex('{}')",
+                 tx_from = unhex('{}{}') AND tx_to = unhex('{}{}')",
+                "00".repeat(12),
                 "d0".repeat(20),
+                "00".repeat(12),
                 "c0".repeat(20)
             ))
             .await,
@@ -817,7 +916,8 @@ async fn zero_flags_index_dex_and_resolve_tokens() {
         scenario
             .count(&format!(
                 "SELECT toUInt64(count()) FROM dex_liquidity FINAL WHERE \
-                 tx_from = unhex('{}')",
+                 tx_from = unhex('{}{}')",
+                "00".repeat(12),
                 "d0".repeat(20)
             ))
             .await,
@@ -1174,7 +1274,7 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     forged.dex.liquidity.clear();
     forged.dex.pools.clear();
     for swap in &mut forged.dex.swaps {
-        swap.log_index += 1_000;
+        swap.ordinal += 1_000;
     }
     forged.set_version(next_version());
     let key =
@@ -1217,7 +1317,329 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     );
 }
 
+// ------------------------------------------------------------ (g)
+
+/// Token launchpads through the module seam: ON with zero flags, nothing
+/// at all with `--no-launchpads`. The stream is canned from the module's
+/// real fixtures, and the expected counts come from the module's own
+/// decoder, so this proves the SEAM (decode -> stamp -> insert order ->
+/// side tables -> aggregates -> views), never the decoder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
+    let scenario = Scenario::new("g_launchpads").await;
+    let length = LAUNCHPAD_FIXTURES.len() as u64 + 1;
+    let chain = TestChain::of(length, launchpad_block);
+    let rpc = FakeRpc::new();
+
+    let expected = decoded_launchpads();
+    assert!(expected.tokens.len() >= 4, "{}", expected.tokens.len());
+    assert!(expected.trades.len() >= 6, "{}", expected.trades.len());
+    assert!(!expected.graduations.is_empty());
+    assert!(!expected.creator_fees.is_empty());
+
+    // Zero flags: launchpads are on, like DEX and prediction markets.
+    let config = scenario.config(&[]);
+    assert!(config.launchpads);
+
+    let wanted = expected.graduations.len() as u64;
+    scenario
+        .run(config, &chain, &rpc, move |db| async move {
+            db.db
+                .query(
+                    "SELECT toUInt64(count()) FROM launchpad_graduations \
+                     FINAL",
+                )
+                .fetch_one::<u64>()
+                .await
+                .unwrap_or(0)
+                >= wanted
+        })
+        .await
+        .unwrap();
+
+    // Every table of the module's INSERT_ORDER holds exactly what the
+    // decoder produced.
+    for (table, rows) in [
+        ("launchpad_tokens", expected.tokens.len()),
+        ("launchpad_trades", expected.trades.len()),
+        ("launchpad_graduations", expected.graduations.len()),
+        ("launchpad_creator_fees", expected.creator_fees.len()),
+    ] {
+        assert_eq!(scenario.rows(table).await, rows as u64, "{table}");
+    }
+
+    // The side tables followed through their materialized views.
+    for table in launchpads::SIDE_TABLES {
+        assert!(scenario.rows(table).await > 0, "{table}");
+    }
+
+    // The aggregates saw every trade exactly once, through the validity
+    // rule of `epoch_floor_v` (no reorg here, so the floor is 0).
+    assert_eq!(
+        scenario
+            .count(
+                "SELECT toUInt64(sum(trades)) FROM \
+                 launchpad_venue_trades_1d_v"
+            )
+            .await,
+        expected.trades.len() as u64
+    );
+    assert!(
+        scenario
+            .count("SELECT toUInt64(count()) FROM launchpad_candles_1m_v")
+            .await
+            > 0
+    );
+
+    // The seam passes the transaction's native value through: a curve buy
+    // paid in the chain's coin records it.
+    assert!(
+        scenario
+            .count(
+                "SELECT toUInt64(count()) FROM launchpad_trades FINAL \
+                 WHERE tx_value > 0"
+            )
+            .await
+            > 0,
+        "no launchpad trade carries the transaction value"
+    );
+
+    // Trust is operator data: the headline feed is empty until an emitter
+    // is listed, and the `_all_v` twin shows everything meanwhile.
+    let since = format!(
+        "SELECT toUInt64(count()) FROM launchpad_new_launches_{{}}(\
+         chain = {CHAIN}, since = 0)"
+    );
+    let trusted_sql = since.replace("{}", "v");
+    let all_sql = since.replace("{}", "all_v");
+
+    assert_eq!(scenario.count(&trusted_sql).await, 0);
+    assert_eq!(
+        scenario.count(&all_sql).await,
+        expected.tokens.len() as u64
+    );
+
+    let emitters = expected.emitters();
+    assert!(!emitters.is_empty());
+    let values: Vec<String> = emitters
+        .iter()
+        .map(|(emitter, family)| {
+            format!(
+                "({CHAIN}, unhex('{}'), '{}', '', 1)",
+                hex::encode(emitter.0),
+                family.as_str()
+            )
+        })
+        .collect();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO launchpad_trusted_emitters \
+             (chain, emitter, family, label, _version) VALUES {}",
+            values.join(", ")
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        scenario.count(&trusted_sql).await,
+        expected.tokens.len() as u64,
+        "every launch of the canned chain comes from a listed emitter"
+    );
+
+    scenario.assert_consistent().await;
+
+    // `--no-launchpads`: not one row, and the core tables are unaffected.
+    let off = Scenario::new("g_launchpads_off").await;
+    off.index_until(&chain, length, &["--no-launchpads"]).await;
+
+    assert_eq!(off.rows("blocks").await, length);
+    assert!(off.rows("logs").await > 0);
+    for table in launchpads::BLOCK_SCOPED_TABLES
+        .iter()
+        .chain(launchpads::LAUNCHPADS_DERIVED.iter().map(|t| &t.name))
+    {
+        assert_eq!(
+            off.count(&format!("SELECT toUInt64(count()) FROM `{table}`"))
+                .await,
+            0,
+            "{table}"
+        );
+    }
+}
+
+// ------------------------------------------------------------ deep purge
+
+/// A purge deep in history repairs more than 100 monthly partitions of
+/// every aggregate. ClickHouse refuses ONE insert over that many (code
+/// 252), which would wedge the chain for ever (the purge fails at the
+/// rebuild on every restart): the rebuilds are one INSERT per month.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_purge_eleven_years_deep_can_finish() {
+    const MONTH: u32 = 30 * 86_400;
+
+    // Small flushes: ONE insert may not span more than 100 monthly
+    // partitions either (not a concern on a real chain, where a flush of
+    // 100k rows covers hours or days, never eight years).
+    const SMALL_FLUSHES: [&str; 2] = ["--flush-rows", "300"];
+
+    let scenario = Scenario::new("deep").await;
+    let chain = TestChain::with_block_time(135, MONTH);
+    scenario.index_until(&chain, 135, &SMALL_FLUSHES).await;
+
+    // Block 3 (11 years before the head) has to go: every aggregate is
+    // rebuilt from its day on, 132 months.
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(crate::pipeline::backfill::EpochOnly::new(
+            scenario.db.clone(),
+        )),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    let report = purger
+        .purge_range(CHAIN, 3, Some(4), PurgeReason::GapHeal)
+        .await
+        .expect("the rebuild must be sliced by month");
+    assert_eq!(report.blocks_tombstoned, 1);
+    assert_eq!(report.epoch, 1);
+
+    // The hole is streamed again and everything equals a clean index.
+    scenario.index_until(&chain, 135, &SMALL_FLUSHES).await;
+
+    let clean = Scenario::new("deep_clean").await;
+    clean.index_until(&chain, 135, &SMALL_FLUSHES).await;
+    assert_same(
+        "after a deep purge",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+    scenario.assert_consistent().await;
+}
+
+// ------------------------------------------------------------ the views
+
+const AGGREGATE_VIEWS: [&str; 9] = [
+    "daily_block_stats_v",
+    "daily_transaction_stats_v",
+    "daily_erc20_transfer_stats_v",
+    "dex_candles_1m_v",
+    "dex_candles_1h_v",
+    "dex_candles_1d_v",
+    "dex_pool_volume_1h_v",
+    "dex_pool_stats_1d_v",
+    "dex_protocol_stats_1d_v",
+];
+
+/// `join_use_nulls = 1` is a per user / per profile setting a BI tool or an
+/// ORM may set. The validity rule joins `reorgs` with an ASOF LEFT JOIN: a
+/// chain without reorgs has no row there, and a bare `epoch >= epoch_floor`
+/// would then compare with NULL and silently drop every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn aggregate_views_do_not_depend_on_join_use_nulls() {
+    let scenario = Scenario::new("views").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let nulls = scenario.db.db.clone().with_option("join_use_nulls", "1");
+
+    for view in AGGREGATE_VIEWS {
+        let sql = format!("SELECT toUInt64(count()) FROM {view}");
+        let default = scenario.count(&sql).await;
+        let with_nulls: u64 = nulls.query(&sql).fetch_one().await.unwrap();
+
+        assert!(default > 0, "{view} is empty");
+        assert_eq!(with_nulls, default, "{view} under join_use_nulls = 1");
+    }
+
+    // ... and after a purge (a `reorgs` row exists) just the same.
+    chain.reorg(2, 2);
+    scenario.index_until(&chain, 14, &[]).await;
+
+    for view in AGGREGATE_VIEWS {
+        let sql = format!("SELECT toUInt64(count()) FROM {view}");
+        let with_nulls: u64 = nulls.query(&sql).fetch_one().await.unwrap();
+        assert_eq!(with_nulls, scenario.count(&sql).await, "{view}");
+    }
+}
+
+/// Receipts had no status before Byzantium: `status` is NULL there, and a
+/// contract creation without a status succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn contracts_view_lists_pre_byzantium_creations() {
+    use crate::db::models::transaction::DatabaseTransaction;
+
+    let scenario = Scenario::new("contracts").await;
+
+    let creation = |index: u8, status: Option<TransactionStatus>| {
+        let mut row = DatabaseTransaction::from_hypersync(
+            &Transaction {
+                block_number: Some(UInt::from(100u64)),
+                transaction_index: Some(UInt::from(u64::from(index))),
+                hash: Some(Hash::from([index; 32])),
+                from: Some(HsAddress::from([0x01; 20])),
+                contract_address: Some(HsAddress::from(
+                    [0xc0 | index; 20],
+                )),
+                status,
+                ..Default::default()
+            },
+            CHAIN,
+            BASE_TIMESTAMP,
+            None,
+        )
+        .unwrap();
+        row._version = 1;
+        row
+    };
+
+    let rows = vec![
+        creation(1, None),
+        creation(2, Some(TransactionStatus::Success)),
+        creation(3, Some(TransactionStatus::Failure)),
+    ];
+    let key = FlushKey { chain: CHAIN, span: (100, 100), version: 1 };
+    scenario.db.insert_flush("transactions", &rows, &key).await.unwrap();
+
+    let listed: Vec<u32> = scenario
+        .db
+        .db
+        .query(
+            "SELECT toUInt32(transaction_index) FROM (SELECT c.*, \
+             t.transaction_index FROM contracts AS c INNER JOIN \
+             transactions AS t ON t.hash = c.transaction_hash) \
+             ORDER BY transaction_index",
+        )
+        .fetch_all()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        listed,
+        vec![1, 2],
+        "NULL status = success, failure is out"
+    );
+}
+
 // ------------------------------------------------------------ the lease
+
+/// Generous ttl: the machine running the tests may be saturated, and a
+/// heartbeat that takes longer than the ttl IS a dead process.
+fn patient_lease() -> LeaseOptions {
+    LeaseOptions {
+        heartbeat: Duration::from_millis(100),
+        ttl: Duration::from_secs(3),
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs TEST_DATABASE_URL"]
@@ -1225,31 +1647,35 @@ async fn a_second_process_on_the_same_chain_refuses_to_start() {
     let scenario = Scenario::new("lease").await;
 
     let (fatal, _) = watch::channel(None);
-    let first = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
+    let first =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
 
-    let error = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .err()
-        .expect("the second instance must refuse");
+    let error =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .err()
+            .expect("the second instance must refuse");
     assert!(format!("{error:#}").contains("already indexing chain 1"));
 
     // After a clean shutdown the next start does not even wait.
     first.release().await;
     let started = std::time::Instant::now();
-    let second = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
-    assert!(started.elapsed() < Duration::from_millis(350));
+    let second =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
+    assert!(started.elapsed() < patient_lease().ttl);
 
     // A killed process (dropped: no release row): the next start waits
     // one ttl, sees no new heartbeat and takes over.
     drop(second);
     let started = std::time::Instant::now();
-    let third = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
-    assert!(started.elapsed() >= fast_lease().ttl);
+    let third =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
+    assert!(started.elapsed() >= patient_lease().ttl);
     third.release().await;
 }

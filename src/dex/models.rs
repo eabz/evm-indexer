@@ -1,18 +1,35 @@
 //! Rows of the `dex_*` tables (`migrations/0010_dex_tables.sql`).
 //!
 //! Field order is irrelevant (the clickhouse crate inserts by name), field
-//! NAMES must match the columns. Hashes / addresses / amounts go through
+//! NAMES must match the columns. Hashes / ids / amounts go through
 //! the `crate::utils::format` serializers, which write the binary
-//! column types of docs/design.md §1: (`FixedString(32)`, `FixedString(20)`, `UInt256`, `Int256`).
+//! column types of docs/design.md §1 and §13.
+//!
+//! The tables are CHAIN NEUTRAL (docs/design.md §13): every identity column
+//! is a `FixedString(32)` holding an EVM address left padded with 12 zero
+//! bytes, or a 32 byte Solana pubkey. The EVM decoders keep their fields
+//! typed [`Address`] and let [`SerId32`] / [`SerVecId32`] do the padding -
+//! nothing here hand rolls it, and reading a row whose padding is NOT zero
+//! fails loudly instead of truncating a pubkey into an address. Fields that
+//! are natively 32 bytes (`pool_id`: a V4 / Balancer id is not an address)
+//! stay [`B256`] with `SerB256`.
+//!
+//! Position is `(chain, block_number, tx_index, ordinal)` in every table:
+//! `tx_index` is the EVM transaction index, `ordinal` the log index.
+//! `tx_id` is the raw transaction hash in a `String` column, because a
+//! Solana signature is 64 bytes.
 
 use std::{fmt, str::FromStr};
 
-use alloy::primitives::{Address, B256, I256, U256};
+use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use clickhouse::Row;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::{serde_as, DeserializeAs, DisplayFromStr, SerializeAs};
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, DisplayFromStr};
 
-use crate::utils::format::{SerAddress, SerB256, SerI256, SerU256};
+use crate::utils::format::{
+    address_of_id32, id32, SerB256, SerI256, SerId32, SerTxId, SerU256,
+    SerVecId32,
+};
 
 /// Event FAMILY a row was decoded from - never a concrete deployment:
 /// every Uniswap V2 fork on every chain is `uniswap_v2`.
@@ -174,54 +191,27 @@ impl FromStr for LiquidityKind {
     }
 }
 
-/// `Array(FixedString(20))`: every address as 20 raw bytes.
-pub struct SerVecAddress(());
-
-impl SerializeAs<Vec<Address>> for SerVecAddress {
-    fn serialize_as<S>(
-        addresses: &Vec<Address>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let raw: Vec<[u8; 20]> =
-            addresses.iter().map(|address| address.0 .0).collect();
-        raw.serialize(serializer)
-    }
-}
-
-impl<'de> DeserializeAs<'de, Vec<Address>> for SerVecAddress {
-    fn deserialize_as<D>(deserializer: D) -> Result<Vec<Address>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw: Vec<[u8; 20]> = Deserialize::deserialize(deserializer)?;
-        Ok(raw.into_iter().map(Address::from).collect())
-    }
-}
-
 /// The pool id of a pool that IS a contract: its address left padded to
-/// 32 bytes. (V4 and Balancer pools use their native `bytes32` id.)
+/// 32 bytes, the same encoding every identity column uses. (V4 and Balancer
+/// pools use their native `bytes32` id.)
 pub fn pool_id_of(address: Address) -> B256 {
-    address.into_word()
+    id32(address)
 }
 
 /// The contract behind an address-derived pool id, `None` when the upper
-/// 12 bytes are not zero (V4 / Balancer ids).
+/// 12 bytes are not zero (V4 / Balancer ids, Solana pubkeys).
 pub fn pool_address_of(pool_id: B256) -> Option<Address> {
-    pool_id.0[..12]
-        .iter()
-        .all(|byte| *byte == 0)
-        .then(|| Address::from_word(pool_id))
+    address_of_id32(pool_id)
 }
 
 /// `dex_pools`: one row per CREATION EVENT of a pool, plus at most one row
-/// written by the RPC resolver (`created_block = 0`, `log_index = 0`).
+/// written by the RPC resolver (`created_block = 0`, `tx_index = 0`,
+/// `ordinal = 0`).
 ///
 /// The table is positional like every block scoped table - key `(chain,
-/// pool_id, emitter, created_block, log_index)` - so versions, tombstones
-/// and re-inserts work exactly as everywhere else (docs/design.md §2).
+/// pool_id, emitter, created_block, tx_index, ordinal)` - so versions,
+/// tombstones and re-inserts work exactly as everywhere else
+/// (docs/design.md §2).
 /// Several live rows of one pool can exist (a forged `PairCreated` costs
 /// one transaction); readers pick THE row through the `dex_pool_current_v`
 /// view: event rows before resolver rows, then the earliest position. The
@@ -236,31 +226,31 @@ pub struct DexPool {
     /// The contract that emits the pool's swap events: the pool itself,
     /// the V4 PoolManager or the Balancer Vault. Matches
     /// `dex_swaps.emitter`.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub emitter: Address,
     /// Emitter of the creation event (zero when resolved through RPC and
     /// the pool has no `factory()`).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub factory: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub protocol: Protocol,
     /// Zero for multi asset pools (see `tokens`). V4: zero = native coin.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub token0: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub token1: Address,
     /// Every token of the pool in pool order (Curve coin index order).
     /// `[token0, token1]` for two token pools.
-    #[serde_as(as = "SerVecAddress")]
+    #[serde_as(as = "SerVecId32")]
     pub tokens: Vec<Address>,
     /// Curve only: coins addressed by `TokenExchangeUnderlying`.
-    #[serde_as(as = "SerVecAddress")]
+    #[serde_as(as = "SerVecId32")]
     pub underlying_tokens: Vec<Address>,
     /// Hundredths of a bip (V3 / V4 `fee`), 0 when the family has none.
     pub fee: u32,
     pub tick_spacing: i32,
     /// V4 hooks contract.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub hooks: Address,
     /// Solidly: stable (`x3y+y3x`) instead of volatile curve.
     pub stable: bool,
@@ -268,9 +258,13 @@ pub struct DexPool {
     pub created_block: u64,
     /// Timestamp of the creation event, 0 when resolved through RPC.
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub log_index: u32,
+    /// Raw transaction id: the 32 bytes of the EVM transaction hash.
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    /// Index of the creation event's transaction inside the block.
+    pub tx_index: u32,
+    /// Position inside the transaction: the log index on EVM.
+    pub ordinal: u64,
     #[serde_as(as = "DisplayFromStr")]
     pub source: PoolSource,
     /// Resolver rows: how often the pool was asked without an answer.
@@ -287,31 +281,35 @@ pub struct DexSwap {
     pub chain: u64,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub log_index: u32,
+    /// Raw transaction id: the 32 bytes of the EVM transaction hash.
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    /// Index of the swap's transaction inside the block.
+    pub tx_index: u32,
+    /// Position inside the transaction: the log index on EVM.
+    pub ordinal: u64,
     #[serde_as(as = "SerB256")]
     pub pool_id: B256,
     /// Contract that emitted the event (pool, PoolManager or Vault).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub emitter: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub protocol: Protocol,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub sender: Address,
     /// Zero when the event has none (V4, Balancer, Curve).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub recipient: Address,
     /// `from` of the transaction; zero until
     /// [`super::DexRows::attach_transactions`] ran.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub tx_from: Address,
     /// `to` of the transaction (router / aggregator attribution).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub tx_to: Address,
     /// Best guess of who traded: `tx_from` when known, else `recipient`,
     /// else `sender`. Feeds the unique trader counts.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub trader: Address,
     /// Pool relative, signed: positive = INTO the pool. Zero for the
     /// multi asset families (Balancer, Curve).
@@ -321,9 +319,9 @@ pub struct DexSwap {
     pub amount1: I256,
     /// Only when the EVENT carries them (Balancer), else zero. A CLAIM of
     /// the emitter, nothing more: see `verified_in` / `verified_out`.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub token_in: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub token_out: Address,
     /// What went into / came out of the pool, every family. Two token
     /// families: the positive / negative side of `amount0`, `amount1`;
@@ -338,9 +336,9 @@ pub struct DexSwap {
     /// in the same transaction, emitted by this token contract. Zero when
     /// nothing proves the leg (see `dex::corroborate`). USD valuation only
     /// ever uses these.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub verified_in: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub verified_out: Address,
     /// V2 / Solidly: reserves AFTER the swap, from the `Sync` the pool
     /// emits right before its `Swap`. Zero when there is none.
@@ -374,29 +372,33 @@ pub struct DexLiquidity {
     pub chain: u64,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub log_index: u32,
+    /// Raw transaction id: the 32 bytes of the EVM transaction hash.
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    /// Index of the event's transaction inside the block.
+    pub tx_index: u32,
+    /// Position inside the transaction: the log index on EVM.
+    pub ordinal: u64,
     #[serde_as(as = "SerB256")]
     pub pool_id: B256,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub emitter: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub protocol: Protocol,
     #[serde_as(as = "DisplayFromStr")]
     pub kind: LiquidityKind,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub sender: Address,
     /// Position owner (V3), recipient of the tokens (V2 / Solidly burn),
     /// zero otherwise.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub owner: Address,
     /// `from` of the transaction: WHO provided / removed the liquidity.
     /// `sender` is usually a router and must not be used for attribution.
     /// Zero until [`super::DexRows::attach_transactions`] ran.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub tx_from: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub tx_to: Address,
     /// Pool relative, signed: mint > 0, burn < 0. Zero for sync / modify.
     #[serde_as(as = "SerI256")]
@@ -453,7 +455,7 @@ mod tests {
         struct Probe {
             #[serde_as(as = "DisplayFromStr")]
             protocol: Protocol,
-            #[serde_as(as = "SerVecAddress")]
+            #[serde_as(as = "SerVecId32")]
             tokens: Vec<Address>,
         }
 
@@ -464,6 +466,79 @@ mod tests {
         .unwrap();
 
         assert_eq!(json["protocol"], "balancer_v2");
-        assert_eq!(json["tokens"][0].as_array().unwrap().len(), 20);
+        // Chain neutral identity: 12 zero bytes + the 20 address bytes.
+        let token = json["tokens"][0].as_array().unwrap();
+        assert_eq!(token.len(), 32);
+        assert!(token[..12].iter().all(|byte| byte.as_u64() == Some(0)));
+        assert!(token[12..].iter().all(|byte| byte.as_u64() == Some(1)));
+    }
+
+    /// Every identity column of every row is a 32 byte id, and a
+    /// transaction id is the raw hash bytes - not a `FixedString(20)`
+    /// anywhere (docs/design.md §13).
+    #[test]
+    fn identity_columns_are_32_bytes_and_tx_ids_are_raw() {
+        let swap = DexSwap {
+            chain: 1,
+            block_number: 7,
+            timestamp: 1,
+            tx_id: crate::utils::format::tx_id(B256::repeat_byte(0xcd)),
+            tx_index: 4,
+            ordinal: 9,
+            pool_id: pool_id_of(Address::repeat_byte(0xab)),
+            emitter: Address::repeat_byte(0xab),
+            protocol: Protocol::UniswapV2,
+            sender: Address::repeat_byte(1),
+            recipient: Address::repeat_byte(2),
+            tx_from: Address::repeat_byte(3),
+            tx_to: Address::repeat_byte(4),
+            trader: Address::repeat_byte(3),
+            amount0: I256::ONE,
+            amount1: I256::MINUS_ONE,
+            token_in: Address::ZERO,
+            token_out: Address::ZERO,
+            amount_in: U256::ZERO,
+            amount_out: U256::ZERO,
+            verified_in: Address::repeat_byte(5),
+            verified_out: Address::repeat_byte(6),
+            reserve0: U256::ZERO,
+            reserve1: U256::ZERO,
+            coin_in: 0,
+            coin_out: 0,
+            underlying: false,
+            sqrt_price_x96: U256::ZERO,
+            liquidity: U256::ZERO,
+            tick: 0,
+            fee: 0,
+            epoch: 0,
+            _version: 0,
+        };
+
+        let json = serde_json::to_value(&swap).unwrap();
+        for column in [
+            "pool_id",
+            "emitter",
+            "sender",
+            "recipient",
+            "tx_from",
+            "tx_to",
+            "trader",
+            "token_in",
+            "token_out",
+            "verified_in",
+            "verified_out",
+        ] {
+            assert_eq!(
+                json[column].as_array().map(Vec::len),
+                Some(32),
+                "{column}"
+            );
+        }
+        assert_eq!(json["tx_id"].as_array().map(Vec::len), Some(32));
+        assert_eq!(json["tx_index"], 4);
+        assert_eq!(json["ordinal"], 9);
+
+        let back: DexSwap = serde_json::from_value(json).unwrap();
+        assert_eq!(back, swap);
     }
 }

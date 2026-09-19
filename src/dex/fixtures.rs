@@ -631,13 +631,23 @@ pub fn transfer(
     )
 }
 
-/// Puts `logs` into one transaction.
+/// Puts `logs` into one transaction: one hash, and one `transaction_index`
+/// (the `tx_index` column of docs/design.md §13).
+///
+/// The index is the smallest log index of the group. A transaction's logs
+/// are contiguous inside a block, so that value is distinct per transaction
+/// and orders the transactions exactly as the chain does - which is what
+/// `(chain, block_number, tx_index, ordinal)` has to sort by.
 pub fn same_transaction(
     mut logs: Vec<DatabaseLog>,
     transaction: u64,
 ) -> Vec<DatabaseLog> {
+    let index =
+        logs.iter().map(|log| log.log_index).min().unwrap_or_default();
+
     for log in &mut logs {
         log.transaction_hash = B256::from(U256::from(transaction));
+        log.transaction_index = index;
     }
     logs
 }
@@ -697,7 +707,7 @@ mod tests {
         assert_eq!(pool.token1, address(WETH));
         assert_eq!(pool.tokens, vec![pool.token0, pool.token1]);
         assert_eq!(pool.created_block, 0x18cd705);
-        assert_eq!(pool.log_index, 0x3a4);
+        assert_eq!((pool.tx_index, pool.ordinal), (3, 0x3a4));
         assert_eq!(pool.source, PoolSource::Event);
         assert_eq!((pool._version, pool.epoch), (0, 0));
         assert_eq!(pool.timestamp, 1_700_000_000);
@@ -712,8 +722,11 @@ mod tests {
         assert_eq!(swap.pool_id, pool_id_of(address(V2_USDC_WETH)));
         assert_eq!(swap.emitter, address(V2_USDC_WETH));
         assert_eq!(swap.block_number, 0x18cd71f);
-        assert_eq!(swap.log_index, 0xf9);
-        assert_eq!(swap.transaction_hash, hash(V2_SWAP.transaction_hash));
+        assert_eq!(swap.ordinal, 0xf9);
+        assert_eq!(
+            swap.tx_id,
+            crate::utils::format::tx_id(hash(V2_SWAP.transaction_hash))
+        );
         assert_eq!(
             swap.sender,
             address("0x7a250d5630b4cf539739df2c5dacb4c659f2488d")
@@ -918,13 +931,13 @@ mod tests {
             (pool.token0, pool.token1),
             (Address::ZERO, Address::ZERO)
         );
-        assert_eq!(pool.log_index, 0x20);
+        assert_eq!(pool.ordinal, 0x20);
 
         // Alone, the tokens still produce a row, at a later position:
         // it loses against the `PoolRegistered` one (first event wins).
         let alone = one(&BALANCER_TOKENS_REGISTERED).pools.remove(0);
         assert_eq!(alone.tokens.len(), 2);
-        assert!(alone.log_index > pool.log_index);
+        assert!(alone.ordinal > pool.ordinal);
     }
 
     #[test]

@@ -593,7 +593,8 @@ mod tests {
             .expect("contracts view");
 
         assert!(view.contains("FROM transactions FINAL"));
-        assert!(view.contains("status = 'success'"));
+        // NULL (pre-Byzantium receipts have no status) counts as success.
+        assert!(view.contains("ifNull(status, 'success') = 'success'"));
         assert!(view.contains("contract_created != toFixedString('', 20)"));
     }
 

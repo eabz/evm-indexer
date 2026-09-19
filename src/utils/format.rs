@@ -11,13 +11,16 @@
 //! | `I256`             | `Int256`          | 32 bytes LE, two's complement |
 //! | `Bytes`            | `String`          | LEB128 length + raw bytes     |
 //!
-//! The chain-neutral analytics modules (docs/design.md §13) add two more:
+//! The analytics data modules (`dex_*`, `launchpad_*`, `prediction_*`) are
+//! shared by every chain family and use two more (docs/design.md section
+//! 13). They are the ONLY way those modules encode an id: nobody hand rolls
+//! the padding.
 //!
 //! | Rust               | ClickHouse        | RowBinary                     |
 //! |--------------------|-------------------|-------------------------------|
-//! | `Address` (`SerId32`) | `FixedString(32)` | 12 zero bytes + 20 address bytes |
-//! | `Vec<Address>` (`SerVecId32`) | `Array(FixedString(32))` | the same, per element |
-//! | `Bytes` (`SerTxId`) | `String` (`tx_id`) | LEB128 length + raw bytes |
+//! | `Address` [`SerId32`] | `FixedString(32)` | 12 zero bytes + 20 address bytes |
+//! | `Vec<Address>` [`SerVecId32`] | `Array(FixedString(32))` | the same, element wise |
+//! | `Bytes` / `Vec<u8>` [`SerTxId`] | `String` | LEB128 length + raw bytes |
 //!
 //! How this maps onto the `clickhouse` crate (checked against 0.14.0,
 //! `src/rowbinary/{ser,validation}.rs`):
@@ -127,167 +130,6 @@ impl<'de> DeserializeAs<'de, Address> for SerAddress {
     }
 }
 
-// STUB - replaced by dex-neutral at merge
-// Signatures taken verbatim from dex-neutral over tirith (message
-// 4234934c, 2026-09-19 05:11:53Z): it owns the implementation, this is a
-// byte-for-byte compatible placeholder so the predictions module can build
-// before its branch lands.
-/// 32 byte form of an EVM address: 12 zero bytes + the 20 address bytes
-/// (docs/design.md §13). The convention `dex_pools.pool_id` already uses.
-#[inline]
-pub fn id32(address: Address) -> B256 {
-    address.into_word()
-}
-
-// STUB - replaced by dex-neutral at merge
-/// The EVM address inside a 32 byte id, `None` when the 12 leading bytes
-/// are not zero (a non-EVM id: it is NOT an address and is never truncated
-/// into one).
-#[inline]
-pub fn address_of_id32(id: B256) -> Option<Address> {
-    id[..12]
-        .iter()
-        .all(|byte| *byte == 0)
-        .then(|| Address::from_slice(&id[12..]))
-}
-
-// STUB - replaced by dex-neutral at merge
-/// `tx_id` of an EVM transaction: the raw 32 bytes of its hash. The column
-/// is a `String` because a Solana signature is 64 bytes (docs/design.md
-/// §13).
-#[inline]
-pub fn tx_id(hash: B256) -> Bytes {
-    Bytes::copy_from_slice(hash.as_slice())
-}
-
-// STUB - replaced by dex-neutral at merge
-/// The EVM transaction hash inside a `tx_id`, `None` unless it is exactly
-/// 32 bytes (a Solana signature is not a `B256`).
-#[inline]
-pub fn tx_hash_of(id: &[u8]) -> Option<B256> {
-    <[u8; 32]>::try_from(id).ok().map(B256::from)
-}
-
-// STUB - replaced by dex-neutral at merge
-/// alloy `Address` <-> `FixedString(32)`, left padded with 12 zero bytes
-/// (docs/design.md §13: one identity type for every chain family).
-/// Deserializing ERRORS on a non-zero padding by design - rows written by a
-/// non-EVM front end are read with raw SQL, never through this adapter.
-pub struct SerId32(());
-
-impl SerializeAs<Address> for SerId32 {
-    #[inline]
-    fn serialize_as<S>(
-        value: &Address,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        id32(*value).0.serialize(serializer)
-    }
-}
-
-impl<'de> DeserializeAs<'de, Address> for SerId32 {
-    fn deserialize_as<D>(deserializer: D) -> Result<Address, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let id = B256::from(<[u8; 32]>::deserialize(deserializer)?);
-        address_of_id32(id).ok_or_else(|| {
-            de::Error::custom(format!(
-                "id {id} is not a left padded EVM address"
-            ))
-        })
-    }
-}
-
-// STUB - replaced by dex-neutral at merge
-/// `Vec<Address>` <-> `Array(FixedString(32))`.
-pub struct SerVecId32(());
-
-impl SerializeAs<Vec<Address>> for SerVecId32 {
-    fn serialize_as<S>(
-        value: &Vec<Address>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let ids: Vec<[u8; 32]> =
-            value.iter().map(|address| id32(*address).0).collect();
-        ids.serialize(serializer)
-    }
-}
-
-impl<'de> DeserializeAs<'de, Vec<Address>> for SerVecId32 {
-    fn deserialize_as<D>(deserializer: D) -> Result<Vec<Address>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Vec::<[u8; 32]>::deserialize(deserializer)?
-            .into_iter()
-            .map(|bytes| {
-                let id = B256::from(bytes);
-                address_of_id32(id).ok_or_else(|| {
-                    de::Error::custom(format!(
-                        "id {id} is not a left padded EVM address"
-                    ))
-                })
-            })
-            .collect()
-    }
-}
-
-// STUB - replaced by dex-neutral at merge
-/// `tx_id` <-> `String` holding the RAW transaction id (32 bytes on EVM,
-/// 64 on Solana). Never hex, never a sorting key column.
-pub struct SerTxId(());
-
-impl SerializeAs<Bytes> for SerTxId {
-    #[inline]
-    fn serialize_as<S>(
-        value: &Bytes,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(value.as_ref())
-    }
-}
-
-impl<'de> DeserializeAs<'de, Bytes> for SerTxId {
-    fn deserialize_as<D>(deserializer: D) -> Result<Bytes, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        SerBytes::deserialize_as(deserializer)
-    }
-}
-
-impl SerializeAs<Vec<u8>> for SerTxId {
-    #[inline]
-    fn serialize_as<S>(
-        value: &Vec<u8>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(value)
-    }
-}
-
-impl<'de> DeserializeAs<'de, Vec<u8>> for SerTxId {
-    fn deserialize_as<D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        SerBytes::deserialize_as(deserializer).map(|bytes| bytes.to_vec())
-    }
-}
-
 /// `Option<B256>` <-> NON nullable `FixedString(32)`: `None` is stored as
 /// 32 zero bytes (log topics). Reading maps zero bytes back to `None`, so a
 /// genuine all-zero topic does not survive a round trip through this
@@ -320,6 +162,165 @@ impl<'de> DeserializeAs<'de, Option<B256>> for SerTopic {
         let topic =
             <[u8; 32]>::deserialize(deserializer).map(B256::from)?;
         Ok((!topic.is_zero()).then_some(topic))
+    }
+}
+
+/// The 32 byte chain-neutral identity of an EVM address: 12 zero bytes
+/// followed by the 20 address bytes (docs/design.md section 13).
+#[inline]
+pub fn id32(address: Address) -> B256 {
+    address.into_word()
+}
+
+/// Inverse of [`id32`]. `None` when the 12 leading bytes are NOT all zero,
+/// i.e. the id is not an EVM address: a Solana pubkey, or a native 32 byte
+/// id such as a Uniswap V4 pool id or a Balancer pool id. Callers must
+/// treat `None` as "do not render this as an address", never as an error to
+/// paper over by truncating.
+#[inline]
+pub fn address_of_id32(id: B256) -> Option<Address> {
+    id.0[..12]
+        .iter()
+        .all(|byte| *byte == 0)
+        .then(|| Address::from_word(id))
+}
+
+/// `Address` <-> `FixedString(32)`: the identity encoding every analytics
+/// (`dex_*`, `launchpad_*`, `prediction_*`) identity column uses. Writing
+/// left pads with 12 zero bytes; reading REFUSES a non-zero padding instead
+/// of truncating, so a 32 byte non-EVM id can never be silently mangled
+/// into an address.
+pub struct SerId32(());
+
+impl SerializeAs<Address> for SerId32 {
+    #[inline]
+    fn serialize_as<S>(
+        value: &Address,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let bytes: &[u8; 32] = &id32(*value).0;
+        bytes.serialize(serializer)
+    }
+}
+
+impl<'de> DeserializeAs<'de, Address> for SerId32 {
+    fn deserialize_as<D>(deserializer: D) -> Result<Address, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let id = <[u8; 32]>::deserialize(deserializer).map(B256::from)?;
+        address_of_id32(id).ok_or_else(|| {
+            de::Error::custom(format!(
+                "id {id} is not an EVM address: the 12 leading bytes are \
+                 not zero"
+            ))
+        })
+    }
+}
+
+/// `Vec<Address>` <-> `Array(FixedString(32))`, element wise [`SerId32`].
+pub struct SerVecId32(());
+
+impl SerializeAs<Vec<Address>> for SerVecId32 {
+    fn serialize_as<S>(
+        value: &Vec<Address>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let raw: Vec<[u8; 32]> =
+            value.iter().map(|address| id32(*address).0).collect();
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> DeserializeAs<'de, Vec<Address>> for SerVecId32 {
+    fn deserialize_as<D>(deserializer: D) -> Result<Vec<Address>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw: Vec<[u8; 32]> = Deserialize::deserialize(deserializer)?;
+        raw.into_iter()
+            .map(|bytes| {
+                let id = B256::from(bytes);
+                address_of_id32(id).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "id {id} is not an EVM address: the 12 leading \
+                         bytes are not zero"
+                    ))
+                })
+            })
+            .collect()
+    }
+}
+
+/// The `tx_id` of an EVM transaction: the 32 raw bytes of its hash. The
+/// column is a `String` because a Solana signature is 64 bytes
+/// (docs/design.md section 13); it is never part of a sorting key.
+#[inline]
+pub fn tx_id(hash: B256) -> Bytes {
+    Bytes::copy_from_slice(hash.as_slice())
+}
+
+/// Inverse of [`tx_id`]. `None` unless the id is exactly 32 bytes, i.e. it
+/// is not an EVM transaction hash.
+#[inline]
+pub fn tx_hash_of(tx_id: &[u8]) -> Option<B256> {
+    tx_id.first_chunk::<32>().filter(|_| tx_id.len() == 32).map(B256::from)
+}
+
+/// Raw transaction id bytes <-> a `String` column: 32 bytes on EVM, 64 on
+/// Solana, never hex and never utf-8. Implemented for both `Bytes` and
+/// `Vec<u8>` so every module can pick the type that suits its rows.
+pub struct SerTxId(());
+
+impl SerializeAs<Bytes> for SerTxId {
+    #[inline]
+    fn serialize_as<S>(
+        value: &Bytes,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value.as_ref())
+    }
+}
+
+impl<'de> DeserializeAs<'de, Bytes> for SerTxId {
+    #[inline]
+    fn deserialize_as<D>(deserializer: D) -> Result<Bytes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        SerBytes::deserialize_as(deserializer)
+    }
+}
+
+impl SerializeAs<Vec<u8>> for SerTxId {
+    #[inline]
+    fn serialize_as<S>(
+        value: &Vec<u8>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+}
+
+impl<'de> DeserializeAs<'de, Vec<u8>> for SerTxId {
+    #[inline]
+    fn deserialize_as<D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        SerBytes::deserialize_as(deserializer).map(|bytes| bytes.into())
     }
 }
 
@@ -890,6 +891,119 @@ mod tests {
         let json = serde_json::to_string(&with_values).unwrap();
         let back: Everything = serde_json::from_str(&json).unwrap();
         assert_eq!(back, with_values);
+    }
+
+    // ------------------------------------- chain neutral ids (section 13)
+
+    #[serde_as]
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Ids {
+        #[serde_as(as = "SerId32")]
+        emitter: Address,
+        #[serde_as(as = "SerVecId32")]
+        tokens: Vec<Address>,
+        #[serde_as(as = "SerTxId")]
+        tx_id: Bytes,
+        #[serde_as(as = "SerTxId")]
+        raw: Vec<u8>,
+    }
+
+    #[test]
+    fn an_id_is_twelve_zero_bytes_then_the_address() {
+        assert_eq!(
+            id32(Address::repeat_byte(0xab)),
+            "0x000000000000000000000000abababababababababababababababababababab"
+                .parse::<B256>()
+                .unwrap()
+        );
+        assert_eq!(id32(Address::ZERO), B256::ZERO);
+
+        let bytes = wire::to_bytes(&Ids {
+            emitter: Address::repeat_byte(0x11),
+            tokens: vec![Address::repeat_byte(0x22)],
+            tx_id: Bytes::from(vec![0xaa, 0xbb]),
+            raw: vec![0xcc],
+        });
+
+        let mut expected = vec![0u8; 12];
+        expected.extend([0x11; 20]);
+        // Array(FixedString(32)): one element, no per element length.
+        expected.push(1);
+        expected.extend(vec![0u8; 12]);
+        expected.extend([0x22; 20]);
+        // String columns: LEB128 length + raw bytes.
+        expected.extend([2, 0xaa, 0xbb]);
+        expected.extend([1, 0xcc]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn ids_and_tx_ids_round_trip() {
+        let sample = Ids {
+            emitter: Address::repeat_byte(0x11),
+            tokens: vec![Address::ZERO, Address::repeat_byte(0xff)],
+            tx_id: tx_id(B256::repeat_byte(0x7a)),
+            raw: vec![],
+        };
+
+        let json = serde_json::to_string(&sample).unwrap();
+        let back: Ids = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, sample);
+
+        for address in [
+            Address::ZERO,
+            Address::repeat_byte(1),
+            Address::repeat_byte(0xff),
+        ] {
+            assert_eq!(address_of_id32(id32(address)), Some(address));
+        }
+
+        let hash = B256::repeat_byte(0x5e);
+        assert_eq!(tx_hash_of(&tx_id(hash)), Some(hash));
+        assert_eq!(tx_id(hash).len(), 32);
+    }
+
+    /// A 32 byte id that is NOT an EVM address - a Solana pubkey, a V4 pool
+    /// id - must never be truncated into one.
+    #[test]
+    fn a_non_evm_id_is_refused_never_truncated() {
+        // One non-zero byte anywhere in the padding is enough.
+        for position in 0..12 {
+            let mut id = B256::ZERO;
+            id.0[position] = 1;
+            assert_eq!(address_of_id32(id), None, "byte {position}");
+        }
+
+        let pubkey = B256::repeat_byte(0xc6);
+        assert_eq!(address_of_id32(pubkey), None);
+
+        // Through the serializers: an error, not a silently cut address.
+        let bad = serde_json::to_string(&pubkey.0.to_vec()).unwrap();
+        let error = serde_json::from_str::<Ids>(&format!(
+            "{{\"emitter\":{bad},\"tokens\":[],\"tx_id\":[],\"raw\":[]}}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not an EVM address"), "{error}");
+
+        let error = serde_json::from_str::<Ids>(&format!(
+            "{{\"emitter\":{},\"tokens\":[{bad}],\"tx_id\":[],\"raw\":[]}}",
+            serde_json::to_string(&id32(Address::ZERO).0.to_vec()).unwrap()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not an EVM address"), "{error}");
+    }
+
+    /// A Solana signature is 64 bytes: `tx_hash_of` says so instead of
+    /// handing back the first half.
+    #[test]
+    fn only_a_32_byte_tx_id_is_an_evm_hash() {
+        assert_eq!(tx_hash_of(&[]), None);
+        assert_eq!(tx_hash_of(&[0u8; 31]), None);
+        assert_eq!(tx_hash_of(&[0u8; 33]), None);
+        assert_eq!(tx_hash_of(&[0u8; 64]), None);
+        assert_eq!(tx_hash_of(&[7u8; 32]), Some(B256::repeat_byte(7)));
     }
 
     #[test]

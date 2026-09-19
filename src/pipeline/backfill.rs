@@ -44,15 +44,15 @@ use crate::{
         store::{ClickhouseReorgStore, Scope},
     },
     reorg::{NoHooks, PurgeReason, Purger, WriterControl},
-    utils::format::{SerAddress, SerB256},
+    utils::format::{SerAddress, SerB256, SerU256},
 };
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use anyhow::{bail, Context, Result};
 use clickhouse::Row;
 use futures::future::BoxFuture;
 use log::info;
 use serde::Deserialize;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillReport {
@@ -78,10 +78,18 @@ struct OriginRow {
     from: Address,
     #[serde_as(as = "Option<SerAddress>")]
     to: Option<Address>,
+    #[serde_as(as = "SerU256")]
+    value: U256,
 }
 
 /// The backfill has no writer to quiesce; it only adopts the epoch.
-struct EpochOnly(Database);
+pub(crate) struct EpochOnly(Database);
+
+impl EpochOnly {
+    pub(crate) fn new(db: Database) -> Self {
+        Self(db)
+    }
+}
 
 impl WriterControl for EpochOnly {
     fn quiesce(&self) -> BoxFuture<'_, Result<()>> {
@@ -98,7 +106,8 @@ fn only(spec: &ModuleSpec) -> Result<EnabledModules> {
     match spec.name {
         "dex" => enabled.dex = true,
         "predictions" => enabled.predictions = true,
-        // MODULE: "launchpads" => enabled.launchpads = true,
+        "launchpads" => enabled.launchpads = true,
+        // MODULE: "<module>" => enabled.<module> = true,
         other => bail!("module '{other}' can not be backfilled"),
     }
     Ok(enabled)
@@ -127,17 +136,27 @@ async fn decode_chunk(
 
     let origins: Vec<OriginRow> = client
         .query(&format!(
-            "SELECT hash, `from`, `to` FROM transactions FINAL WHERE \
-             chain = {} AND block_number >= {} AND block_number < {}",
+            "SELECT hash, `from`, `to`, value FROM transactions FINAL \
+             WHERE chain = {} AND block_number >= {} AND \
+             block_number < {}",
             db.chain_id, chunk.from, chunk.to
         ))
         .fetch_all()
         .await
         .with_context(|| format!("read the transactions of {chunk}"))?;
 
-    let origins: HashMap<B256, (Address, Option<Address>)> = origins
+    let origins: modules::TxOrigins = origins
         .into_iter()
-        .map(|row| (row.hash, (row.from, row.to)))
+        .map(|row| {
+            (
+                row.hash,
+                modules::TxOrigin {
+                    from: row.from,
+                    to: row.to,
+                    value: row.value,
+                },
+            )
+        })
         .collect();
 
     let count = logs.len() as u64;
@@ -178,6 +197,7 @@ pub async fn backfill(
     };
     let range = BlockRange::new(from_block, end.max(from_block));
 
+    db.seed_version(&modules::versioned_tables()).await?;
     db.set_epoch(db.current_epoch().await?);
 
     let chunks_of = |range: BlockRange| {
@@ -250,7 +270,7 @@ pub async fn backfill(
             db.clone(),
             Scope::Module(spec),
         )),
-        Arc::new(EpochOnly(db.clone())),
+        Arc::new(EpochOnly::new(db.clone())),
         Arc::new(NoHooks),
         Arc::new(NoHooks),
     );

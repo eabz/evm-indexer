@@ -46,7 +46,11 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, B256, U256};
 
 use crate::{
-    db::models::log::DatabaseLog, utils::events::TRANSFER_EVENT_SIGNATURE,
+    db::models::log::DatabaseLog,
+    utils::{
+        events::TRANSFER_EVENT_SIGNATURE,
+        format::{address_of_id32, tx_hash_of},
+    },
 };
 
 use super::{
@@ -83,11 +87,10 @@ pub struct Evidence {
     by_transaction: HashMap<B256, TxEvidence>,
 }
 
+/// An indexed `address` topic: the 12 leading bytes must be zero. Same rule
+/// as the chain neutral id encoding, so it shares its helper.
 fn clean_address(word: &B256) -> Option<Address> {
-    word.0[..12]
-        .iter()
-        .all(|byte| *byte == 0)
-        .then(|| Address::from_word(*word))
+    address_of_id32(*word)
 }
 
 impl Evidence {
@@ -150,19 +153,26 @@ impl Evidence {
         // Transfers are consumed in chain order whatever the input order.
         let mut order: Vec<usize> = (0..swaps.len()).collect();
         order.sort_by_key(|&index| {
-            (swaps[index].block_number, swaps[index].log_index)
+            (
+                swaps[index].block_number,
+                swaps[index].tx_index,
+                swaps[index].ordinal,
+            )
         });
 
         for index in order {
             let swap = &mut swaps[index];
 
-            let Some(transaction) =
-                self.by_transaction.get_mut(&swap.transaction_hash)
+            // Corroboration is an EVM ERC-20 rule, so the evidence is keyed
+            // by the 32 byte transaction hash the logs carry. A tx_id that
+            // is not 32 bytes can not have come from this decoder.
+            let Some(hash) = tx_hash_of(&swap.tx_id) else { continue };
+            let Some(transaction) = self.by_transaction.get_mut(&hash)
             else {
                 continue;
             };
 
-            let position = u64::from(swap.log_index);
+            let position = swap.ordinal;
             // Contract pools transfer first and emit last; singletons
             // emit first and settle later.
             let before = if swap.protocol.is_singleton() {
@@ -599,8 +609,8 @@ mod tests {
         logs.reverse();
 
         let rows = decode(1, &logs);
-        let at = |index: u32| {
-            rows.swaps.iter().find(|swap| swap.log_index == index).unwrap()
+        let at = |index: u64| {
+            rows.swaps.iter().find(|swap| swap.ordinal == index).unwrap()
         };
 
         assert_eq!(at(10).verified_in, usdc());

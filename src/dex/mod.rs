@@ -28,8 +28,14 @@
 //!   `token1()` itself (or, for singleton families, per emitter), see the
 //!   `dex_pool_current_v` view. "A wrong number is worse than a missing
 //!   one."
-//! * `pool_id` is 32 bytes: the pool address left padded with zeros, or
-//!   the native `bytes32` id (V4, Balancer). `emitter` is the contract that
+//! * **Every identity column is 32 bytes** (docs/design.md §13): an EVM
+//!   address left padded with 12 zero bytes, or a Solana pubkey. The rows
+//!   here keep their fields typed [`Address`] and let
+//!   [`crate::utils::format::SerId32`] pad; `pool_id` is a [`B256`] because
+//!   a V4 / Balancer id is not an address at all. Position is `(chain,
+//!   block_number, tx_index, ordinal)` - `tx_index` is the transaction's
+//!   index in the block, `ordinal` the log index - and `tx_id` holds the
+//!   raw transaction hash bytes. `emitter` is the contract that
 //!   emitted the event (pool, PoolManager, Vault) and is part of the pool's
 //!   identity, so a forked singleton can not collide with the original.
 //! * Decoding never needs RPC. Pool tokens come from creation events; pools
@@ -54,17 +60,18 @@
 //!
 //! USD valuation needs to know which tokens are dollars and which one is
 //! the wrapped native coin. No chain specific data ships with the indexer;
-//! insert the rows once per chain (addresses are raw bytes):
+//! insert the rows once per chain. `token` is a 32 byte id, so an EVM
+//! address is left padded with 12 zero bytes:
 //!
 //! ```sql
 //! INSERT INTO quote_tokens (chain, token, kind) VALUES
-//!   (1, unhex('A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'), 'stable'),  -- USDC
-//!   (1, unhex('dAC17F958D2ee523a2206206994597C13D831ec7'), 'stable'),  -- USDT
-//!   (1, unhex('C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'), 'native');  -- WETH
+//!   (1, unhex(concat(repeat('00', 12), 'A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48')), 'stable'),  -- USDC
+//!   (1, unhex(concat(repeat('00', 12), 'dAC17F958D2ee523a2206206994597C13D831ec7')), 'stable'),  -- USDT
+//!   (1, unhex(concat(repeat('00', 12), 'C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2')), 'native');  -- WETH
 //! -- pseudo addresses without a contract need decimals (and a symbol):
 //! INSERT INTO quote_tokens (chain, token, kind, decimals, symbol) VALUES
-//!   (1, unhex('0000000000000000000000000000000000000000'), 'native', 18, 'ETH'),
-//!   (1, unhex('EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE'), 'native', 18, 'ETH');
+//!   (1, unhex(concat(repeat('00', 12), '0000000000000000000000000000000000000000')), 'native', 18, 'ETH'),
+//!   (1, unhex(concat(repeat('00', 12), 'EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE')), 'native', 18, 'ETH');
 //! ```
 //!
 //! To retire a quote token insert it again with `kind = ''`. The views pick
@@ -88,6 +95,8 @@ pub(crate) mod sql;
 use std::collections::HashSet;
 
 use alloy::primitives::{Address, B256};
+
+use crate::utils::format::tx_hash_of;
 
 pub use self::{
     decode::decode,
@@ -171,7 +180,7 @@ pub fn tombstone_sql(
 /// `dex_pools` row at all, only (forgeable) creation events, or a
 /// `no_answer` row whose backoff (1 h x 2^attempts, at most 30 days) is
 /// over. Placeholders: `{chain}`, `{limit}`. Columns: `pool_id
-/// FixedString(32)`, `emitter FixedString(20)`, `protocol String`,
+/// FixedString(32)`, `emitter FixedString(32)`, `protocol String`,
 /// `attempts UInt32`.
 ///
 /// Driven by the small hourly aggregate, not by the swap tables. Stable
@@ -280,7 +289,8 @@ impl DexRows {
         F: Fn(&B256) -> Option<TxOrigin>,
     {
         for swap in &mut self.swaps {
-            if let Some(origin) = lookup(&swap.transaction_hash) {
+            let Some(hash) = tx_hash_of(&swap.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
                 swap.tx_from = origin.from;
                 swap.tx_to = origin.to.unwrap_or_default();
                 if !origin.from.is_zero() {
@@ -290,7 +300,8 @@ impl DexRows {
         }
 
         for row in &mut self.liquidity {
-            if let Some(origin) = lookup(&row.transaction_hash) {
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
                 row.tx_from = origin.from;
                 row.tx_to = origin.to.unwrap_or_default();
             }
@@ -368,8 +379,9 @@ mod tests {
             chain: 1,
             block_number: 1,
             timestamp: 1,
-            transaction_hash: B256::repeat_byte(9),
-            log_index: 0,
+            tx_id: crate::utils::format::tx_id(B256::repeat_byte(9)),
+            tx_index: 0,
+            ordinal: 0,
             pool_id: pool_id_of(pool),
             emitter: pool,
             protocol,

@@ -1,0 +1,910 @@
+//! Launchpad tables, aggregates and views against a REAL ClickHouse.
+//! Ignored by default:
+//!
+//! ```sh
+//! TEST_DATABASE_URL=http://default@localhost:8123/anything \
+//!   cargo test launchpads::integration -- --ignored --nocapture
+//! ```
+//!
+//! Every test creates its OWN database on that server (name ending in
+//! `_test`), applies EVERY embedded migration to it through
+//! `crate::db::migrate` (core, DEX, predictions, launchpads, 0090) and
+//! never touches the database named in the url. Rows go through
+//! [`decode`] and the clickhouse crate's RowBinary inserts, exactly like
+//! the pipeline writes them. No test issues a DELETE: reorgs are
+//! tombstones + epochs (docs/design.md §2).
+//!
+//! The data is REAL (see `fixtures_data.rs`) except where a test says
+//! "forged" / "constructed": the forgeries and the hostile amounts.
+
+// The literals below mirror on-chain amounts digit by digit.
+#![allow(clippy::excessive_precision, clippy::inconsistent_digit_grouping)]
+
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use alloy::primitives::{Address, B256, U256};
+use clickhouse::{Client, Row};
+use serde::Serialize;
+
+use crate::{
+    db::{
+        migrate, models::erc20_transfer::DatabaseERC20Transfer,
+        tombstone_sql, DatabaseParams,
+    },
+    launchpads::{
+        cookbook, decode,
+        derived::rebuild_statements,
+        fixtures::{self, address, Place, RawTx},
+        models::id_of,
+        LaunchpadRows, BASE_TABLES, LAUNCHPADS_DERIVED, SIDE_TABLES,
+    },
+};
+
+const CHAIN: u64 = 4663;
+
+/// Pons V2 on Robinhood Chain: the singletons an operator trusts.
+const PONS_FACTORY: &str = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e";
+const PONS_HOOK: &str = "0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044";
+const FLAP_RH: &str = "0x26605f322f7fF986f381bB9A6e3f5DAb0bEaEb09";
+const FLAP_BNB: &str = "0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0";
+
+/// The token that launched and graduated 12 blocks (1.2 s) later.
+const TOKEN: &str = "0x95eb2d489fcc07a6f527b3989e6c0d0a7e69e37d";
+const CURVE: &str = "0x249915281e027c9559eb018b19784d02fb046ed3";
+const CREATOR: &str = "0xf523e8b611d3f003929379fc235de5d7d662c2e5";
+/// Its destination Uniswap V4 pool (the `Initialize` of the same tx).
+const GRADUATION_POOL: &str =
+    "3875d4c5c08fcb207d3db0b096b4c84ca59c2e04828b91eb9d230ea2828ee856";
+/// The bundler that bought for 15 recipients one block after the launch.
+const BUNDLER: &str = "0x14b9a544e8c179fc2040d3089dcc73baf25aa8f9";
+
+const LAUNCH_BLOCK: u64 = 66_679_543;
+const GRADUATION_BLOCK: u64 = 66_679_555;
+/// The graduation threshold of that curve, in wei of the native coin.
+const THRESHOLD: f64 = 4.2e18;
+
+struct TestDb {
+    admin: Client,
+    client: Client,
+    name: String,
+}
+
+impl TestDb {
+    async fn create(tag: &str) -> Self {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must be set for the ignored tests");
+        let params = DatabaseParams::parse(&url).unwrap();
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        static SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let sequence =
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!(
+            "launchpads_{tag}_{}_{nanos}_{sequence}_test",
+            std::process::id()
+        );
+
+        let admin = Client::default()
+            .with_url(&params.endpoint)
+            .with_user(&params.user)
+            .with_password(&params.password);
+
+        let mut target = url::Url::parse(&url).unwrap();
+        target.set_path(&format!("/{name}"));
+        migrate::run(target.as_str()).await.unwrap();
+
+        let client = admin.clone().with_database(&name);
+        Self { admin, client, name }
+    }
+
+    async fn execute(&self, sql: &str) {
+        self.client
+            .query(&sql.replace('?', "??"))
+            .execute()
+            .await
+            .unwrap_or_else(|error| panic!("{error}\n{sql}"));
+    }
+
+    async fn rows<T>(&self, sql: &str) -> Vec<T>
+    where
+        T: clickhouse::RowOwned + clickhouse::RowRead,
+    {
+        self.client
+            .query(&sql.replace('?', "??"))
+            .fetch_all::<T>()
+            .await
+            .unwrap_or_else(|error| panic!("{error}\n{sql}"))
+    }
+
+    async fn count(&self, sql: &str) -> u64 {
+        self.rows::<u64>(sql).await[0]
+    }
+
+    async fn number(&self, sql: &str) -> f64 {
+        self.rows::<f64>(sql).await[0]
+    }
+
+    async fn text(&self, sql: &str) -> String {
+        self.rows::<String>(sql).await.pop().unwrap_or_default()
+    }
+
+    /// Every row of `source` as text, sorted: two indexes are equal iff
+    /// their snapshots are.
+    async fn snapshot(&self, source: &str) -> Vec<String> {
+        self.rows::<String>(&format!(
+            "SELECT hex(toString(tuple(*))) AS line FROM ({source}) \
+             ORDER BY line"
+        ))
+        .await
+    }
+
+    async fn write<T>(&self, table: &str, rows: &[T])
+    where
+        T: Serialize,
+        for<'a> T: Row<Value<'a> = T>,
+    {
+        if rows.is_empty() {
+            return;
+        }
+
+        // Validation off: the crate has no mapping for (U)Int256, exactly
+        // like db::Database::insert_once.
+        let client = self.client.clone().with_validation(false);
+        let mut insert = client.insert::<T>(table).await.unwrap();
+        for row in rows {
+            insert.write(row).await.unwrap();
+        }
+        insert.end().await.unwrap();
+    }
+
+    async fn store(&self, rows: &LaunchpadRows) {
+        self.write("launchpad_tokens", &rows.tokens).await;
+        self.write("launchpad_trades", &rows.trades).await;
+        self.write("launchpad_graduations", &rows.graduations).await;
+        self.write("launchpad_creator_fees", &rows.creator_fees).await;
+    }
+
+    /// The operator data every headline view depends on.
+    async fn trust_the_real_venues(&self) {
+        self.execute(&format!(
+            "INSERT INTO launchpad_trusted_emitters \
+             (chain, emitter, family, label) VALUES \
+             ({CHAIN}, {}, 'pons_v2', 'factory'), \
+             ({CHAIN}, {}, 'pons_v2', 'hook'), \
+             ({CHAIN}, {}, 'flap_portal', 'portal'), \
+             (56, {}, 'flap_portal', 'portal')",
+            id_literal(PONS_FACTORY),
+            id_literal(PONS_HOOK),
+            id_literal(FLAP_RH),
+            id_literal(FLAP_BNB),
+        ))
+        .await;
+    }
+
+    async fn drop_database(&self) {
+        self.admin
+            .query(&format!("DROP DATABASE IF EXISTS {}", self.name))
+            .execute()
+            .await
+            .unwrap();
+    }
+}
+
+/// A `FixedString(32)` identity literal for SQL.
+fn id_literal(address_hex: &str) -> String {
+    format!("unhex('{}')", hex::encode(id_of(address(address_hex))))
+}
+
+fn id_hex(address_hex: &str) -> String {
+    hex::encode(id_of(address(address_hex)))
+}
+
+/// Every fixture decoded the way the pipeline does it, stamped.
+fn rows_of(
+    transactions: &[&RawTx],
+    version: u64,
+    epoch: u32,
+) -> LaunchpadRows {
+    let mut rows = LaunchpadRows::default();
+
+    for tx in transactions {
+        let mut decoded = decode(tx.chain, &tx.logs());
+        decoded.attach_transactions(|hash| {
+            (*hash == tx.hash()).then(|| tx.origin())
+        });
+        rows.append(&mut decoded);
+    }
+
+    rows.set_version(version);
+    rows.set_epoch(epoch);
+    rows
+}
+
+/// The core `erc20_transfers` rows of the same fixtures: the holder screen
+/// reads them, and they are the evidence the corroboration rests on.
+fn transfers_of(
+    transactions: &[&RawTx],
+    version: u64,
+    epoch: u32,
+) -> Vec<DatabaseERC20Transfer> {
+    transactions
+        .iter()
+        .flat_map(|tx| tx.logs())
+        .filter_map(|log| DatabaseERC20Transfer::from_log(&log))
+        .map(|mut row| {
+            row._version = version;
+            row.epoch = epoch;
+            row
+        })
+        .collect()
+}
+
+/// A `dex_pools` row for the Uniswap V4 pool the token graduated into, as
+/// the DEX module would have written it from the `Initialize` event of the
+/// very same transaction. Proves the graduation join key.
+async fn store_the_destination_pool(db: &TestDb) {
+    db.execute(&format!(
+        "INSERT INTO dex_pools (chain, pool_id, emitter, factory, protocol, \
+         token0, token1, tokens, underlying_tokens, fee, tick_spacing, hooks, \
+         stable, created_block, timestamp, tx_id, tx_index, ordinal, \
+         source, _version) VALUES ({CHAIN}, unhex('{GRADUATION_POOL}'), \
+         unhex('0000000000000000000000008366a39cc670b4001a1121b8f6a443a643e40951'), \
+         unhex('0000000000000000000000008366a39cc670b4001a1121b8f6a443a643e40951'), 'uniswap_v4', \
+         unhex('0000000000000000000000000000000000000000000000000000000000000000'), \
+         unhex('000000000000000000000000{TOKEN_20}'), [], [], 0, 200, \
+         unhex('000000000000000000000000e5e702641ea86f4ae6cc3cdaed2b886f976be044'), false, \
+         {GRADUATION_BLOCK}, toDateTime(1789780288), \
+         unhex('0000000000000000000000000000000000000000000000000000000000000001'), \
+         0, 18, 'event', 1)",
+        TOKEN_20 = &TOKEN[2..],
+    ))
+    .await;
+    // A singleton family: dex_pool_current_v only calls it 'event' when the
+    // emitter is a trusted one.
+    db.execute(&format!(
+        "INSERT INTO dex_trusted_emitters (chain, emitter, protocol) VALUES \
+         ({CHAIN}, unhex('0000000000000000000000008366a39cc670b4001a1121b8f6a443a643e40951'), \
+         'uniswap_v4')"
+    ))
+    .await;
+}
+
+// -------------------------------------------------------------- the tests
+
+#[tokio::test]
+#[ignore]
+async fn real_rows_round_trip_and_the_side_tables_follow() {
+    let db = TestDb::create("roundtrip").await;
+    let rows = rows_of(fixtures::ALL, 1, 0);
+
+    assert_eq!(rows.tokens.len(), 9, "launches");
+    assert_eq!(rows.trades.len(), 43, "curve trades");
+    assert_eq!(rows.graduations.len(), 2, "graduations");
+    assert_eq!(rows.creator_fees.len(), 9, "fee components");
+
+    db.store(&rows).await;
+
+    for table in BASE_TABLES {
+        let stored =
+            db.count(&format!("SELECT count() FROM {table} FINAL")).await;
+        assert!(stored > 0, "{table}");
+    }
+
+    // Every MV-fed side table carries exactly its parent's rows.
+    assert_eq!(
+        db.count("SELECT count() FROM launchpad_trades_by_token FINAL")
+            .await,
+        rows.trades.len() as u64
+    );
+    assert_eq!(
+        db.count("SELECT count() FROM launchpad_launches_by_time FINAL")
+            .await,
+        rows.tokens.len() as u64
+    );
+    assert_eq!(
+        db.count(
+            "SELECT count() FROM launchpad_launches_by_creator FINAL"
+        )
+        .await,
+        rows.tokens.len() as u64
+    );
+
+    // 256-bit round trip: the initial supply is 1e27, above 2^53, and the
+    // exact integer must survive the wire.
+    let supply = db
+        .text(&format!(
+            "SELECT toString(initial_supply) FROM launchpad_tokens FINAL \
+             WHERE chain = {CHAIN} AND token = unhex('{}')",
+            id_hex(TOKEN)
+        ))
+        .await;
+    assert_eq!(supply, "1000000000000000000000000000");
+
+    // Every trade of the fixtures has a VERIFIED token leg.
+    assert_eq!(
+        db.count("SELECT count() FROM launchpad_trades FINAL WHERE token_verified = 1")
+            .await,
+        rows.trades.len() as u64
+    );
+    // The native-quoted ones can never be verified, the ERC-20 ones always
+    // are. 5 of the 43 are ERC-20 quoted (4 Pons V2 buys + 1 sell on the
+    // ERC-20 curve) plus 3 on the Flap portal.
+    assert_eq!(
+        db.count("SELECT count() FROM launchpad_trades FINAL WHERE quote_verified = 1")
+            .await,
+        8
+    );
+
+    db.drop_database().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_cookbook_runs_on_real_data() {
+    let db = TestDb::create("cookbook").await;
+    let rows = rows_of(fixtures::ALL, 1, 0);
+    db.store(&rows).await;
+    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0)).await;
+    db.trust_the_real_venues().await;
+    store_the_destination_pool(&db).await;
+    db.execute(&format!(
+        "INSERT INTO launchpad_frontends (chain, address, name, kind) \
+         VALUES ({CHAIN}, {}, 'bundler', 'router')",
+        id_literal(BUNDLER)
+    ))
+    .await;
+
+    let token = id_hex(TOKEN);
+    let creator = id_hex(CREATOR);
+    let parameters: Vec<(&str, &str)> = vec![
+        ("chain", "4663"),
+        ("since", "0"),
+        ("now", "1789999999"),
+        ("dead_after", "3600"),
+        ("from_block", "0"),
+        ("as_of_block", "18446744073709551615"),
+        ("blocks", "5"),
+        ("token", &token),
+        ("creator", &creator),
+    ];
+
+    // Every recipe runs, and each one is a single cheap statement.
+    for recipe in cookbook::COOKBOOK {
+        let sql = recipe.render(&parameters);
+        assert!(!sql.contains('{'), "{sql}");
+
+        let started = Instant::now();
+        let lines = db.snapshot(&sql).await;
+        println!(
+            "{:<38} {:>4} rows  {:>6.1} ms",
+            recipe.screen,
+            lines.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    // ---- new launch feed: 7 of the 9 launches are on this chain (one
+    // Flap is on BNB Chain, one Clanker on Base) and 3 of those 7 come
+    // from a trusted emitter: 2 Pons V2 and 1 Flap portal.
+    assert_eq!(
+        db.count(&format!(
+            "SELECT count() FROM ({})",
+            cookbook::NEW_LAUNCHES.render(&parameters)
+        ))
+        .await,
+        3
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT count() FROM ({})",
+            cookbook::NEW_LAUNCHES_ALL.render(&parameters)
+        ))
+        .await,
+        7
+    );
+
+    // ---- token page, hand computed against README §1.1.
+    let page = |column: &str| {
+        format!(
+            "SELECT ifNull(toString({column}), '') FROM \
+             launchpad_token_v(chain = {CHAIN}, token = unhex('{token}'))"
+        )
+    };
+    assert_eq!(
+        db.text(&page("launch_block")).await,
+        LAUNCH_BLOCK.to_string()
+    );
+    assert_eq!(db.text(&page("trades")).await, "32");
+    assert_eq!(db.text(&page("buys")).await, "32");
+    assert_eq!(db.text(&page("trusted")).await, "1");
+    assert_eq!(db.text(&page("graduated")).await, "1");
+    assert_eq!(
+        db.text(&page("hex(pool_id)")).await.to_lowercase(),
+        GRADUATION_POOL
+    );
+    // The 33 buys raised the threshold exactly (4.2e18 + 3 wei).
+    let raised = db
+        .number(&format!(
+            "SELECT raised_raw FROM launchpad_token_v(chain = {CHAIN}, \
+             token = unhex('{token}'))"
+        ))
+        .await;
+    assert!((raised - THRESHOLD).abs() < 1.0, "raised {raised}");
+    assert_eq!(db.text(&page("curve_progress")).await, "1");
+
+    // ---- candles: the curve lived for 13 blocks inside one minute.
+    let buckets = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_candles_1m_v WHERE chain = \
+             {CHAIN} AND token = unhex('{token}')"
+        ))
+        .await;
+    assert_eq!(buckets, 1);
+    let candle = |column: &str| {
+        format!(
+            "SELECT {column} FROM launchpad_candles_1m_v WHERE chain = \
+             {CHAIN} AND token = unhex('{token}')"
+        )
+    };
+    assert_eq!(db.number(&candle("toFloat64(trades)")).await, 32.0);
+    // The launch buy: 53,565,734,934,637,059 wei for
+    // 30,000,000,000,000,005,519,761,904 raw token units.
+    let open = db.number(&candle("ifNull(open_raw, 0.)")).await;
+    assert!(
+        (open
+            - 53_565_734_934_637_059.0
+                / 30_000_000_000_000_005_519_761_904.0)
+            .abs()
+            < 1e-30,
+        "open {open}"
+    );
+    assert!(db.number(&candle("ifNull(high_raw, 0.)")).await > open);
+
+    // ---- graduation feed: the DEX join really resolves the pool.
+    let graduation = db
+        .rows::<(String, String, u8)>(&format!(
+            "SELECT ifNull(toString(pool_status), ''), \
+             ifNull(toString(pool_protocol), ''), \
+             toUInt8(ifNull(pool_trusted, 0)) FROM \
+             launchpad_graduations_v(chain = {CHAIN}, since = 0)"
+        ))
+        .await;
+    assert_eq!(graduation.len(), 1);
+    assert_eq!(graduation[0].0, "event");
+    assert_eq!(graduation[0].1, "uniswap_v4");
+    assert_eq!(graduation[0].2, 1);
+
+    // ---- creator page: one launch, it graduated, fees really paid out.
+    let creator_row = |column: &str| {
+        format!(
+            "SELECT ifNull(toString({column}), '') FROM \
+             launchpad_creator_v(chain = {CHAIN}, creator = \
+             unhex('{creator}'), as_of = 1789999999, dead_after = 3600)"
+        )
+    };
+    assert_eq!(db.text(&creator_row("launches")).await, "1");
+    assert_eq!(db.text(&creator_row("graduated")).await, "1");
+    assert_eq!(db.text(&creator_row("died")).await, "0");
+    let fees = db
+        .number(&format!(
+            "SELECT realised_creator_fees_raw FROM launchpad_creator_v(\
+             chain = {CHAIN}, creator = unhex('{creator}'), as_of = \
+             1789999999, dead_after = 3600)"
+        ))
+        .await;
+    assert!(
+        (fees - 147_906_635_318_930_699.0).abs() < 1_000.0,
+        "creator fees {fees}"
+    );
+
+    // ---- sniper view: the bundle of 15 recipients is visible as such.
+    let bundle = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_snipers_v(chain = {CHAIN}, \
+             token = unhex('{token}'), blocks = 5) WHERE bundle_size = 15"
+        ))
+        .await;
+    assert_eq!(bundle, 15);
+    let funders = db
+        .count(&format!(
+            "SELECT uniqExact(funder) FROM launchpad_snipers_v(chain = \
+             {CHAIN}, token = unhex('{token}'), blocks = 5) WHERE \
+             bundle_size = 15"
+        ))
+        .await;
+    assert_eq!(funders, 1, "one transaction funded all fifteen");
+
+    // ---- holders: the curve gave the tokens out, so the sum of the
+    // balances is the initial supply minus what the curve still holds.
+    let holders = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_token_holders_v(chain = {CHAIN}, \
+             token = unhex('{token}'), as_of_block = \
+             18446744073709551615)"
+        ))
+        .await;
+    assert!(holders >= 15, "holders {holders}");
+
+    // ---- front ends: the split adds up to the venue's own volume.
+    let venue = db
+        .number(&format!(
+            "SELECT sum(volume_quote_raw) FROM launchpad_venues_1d_v(chain \
+             = {CHAIN}) WHERE family = 'pons_v2'"
+        ))
+        .await;
+    let split = db
+        .number(&format!(
+            "SELECT sum(volume_quote_raw) FROM launchpad_frontend_volume_v(\
+             chain = {CHAIN}, since = 0) WHERE family = 'pons_v2'"
+        ))
+        .await;
+    assert!((venue - split).abs() < 1.0, "{venue} != {split}");
+    assert!(
+        db.count(&format!(
+            "SELECT count() FROM launchpad_frontend_volume_v(chain = \
+             {CHAIN}, since = 0) WHERE frontend = 'bundler'"
+        ))
+        .await
+            >= 1
+    );
+
+    db.drop_database().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_purge_and_a_rebuild_equal_a_clean_index() {
+    // The canonical chain keeps the launch and the graduation but has
+    // FEWER trades: four snipes of block 66,679,545 never happened.
+    let reorged: Vec<&RawTx> = fixtures::ALL.to_vec();
+    let canonical: Vec<&RawTx> = fixtures::ALL
+        .iter()
+        .copied()
+        .filter(|tx| {
+            !std::ptr::eq(*tx, &fixtures::PONS_SNIPE_03)
+                && !std::ptr::eq(*tx, &fixtures::PONS_SNIPE_04)
+                && !std::ptr::eq(*tx, &fixtures::PONS_SNIPE_05)
+                && !std::ptr::eq(*tx, &fixtures::PONS_SNIPE_06)
+        })
+        .collect();
+    assert_eq!(canonical.len(), reorged.len() - 4);
+
+    let fork: u64 = 66_679_545;
+    let before: Vec<&RawTx> = canonical
+        .iter()
+        .copied()
+        .filter(|tx| tx.chain != CHAIN || tx.block_number < fork)
+        .collect();
+    let after: Vec<&RawTx> = canonical
+        .iter()
+        .copied()
+        .filter(|tx| tx.chain == CHAIN && tx.block_number >= fork)
+        .collect();
+
+    // --- the clean index
+    let clean = TestDb::create("clean").await;
+    clean.store(&rows_of(&canonical, 1, 0)).await;
+    clean.trust_the_real_venues().await;
+
+    // --- the reorged one: everything, then a purge, then the canonical
+    // tail. Nothing is ever deleted.
+    let db = TestDb::create("reorged").await;
+    db.store(&rows_of(&reorged, 1, 0)).await;
+    db.trust_the_real_venues().await;
+
+    let epoch: u32 = 1;
+    let from_ts = 1_789_780_286 - 1_789_780_286 % 86_400;
+    for table in BASE_TABLES {
+        let sql = tombstone_sql(table, CHAIN, fork, None, 2).expect(table);
+        db.execute(&sql).await;
+    }
+    db.execute(&format!(
+        "INSERT INTO reorgs (chain, epoch, from_ts, detected_at, \
+         fork_block, old_head, depth, rows_tombstoned, reason) \
+         VALUES ({CHAIN}, {epoch}, toDateTime({from_ts}), now(), {fork}, \
+         {GRADUATION_BLOCK}, 12, 0, 'reorg')"
+    ))
+    .await;
+    for table in LAUNCHPADS_DERIVED {
+        for sql in
+            rebuild_statements(table, CHAIN, from_ts, 1_790_000_000, epoch)
+        {
+            db.execute(&sql).await;
+        }
+    }
+    db.store(&rows_of(&after, 3, epoch)).await;
+
+    // Sanity: the tombstoned trades really are gone from the live rows and
+    // still on disk (insert-only).
+    assert!(
+        db.count("SELECT count() FROM launchpad_trades").await
+            > db.count("SELECT count() FROM launchpad_trades FINAL").await
+    );
+    let _ = before;
+
+    // --- every table, every side table and every view must agree.
+    for table in BASE_TABLES.iter().chain(SIDE_TABLES) {
+        let source = format!(
+            "SELECT * EXCEPT (_version, epoch) FROM {table} FINAL WHERE \
+             is_deleted = 0"
+        );
+        assert_eq!(
+            db.snapshot(&source).await,
+            clean.snapshot(&source).await,
+            "{table}"
+        );
+    }
+
+    // Float64 sums are compared at Float32 precision: a rebuild adds the
+    // surviving rows in ONE group, the materialized view added them
+    // incrementally, and floating point addition is not associative. Every
+    // integer, id and timestamp is compared exactly.
+    let token = id_hex(TOKEN);
+    let candles = |view: &str| {
+        format!(
+            "SELECT chain, token, emitter, bucket, toFloat32(open_raw), \
+             toFloat32(high_raw), toFloat32(low_raw), toFloat32(close_raw), \
+             trades, priced_trades, buys, toFloat32(volume_quote_raw), \
+             toFloat32(volume_token_raw), \
+             toFloat32(volume_quote_verified_raw), unique_traders, \
+             toFloat32(curve_progress) FROM {view} WHERE chain = {CHAIN}"
+        )
+    };
+    for view in [
+        candles("launchpad_candles_1m_v"),
+        candles("launchpad_candles_1h_v"),
+        format!(
+            "SELECT chain, family, emitter, bucket, trades, buys, \
+             toFloat32(volume_quote_raw), \
+             toFloat32(volume_quote_verified_raw), toFloat32(fees_raw), \
+             unique_traders, unique_tokens FROM \
+             launchpad_venue_trades_1d_v WHERE chain = {CHAIN}"
+        ),
+        format!(
+            "SELECT * FROM launchpad_launches_1d_v WHERE chain = {CHAIN}"
+        ),
+        format!(
+            "SELECT chain, family, emitter, bucket, graduations, \
+             toFloat32(quote_in_raw), unique_tokens FROM \
+             launchpad_graduations_1d_v WHERE chain = {CHAIN}"
+        ),
+        format!(
+            "SELECT chain, family, emitter, recipient, kind, phase, \
+             bucket, events, toFloat32(amount_raw) FROM \
+             launchpad_creator_fees_1d_v WHERE chain = {CHAIN}"
+        ),
+        format!(
+            "SELECT chain, family, emitter, bucket, launches, graduations, \
+             trades, buys, toFloat32(volume_quote_raw), \
+             toFloat32(volume_quote_verified_raw), toFloat32(fees_raw), \
+             toFloat32(graduated_quote_raw), unique_traders, \
+             unique_creators, trusted FROM \
+             launchpad_venues_1d_all_v(chain = {CHAIN})"
+        ),
+        format!(
+            "SELECT token, family, emitter, curve, creator, launch_block, \
+             launch_time, trades, buys, unique_traders, \
+             toFloat32(volume_quote_raw), toFloat32(last_price_raw), \
+             toFloat32(curve_progress), graduated, pool_id FROM \
+             launchpad_token_v(chain = {CHAIN}, token = unhex('{token}'))"
+        ),
+    ] {
+        assert_eq!(
+            db.snapshot(&view).await,
+            clean.snapshot(&view).await,
+            "{view}"
+        );
+    }
+
+    // And the repaired index really lost the four trades.
+    assert_eq!(
+        db.count(&format!(
+            "SELECT sum(trades) FROM launchpad_candles_1m_v WHERE chain = \
+             {CHAIN} AND token = unhex('{token}')"
+        ))
+        .await,
+        28
+    );
+
+    db.drop_database().await;
+    clean.drop_database().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_forged_venue_moves_no_headline_number() {
+    let db = TestDb::create("forgery").await;
+    db.store(&rows_of(fixtures::ALL, 1, 0)).await;
+    db.trust_the_real_venues().await;
+
+    let headline = |view: &str| {
+        format!(
+            "SELECT round(sum(volume_quote_raw)) FROM {view}(chain = \
+             {CHAIN}) WHERE family = 'pons_v2'"
+        )
+    };
+    let honest_volume =
+        db.number(&headline("launchpad_venues_1d_v")).await;
+    let honest_launches = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_new_launches_v(chain = {CHAIN}, \
+             since = 0)"
+        ))
+        .await;
+    assert!(honest_volume > 0.0 && honest_launches > 0);
+
+    // A forged launch and a forged trade of 1e30 quote units, fully
+    // corroborated by a token the forger also controls: the corroboration
+    // is satisfied, only the emitter list is not.
+    let forger = Address::repeat_byte(0x66);
+    let fake_token = Address::repeat_byte(0x67);
+    let fake_curve = Address::repeat_byte(0x68);
+    let huge = U256::from(10u64).pow(U256::from(30u64));
+    let place = |log_index: u32| Place {
+        chain: CHAIN,
+        block_number: 66_679_560,
+        log_index,
+        timestamp: 1_789_780_300,
+        transaction_hash: B256::repeat_byte(0x99),
+    };
+
+    let logs = vec![
+        fixtures::constructed_launch(
+            place(0),
+            forger,
+            fake_token,
+            fake_curve,
+            forger,
+            huge,
+        ),
+        fixtures::constructed_transfer(
+            place(1),
+            fake_token,
+            fake_curve,
+            forger,
+            huge,
+        ),
+        fixtures::constructed_buy(
+            place(2),
+            fake_curve,
+            forger,
+            forger,
+            huge,
+            huge,
+            U256::ZERO,
+            U256::ZERO,
+        ),
+    ];
+
+    let mut forged = decode(CHAIN, &logs);
+    assert_eq!(forged.trades.len(), 1);
+    // The forger DID move a real token through their own curve, so the
+    // token leg is verified: corroboration bounds amounts, not identity.
+    assert_eq!(forged.trades[0].token_verified, 1);
+    forged.set_version(2);
+    db.store(&forged).await;
+
+    assert_eq!(
+        db.number(&headline("launchpad_venues_1d_v")).await,
+        honest_volume,
+        "a forged venue changed the trusted volume"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT count() FROM launchpad_new_launches_v(chain = {CHAIN}, \
+             since = 0)"
+        ))
+        .await,
+        honest_launches
+    );
+    assert!(
+        db.count(&format!(
+            "SELECT count() FROM launchpad_trusted_curves_v WHERE chain = \
+             {CHAIN} AND curve = {}",
+            id_literal(&format!("{fake_curve:?}"))
+        ))
+        .await
+            == 0
+    );
+
+    // The exploration views DO show it, which is the point of having them.
+    assert!(
+        db.number(&headline("launchpad_venues_1d_all_v")).await
+            > honest_volume
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT count() FROM launchpad_new_launches_all_v(chain = \
+             {CHAIN}, since = 0) WHERE trusted = 0"
+        ))
+        .await,
+        5
+    );
+
+    db.drop_database().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn hostile_amounts_do_not_wrap() {
+    let db = TestDb::create("hostile").await;
+    db.trust_the_real_venues().await;
+
+    let curve = address(CURVE);
+    let token = address(TOKEN);
+    let max = U256::MAX;
+    let place = |log_index: u32| Place {
+        chain: CHAIN,
+        block_number: LAUNCH_BLOCK,
+        log_index,
+        timestamp: 1_789_780_286,
+        transaction_hash: B256::repeat_byte(0x11),
+    };
+
+    // CONSTRUCTED: three buys of 2^256-1 on the real curve.
+    let mut logs = vec![fixtures::constructed_launch(
+        place(0),
+        address(PONS_FACTORY),
+        token,
+        curve,
+        address(CREATOR),
+        max,
+    )];
+    for index in 0..3u32 {
+        logs.push(fixtures::constructed_transfer(
+            place(1 + index * 2),
+            token,
+            curve,
+            Address::repeat_byte(0x22),
+            max,
+        ));
+        logs.push(fixtures::constructed_buy(
+            place(2 + index * 2),
+            curve,
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x22),
+            max,
+            max,
+            U256::ZERO,
+            U256::ZERO,
+        ));
+    }
+
+    let mut rows = decode(CHAIN, &logs);
+    rows.set_version(1);
+    assert_eq!(rows.trades.len(), 3);
+    db.store(&rows).await;
+
+    // The exact integer survives.
+    assert_eq!(
+        db.text("SELECT toString(max(quote_amount)) FROM launchpad_trades FINAL")
+            .await,
+        max.to_string()
+    );
+    // And the aggregate sums Float64, so three of them are 3 * 1.157e77 -
+    // a raw UInt256 sum would have wrapped to something small.
+    let volume = db
+        .number(&format!(
+            "SELECT sum(volume_quote_raw) FROM launchpad_venue_trades_1d_v \
+             WHERE chain = {CHAIN}"
+        ))
+        .await;
+    assert!(volume > 3.4e77, "volume {volume}");
+    assert!(volume.is_finite());
+
+    // The price of max/max is 1, not a division blow-up.
+    let close = db
+        .number(&format!(
+            "SELECT ifNull(close_raw, 0.) FROM launchpad_candles_1m_v WHERE chain = \
+             {CHAIN} AND token = unhex('{}')",
+            id_hex(TOKEN)
+        ))
+        .await;
+    assert_eq!(close, 1.0);
+
+    db.drop_database().await;
+}
