@@ -279,6 +279,45 @@ mod tests {
         );
     }
 
+    /// The README ships the rows this table is meant to hold, because a
+    /// migration may not. That only helps while the two agree, so: every
+    /// program the module streams, and every trusted launchpad emitter,
+    /// must appear there in base58.
+    ///
+    /// The statements themselves were run against a real ClickHouse 25.12
+    /// with the full migration set; this keeps them from drifting.
+    #[test]
+    fn the_readme_ships_an_insert_for_every_streamed_program() {
+        const README: &str = include_str!("README.md");
+
+        for venue in crate::svm::programs::VENUES {
+            assert!(
+                README.contains(venue.program_b58()),
+                "{} is streamed but the README's sol_dex_programs INSERT \
+                 does not list it",
+                venue.as_str()
+            );
+        }
+        for family in crate::svm::launchpads::SolFamily::ALL {
+            assert!(
+                README.contains(family.venue().program_b58()),
+                "{family} has no launchpad_trusted_emitters row in the \
+                 README"
+            );
+            assert!(
+                README.contains(family.as_str()),
+                "{family} is not named in the README"
+            );
+        }
+        // The one form that keeps all 32 bytes AND round trips: a bare
+        // `base58Decode` yields a String, and the column is a
+        // FixedString(32).
+        assert!(
+            README.contains("toFixedString(base58Decode("),
+            "the README's INSERTs must build a FixedString(32)"
+        );
+    }
+
     #[test]
     fn the_load_query_names_every_column_of_the_row() {
         for column in SolDexProgram::COLUMN_NAMES {
