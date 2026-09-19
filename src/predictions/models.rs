@@ -441,6 +441,15 @@ pub struct PredictionTrade {
     pub collateral_amount: U256,
     #[serde_as(as = "DisplayFromStr")]
     pub match_type: MatchType,
+    /// 1 when the SHARES of this fill are proven by the chain: the same
+    /// transaction carries ERC-1155 transfers of this exact
+    /// `outcome_token_id` emitted by this `registry`, and the fills of
+    /// that (registry, token) do not claim more shares than actually
+    /// moved. Candles, the ledger's priced legs and the leaderboard count
+    /// `verified = 1` only - an `OrderFilled` is free to emit, so without
+    /// the bound one forged log owns a real market's volume and price.
+    /// See `decode::verify_shares`.
+    pub verified: u8,
     /// The token of the MAKER order: the same as `outcome_token_id` for
     /// `complementary` / `direct` / `amm`, the other outcome for `mint` /
     /// `merge`.

@@ -61,7 +61,8 @@ SELECT
 FROM prediction_candles_1m AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
-  AND a.epoch >= f.epoch_floor
+  AND a.epoch >= ifNull(f.epoch_floor, 0)
+  AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
 
 CREATE VIEW IF NOT EXISTS prediction_candles_1h_v AS
@@ -89,7 +90,8 @@ SELECT
 FROM prediction_candles_1h AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
-  AND a.epoch >= f.epoch_floor
+  AND a.epoch >= ifNull(f.epoch_floor, 0)
+  AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
 
 CREATE VIEW IF NOT EXISTS prediction_candles_1d_v AS
@@ -117,7 +119,8 @@ SELECT
 FROM prediction_candles_1d AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
-  AND a.epoch >= f.epoch_floor
+  AND a.epoch >= ifNull(f.epoch_floor, 0)
+  AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
 
 -- Every market, computed from scratch. Correct at any instant and the
@@ -135,10 +138,51 @@ token_map AS (
   FROM prediction_outcome_tokens_by_market FINAL
 ),
 -- A condition split against several collaterals has one position set per
--- collateral. The first one seen is the market's.
-primary_collateral AS (
-  SELECT chain, registry, market_id, argMin(collateral_token, first_seen_block) AS collateral_token
+-- collateral. WHICH one is the market's cannot be decided by "first seen":
+-- prediction_outcome_tokens is arithmetic, never purged and never
+-- tombstoned, so a split that only ever existed on an orphaned fork - or a
+-- deliberate 1 wei split in a worthless ERC-20 mined a block earlier -
+-- would own the market for ever and drop its real outcome tokens out of
+-- the INNER JOIN below. So: the collateral with the most LIVE, purge-aware
+-- split flow wins (prediction_market_flows_1d is block scoped and epoch
+-- filtered), then the one a trusted venue of that registry settles in,
+-- then the earliest sighting, then the id itself so ties are still
+-- deterministic.
+collateral_flow AS (
+  SELECT
+    a.chain AS chain, a.registry AS registry, a.market_id AS market_id,
+    a.collateral_token AS collateral_token,
+    toFloat64(sum(a.split)) + toFloat64(sum(a.merged)) + toFloat64(sum(a.redeemed)) AS flow
+  FROM prediction_market_flows_1d AS a
+  ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+  WHERE a.epoch >= ifNull(f.epoch_floor, 0)
+  GROUP BY chain, registry, market_id, collateral_token
+),
+venue_collateral AS (
+  SELECT DISTINCT v.chain AS chain, v.registry AS registry, v.collateral_token AS collateral_token
+  FROM prediction_venues AS v FINAL
+  INNER JOIN prediction_trusted_exchanges_v AS t
+    ON t.chain = v.chain AND t.exchange = v.exchange AND t.registry = v.registry
+  WHERE v.source = 'rpc'
+),
+collateral_candidates AS (
+  SELECT chain, registry, market_id, collateral_token, min(first_seen_block) AS first_seen_block
   FROM token_map
+  GROUP BY chain, registry, market_id, collateral_token
+),
+primary_collateral AS (
+  SELECT
+    c.chain AS chain, c.registry AS registry, c.market_id AS market_id,
+    argMax(
+      c.collateral_token,
+      (ifNull(w.flow, 0.), toUInt8(v.collateral_token != ''), -toInt64(c.first_seen_block), c.collateral_token)
+    ) AS collateral_token
+  FROM collateral_candidates AS c
+  LEFT JOIN collateral_flow AS w
+    ON w.chain = c.chain AND w.registry = c.registry AND w.market_id = c.market_id
+       AND w.collateral_token = c.collateral_token
+  LEFT JOIN venue_collateral AS v
+    ON v.chain = c.chain AND v.registry = c.registry AND v.collateral_token = c.collateral_token
   GROUP BY chain, registry, market_id
 ),
 token_totals AS (
@@ -152,7 +196,7 @@ token_totals AS (
     uniqMergeState(a.traders) AS traders
   FROM prediction_candles_1d AS a
   ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
-  WHERE a.epoch >= f.epoch_floor
+  WHERE a.epoch >= ifNull(f.epoch_floor, 0)
   GROUP BY chain, registry, outcome_token_id
 ),
 token_day AS (
@@ -162,7 +206,7 @@ token_day AS (
     toUInt64(sum(a.fills)) AS fills
   FROM prediction_candles_1h AS a
   ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
-  WHERE a.bucket >= now() - INTERVAL 24 HOUR AND a.epoch >= f.epoch_floor
+  WHERE a.bucket >= now() - INTERVAL 24 HOUR AND a.epoch >= ifNull(f.epoch_floor, 0)
   GROUP BY chain, registry, outcome_token_id
 ),
 trading AS (
@@ -201,7 +245,7 @@ flows AS (
     toFloat64(sum(a.split)) - toFloat64(sum(a.merged)) - toFloat64(sum(a.redeemed)) AS open_interest_raw
   FROM prediction_market_flows_1d AS a
   ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
-  WHERE a.epoch >= f.epoch_floor
+  WHERE a.epoch >= ifNull(f.epoch_floor, 0)
   GROUP BY chain, registry, market_id, collateral_token
 ),
 -- The token map is arithmetic and survives a reorg, so it proves nothing:
@@ -327,21 +371,40 @@ LEFT JOIN collaterals AS c ON c.chain = k.chain AND c.address = t.collateral_tok
 LEFT JOIN enriched AS md ON md.chain = k.chain AND md.market_id = k.market_id
 LEFT JOIN labels AS l ON l.chain = k.chain AND l.address = k.registry;
 
--- The market list as a table: recomputed from prediction_markets_live_v
--- once a minute by ClickHouse (refreshable materialized view - the new
--- contents replace the old ones atomically, no DELETE involved, no
--- indexer process takes part). At most a minute behind the chain - the
--- chart and the tape of a market page are live.
+-- The market list as a table: recomputed by ClickHouse itself (refreshable
+-- materialized view - the new contents replace the old ones atomically, no
+-- DELETE involved, no indexer process takes part), holding the markets of
+-- TRUSTED registries only (0020). A market of an untrusted registry is
+-- still in prediction_markets_all_v.
+--
+-- REQUIRES an Atomic or Replicated database: a refreshable materialized
+-- view without APPEND is refused on any other engine with
+-- "Code: 80 ... only support Atomic and Replicated database engines". The
+-- migration runner checks this before it applies 0022.
+--
+-- COST: the refresh recomputes prediction_markets_live_v in full, which has
+-- no chain filter and reads every prediction_candles_1d row ever written.
+-- That is why the interval is 5 minutes and not 1, and why the README's
+-- Known gaps carry the bounded redesign (per chain incremental market
+-- stats) - at the 50 chain target this is the module's largest standing
+-- cost. A refresh that overruns simply runs back to back.
 CREATE MATERIALIZED VIEW IF NOT EXISTS prediction_market_list
-REFRESH EVERY 1 MINUTE
+REFRESH EVERY 5 MINUTE
 ENGINE = MergeTree
 ORDER BY (chain, market_id, registry)
-AS SELECT * FROM prediction_markets_live_v;
+AS SELECT * FROM prediction_markets_live_v
+WHERE (chain, registry) IN (
+  SELECT chain, registry FROM prediction_trusted_registries_v);
 
 -- Market list / search / header. One row per market with outcome arrays
--- (index i of every array = outcome i).
+-- (index i of every array = outcome i). Trusted registries only.
 CREATE VIEW IF NOT EXISTS prediction_markets_v AS
 SELECT * FROM prediction_market_list;
+
+-- FORENSICS: every market anyone ever prepared or split, trusted or not,
+-- computed from scratch. Reads the whole database - never a UI query.
+CREATE VIEW IF NOT EXISTS prediction_markets_all_v AS
+SELECT * FROM prediction_markets_live_v;
 
 -- Trades tape of a market, from the taker's point of view.
 --   SELECT * FROM prediction_trades_v(chain = 137, market_id = '<hex>')
@@ -350,10 +413,18 @@ CREATE VIEW IF NOT EXISTS prediction_trades_v AS
 WITH
 toFixedString(unhex(if(length({market_id:String}) = 40,
   concat('000000000000000000000000', {market_id:String}), {market_id:String})), 32) AS market_key,
+-- Scoped to the market's OWN (registry, collateral): market_id is the
+-- permissionless conditionId, so any contract can put itself in this map
+-- under the same market_id. prediction_market_list is already restricted
+-- to trusted registries and names the market's primary collateral, so one
+-- IN does both.
 mapping AS (
   SELECT registry, outcome_token_id, outcome_index
   FROM prediction_outcome_tokens_by_market FINAL
   WHERE chain = {chain:UInt64} AND market_id = market_key
+    AND (registry, collateral_token) IN (
+      SELECT registry, collateral_token FROM prediction_market_list
+      WHERE chain = {chain:UInt64} AND market_id = market_key)
 ),
 market AS (
   SELECT registry, outcomes, collateral_decimals, collateral_symbol
@@ -391,6 +462,46 @@ INNER JOIN mapping AS o ON o.registry = s.registry AND o.outcome_token_id = s.ou
 LEFT JOIN market AS m ON m.registry = s.registry
 WHERE s.chain = {chain:UInt64}
   AND (s.registry, s.outcome_token_id) IN (SELECT registry, outcome_token_id FROM mapping)
+  AND s.share_amount != 0
+  AND s.verified = 1
+  AND (s.exchange, s.registry) IN (
+    SELECT exchange, registry FROM prediction_trusted_exchanges_v
+    WHERE chain = {chain:UInt64});
+
+-- FORENSICS: the same tape without the trust and proof filters, plus the
+-- two flags, so an operator can see what was rejected and why. Never a UI
+-- query: an unverified row is attacker controlled in every column.
+CREATE VIEW IF NOT EXISTS prediction_trades_all_v AS
+WITH
+toFixedString(unhex(if(length({market_id:String}) = 40,
+  concat('000000000000000000000000', {market_id:String}), {market_id:String})), 32) AS market_key
+SELECT
+  s.chain AS chain,
+  market_key AS market_id,
+  s.registry AS registry,
+  s.timestamp AS timestamp,
+  s.block_number AS block_number,
+  s.tx_index AS tx_index,
+  s.ordinal AS ordinal,
+  s.tx_id AS tx_id,
+  s.outcome_token_id AS outcome_token_id,
+  toString(s.side) AS side,
+  toFloat64(s.collateral_amount) / toFloat64(s.share_amount) AS price,
+  s.share_amount AS share_amount,
+  s.collateral_amount AS collateral_amount,
+  s.taker AS trader,
+  s.maker AS maker,
+  s.exchange AS exchange,
+  toString(s.protocol) AS protocol,
+  s.verified AS verified,
+  (s.exchange, s.registry) IN (
+    SELECT exchange, registry FROM prediction_trusted_exchanges_v
+    WHERE chain = {chain:UInt64}) AS trusted
+FROM prediction_trades_by_token AS s FINAL
+WHERE s.chain = {chain:UInt64}
+  AND (s.registry, s.outcome_token_id) IN (
+    SELECT registry, outcome_token_id FROM prediction_outcome_tokens_by_market FINAL
+    WHERE chain = {chain:UInt64} AND market_id = market_key)
   AND s.share_amount != 0;
 
 -- Holders of a market, per outcome.
@@ -404,6 +515,9 @@ mapping AS (
   SELECT registry, outcome_token_id, outcome_index
   FROM prediction_outcome_tokens_by_market FINAL
   WHERE chain = {chain:UInt64} AND market_id = market_key
+    AND (registry, collateral_token) IN (
+      SELECT registry, collateral_token FROM prediction_market_list
+      WHERE chain = {chain:UInt64} AND market_id = market_key)
 ),
 market AS (
   SELECT registry, outcomes, outcome_prices, payouts, status, collateral_decimals
@@ -478,6 +592,9 @@ ledger AS (
     max(timestamp) AS last_activity_at
   FROM prediction_ledger_by_holder FINAL
   WHERE chain = {chain:UInt64} AND holder = holder_id
+    AND registry IN (
+      SELECT registry FROM prediction_trusted_registries_v
+      WHERE chain = {chain:UInt64})
   GROUP BY registry, outcome_token_id
 ),
 mapping AS (
@@ -540,6 +657,9 @@ ledger AS (
   FROM prediction_ledger_by_holder FINAL
   WHERE chain = {chain:UInt64} AND holder = holder_id
     AND reason != 'trade'
+    AND registry IN (
+      SELECT registry FROM prediction_trusted_registries_v
+      WHERE chain = {chain:UInt64})
 ),
 mapping AS (
   SELECT registry, outcome_token_id, market_id, outcome_index
@@ -580,21 +700,42 @@ FROM ledger AS l
 INNER JOIN mapping AS o ON o.registry = l.registry AND o.outcome_token_id = l.outcome_token_id
 LEFT JOIN markets AS m ON m.registry = l.registry AND m.market_id = o.market_id;
 
--- Leaderboard of a period (whole UTC days, both ends included).
+-- Leaderboard of a period (whole UTC days, both ends included), ONE ROW
+-- PER (trader, collateral token).
 --   SELECT * FROM prediction_leaderboard_v(chain = 137, from_day = '2026-09-01', to_day = '2026-09-18')
---   ORDER BY volume DESC LIMIT 100
+--   ORDER BY volume DESC NULLS LAST LIMIT 100
 --
 --   volume        = collateral the trader paid + received in trades
 --   net_cash_flow = sold + merged + redeemed - bought - split - fees: what
 --     the period put into the trader's pocket. It IS the realized profit of
 --     everything opened and closed inside the period. Positions still open
 --     at the end count at cost (their value is in prediction_positions_v).
+--
+-- Per collateral token, because a market in USDC and a market in WXDAI do
+-- not add up and this module has no price feed - one number over both
+-- would be an invented exchange rate. A UI that wants one ranking picks
+-- the collateral it cares about (on Polymarket: USDC.e).
+--
+-- NULL, never 0, when the amount cannot be converted: the decimals of the
+-- collateral are unknown (the token worker has not stored them, or the
+-- venue resolver has not named the exchange's collateral yet). Zero would
+-- read as "traded nothing". unpriced_trades counts those fills, and the
+-- collateral_token of such a row is 32 zero bytes.
+--
+-- Counts TRUSTED emitters only (0020): a fill on an untrusted exchange or
+-- a split at an untrusted registry is not this leaderboard's business.
 -- Addresses labelled in prediction_venue_labels (exchanges, adapters) are
--- not traders. Amounts need the decimals of the collateral: trades take
--- them from prediction_venues (exchange -> collateral token) and tokens.
--- unpriced_trades counts the trades that could not be converted yet.
+-- not traders either.
 CREATE VIEW IF NOT EXISTS prediction_leaderboard_v AS
 WITH
+trusted_exchanges AS (
+  SELECT exchange, registry FROM prediction_trusted_exchanges_v
+  WHERE chain = {chain:UInt64}
+),
+trusted_emitters AS (
+  SELECT address FROM prediction_trusted FINAL
+  WHERE chain = {chain:UInt64} AND is_deleted = 0
+),
 trading AS (
   SELECT
     a.trader AS trader, a.exchange AS exchange,
@@ -605,7 +746,8 @@ trading AS (
   ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
   WHERE a.chain = {chain:UInt64}
     AND a.bucket >= toDateTime({from_day:Date}, 'UTC') AND a.bucket <= toDateTime({to_day:Date}, 'UTC')
-    AND a.epoch >= f.epoch_floor
+    AND a.epoch >= ifNull(f.epoch_floor, 0)
+    AND a.exchange IN (SELECT exchange FROM trusted_exchanges)
   GROUP BY trader, exchange
 ),
 funding AS (
@@ -617,13 +759,15 @@ funding AS (
   ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
   WHERE a.chain = {chain:UInt64}
     AND a.bucket >= toDateTime({from_day:Date}, 'UTC') AND a.bucket <= toDateTime({to_day:Date}, 'UTC')
-    AND a.epoch >= f.epoch_floor
+    AND a.epoch >= ifNull(f.epoch_floor, 0)
+    AND a.emitter IN (SELECT address FROM trusted_emitters)
   GROUP BY trader, collateral_token
 ),
 venues AS (
-  SELECT exchange, collateral_token
-  FROM prediction_venues FINAL
-  WHERE chain = {chain:UInt64} AND source = 'rpc'
+  SELECT v.exchange AS exchange, v.collateral_token AS collateral_token
+  FROM prediction_venues AS v FINAL
+  WHERE v.chain = {chain:UInt64} AND v.source = 'rpc'
+    AND v.exchange IN (SELECT exchange FROM trusted_exchanges)
 ),
 -- tokens is EVM only: its address is padded to the 32 byte id (see
 -- prediction_markets_live_v).
@@ -642,11 +786,12 @@ labelled AS (
 lines AS (
   SELECT
     t.trader AS trader,
-    if(d.known = 1, (t.bought + t.sold) / pow(10, d.decimals), 0.) AS volume,
-    if(d.known = 1, (t.sold - t.bought - t.fees) / pow(10, d.decimals), 0.) AS cash,
-    if(d.known = 1, t.fees / pow(10, d.decimals), 0.) AS fees,
+    if(ifNull(d.known, 0) = 1, v.collateral_token, toFixedString('', 32)) AS collateral_token,
+    if(ifNull(d.known, 0) = 1, toNullable((t.bought + t.sold) / pow(10, d.decimals)), NULL) AS volume,
+    if(ifNull(d.known, 0) = 1, toNullable((t.sold - t.bought - t.fees) / pow(10, d.decimals)), NULL) AS cash,
+    if(ifNull(d.known, 0) = 1, toNullable(t.fees / pow(10, d.decimals)), NULL) AS fees,
     t.trades AS trades,
-    if(d.known = 1, 0, t.trades) AS unpriced_trades,
+    if(ifNull(d.known, 0) = 1, toUInt64(0), t.trades) AS unpriced_trades,
     t.tokens AS tokens
   FROM trading AS t
   LEFT JOIN venues AS v ON v.exchange = t.exchange
@@ -654,9 +799,10 @@ lines AS (
   UNION ALL
   SELECT
     u.trader AS trader,
-    0. AS volume,
-    if(d.known = 1, (u.merged + u.redeemed - u.split) / pow(10, d.decimals), 0.) AS cash,
-    0. AS fees,
+    if(ifNull(d.known, 0) = 1, u.collateral_token, toFixedString('', 32)) AS collateral_token,
+    CAST(NULL AS Nullable(Float64)) AS volume,
+    if(ifNull(d.known, 0) = 1, toNullable((u.merged + u.redeemed - u.split) / pow(10, d.decimals)), NULL) AS cash,
+    CAST(NULL AS Nullable(Float64)) AS fees,
     toUInt64(0) AS trades,
     toUInt64(0) AS unpriced_trades,
     arrayReduce('uniqState', CAST([] AS Array(UInt256))) AS tokens
@@ -666,12 +812,13 @@ lines AS (
 SELECT
   {chain:UInt64} AS chain,
   trader,
+  collateral_token,
   sum(volume) AS volume,
   sum(cash) AS net_cash_flow,
-  sum(fees) AS fees,
+  sum(lines.fees) AS fees,
   sum(lines.trades) AS trades,
   sum(lines.unpriced_trades) AS unpriced_trades,
   uniqMerge(lines.tokens) AS outcome_tokens_traded
 FROM lines
 WHERE trader NOT IN (SELECT address FROM labelled)
-GROUP BY trader;
+GROUP BY trader, collateral_token;

@@ -39,10 +39,61 @@
 -- market_id / question_id / order_hash are 32 bytes on every chain already
 -- and outcome_token_id stays UInt256.
 
+-- USER POPULATED, and the ONE thing that separates a real market from a
+-- forgery. Nothing on chain does: ConditionPreparation, PositionSplit and
+-- OrderFilled are permissionless, so anyone can mint a market carrying a
+-- real oracle + questionId (the decoder re-derives the conditionId, and a
+-- forger can too) and trade against it at any price. The indexer ships NO
+-- address list - it decodes by event family - so the operator says which
+-- contracts it believes. src/predictions/README.md has ready INSERTs for
+-- Polymarket and its known forks.
+--   kind 'registry': address = the ERC-1155 conditional tokens contract.
+--     registry = the same address.
+--   kind 'exchange': address = the order book / AMM, registry = the
+--     ERC-1155 contract it settles into.
+-- The HEADLINE views (prediction_markets_v, prediction_trades_v,
+-- prediction_holders_v, prediction_positions_v, prediction_candles_*_v,
+-- prediction_leaderboard_v) count trusted emitters ONLY, so an empty table
+-- means empty screens - missing numbers, never wrong ones. The *_all_v
+-- views and prediction_markets_live_v stay unfiltered for forensics.
+CREATE TABLE IF NOT EXISTS prediction_trusted (
+  chain UInt64,
+  -- 'registry' | 'exchange'
+  kind LowCardinality(String),
+  address FixedString(32),
+  registry FixedString(32),
+  note String DEFAULT '',
+  _version UInt64 DEFAULT toUnixTimestamp64Milli(now64(3)),
+  is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
+PARTITION BY chain
+ORDER BY (chain, kind, address)
+SETTINGS do_not_merge_across_partitions_select_final = 1;
+
+-- The two lenses on it, so a view never has to remember the kind string.
+CREATE VIEW IF NOT EXISTS prediction_trusted_registries_v AS
+SELECT chain, address AS registry
+FROM prediction_trusted FINAL
+WHERE kind = 'registry' AND is_deleted = 0;
+
+CREATE VIEW IF NOT EXISTS prediction_trusted_exchanges_v AS
+SELECT chain, address AS exchange, registry
+FROM prediction_trusted FINAL
+WHERE kind = 'exchange' AND is_deleted = 0;
+
 -- One row per ConditionPreparation (source 'event'). Keyed by identity
 -- first - a condition can be prepared once per registry - then by
 -- position, so a re-inserted block replaces itself and a reorged-out
 -- preparation is tombstoned by block_number.
+--
+-- PARTITION BY chain, not by month (design section 1's default for base
+-- tables): this table, prediction_resolutions and prediction_questions are
+-- read by IDENTITY (market_id / question_id), never by time - every view
+-- here does `FROM ... FINAL GROUP BY chain, registry, market_id`. A month
+-- partitioning would fan a single market's FINAL over every month it was
+-- ever touched. One row per market per chain also keeps the part count at
+-- the chain count, which is the 50 the design budgets for.
 CREATE TABLE IF NOT EXISTS prediction_markets (
   chain UInt64,
   market_id FixedString(32),
@@ -211,6 +262,14 @@ CREATE TABLE IF NOT EXISTS prediction_trades (
   -- collateral of the taker for share_amount, fees excluded
   collateral_amount UInt256,
   match_type LowCardinality(String),
+  -- 1 when the SHARES of this fill are proven: the same transaction
+  -- carries ERC-1155 transfers of this exact outcome_token_id emitted by
+  -- this registry, and the fills of that (registry, token) do not claim
+  -- more shares than actually moved. A lone forged OrderFilled naming a
+  -- real token id is 0. Candles, the ledger's priced legs and the
+  -- leaderboard count verified = 1 ONLY (see 0021). The raw row is always
+  -- kept - prediction_trades_all_v shows it.
+  verified UInt8 DEFAULT 0,
   maker_outcome_token_id UInt256,
   maker_side LowCardinality(String),
   maker_collateral_amount UInt256,
@@ -376,6 +435,7 @@ CREATE TABLE IF NOT EXISTS prediction_trades_by_token (
   share_amount UInt256,
   collateral_amount UInt256,
   match_type LowCardinality(String),
+  verified UInt8 DEFAULT 0,
   taker_fee_amount UInt256,
   taker_fee_unit LowCardinality(String),
   epoch UInt32 DEFAULT 0,
@@ -393,7 +453,7 @@ TO prediction_trades_by_token AS
 SELECT
   chain, registry, outcome_token_id, block_number, tx_index, ordinal,
   timestamp, tx_id, protocol, exchange, maker, taker, tx_from, side,
-  share_amount, collateral_amount, match_type, taker_fee_amount,
+  share_amount, collateral_amount, match_type, verified, taker_fee_amount,
   taker_fee_unit, epoch, _version, is_deleted
 FROM prediction_trades;
 
@@ -532,6 +592,7 @@ FROM
     (taker, toUInt8(1), toString(side), outcome_token_id, collateral_amount, taker_fee_amount, toString(taker_fee_unit), maker)
   ]) AS entry
   FROM prediction_trades
+  WHERE verified = 1
 );
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS prediction_ledger_by_token_trades_mv
@@ -557,4 +618,5 @@ FROM
     (taker, toUInt8(1), toString(side), outcome_token_id, collateral_amount, taker_fee_amount, toString(taker_fee_unit), maker)
   ]) AS entry
   FROM prediction_trades
+  WHERE verified = 1
 );

@@ -47,6 +47,20 @@ const MAX_OUTCOMES: usize = 256;
 const MAX_BATCH: usize = 4_096;
 /// Most bytes of an on chain text payload that are kept.
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+/// Most outcome token ids ONE log may make the decoder compute. The CTF's
+/// own limit on a partition, so nothing legitimate is lost.
+const MAX_IDS_PER_LOG: usize = MAX_OUTCOMES;
+/// Most outcome token ids one [`decode`] call may compute that are not
+/// already cached. Each one is an `alt_bn128` square root: a 256 round
+/// modular exponentiation, tens of microseconds. `PositionSplit` is
+/// permissionless and its `conditionId` is a free log topic, so the cache
+/// key varies at no cost to a spammer: 256 index sets per log times as
+/// many logs as a block has gas for is minutes of single threaded CPU on
+/// the transform path. Past the budget the decoder stops computing ids
+/// for the rest of the batch - the outcome token map is derived, not
+/// authoritative, so it simply heals at the next honest split of the same
+/// condition (the map row is idempotent, see `first_seen_version`).
+const MAX_IDS_PER_BATCH: u32 = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -562,9 +576,24 @@ struct TokenFacts {
 
 /// Position ids are keccak + a modular square root: computed once per
 /// `(collateral, condition, index set)` of a batch.
-#[derive(Default)]
+#[derive(Debug)]
 struct IdCache {
     tokens: HashMap<(Address, B256, U256), Option<U256>>,
+    /// Ids left to COMPUTE in this batch, see [`MAX_IDS_PER_BATCH`]. A
+    /// cache hit is free and never spends it.
+    budget: u32,
+    /// Ids the batch refused to compute. The caller logs / counts it.
+    skipped: u64,
+}
+
+impl Default for IdCache {
+    fn default() -> Self {
+        Self {
+            tokens: HashMap::new(),
+            budget: MAX_IDS_PER_BATCH,
+            skipped: 0,
+        }
+    }
 }
 
 impl IdCache {
@@ -574,12 +603,21 @@ impl IdCache {
         condition: B256,
         index_set: U256,
     ) -> Option<U256> {
-        *self
-            .tokens
-            .entry((collateral, condition, index_set))
-            .or_insert_with(|| {
-                ids::outcome_token_id(collateral, condition, index_set)
-            })
+        if let Some(cached) =
+            self.tokens.get(&(collateral, condition, index_set))
+        {
+            return *cached;
+        }
+        if self.budget == 0 {
+            self.skipped += 1;
+            return None;
+        }
+        self.budget -= 1;
+
+        let token =
+            ids::outcome_token_id(collateral, condition, index_set);
+        self.tokens.insert((collateral, condition, index_set), token);
+        token
     }
 }
 
@@ -595,6 +633,8 @@ fn decode_transaction(
     context: &mut Context<'_>,
     logs: &[(&DatabaseLog, Parsed)],
 ) {
+    let first_trade = context.rows.trades.len();
+
     // Who traded here: transfers to / from them are trades.
     let exchanges: HashSet<Address> = logs
         .iter()
@@ -617,7 +657,7 @@ fn decode_transaction(
             continue;
         }
 
-        for index_set in &flow.index_sets {
+        for index_set in flow.index_sets.iter().take(MAX_IDS_PER_LOG) {
             let Some(token) = context.ids.token(
                 flow.collateral,
                 flow.condition,
@@ -663,12 +703,22 @@ fn decode_transaction(
         }
     }
 
-    // The ERC-1155 contract that moved a token id in this transaction.
+    // The ERC-1155 contract that moved a token id in this transaction,
+    // and HOW MUCH each contract moved of it. `movers` names the registry
+    // of a fill; `moved` is the only thing that bounds what a fill may
+    // claim, because an `OrderFilled` is just an event any contract can
+    // emit with any numbers in it (see the `verified` column of
+    // `prediction_trades`).
     let mut movers: HashMap<U256, Address> = HashMap::new();
+    let mut moved: HashMap<(Address, U256), U256> = HashMap::new();
     for (log, parsed) in logs {
         if let Parsed::Transfer { legs, .. } = parsed {
-            for (token, _) in legs {
+            for (token, amount) in legs {
                 movers.entry(*token).or_insert(log.address);
+                let entry = moved
+                    .entry((log.address, *token))
+                    .or_insert(U256::ZERO);
+                *entry = entry.saturating_add(*amount);
             }
         }
     }
@@ -856,6 +906,9 @@ fn decode_transaction(
                     share_amount: *shares,
                     collateral_amount: *collateral,
                     match_type: MatchType::Amm,
+                    // Set by verify_shares once the whole transaction is
+                    // decoded.
+                    verified: 0,
                     maker_outcome_token_id: token,
                     maker_side: side.opposite(),
                     maker_collateral_amount: *collateral,
@@ -876,6 +929,53 @@ fn decode_transaction(
         .sort_by_key(|fills| fills.first().map(|(log, _)| log.log_index));
     for makers in leftovers {
         close_match(context, &movers, &makers, None);
+    }
+
+    verify_shares(context, first_trade, moved);
+}
+
+/// Marks the fills of this transaction whose SHARES the chain actually
+/// shows (`prediction_trades.verified`).
+///
+/// An `OrderFilled` proves nothing on its own: `topic0` and the whole
+/// payload are free to emit, and `registry` comes from whichever ERC-1155
+/// contract moved that token id in the transaction - which an attacker
+/// arranges by calling the real registry's permissionless `splitPosition`
+/// with one unit of collateral. The price is already bounded (a print
+/// above 1 collateral per share is dropped by the candle views), but the
+/// SIZE is not, so without this a single forged log sets a real market's
+/// volume, last price and trader count.
+///
+/// The bound: for each `(registry, outcome token)`, the fills of this
+/// transaction may claim no more shares in total than that registry
+/// actually moved of that token here. Fills are served in the order they
+/// were decoded (log order), so a genuine match keeps its fills - they add
+/// up to exactly what the registry moved - and anything beyond the real
+/// movement stays `verified = 0`.
+///
+/// NOT checked, and why: the COLLATERAL leg. A match settles collateral
+/// once per ORDER (six fills of one taker order move collateral once,
+/// netted), so no per-fill ERC-20 `Transfer` exists to compare against,
+/// and the stored fixtures carry only the decoder relevant logs - no
+/// ERC-20 `Transfer`s at all - so a per-transaction collateral bound
+/// cannot be validated against real data today. See the README's Known
+/// gaps.
+fn verify_shares(
+    context: &mut Context<'_>,
+    first_trade: usize,
+    mut budget: HashMap<(Address, U256), U256>,
+) {
+    for trade in &mut context.rows.trades[first_trade..] {
+        let Some(left) =
+            budget.get_mut(&(trade.registry, trade.outcome_token_id))
+        else {
+            continue;
+        };
+
+        if *left >= trade.share_amount {
+            *left -= trade.share_amount;
+            trade.verified = 1;
+        }
     }
 }
 
@@ -955,6 +1055,7 @@ fn close_match(
             share_amount: maker.shares,
             collateral_amount: collateral,
             match_type,
+            verified: 0,
             maker_outcome_token_id: maker.token,
             maker_side: maker.side,
             maker_collateral_amount: maker.collateral,
@@ -1463,6 +1564,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every fill of a REAL transaction is proven by that transaction's
+    /// own ERC-1155 transfers: the bound of `verify_shares` must not cost
+    /// a single genuine trade.
+    #[test]
+    fn every_real_fill_is_verified_by_its_own_transfers() {
+        let mut fills = 0;
+
+        for tx in fixtures::ALL {
+            let rows = decode(tx.chain, &tx.logs());
+            for trade in &rows.trades {
+                assert_eq!(
+                    trade.verified, 1,
+                    "{}: fill at ordinal {} is not proven",
+                    tx.hash, trade.ordinal
+                );
+                fills += 1;
+            }
+        }
+
+        assert!(fills >= 9, "{fills}");
+    }
+
+    /// The forgery of review finding 2: call the genuine registry's
+    /// permissionless `splitPosition` with one unit of collateral so it
+    /// moves the real outcome token, then emit an `OrderFilled` of your
+    /// own naming that token id and 10^30 shares. The trade row is kept
+    /// (with the real registry - `movers` cannot tell), but it is NOT
+    /// verified, so no candle, ledger price or leaderboard line counts it.
+    #[test]
+    fn a_fill_claiming_more_shares_than_moved_is_not_verified() {
+        let registry = Address::repeat_byte(0xc7);
+        let exchange = Address::repeat_byte(0xe1);
+        let taker = Address::repeat_byte(0x7a);
+        let maker = Address::repeat_byte(0xa1);
+        let token = U256::from(77u8);
+        let place = |log_index| fixtures::Place {
+            chain: 137,
+            block_number: 10,
+            log_index,
+            timestamp: 1_700_000_000,
+            transaction_hash: B256::repeat_byte(1),
+        };
+
+        // The real registry really moves ONE unit of the real token.
+        let dust = fixtures::constructed_transfer(
+            place(0),
+            registry,
+            registry,
+            Address::ZERO,
+            maker,
+            token,
+            U256::from(1u8),
+        );
+        let forged = fixtures::constructed_v2_fill(
+            place(1),
+            exchange,
+            B256::repeat_byte(0xa1),
+            maker,
+            taker,
+            true,
+            token,
+            U256::from(10u8).pow(U256::from(30u8)),
+            U256::from(10u8).pow(U256::from(30u8)) - U256::from(1u8),
+            U256::ZERO,
+        );
+
+        let rows = decode(137, &[dust, forged]);
+        assert_eq!(rows.trades.len(), 1);
+        assert_eq!(rows.trades[0].registry, registry);
+        assert_eq!(rows.trades[0].verified, 0);
+
+        // The same fill for exactly what moved IS proven.
+        let honest = fixtures::constructed_v2_fill(
+            place(1),
+            exchange,
+            B256::repeat_byte(0xa1),
+            maker,
+            taker,
+            true,
+            token,
+            U256::from(10u8),
+            U256::from(6u8),
+            U256::ZERO,
+        );
+        let dust = fixtures::constructed_transfer(
+            place(0),
+            registry,
+            registry,
+            Address::ZERO,
+            maker,
+            token,
+            U256::from(10u8),
+        );
+        let rows = decode(137, &[dust, honest]);
+        assert_eq!(rows.trades.len(), 1);
+        assert_eq!(rows.trades[0].verified, 1);
+    }
+
+    /// A batch cannot be made to compute unboundedly many modular square
+    /// roots: past [`MAX_IDS_PER_BATCH`] the decoder stops and says so.
+    #[test]
+    fn the_id_budget_of_a_batch_is_bounded() {
+        let mut cache = IdCache::default();
+        let collateral = Address::repeat_byte(0x11);
+
+        // Every call is a cache MISS: the condition varies, which is what
+        // a spammer gets for free (it is a log topic).
+        for index in 0..MAX_IDS_PER_BATCH + 10 {
+            cache.token(
+                collateral,
+                B256::from(U256::from(index).to_be_bytes()),
+                U256::from(1u8),
+            );
+        }
+        assert_eq!(cache.budget, 0);
+        assert_eq!(cache.skipped, 10);
+        assert_eq!(cache.tokens.len(), MAX_IDS_PER_BATCH as usize);
+
+        // A cache HIT is free and never spends the budget.
+        let mut cache = IdCache::default();
+        let condition = B256::repeat_byte(3);
+        for _ in 0..MAX_IDS_PER_BATCH + 10 {
+            cache.token(collateral, condition, U256::from(1u8));
+        }
+        assert_eq!(cache.budget, MAX_IDS_PER_BATCH - 1);
+        assert_eq!(cache.skipped, 0);
     }
 
     #[test]

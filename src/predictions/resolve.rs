@@ -11,10 +11,21 @@
 //! Exchange V1 / V2, Gnosis and Base FixedProductMarketMakers). Trades are
 //! decoded and priced without any of this: the collateral token only turns
 //! raw amounts of the leaderboard into decimal ones.
+//!
+//! **Never a bare `eth_call`.** Every getter goes through
+//! [`call_confirmed`], which only returns an answer two independent
+//! endpoints agree on - the same rule `src/dex/resolve.rs` and the token
+//! worker follow. The endpoints are discovered and public, so one lying or
+//! compromised node would otherwise set `prediction_venues.collateral_token`
+//! to any ERC-20 it likes; the row is written with `source = 'rpc'` and
+//! `MISSING_VENUES_SQL` never asks about an exchange that already has one,
+//! so the wrong decimals would scale that exchange's whole leaderboard by
+//! `10^(wrong - right)` for ever. Without agreement the answer is
+//! [`Resolution::Retry`] and NOTHING is cached.
 
 use alloy::primitives::{keccak256, Address, Bytes};
 
-use crate::tokens::multicall::{CallError, EmptyCheck, EthCaller};
+use crate::tokens::multicall::{call_confirmed, CallError, EthCaller};
 
 use super::{
     models::{
@@ -78,24 +89,19 @@ async fn ask(
     to: Address,
     getter: Getter,
 ) -> Answer {
-    let data = getter.calldata();
-
-    match caller.call(to, data.clone()).await {
+    // Two independent endpoints must return the same bytes (or both
+    // refuse) before anything here is believed - see the module docs.
+    // `call_confirmed` maps "no agreement" onto `Transient`, which is
+    // `Retry`: nothing is stored, the exchange is asked again later.
+    match call_confirmed(caller, to, getter.calldata()).await {
         Ok(bytes)
             if bytes.len() == 32
                 && bytes[..12].iter().all(|b| *b == 0) =>
         {
             Answer::Address(Address::from_slice(&bytes[12..]))
         }
-        Ok(bytes) if bytes.is_empty() => {
-            match caller.confirm_empty(to, data).await {
-                EmptyCheck::Confirmed => Answer::Nothing,
-                // A lagging node: whatever the other one said, ask again.
-                EmptyCheck::Refuted(_) | EmptyCheck::Undecided => {
-                    Answer::Retry
-                }
-            }
-        }
+        // A confirmed empty answer: the contract has no such getter.
+        Ok(bytes) if bytes.is_empty() => Answer::Nothing,
         Ok(_) | Err(CallError::Execution(_)) => Answer::Nothing,
         Err(CallError::Transient(_)) => Answer::Retry,
     }
