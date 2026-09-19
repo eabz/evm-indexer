@@ -7,14 +7,14 @@ use hypersync_client::{
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::utils::{
-    convert::{
-        address_to_alloy, data_to_bytes, hash_to_b256, quantity_to_u256,
-        quantity_to_u64, sat_u32,
-    },
-    format::{
+use crate::{
+    db::format::{
         method_selector, SerAddress, SerB256, SerBytes, SerSelector,
         SerU256,
+    },
+    utils::convert::{
+        address_to_alloy, data_to_bytes, hash_to_b256, quantity_to_u256,
+        quantity_to_u64, sat_u32,
     },
 };
 

@@ -25,7 +25,7 @@ use std::{
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 
-use crate::{db::models::log::DatabaseLog, utils::format::tx_id};
+use crate::{db::format::tx_id, db::models::log::DatabaseLog};
 
 use super::{
     events::{self, EventDef},

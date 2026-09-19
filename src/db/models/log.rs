@@ -5,9 +5,11 @@ use hypersync_client::simple_types::Log;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::utils::{
-    convert::{address_to_alloy, data_to_bytes, hash_to_b256, sat_u32},
-    format::{SerAddress, SerB256, SerBytes, SerTopic},
+use crate::{
+    db::format::{SerAddress, SerB256, SerBytes, SerTopic},
+    utils::convert::{
+        address_to_alloy, data_to_bytes, hash_to_b256, sat_u32,
+    },
 };
 
 /// Row of `logs`. Field names are the column names.

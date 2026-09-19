@@ -1,4 +1,5 @@
 pub mod derived;
+pub mod format;
 #[cfg(test)]
 mod integration_tests;
 pub mod migrate;
@@ -199,7 +200,7 @@ impl RowBatch {
 #[serde_with::serde_as]
 #[derive(Debug, Row, serde::Deserialize)]
 struct HashRow {
-    #[serde_as(as = "crate::utils::format::SerB256")]
+    #[serde_as(as = "crate::db::format::SerB256")]
     hash: B256,
 }
 
@@ -1020,7 +1021,7 @@ impl Database {
     {
         // Validation is OFF for inserts: the crate's schema validation
         // has no mapping for (U)Int256 and panics on those columns (see
-        // `utils::format`). The rows go out as plain `RowBinary` with an
+        // `db::format`). The rows go out as plain `RowBinary` with an
         // explicit column list taken from the struct, so the column ORDER
         // of the table does not matter and columns that are not part of
         // the struct get their DEFAULT. The integration tests are the

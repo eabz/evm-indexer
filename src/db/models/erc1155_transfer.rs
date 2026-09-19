@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::log::DatabaseLog;
-use crate::utils::{
-    events::{
+use crate::{
+    db::format::{SerAddress, SerB256, SerU256},
+    utils::events::{
         ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
         ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
     },
-    format::{SerAddress, SerB256, SerU256},
 };
 
 /// Row of `erc1155_transfers`. Field names are the column names.

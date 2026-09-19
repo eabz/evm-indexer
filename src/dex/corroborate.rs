@@ -46,11 +46,9 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, B256, U256};
 
 use crate::{
+    db::format::{address_of_id32, tx_hash_of},
     db::models::log::DatabaseLog,
-    utils::{
-        events::TRANSFER_EVENT_SIGNATURE,
-        format::{address_of_id32, tx_hash_of},
-    },
+    utils::events::TRANSFER_EVENT_SIGNATURE,
 };
 
 use super::{

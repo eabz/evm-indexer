@@ -3,7 +3,7 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::utils::format::SerAddress;
+use crate::db::format::SerAddress;
 
 /// Row of `tokens`. Field names are the column names.
 ///

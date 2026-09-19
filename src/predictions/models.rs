@@ -3,7 +3,7 @@
 //!
 //! Field order is irrelevant (the clickhouse crate inserts by name), field
 //! NAMES must match the columns. Hashes / ids / amounts go through the
-//! `crate::utils::format` serializers, which write the binary column types
+//! `crate::db::format` serializers, which write the binary column types
 //! of docs/design.md §1 (`FixedString(32)`, `UInt256`, `Int256`).
 //! `is_deleted` is never written by the decoder (it defaults to 0;
 //! tombstones are server side `INSERT ... SELECT`s).
@@ -23,9 +23,9 @@
 //!   `tx_index` = the transaction index, `ordinal` = the log index.
 //!   `block_number` keeps its name on every chain.
 //!
-//! [`SerId32`]: crate::utils::format::SerId32
-//! [`SerTxId`]: crate::utils::format::SerTxId
-//! [`tx_hash_of`]: crate::utils::format::tx_hash_of
+//! [`SerId32`]: crate::db::format::SerId32
+//! [`SerTxId`]: crate::db::format::SerTxId
+//! [`tx_hash_of`]: crate::db::format::tx_hash_of
 
 use std::{fmt, str::FromStr};
 
@@ -34,7 +34,7 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
-use crate::utils::format::{SerB256, SerBytes, SerId32, SerTxId, SerU256};
+use crate::db::format::{SerB256, SerBytes, SerId32, SerTxId, SerU256};
 
 macro_rules! string_enum {
     ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident => $text:literal),+ $(,)? }) => {

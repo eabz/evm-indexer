@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(swap.ordinal, 0xf9);
         assert_eq!(
             swap.tx_id,
-            crate::utils::format::tx_id(hash(V2_SWAP.transaction_hash))
+            crate::db::format::tx_id(hash(V2_SWAP.transaction_hash))
         );
         assert_eq!(
             swap.sender,

@@ -21,6 +21,7 @@
 //! therefore work for `sol_*` with no change.
 
 use crate::{
+    db::format::SerB256,
     db::{
         self,
         derived::DerivedTable,
@@ -31,7 +32,6 @@ use crate::{
     launchpads,
     reorg::{ReorgRecord, ReorgStore},
     svm,
-    utils::format::SerB256,
 };
 use alloy::primitives::B256;
 use anyhow::{Context, Result};

@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::log::DatabaseLog;
-use crate::utils::{
-    events::TRANSFER_EVENT_SIGNATURE,
-    format::{SerAddress, SerB256, SerU256},
+use crate::{
+    db::format::{SerAddress, SerB256, SerU256},
+    utils::events::TRANSFER_EVENT_SIGNATURE,
 };
 
 /// Row of `erc20_transfers`. Field names are the column names.

@@ -4,9 +4,11 @@ use hypersync_client::format::Withdrawal;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::utils::{
-    convert::{address_to_alloy, quantity_to_u256, quantity_to_u64},
-    format::{SerAddress, SerU256},
+use crate::{
+    db::format::{SerAddress, SerU256},
+    utils::convert::{
+        address_to_alloy, quantity_to_u256, quantity_to_u64,
+    },
 };
 
 #[serde_as]

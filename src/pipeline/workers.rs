@@ -5,6 +5,7 @@
 //! the live path missed (docs/design.md, sections 4 and 5).
 
 use crate::{
+    db::format::{id32, SerAddress, SerB256, SerId32},
     db::{models::token::DatabaseToken, Database},
     dex::{
         self, DexPool, MissingPoolSource, PoolCandidate, PoolSink,
@@ -20,7 +21,6 @@ use crate::{
         multicall::EthCaller, MissingTokenSource, TokenSink,
         TokenStandard, TokenWorker, TokenWorkerOptions, TokenWorkerStats,
     },
-    utils::format::{id32, SerAddress, SerB256, SerId32},
 };
 use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result};

@@ -237,7 +237,7 @@ fn addr(value: &Address) -> String {
 /// An identity column: the address left padded to 32 bytes
 /// (docs/design.md §13).
 fn id(value: &Address) -> String {
-    bytes(crate::utils::format::id32(*value).as_slice())
+    bytes(crate::db::format::id32(*value).as_slice())
 }
 
 fn word(value: &B256) -> String {

@@ -1649,9 +1649,8 @@ async fn the_worker_queries_run_against_a_real_database() {
     let chain = TestChain::new(12);
     scenario.index_until(&chain, 12, &[]).await;
 
-    let id = |address: Address| {
-        hex::encode(crate::utils::format::id32(address).0)
-    };
+    let id =
+        |address: Address| hex::encode(crate::db::format::id32(address).0);
     let exec = |sql: String| {
         let db = scenario.db.clone();
         async move {

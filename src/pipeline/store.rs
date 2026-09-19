@@ -6,6 +6,7 @@
 //! PARTITION` (docs/design.md, section 2): rows are removed by tombstone.
 
 use crate::{
+    db::format::SerB256,
     db::{
         self,
         derived::{DerivedTable, CORE_DERIVED},
@@ -20,7 +21,6 @@ use crate::{
         plain_rebuild, range_predicate, ModuleSpec, Rebuild, ALL_MODULES,
     },
     reorg::{ReorgRecord, ReorgStore},
-    utils::format::SerB256,
 };
 use alloy::primitives::B256;
 use anyhow::{Context, Result};

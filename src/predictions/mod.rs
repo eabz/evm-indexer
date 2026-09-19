@@ -87,7 +87,7 @@ use std::collections::HashSet;
 
 use alloy::primitives::{Address, B256};
 
-use crate::utils::format::tx_hash_of;
+use crate::db::format::tx_hash_of;
 
 pub use self::{
     decode::decode,

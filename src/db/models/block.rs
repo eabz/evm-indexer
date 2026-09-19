@@ -5,12 +5,12 @@ use hypersync_client::simple_types::Block;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::utils::{
-    convert::{
+use crate::{
+    db::format::{SerAddress, SerB256, SerB64, SerBytes, SerU256},
+    utils::convert::{
         address_to_alloy, data_to_bytes, hash_to_b256, nonce_to_b64,
         quantity_to_u256, quantity_to_u32, quantity_to_u64, sat_u32,
     },
-    format::{SerAddress, SerB256, SerB64, SerBytes, SerU256},
 };
 
 /// Row of `blocks`. Field names are the column names.

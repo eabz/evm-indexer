@@ -48,8 +48,8 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, Bytes, B256, U256};
 
 use crate::{
+    db::format::{address_of_id32, id32, tx_id},
     db::models::log::DatabaseLog,
-    utils::format::{address_of_id32, id32, tx_id},
 };
 
 use super::{
