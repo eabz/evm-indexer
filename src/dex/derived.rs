@@ -43,6 +43,31 @@ pub const REBUILD_RANGE: &str = "chain = {chain} \
 /// What the rebuild selects instead of the rows' own epoch.
 pub const REBUILD_EPOCH: &str = "toUInt32({epoch}) AS epoch";
 
+/// The DUST FLOOR, in RAW token units, and the ONE place it is written
+/// down. A candle takes a price from a trade only when BOTH legs are at
+/// least this large.
+///
+/// Why a candle needs it: a price is one leg divided by the other, so a
+/// trade of one raw unit against one raw unit prices the pair at 1.0 -
+/// a number with no economic meaning whatever the two tokens are. Nothing
+/// stops anybody from making such a trade (they are trivial and common on
+/// Solana), and `argMinStateIf` / `argMaxStateIf` / `max` / `min` would
+/// take it straight into open / high / low / close. 1000 raw units is far
+/// below any real trade of a token with decimals and far above the dust a
+/// prank costs.
+///
+/// It is NOT applied to volumes or trade counts: a dust trade happened and
+/// is counted, it just does not get to say what the price was.
+///
+/// The threshold lives in SQL text in four places - the EVM DEX candles
+/// (`migrations/0011`), the Solana DEX candles (`0042`), the launchpad
+/// candles (`0031`) and each of their `rebuild_sql` twins - because a
+/// migration cannot read a Rust constant.
+/// [`every_candle_family_uses_the_same_dust_floor`] is what keeps the four
+/// from drifting: it reads the embedded migrations and every
+/// `DerivedTable` of every family.
+pub const DUST_FLOOR_RAW: u64 = 1000;
+
 macro_rules! candles {
     ($name:literal, $seconds:literal) => {
         DerivedTable {
@@ -344,6 +369,95 @@ mod tests {
                 table.name
             );
         }
+    }
+
+    /// Every candle family - EVM DEX, Solana DEX, launchpads - takes its
+    /// price from a trade only when BOTH legs reach [`DUST_FLOOR_RAW`].
+    ///
+    /// The threshold has to be repeated in SQL text (a migration cannot
+    /// read a Rust constant), and repeated text drifts: the Solana and
+    /// launchpad candles were written from the EVM ones and silently left
+    /// the floor out (review round 4, MAJOR 13). This test reads the
+    /// embedded migrations and every family's `rebuild_sql`, so a new
+    /// candle without the floor - or a floor changed in one place only -
+    /// fails here.
+    #[test]
+    fn every_candle_family_uses_the_same_dust_floor() {
+        let floor = DUST_FLOOR_RAW;
+
+        // (the column pair, the aggregates, the migration that holds
+        // their materialized views).
+        let evm = (
+            ["amount0", "amount1"],
+            DEX_DERIVED,
+            crate::dex::sql::AGGREGATES_SQL,
+        );
+        let solana = (
+            ["amount0", "amount1"],
+            crate::svm::derived::SOL_DERIVED,
+            include_str!(
+                "../../migrations/0042_solana_aggregates.sql"
+            ),
+        );
+        let launchpads = (
+            ["token_amount", "quote_amount"],
+            crate::launchpads::LAUNCHPADS_DERIVED,
+            crate::launchpads::sql::AGGREGATES_SQL,
+        );
+
+        let guard = |columns: [&str; 2]| {
+            format!(
+                "abs(toFloat64({})) >= {floor} AND abs(toFloat64({})) >= \
+                 {floor}",
+                columns[0], columns[1]
+            )
+        };
+
+        // An aggregate that never divides one leg by the other has no
+        // price to protect (`dex_pool_volume_1h`, the launchpad 1d
+        // counters): what marks a candle is the price alias.
+        let prices = |sql: &str| {
+            sql.contains("AS trade_price") || sql.contains("AS price,")
+        };
+
+        let mut checked = 0;
+        for (columns, tables, migration) in [evm, solana, launchpads] {
+            let guard = guard(columns);
+            let migration = normalize(migration);
+
+            for table in tables.iter().filter(|t| prices(t.rebuild_sql)) {
+                checked += 1;
+                let rebuild = normalize(table.rebuild_sql);
+                assert!(
+                    rebuild.contains(&guard),
+                    "{}: the rebuild is missing the dust floor `{guard}`",
+                    table.name
+                );
+
+                let view = migration
+                    .split(&format!(
+                        "CREATE MATERIALIZED VIEW IF NOT EXISTS {}_mv",
+                        table.name
+                    ))
+                    .nth(1)
+                    .unwrap_or_else(|| {
+                        panic!("no materialized view for {}", table.name)
+                    })
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                assert!(
+                    view.contains(&guard),
+                    "{}_mv: the view is missing the dust floor `{guard}`",
+                    table.name
+                );
+            }
+        }
+
+        // Three EVM candles, three Solana candles, two launchpad ones: a
+        // filter that stopped matching would otherwise pass silently.
+        assert_eq!(checked, 8);
     }
 
     #[test]

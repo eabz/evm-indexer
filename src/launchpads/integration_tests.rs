@@ -1605,3 +1605,114 @@ async fn hostile_amounts_do_not_wrap() {
 
     db.drop_database().await;
 }
+
+/// A dust trade must not set the candle's open / high / low / close.
+///
+/// `price = quote_amount / token_amount` in RAW units, so 999 raw units of
+/// quote against one raw unit of token prices the token at 999 - a number
+/// with no economic meaning that `argMinStateIf` / `argMaxStateIf` / `max`
+/// / `min` would otherwise take straight into the candle. The EVM DEX
+/// candles have refused legs below `dex::derived::DUST_FLOOR_RAW` raw
+/// units since migration 0011; the launchpad candles did not (review round
+/// 4, MAJOR 13).
+#[tokio::test]
+#[ignore]
+async fn a_dust_trade_does_not_set_the_launchpad_candle() {
+    let db = TestDb::create("dust").await;
+    db.trust_the_real_venues().await;
+
+    let curve = address(CURVE);
+    let token = address(TOKEN);
+    let buyer = Address::repeat_byte(0x22);
+    let place = |log_index: u32| Place {
+        chain: CHAIN,
+        block_number: LAUNCH_BLOCK,
+        log_index,
+        timestamp: 1_789_780_286,
+        transaction_hash: B256::repeat_byte(0x11),
+    };
+
+    // CONSTRUCTED. Both trades fall in one minute bucket. The dust one is
+    // FIRST, so it would be the candle's open, and it prices the token at
+    // 999 while the real trade prices it at 1e-9: a chart nobody can read.
+    let real_quote = U256::from(2_000_000_000_000_000_000u128);
+    let real_tokens =
+        U256::from(2_000_000_000_000_000_000_000_000_000u128);
+    let logs = vec![
+        fixtures::constructed_launch(
+            place(0),
+            address(PONS_FACTORY),
+            token,
+            curve,
+            address(CREATOR),
+            real_tokens,
+        ),
+        // The dust buy: 999 wei for one raw token unit.
+        fixtures::constructed_transfer(
+            place(1),
+            token,
+            curve,
+            buyer,
+            U256::from(1),
+        ),
+        fixtures::constructed_buy(
+            place(2),
+            curve,
+            buyer,
+            buyer,
+            U256::from(999),
+            U256::from(1),
+            U256::ZERO,
+            U256::ZERO,
+        ),
+        // The real buy.
+        fixtures::constructed_transfer(
+            place(3),
+            token,
+            curve,
+            buyer,
+            real_tokens,
+        ),
+        fixtures::constructed_buy(
+            place(4),
+            curve,
+            buyer,
+            buyer,
+            real_quote,
+            real_tokens,
+            U256::ZERO,
+            U256::ZERO,
+        ),
+    ];
+
+    let mut rows = decode(CHAIN, &logs);
+    rows.set_version(1);
+    assert_eq!(rows.trades.len(), 2, "both trades are stored");
+    db.store(&rows).await;
+
+    db.set(&cookbook_parameters(&id_hex(TOKEN), &id_hex(CREATOR)));
+    let candle = |column: &str| {
+        format!(
+            "SELECT {column} FROM launchpad_candles_1m_v(\
+             chain = {{chain:UInt64}}, token = {{token:String}})"
+        )
+    };
+
+    // Both trades are counted: the guard is about the PRICE, never about
+    // the trade count or the volume.
+    assert_eq!(db.number(&candle("toFloat64(trades)")).await, 2.0);
+    assert_eq!(db.number(&candle("toFloat64(priced_trades)")).await, 1.0);
+
+    let real_price = 2_000_000_000_000_000_000.0
+        / 2_000_000_000_000_000_000_000_000_000.0;
+    for column in ["open_raw", "high_raw", "low_raw", "close_raw"] {
+        let value =
+            db.number(&candle(&format!("ifNull({column}, 0.)"))).await;
+        assert!(
+            (value - real_price).abs() < real_price * 1e-9,
+            "{column} is {value}, the dust trade priced the candle"
+        );
+    }
+
+    db.drop_database().await;
+}

@@ -67,7 +67,7 @@ ORDER BY (chain, pool_id, venue_program, bucket, epoch);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS sol_dex_candles_1m_mv
 TO sol_dex_candles_1m AS
-WITH (amount0 > 0) != (amount1 > 0) AND amount0 != 0 AND amount1 != 0 AS trade_ok, abs(toFloat64(amount1)) / abs(toFloat64(amount0)) AS trade_price, reserve0 != 0 AND reserve1 != 0 AS pool_ok, toFloat64(reserve1) / toFloat64(reserve0) AS pool_price
+WITH (amount0 > 0) != (amount1 > 0) AND amount0 != 0 AND amount1 != 0 AND abs(toFloat64(amount0)) >= 1000 AND abs(toFloat64(amount1)) >= 1000 AS trade_ok, abs(toFloat64(amount1)) / abs(toFloat64(amount0)) AS trade_price, reserve0 != 0 AND reserve1 != 0 AS pool_ok, toFloat64(reserve1) / toFloat64(reserve0) AS pool_price
 SELECT
   chain, pool_id, venue_program,
   toDateTime(intDiv(toUInt32(timestamp), 60) * 60, 'UTC') AS bucket,
@@ -117,7 +117,7 @@ ORDER BY (chain, pool_id, venue_program, bucket, epoch);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS sol_dex_candles_1h_mv
 TO sol_dex_candles_1h AS
-WITH (amount0 > 0) != (amount1 > 0) AND amount0 != 0 AND amount1 != 0 AS trade_ok, abs(toFloat64(amount1)) / abs(toFloat64(amount0)) AS trade_price, reserve0 != 0 AND reserve1 != 0 AS pool_ok, toFloat64(reserve1) / toFloat64(reserve0) AS pool_price
+WITH (amount0 > 0) != (amount1 > 0) AND amount0 != 0 AND amount1 != 0 AND abs(toFloat64(amount0)) >= 1000 AND abs(toFloat64(amount1)) >= 1000 AS trade_ok, abs(toFloat64(amount1)) / abs(toFloat64(amount0)) AS trade_price, reserve0 != 0 AND reserve1 != 0 AS pool_ok, toFloat64(reserve1) / toFloat64(reserve0) AS pool_price
 SELECT
   chain, pool_id, venue_program,
   toDateTime(intDiv(toUInt32(timestamp), 3600) * 3600, 'UTC') AS bucket,
@@ -167,7 +167,7 @@ ORDER BY (chain, pool_id, venue_program, bucket, epoch);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS sol_dex_candles_1d_mv
 TO sol_dex_candles_1d AS
-WITH (amount0 > 0) != (amount1 > 0) AND amount0 != 0 AND amount1 != 0 AS trade_ok, abs(toFloat64(amount1)) / abs(toFloat64(amount0)) AS trade_price, reserve0 != 0 AND reserve1 != 0 AS pool_ok, toFloat64(reserve1) / toFloat64(reserve0) AS pool_price
+WITH (amount0 > 0) != (amount1 > 0) AND amount0 != 0 AND amount1 != 0 AND abs(toFloat64(amount0)) >= 1000 AND abs(toFloat64(amount1)) >= 1000 AS trade_ok, abs(toFloat64(amount1)) / abs(toFloat64(amount0)) AS trade_price, reserve0 != 0 AND reserve1 != 0 AS pool_ok, toFloat64(reserve1) / toFloat64(reserve0) AS pool_price
 SELECT
   chain, pool_id, venue_program,
   toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS bucket,

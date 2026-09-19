@@ -108,6 +108,14 @@ impl TestDb {
             .unwrap_or_else(|e| panic!("{sql}: {e}"))
     }
 
+    async fn number(&self, sql: &str) -> f64 {
+        self.client()
+            .query(sql)
+            .fetch_one::<f64>()
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
     /// Waits until `sql` returns `expected`.
     ///
     /// ClickHouse 25.12 gives NO read-your-writes guarantee: right after an
@@ -590,6 +598,80 @@ async fn a_candle_query_over_solana_swaps_works() {
         netting.volume_quote > 1.0,
         "transaction-level netting would have hidden this volume: {netting:?}"
     );
+
+    db.drop().await;
+}
+
+/// A dust swap must not set open / high / low / close of a Solana candle.
+///
+/// `trade_price = |amount1| / |amount0|`, so one raw unit against 999 raw
+/// units prices the pool at 999 - an arbitrary number that
+/// `argMinStateIf` / `argMaxStateIf` / `max` / `min` take straight into the
+/// candle. Dust swaps are trivial and common on Solana. The EVM DEX
+/// candles have refused legs below `dex::derived::DUST_FLOOR_RAW` raw units
+/// since migration 0011; these did not (review round 4, MAJOR 13).
+#[tokio::test]
+#[ignore]
+async fn a_dust_swap_does_not_set_the_candle() {
+    use alloy::primitives::I256;
+
+    let db = TestDb::create().await;
+    let database = db.database().await;
+    let rows = all_rows();
+
+    // One real recorded swap, both of whose legs are far above the floor.
+    let real = rows
+        .swaps
+        .iter()
+        .find(|swap| {
+            let size = |amount: I256| {
+                amount.unsigned_abs().to::<u128>() >= 1_000
+            };
+            size(swap.amount0) && size(swap.amount1)
+        })
+        .expect("a recorded swap with two real legs")
+        .clone();
+    let price = real.amount1.unsigned_abs().to::<u128>() as f64
+        / real.amount0.unsigned_abs().to::<u128>() as f64;
+
+    // CONSTRUCTED: the same pool, the same minute, an EARLIER position -
+    // so it would be the candle's open - and one raw unit a side.
+    let mut dust = real.clone();
+    dust.ordinal = 1;
+    dust.amount0 = I256::try_from(1i64).unwrap();
+    dust.amount1 = I256::try_from(-999i64).unwrap();
+    let mut real = real;
+    real.ordinal = 2;
+
+    let key = FlushKey {
+        chain: CHAIN,
+        span: (real.block_number, real.block_number),
+        version: real._version,
+    };
+    database
+        .insert_flush("sol_dex_swaps", &[dust, real], &key)
+        .await
+        .expect("insert sol_dex_swaps");
+    db.settle(SWAP_COUNT, 2).await;
+
+    let candle = |column: &str| {
+        format!(
+            "SELECT toFloat64(ifNull({column}, 0.)) \
+             FROM sol_dex_candles_1m_v WHERE chain = {CHAIN}"
+        )
+    };
+    // Both swaps are counted; only the real one is priced.
+    assert_eq!(db.number(&candle("swaps")).await, 2.0);
+    assert_eq!(db.number(&candle("trades")).await, 1.0);
+
+    for column in ["open", "high", "low", "close"] {
+        let value = db.number(&candle(column)).await;
+        assert!(
+            (value - price).abs() < price * 1e-9,
+            "{column} is {value} rather than {price}: the dust swap \
+             priced the candle"
+        );
+    }
 
     db.drop().await;
 }
