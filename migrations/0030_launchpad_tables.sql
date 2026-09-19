@@ -14,9 +14,12 @@
 -- migration 0006, which is also where THE expression lives):
 --   concat('0x', lower(hex(substring(id, 13))))  for 'evm'
 --   base58Encode(substring(id, 1, 32))           for 'svm'
--- The substring() is NOT optional: toString(FixedString), CAST to String
--- and the implicit conversion base58Encode() performs all TRIM TRAILING
--- ZERO BYTES, so base58Encode(id) silently encodes a shortened pubkey.
+-- The substring() is NOT optional: toString(FixedString) and CAST(id AS
+-- String) TRIM TRAILING ZERO BYTES, so anything that routes an id through
+-- them silently shortens a pubkey. substring(id, 1, 32) and concat(id, '')
+-- keep every byte, which is why hex(substring(id, 13)) is safe too. Do not
+-- rely on base58Encode(id) doing the conversion right: it keeps all 32
+-- bytes on 25.12.1.322, but the form above is correct on every build.
 -- A pool_id is NOT an address even on EVM (a Uniswap V4 / Balancer pool id
 -- is a native 32 byte value): print all 32 bytes, never the 'evm' branch.
 --

@@ -27,8 +27,9 @@
 -- THE expression documented in migration 0006, where chains_v gives the
 -- family: concat('0x', lower(hex(substring(id, 13)))) for 'evm',
 -- base58Encode(substring(id, 1, 32)) for 'svm'. The substring() is NOT
--- decoration - toString(), CAST to String and the implicit conversion
--- base58Encode() performs all trim trailing zero bytes. A pool_id prints
+-- decoration - toString(id) and CAST(id AS String) trim trailing zero
+-- bytes, and only substring() / concat(id, '') keep every one of them.
+-- A pool_id prints
 -- as all 32 bytes, because a Uniswap V4 / Balancer pool id is not an
 -- address. Joins into the EVM-only erc20_transfers table PAD that table's
 -- FixedString(20) address up to 32 bytes (the dex_token_info_v rule of

@@ -172,8 +172,15 @@ The tables follow docs/design.md §13, exactly like `dex_*` and
 use THE expression of migration `0006`, where `chains_v` gives the family:
 `base58Encode(substring(id, 1, 32))` for `svm`, `concat('0x',
 lower(hex(substring(id, 13))))` for `evm`. The `substring()` is not
-decoration - `toString()`, a `CAST` to `String` and the implicit
-conversion `base58Encode(id)` performs all trim trailing zero bytes.
+decoration: `toString(id)` and `CAST(id AS String)` TRIM TRAILING ZERO
+BYTES (checked on 25.12.1.322:
+`length(toString(toFixedString(unhex('0102030000'), 5)))` is 3), so
+anything that routes an id through them shortens a pubkey.
+`substring(id, 1, 32)` and `concat(id, '')` keep every byte, which is
+also why `hex(substring(id, 13))` is safe. Note that on 25.12.1.322
+`base58Encode(id)` on a `FixedString` did NOT trim - the conversion the
+header of migration `0006` warns about is the `toString` / `CAST` one.
+Use the `substring()` form regardless: it is right on every build.
 
 **The 20 vs 32 byte seam.** The only EVM-only table these views touch is
 `erc20_transfers` (`launchpad_token_holders_v`), whose `token_address` /
