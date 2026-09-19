@@ -34,29 +34,92 @@
 //! and only when exactly one of the two candidates is off the curve;
 //! otherwise the decoder reports the swap as ambiguous rather than guessing.
 
+use std::cell::RefCell;
+
 use alloy::primitives::U256;
+
+/// The curve constants, parsed once.
+///
+/// They used to be rebuilt on every call, and two of them by parsing a
+/// DECIMAL STRING - which a profile of the decoder showed costing more than
+/// some whole transactions. See `svm::profile`.
+struct Constants {
+    p: U256,
+    d: U256,
+    sqrt_m1: U256,
+    /// `(p - 5) / 8`, the square-root exponent.
+    exponent: U256,
+}
+
+fn constants() -> &'static Constants {
+    static CONSTANTS: std::sync::OnceLock<Constants> =
+        std::sync::OnceLock::new();
+    CONSTANTS.get_or_init(|| {
+        let p = (U256::from(1u8) << 255) - U256::from(19u8);
+        Constants {
+            p,
+            d: U256::from_str_radix(
+                "37095705934669439343138083508754565189542113879843219016388785533085940283555",
+                10,
+            )
+            .expect("curve constant d"),
+            sqrt_m1: U256::from_str_radix(
+                "19681161376707505956807079304988542015446066515923890162744021073123829784752",
+                10,
+            )
+            .expect("curve constant sqrt(-1)"),
+            exponent: (p - U256::from(5u8)) >> 3,
+        }
+    })
+}
 
 /// The field prime, `2^255 - 19`.
 fn p() -> U256 {
-    (U256::from(1u8) << 255) - U256::from(19u8)
+    constants().p
 }
 
 /// The Edwards curve constant `d = -121665 / 121666 (mod p)`.
 fn d() -> U256 {
-    U256::from_str_radix(
-        "37095705934669439343138083508754565189542113879843219016388785533085940283555",
-        10,
-    )
-    .expect("curve constant d")
+    constants().d
 }
 
 /// `sqrt(-1) (mod p)`, i.e. `2^((p-1)/4)`.
 fn sqrt_m1() -> U256 {
-    U256::from_str_radix(
-        "19681161376707505956807079304988542015446066515923890162744021073123829784752",
-        10,
-    )
-    .expect("curve constant sqrt(-1)")
+    constants().sqrt_m1
+}
+
+// --- the memo ------------------------------------------------------------
+
+/// Slots in the per-thread memo. A power of two so the index is a mask.
+///
+/// 8,192 entries is 264 KB per decoding thread, which is nothing next to what
+/// it saves: the answer is a pure function of the 32 bytes, and in a real
+/// stream the SAME pool authorities come back in transaction after
+/// transaction - a busy PumpSwap pool appears hundreds of times in one slot.
+const MEMO_SLOTS: usize = 1 << 13;
+
+/// Direct mapped, so an entry is simply overwritten on a collision. There is
+/// no correctness question either way: a miss just recomputes.
+#[derive(Clone, Copy)]
+struct Memo {
+    key: [u8; 32],
+    /// 0 = empty, 1 = off the curve, 2 = on the curve.
+    state: u8,
+}
+
+thread_local! {
+    static MEMO: RefCell<Box<[Memo]>> = RefCell::new(
+        vec![Memo { key: [0u8; 32], state: 0 }; MEMO_SLOTS]
+            .into_boxed_slice(),
+    );
+}
+
+/// Index of `key` in the memo. Pubkeys are uniformly distributed, so the low
+/// bytes are as good a hash as anything.
+fn memo_slot(key: &[u8; 32]) -> usize {
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&key[..8]);
+    (u64::from_le_bytes(head) as usize) & (MEMO_SLOTS - 1)
 }
 
 /// Is `key` a valid ed25519 point, i.e. an address somebody could hold the
@@ -65,7 +128,36 @@ fn sqrt_m1() -> U256 {
 /// `false` means the value is off the curve, which for a Solana account
 /// means it is a program derived address: a pool, a vault authority, a
 /// bonding curve, a config account.
+/// It is also MEMOISED, per thread. The curve test is a modular
+/// exponentiation with a 252-bit exponent - measured at ~56 microseconds a
+/// call, which made it by far the most expensive thing the decoder does -
+/// and the answer depends on nothing but the 32 bytes, so the same pool
+/// authority never needs computing twice.
 pub fn is_on_curve(key: &[u8; 32]) -> bool {
+    let slot = memo_slot(key);
+    let cached = MEMO.with(|memo| {
+        let memo = memo.borrow();
+        let entry = &memo[slot];
+        if entry.state != 0 && entry.key == *key {
+            Some(entry.state == 2)
+        } else {
+            None
+        }
+    });
+    if let Some(answer) = cached {
+        return answer;
+    }
+
+    let answer = compute_on_curve(key);
+    MEMO.with(|memo| {
+        memo.borrow_mut()[slot] =
+            Memo { key: *key, state: if answer { 2 } else { 1 } };
+    });
+    answer
+}
+
+/// The curve test itself, with no memo in front of it.
+fn compute_on_curve(key: &[u8; 32]) -> bool {
     let p = p();
 
     // The compressed encoding is little endian, with the top bit carrying
@@ -90,7 +182,7 @@ pub fn is_on_curve(key: &[u8; 32]) -> bool {
     let v2 = v.mul_mod(v, p);
     let v3 = v2.mul_mod(v, p);
     let v7 = v3.mul_mod(v3, p).mul_mod(v, p);
-    let exponent = (p - U256::from(5u8)) >> 3;
+    let exponent = constants().exponent;
     let mut x =
         u.mul_mod(v3, p).mul_mod(u.mul_mod(v7, p).pow_mod(exponent, p), p);
 

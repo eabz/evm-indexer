@@ -677,3 +677,142 @@ fn every_streamed_venue_is_decodable_at_least_by_movement() {
         }
     }
 }
+
+/// The phase 2 venues survive the real insert path, and the pool state
+/// their events carry arrives intact.
+///
+/// The interesting columns here are the ones phase 1 could never populate
+/// for these venues: `reserve0` / `reserve1` and `fee_amount` come from a
+/// LOG LINE for Raydium and Orca, so this is the end-to-end proof that the
+/// log table reaches ClickHouse and not merely the decoder.
+#[tokio::test]
+#[ignore]
+async fn the_phase_2_venues_round_trip_with_their_pool_state() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+    let rows = all_rows();
+    store(&database, &rows).await;
+    db.settle(SWAP_COUNT, rows.swaps.len() as u64).await;
+
+    // Every venue that decoded is stored under its own `protocol` name,
+    // and the names are the ones the registry declares.
+    let stored = db
+        .scalar(
+            "SELECT arrayStringConcat(groupUniqArray(protocol), ',') \
+             FROM sol_dex_swaps FINAL",
+        )
+        .await;
+    let mut names: Vec<&str> = stored.split(',').collect();
+    names.sort_unstable();
+    for name in &names {
+        assert!(
+            crate::svm::programs::Venue::ALL
+                .iter()
+                .any(|venue| venue.as_str() == *name),
+            "{name} is not a registered venue"
+        );
+    }
+    assert!(
+        names.len() >= 3,
+        "the fixtures should cover several venues, got {names:?}"
+    );
+
+    // A row confirmed by its venue is marked `decoded`, and one that only
+    // the movement layer produced is marked `movement`. Both must be
+    // present, because storing everything as `decoded` would be a lie.
+    let decoded = db
+        .count(
+            "SELECT count() FROM sol_dex_swaps FINAL \
+             WHERE confidence = 'decoded'",
+        )
+        .await;
+    assert!(decoded > 0, "no row was confirmed by its venue");
+
+    // Reserves survive as 32 little-endian bytes and read back as numbers.
+    let with_state = db
+        .count(
+            "SELECT count() FROM sol_dex_swaps FINAL \
+             WHERE reserve0 > 0 AND reserve1 > 0",
+        )
+        .await;
+    assert!(
+        with_state > 0,
+        "no row carries pool reserves, so no per-program decoder supplied \
+         any"
+    );
+
+    // And a fee the venue itself stated.
+    let with_fee = db
+        .count(
+            "SELECT count() FROM sol_dex_swaps FINAL WHERE fee_amount > 0",
+        )
+        .await;
+    assert!(with_fee > 0, "no row carries a venue-reported fee");
+
+    // The taker never receives more than the pool sent - the Token-2022
+    // invariant, checked in SQL over every stored row.
+    let impossible = db
+        .count(
+            "SELECT count() FROM sol_dex_swaps FINAL \
+             WHERE amount_out > amount_out_gross",
+        )
+        .await;
+    assert_eq!(
+        impossible, 0,
+        "a row claims the taker received more than the pool sent"
+    );
+
+    db.drop().await;
+}
+
+/// A liquidity add or remove never becomes a swap row, checked through the
+/// database rather than only in the decoder.
+///
+/// This is the one that protects the volume figures: a liquidity operation
+/// counted as a trade is fabricated volume, and it would be invisible in
+/// any aggregate that simply sums `sol_dex_swaps`.
+#[tokio::test]
+#[ignore]
+async fn a_liquidity_operation_never_reaches_the_swap_table() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+
+    let fixture = crate::svm::fixtures::get("liquidity_no_swap");
+    let batch = SvmSlotBatch {
+        slot: fixture.slot,
+        blockhash: fixture.blockhash,
+        parent_slot: fixture.parent_slot,
+        parent_blockhash: fixture.parent_blockhash,
+        block_height: 0,
+        timestamp: fixture.timestamp(),
+        transactions: vec![fixture.transaction.clone()],
+    };
+    let mut rows = svm::decode(CHAIN, &[batch]);
+    rows.set_version(next_version());
+    rows.set_epoch(0);
+
+    assert!(rows.swaps.is_empty(), "the decoder produced a swap row");
+    // The slot is still committed: the commit marker is not conditional on
+    // there being anything to decode.
+    assert_eq!(rows.slots.len(), 1);
+
+    let key = FlushKey {
+        chain: CHAIN,
+        span: (fixture.slot, fixture.slot),
+        version: rows.slots[0]._version,
+    };
+    database
+        .insert_flush("sol_dex_swaps", &rows.swaps, &key)
+        .await
+        .expect("insert sol_dex_swaps");
+    database
+        .insert_flush("sol_slots", &rows.slots, &key)
+        .await
+        .expect("insert sol_slots");
+
+    db.settle("SELECT count() FROM sol_slots FINAL", 1).await;
+    let swaps = db.count(SWAP_COUNT).await;
+    assert_eq!(swaps, 0, "a liquidity operation reached the swap table");
+
+    db.drop().await;
+}

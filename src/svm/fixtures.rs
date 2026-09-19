@@ -19,13 +19,27 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 use crate::svm::{
-    decode::{SvmAccountActivity, SvmInstruction, SvmTransaction},
+    decode::{SvmAccountActivity, SvmInstruction, SvmLog, SvmTransaction},
     models::{Pubkey, SigBytes},
     programs::pubkey,
 };
 
 /// The recorded dump, embedded at compile time.
 const RECORDED: &str = include_str!("fixtures/recorded.json");
+
+/// Phase 2's recordings, in the same shape. Separate file so the phase 1
+/// corpus stays byte-identical to what that engineer captured.
+///
+/// | Name | Why it is here |
+/// |---|---|
+/// | `multi_hop_route` | one transaction, hops on two DIFFERENT phase 2 venues: it must become one swap per venue |
+/// | `liquidity_no_swap` | a liquidity instruction on a phase 2 venue. Both mints move the SAME way, so it must decode to NO swap |
+/// | `token_2022_fee` | a Token-2022 transfer-fee mint, where what the pool SENT and what the taker RECEIVED differ |
+/// | `clmm_tick_crossing` | an Orca concentrated-liquidity swap whose `pre_sqrt_price` and `post_sqrt_price` are more than one tick apart |
+///
+/// Unlike `recorded.json` these carry a `logs` array, because half the
+/// phase 2 venues publish their swap event only as a log line.
+const PHASE2: &str = include_str!("fixtures/phase2.json");
 
 #[derive(Debug, Deserialize)]
 struct RawFixture {
@@ -38,6 +52,29 @@ struct RawFixture {
     transaction: RawTransaction,
     instruction_calls: Vec<RawInstruction>,
     account_activity: Vec<RawActivity>,
+    /// Why this transaction was recorded, written down by the recorder at
+    /// the moment it matched. A fixture whose reason for existing is not
+    /// stated tends to become a fixture nobody dares change.
+    #[serde(default)]
+    why: Option<String>,
+    /// Phase 2. Absent from the phase 1 recordings, which is why it
+    /// defaults: Raydium's and Orca's swap events are LOG lines, so a
+    /// fixture for those venues has to carry the log table too.
+    #[serde(default)]
+    logs: Vec<RawLog>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLog {
+    #[serde(default)]
+    instruction_address: Vec<u32>,
+    program_id: String,
+    /// HyperSync's `LogKind`: `data` for a `Program data:` line, `log` for a
+    /// `Program log:` one. The message is stored with the prefix already
+    /// stripped, exactly as the server serves it.
+    kind: String,
+    #[serde(default)]
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +135,9 @@ struct RawActivity {
 /// One recorded transaction, decoded into the shapes the decoder takes.
 pub struct Fixture {
     pub name: String,
+    /// What this recording is FOR, as the recorder stated it. Empty for the
+    /// phase 1 corpus, whose rationale lives in this module's doc comment.
+    pub why: String,
     pub slot: u64,
     pub block_time: i64,
     pub blockhash: Pubkey,
@@ -123,8 +163,12 @@ fn signature(base58: &str) -> SigBytes {
 }
 
 fn parse() -> Vec<Fixture> {
-    let raw: Vec<RawFixture> = serde_json::from_str(RECORDED)
+    let mut raw: Vec<RawFixture> = serde_json::from_str(RECORDED)
         .expect("fixtures/recorded.json parses");
+    raw.extend(
+        serde_json::from_str::<Vec<RawFixture>>(PHASE2)
+            .expect("fixtures/phase2.json parses"),
+    );
 
     raw.into_iter()
         .map(|fixture| {
@@ -173,8 +217,20 @@ fn parse() -> Vec<Fixture> {
                 })
                 .collect();
 
+            let logs = fixture
+                .logs
+                .into_iter()
+                .map(|log| SvmLog {
+                    path: log.instruction_address,
+                    program: pubkey(&log.program_id),
+                    is_data: log.kind == "data",
+                    message: log.message,
+                })
+                .collect();
+
             Fixture {
                 name: fixture.name,
+                why: fixture.why.unwrap_or_default(),
                 slot: fixture.slot,
                 block_time: fixture.block_time,
                 blockhash: pubkey(&fixture.blockhash),
@@ -197,6 +253,7 @@ fn parse() -> Vec<Fixture> {
                         .has_dropped_log_messages,
                     instructions,
                     activity,
+                    logs,
                 },
             }
         })
@@ -261,7 +318,7 @@ mod tests {
     #[test]
     fn every_fixture_parses() {
         let fixtures = all();
-        assert_eq!(fixtures.len(), 5, "a fixture went missing");
+        assert_eq!(fixtures.len(), 9, "a fixture went missing");
         for fixture in fixtures {
             assert!(
                 !fixture.transaction.instructions.is_empty(),
@@ -271,6 +328,15 @@ mod tests {
             assert!(
                 fixture.transaction.success,
                 "{} should be a committed transaction",
+                fixture.name
+            );
+            // A phase 2 recording states, in the file, what it is for.
+            if fixture.transaction.logs.is_empty() {
+                continue;
+            }
+            assert!(
+                fixture.why.len() > 20,
+                "{} does not say why it was recorded",
                 fixture.name
             );
             // Every instruction path must be packable into an ordinal.
