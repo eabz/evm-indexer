@@ -32,7 +32,7 @@ use crate::{
             run_with, SlotPage, SlotSource, SolanaRuntime, Tripwire,
             FIRST_SERVED_SLOT,
         },
-        solana_store::SolanaReorgStore,
+        solana_store::{SolanaReorgStore, COMMIT_MARKER},
         solana_verify,
         solana_writer::{store_children, SvmBatch},
     },
@@ -1703,4 +1703,91 @@ async fn the_program_registry_is_read_again_not_only_at_startup() {
     }
 
     panic!("the registry read never saw the operator's new row");
+}
+
+/// One slot whose `blockTime` the node did not report is stored with
+/// `timestamp` 0 (`src/source/solana.rs` maps `None` to the default), and
+/// 0 is NOT a block time. Taking it as the start of a repair window arms
+/// the validity rule from 1970 on: `epoch_floor_v` raises the floor on
+/// ~20,700 days at once and every aggregate of the chain reads as zero
+/// until a rebuild that slices fifty years into monthly INSERTs per
+/// aggregate finishes (docs/review-round-4.md, MAJOR 6).
+///
+/// The store therefore reports the oldest REAL timestamp of the range, as
+/// the EVM store now does. The shared clamp in `src/reorg` stays as the
+/// last line of defence; this is the line that keeps it from firing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_slot_without_a_block_time_does_not_start_the_repair_window() {
+    let scenario = Scenario::new("h_missing_block_time").await;
+    let store = SolanaReorgStore::new(scenario.db.clone());
+    let version = next_version();
+
+    // Three produced slots: the middle one lost its block time.
+    let rows = [
+        (FIRST_SLOT, BASE_TIMESTAMP),
+        (FIRST_SLOT + 1, 0),
+        (FIRST_SLOT + 2, BASE_TIMESTAMP + SECONDS_PER_SLOT),
+    ]
+    .iter()
+    .map(|(slot, timestamp)| {
+        format!(
+            "({CHAIN}, {slot}, toFixedString('', 32), {}, \
+             toFixedString('', 32), {}, toDateTime({timestamp}), 0, \
+             {version}, 0)",
+            slot - 1,
+            900_000 + slot - FIRST_SLOT
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(", ");
+
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO `{COMMIT_MARKER}` (chain, block_number, \
+             blockhash, parent_slot, parent_blockhash, block_height, \
+             timestamp, epoch, _version, is_deleted) VALUES {rows}"
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // No read-your-writes: wait for the rows rather than race them.
+    for _ in 0..200 {
+        let stored = store
+            .stored_slots(
+                CHAIN,
+                BlockRange::new(FIRST_SLOT, FIRST_SLOT + 3),
+            )
+            .await
+            .unwrap();
+        if stored == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let span = store
+        .timestamp_span(CHAIN, FIRST_SLOT, Some(FIRST_SLOT + 3))
+        .await
+        .unwrap()
+        .expect("three stored slots are a span");
+
+    assert_eq!(
+        span,
+        (BASE_TIMESTAMP, BASE_TIMESTAMP + SECONDS_PER_SLOT),
+        "the repair window starts at the oldest REAL block time, not at \
+         the missing one"
+    );
+
+    // A range in which NOTHING has a real block time is a different case:
+    // day 0 really is the only bucket those rows contributed to, so the
+    // span is reported rather than hidden.
+    let only_zero = store
+        .timestamp_span(CHAIN, FIRST_SLOT + 1, Some(FIRST_SLOT + 2))
+        .await
+        .unwrap();
+    assert_eq!(only_zero, Some((0, 0)));
 }
