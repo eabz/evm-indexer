@@ -970,6 +970,18 @@ pub fn is_race(replaces_atomically: bool, code: u32) -> bool {
         || (replaces_atomically && CODES_REPLACE_RACE.contains(&code))
 }
 
+/// Did a `CREATE` of a lock (or takeover marker) table lose to another
+/// runner? "Already exists" is the tidy answer; two runners creating, or one
+/// creating while another drops, the same name at the same instant get a
+/// path collision from [`CODES_DDL_RACE`] instead (seen in CI on Linux as
+/// ATOMIC_RENAME_FAIL on `schema_migrations_lock.sql.tmp`). Either way the
+/// lock is not ours and the caller polls again.
+fn lost_lock_race(code: Option<u32>) -> bool {
+    code.is_some_and(|code| {
+        code == CODE_TABLE_ALREADY_EXISTS || CODES_DDL_RACE.contains(&code)
+    })
+}
+
 /// Runs `execute` again while it loses a race with a concurrent runner
 /// ([`is_race`]), at most `attempts` times in total, waiting `backoff`
 /// (jittered, doubling) in between. Returns the last result and how many
@@ -1611,7 +1623,11 @@ impl Migrator {
             .context("read the migration lock")
     }
 
-    /// `Ok(false)`: the table exists already (somebody else won).
+    /// `Ok(false)`: the table exists already (somebody else won), or this
+    /// `CREATE` collided with another runner creating or dropping the same
+    /// name at the same instant ([`CODES_DDL_RACE`]: on Linux that is an
+    /// errno-based ATOMIC_RENAME_FAIL, not a tidy "already exists"). Both
+    /// mean "not ours": the caller polls again and decides afresh.
     async fn create_lock_table(
         &self,
         table: &str,
@@ -1625,11 +1641,7 @@ impl Migrator {
 
         match self.db.query(&create).execute().await {
             Ok(()) => Ok(true),
-            Err(e)
-                if error_code(&e) == Some(CODE_TABLE_ALREADY_EXISTS) =>
-            {
-                Ok(false)
-            }
+            Err(e) if lost_lock_race(error_code(&e)) => Ok(false),
             Err(e) => Err(anyhow!(e).context("take the migration lock")),
         }
     }
@@ -2910,6 +2922,25 @@ FROM transactions;
             "SELECT 'unterminated",
         ] {
             assert!(!replaces_atomically(statement), "{statement}");
+        }
+    }
+
+    /// CI (Linux, ClickHouse 25.8) failed
+    /// `racing_runners_without_a_working_lock_still_converge` with code 521
+    /// on `schema_migrations_lock.sql.tmp`: the lock `CREATE` treated only
+    /// "already exists" as a lost race and made the path collision fatal.
+    #[test]
+    fn a_lock_create_that_collides_is_a_lost_race_not_an_error() {
+        assert!(lost_lock_race(Some(CODE_TABLE_ALREADY_EXISTS)));
+        for code in CODES_DDL_RACE {
+            assert!(lost_lock_race(Some(code)), "{code}");
+        }
+
+        // Anything else is a real failure and must surface.
+        assert!(!lost_lock_race(None));
+        assert!(!lost_lock_race(Some(CODE_UNKNOWN_DATABASE)));
+        for code in CODES_REJECTED {
+            assert!(!lost_lock_race(Some(code)), "{code}");
         }
     }
 
