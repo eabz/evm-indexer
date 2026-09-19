@@ -1,6 +1,6 @@
 //! Envio Solana HyperSync: the only place that talks to the Solana source.
 //!
-//! Shaped like `source/mod.rs` (the EVM source) but it is a SEPARATE client
+//! Shaped like `source::evm` but it is a SEPARATE client
 //! crate with a different query language, so it does not share code with it.
 //! The seam the pipeline sees is [`SolanaSource::stream`] /
 //! [`SolanaSource::head`] / [`SolanaSource::headers`].

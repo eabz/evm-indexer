@@ -58,7 +58,7 @@ use crate::{
         ReorgConfig, ReorgError, ReorgGuard, StreamGuard, Verdict,
         WriterControl,
     },
-    source::Source,
+    source::evm::Source,
     tokens::{self, multicall::EthCaller},
 };
 use anyhow::{bail, Context, Result};
