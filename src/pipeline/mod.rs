@@ -22,6 +22,7 @@ pub mod backfill;
 mod dedup;
 pub mod lease;
 pub mod modules;
+pub mod status;
 pub mod store;
 #[cfg(test)]
 mod sync_tests;
@@ -67,6 +68,7 @@ use hypersync_client::net_types::RollbackGuard;
 use lease::{Fence, Lease, LeaseOptions};
 use log::{debug, error, info, warn};
 use modules::{DecodeState, EnabledModules};
+use status::{ChainState, StatusSink};
 use std::{
     future::Future,
     sync::{Arc, Mutex},
@@ -326,6 +328,10 @@ struct Indexer<S: BlockSource, P: Progress> {
     fence: Fence,
     /// When `checkpoints` was last compacted.
     compacted: Option<tokio::time::Instant>,
+    /// Where the chain says what it is doing. Off outside `indexer fleet`.
+    status: StatusSink,
+    /// The last state sent to `status`, so only CHANGES are reported.
+    reported: Option<ChainState>,
 }
 
 /// What [`run_with`] needs besides the configuration: everything that
@@ -340,8 +346,18 @@ pub struct Runtime<S: BlockSource> {
     pub caller: Option<Arc<dyn EthCaller>>,
     pub workers: WorkerOptions,
     pub lease: LeaseOptions,
-    /// Resolves when the process should stop (SIGINT / SIGTERM).
+    /// Resolves when this chain should stop. `indexer run` passes the
+    /// process signal; `indexer fleet` passes a per-chain cancellation
+    /// handle, so one chain can be stopped through the graceful path
+    /// (flush, release the lease) without touching the others.
     pub shutdown: BoxFuture<'static, ()>,
+    /// The metrics handle to record into. `None` = build one from
+    /// `--metrics-addr` and serve it here, which is what `indexer run`
+    /// does; the fleet passes its own so that one endpoint can expose
+    /// every chain (`fleet::metrics`).
+    pub metrics: Option<Metrics>,
+    /// Where the chain reports what it is doing. Off for `indexer run`.
+    pub status: StatusSink,
 }
 
 /// Runs the indexer. Returns `Ok` when `--end-block` was reached or a
@@ -377,6 +393,8 @@ pub async fn run(config: Config) -> Result<()> {
         workers: WorkerOptions::default(),
         lease: LeaseOptions::default(),
         shutdown: Box::pin(shutdown_signal()),
+        metrics: None,
+        status: StatusSink::off(),
     };
 
     run_with(config, runtime).await
@@ -387,14 +405,22 @@ pub async fn run_with<S: BlockSource>(
     config: Config,
     runtime: Runtime<S>,
 ) -> Result<()> {
-    let metrics = match config.metrics_addr {
-        Some(_) => Metrics::new(config.chain_id, READY_STALENESS),
-        None => Metrics::disabled(),
+    // The fleet hands its own handle in, already labelled with this chain,
+    // and serves it from one endpoint for every chain. `indexer run` builds
+    // one here and serves it itself - unchanged.
+    let fleet_metrics = runtime.metrics.is_some();
+    let metrics = match (runtime.metrics, config.metrics_addr) {
+        (Some(metrics), _) => metrics,
+        (None, Some(_)) => Metrics::new(config.chain_id, READY_STALENESS),
+        (None, None) => Metrics::disabled(),
     };
+
+    let status = runtime.status;
+    status.state(ChainState::Starting);
 
     let (stop_metrics, metrics_stopped) = watch::channel(false);
 
-    if let Some(addr) = config.metrics_addr {
+    if let Some(addr) = config.metrics_addr.filter(|_| !fleet_metrics) {
         // Fails fast: a port that is taken is a configuration error.
         let server = metrics::bind(addr, metrics.clone())
             .await
@@ -592,6 +618,8 @@ pub async fn run_with<S: BlockSource>(
         stale,
         fence: lease.fence(),
         compacted: None,
+        status: status.clone(),
+        reported: None,
     };
 
     // 1. Stop the stream ...
@@ -602,10 +630,22 @@ pub async fn run_with<S: BlockSource>(
             Ok(())
         }
         reason = async {
-            match fatal.wait_for(|reason| reason.is_some()).await {
-                Ok(reason) => reason.clone().unwrap_or_default(),
+            // The borrow of the watch cell is dropped BEFORE the `pending`
+            // await below, so this future stays `Send` and the whole loop
+            // can be spawned - which is what `indexer fleet` does with one
+            // chain per task (`pipeline::solana::run_with` already had to
+            // be written this way for the same reason).
+            let verdict = match
+                fatal.wait_for(|reason| reason.is_some()).await
+            {
+                Ok(reason) => Some(reason.clone().unwrap_or_default()),
                 // The lease task ended without a verdict: never fatal.
-                Err(_) => std::future::pending().await,
+                Err(_) => None,
+            };
+
+            match verdict {
+                Some(reason) => reason,
+                None => std::future::pending().await,
             }
         } => Err(anyhow::anyhow!(reason)),
     };
@@ -764,6 +804,14 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
                     at.elapsed() < self.settings.tip_interval
                 });
 
+            // One comparison per turn, a call only when the answer changed:
+            // the status sink must not become a per-block cost.
+            self.report(if at_tip {
+                ChainState::Following
+            } else {
+                ChainState::Backfilling
+            });
+
             if target > cursor && !paced {
                 match self.pass(BlockRange::new(cursor, target)).await {
                     Ok(PassOutcome::Covered(covered_until)) => {
@@ -788,6 +836,11 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
                         self.metrics.stream_error();
                         let wait = pass_backoff(failures);
                         warn!("Sync pass failed: {e:#}. Retrying in {wait:?}.");
+                        self.status.failed(
+                            &crate::tokens::redact::redact_urls(&format!(
+                                "{e:#}"
+                            )),
+                        );
                         tokio::time::sleep(wait).await;
                     }
                 }
@@ -846,6 +899,14 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
                  tries again.",
                 self.settings.chain_id
             );
+        }
+    }
+
+    /// Tells the status sink about a state CHANGE and nothing else.
+    fn report(&mut self, state: ChainState) {
+        if self.reported != Some(state) {
+            self.reported = Some(state);
+            self.status.state(state);
         }
     }
 

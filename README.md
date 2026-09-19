@@ -26,6 +26,7 @@ An indexer that streams blockchain data from [Envio HyperSync](https://docs.envi
 - [DEX analytics](#dex-analytics)
 - [Prediction markets and perps](#prediction-markets-and-perps)
 - [Solana](#solana)
+- [Fleet mode and the control panel](#fleet-mode-and-the-control-panel)
 - [Metrics and health checks](#metrics-and-health-checks)
 - [Performance tuning](#performance-tuning)
 - [Upgrading from 2.x](#upgrading-from-2x)
@@ -156,7 +157,8 @@ cargo build --release
 | `indexer run [OPTIONS]` | Index a chain. Applies pending schema migrations first (unless `--no-migrate`). `indexer [OPTIONS]` without a subcommand is the same thing |
 | `indexer migrate --database <url> [--dry-run]` | Create the database if it is missing, apply pending migrations and exit. `--dry-run` only lists what is pending and creates nothing |
 | `indexer verify --database <url> [--chain N] [--start-block A] [--end-block B]` | Read-only consistency check of what is stored for a chain: missing blocks (gaps), rows without their block (left by an interrupted write; the next `indexer run` purges them), and checkpoints that claim missing blocks. Prints a report; exit status `0` = consistent, `1` = problems found |
-| `indexer backfill --module dex\|predictions --database <url> [--chain N] [--from-block A] [--to-block B]` | Decode a module's rows again **from the stored `logs`** (no re-sync, no HyperSync traffic), e.g. after a decoder fix or a new event family. Compares first and writes nothing when the stored rows already match; otherwise the module's rows of the affected block range are replaced and every aggregate of the chain is rebuilt under a new epoch, so nothing is counted twice. Safe to run while `indexer run` is live on the same chain |
+| `indexer fleet --database <url> --hypersync-token <token> [--chain N]...` | Index MANY chains in one process, with a web control panel. Applies pending migrations once, at start. See [Fleet mode and the control panel](#fleet-mode-and-the-control-panel) |
+| `indexer backfill --module dex\|predictions --database <url> [--chain A] [--from-block A] [--to-block B]` | Decode a module's rows again **from the stored `logs`** (no re-sync, no HyperSync traffic), e.g. after a decoder fix or a new event family. Compares first and writes nothing when the stored rows already match; otherwise the module's rows of the affected block range are replaced and every aggregate of the chain is rebuilt under a new epoch, so nothing is counted twice. Safe to run while `indexer run` is live on the same chain |
 
 The schema lives in `migrations/NNNN_name.sql` and is **compiled into the binary**; the container image needs no SQL files and ClickHouse needs no init scripts.
 
@@ -176,7 +178,7 @@ Options of `indexer run`:
 |------|----------------------|---------|-------------|
 | `--chain` | `CHAIN_ID` | `1` | Chain ID to index. One process per chain: a second `indexer run` on the same chain and database refuses to start (any number of chains can share a database) |
 | `--database` | `DATABASE_URL` | *required* | ClickHouse HTTP endpoint: `http://user:pass@host:port/db` (use `https://` for TLS). Always include the port (usually `8123`). The database is created when missing |
-| `--hypersync-url` | `HYPERSYNC_URL` | derived from the chain ID | HyperSync endpoint. Only needed to override the default endpoint for the chain |
+| `--hypersync-url` | `HYPERSYNC_URL` | derived from the chain ID | HyperSync endpoint. Only needed to override the default endpoint for the chain. **A custom endpoint must be able to say which chain it serves**: the indexer asks it at startup and refuses to start if it answers with a different chain, or cannot answer at all. Your API token is sent to whatever endpoint you name here, and an endpoint that cannot be checked could feed the indexer blocks from anywhere |
 | `--hypersync-token` | `ENVIO_API_TOKEN` | *required* | [Envio API token](https://docs.envio.dev/docs/HyperSync/api-tokens) |
 | `--rpc` | `RPC_URL` | `auto` | Comma-separated JSON-RPC endpoints for token / pool metadata `eth_call`s. `auto` = discover public endpoints, `none` = disable. See [Token metadata and RPC endpoints](#token-metadata-and-rpc-endpoints) |
 | `--redis` | `REDIS_URL` | *none* | Redis or Dragonfly URL for the token metadata cache. Without it an in-memory cache is used |
@@ -194,7 +196,29 @@ Options of `indexer run`:
 | `--flush-interval-ms` | `FLUSH_INTERVAL_MS` | `2000` | Maximum time in milliseconds between flushes during a historical sync. While following the chain head the indexer commits at most once every 2x this value (4 s by default): every commit is one synchronous ClickHouse insert per table, and fewer, larger inserts are what keeps a server shared by many chains healthy |
 | `--debug` | `DEBUG` | `false` | Enable debug logging |
 
-`indexer migrate` takes `--database`, `--dry-run` and `--debug`; `indexer verify` and `indexer backfill` take the options shown in the table above (plus `--debug`). See [`.env.example`](.env.example) for a commented template; for Docker Compose it additionally contains the ClickHouse container credentials (`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DB`) and `METRICS_PORT`.
+Options of `indexer fleet`. Everything here is the same for every chain in the process; the per-chain options above come from the `fleet_chains` table and the control panel, not from the environment:
+
+| Flag | Environment variable | Default | Description |
+|------|----------------------|---------|-------------|
+| `--database` | `DATABASE_URL` | *required* | As above |
+| `--hypersync-token` | `ENVIO_API_TOKEN` | *required* | One token serves every chain |
+| `--chain` | | *none* | Index this chain even when `fleet_chains` does not list it yet. Repeatable; a chain id or `solana`. A fresh database needs this once, after that the panel adds chains |
+| `--rpc` | `RPC_URL` | `auto` | Default for chains whose own RPC setting is empty |
+| `--redis` | `REDIS_URL` | *none* | Shared by every chain |
+| `--metrics-addr` | `METRICS_ADDR` | *off* | ONE `/metrics` for the whole fleet; every series carries its `chain` label |
+| `--admin-addr` | `ADMIN_ADDR` | `127.0.0.1:8090` | Where the control panel listens. Refused unless it is a loopback address or `--admin-allow-remote` is given |
+| | `ADMIN_PASSWORD` | *unset* | **Environment only, never a flag** (a flag is visible in `ps`). The panel is off and unbound while this is unset, and also while it is **shorter than 12 characters** - the panel starts and stops the indexing of every chain, and it will not run behind a password that can be guessed |
+| `--admin-allow-remote` | | `false` | Allow the panel to bind something other than localhost. Only behind a TLS reverse proxy |
+| `--admin-secure-cookie` | | `false` | Mark the session cookie `Secure` (the panel is behind TLS) |
+| `--admin-trust-forwarded-proto` | | `false` | Believe `X-Forwarded-Proto: https` from the proxy. Off by default: any client can set that header |
+| `--admin-host <name>` | | *none* | A name the panel answers to besides its own address and the loopback names. **Required behind a reverse proxy**, which serves it under a name; a request for any other name is refused with `421` before it is routed. That check is what stops a web page you merely visit from reaching the panel through DNS rebinding. Repeatable |
+| `--admin-trusted-proxy <ip>` | | *none* | The reverse proxy's address. Only a connection from exactly this address has its `X-Forwarded-For` believed, and then the sign-in throttle counts per client instead of counting every client behind the proxy as one. Without it the header is ignored entirely |
+| `--fleet-max-inflight-mb` | `FLEET_MAX_INFLIGHT_MB` | `2048` | Rough cap on the rows the WHOLE fleet buffers before writing, split over the running chains |
+| `--solana-queries-per-minute` | `SOLANA_QUERIES_PER_MINUTE` | `25` | Metered Solana HyperSync queries a minute, shared by every Solana chain in the process. The free tier allows 30 |
+| `--no-migrate` | `NO_MIGRATE` | `false` | As above; the fleet migrates once, before any chain starts |
+| `--debug` | `DEBUG` | `false` | Enable debug logging |
+
+`indexer migrate` takes `--database`, `--dry-run` and `--debug`; `indexer verify` and `indexer backfill` take the options shown in the first table (plus `--debug`). See [`.env.example`](.env.example) for a commented template; for Docker Compose it additionally contains the ClickHouse container credentials (`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DB`) and `METRICS_PORT`.
 
 Any network available on HyperSync can be indexed: see the [list of supported networks](https://docs.envio.dev/docs/HyperSync/hypersync-supported-networks). The HyperSync endpoint is derived from `--chain`; use `--hypersync-url` to point to a different endpoint.
 
@@ -559,6 +583,145 @@ WHERE chain = 1399811149
 ORDER BY bucket DESC LIMIT 48;
 ```
 
+## Fleet mode and the control panel
+
+`indexer run` is one chain per process and stays exactly as it is. `indexer
+fleet` is the other way to run the same code: **one process, many chains**,
+with a small web page to start and stop them.
+
+```bash
+indexer fleet \
+  --database http://indexer:indexer@localhost:8123/indexer \
+  --hypersync-token <your-envio-api-token> \
+  --chain 1 --chain 8453 --chain solana \
+  --metrics-addr 127.0.0.1:9090
+```
+
+Each chain runs in its own task and calls exactly the same code
+`indexer run` calls, so every safety property is unchanged: its own lease,
+its own epoch, its own tombstones, its own writer. What the fleet adds is a
+supervisor.
+
+- **One chain failing never touches the others.** It is restarted on its
+  own, waiting 2 s, 4 s, 8 s ... up to 5 minutes, and the last error is
+  kept.
+- **A chain another process already indexes is a state, not an error.** It
+  shows as "running elsewhere" and is looked at again every 30 seconds, so
+  it takes over the moment the other process stops.
+- **Migrations run once**, before any chain starts.
+- **One `/metrics` for the whole fleet.** Every series carries its
+  `chain` label, exactly as it does for a single chain, so one scrape
+  target replaces one per chain.
+- **Shared budgets.** One HyperSync token serves every chain and the
+  provider meters the token, so the Solana query allowance
+  (`--solana-queries-per-minute`, default 25) is one budget for the process.
+  `--fleet-max-inflight-mb` (default 2048) is likewise split over the
+  running chains: adding a chain makes everybody's write batches smaller
+  instead of making the process bigger.
+
+Which chains the process indexes is remembered in the `fleet_chains` table
+(read once, at start), so a restart comes up the way you left it. `--chain`
+adds a chain the table does not know yet, which a fresh database needs once;
+after that the panel is the place to add them. Adding a chain needs nothing
+but its id - every `indexer run` default applies.
+
+### The control panel
+
+Set `ADMIN_PASSWORD` and the fleet serves a single page on
+`--admin-addr` (default `127.0.0.1:8090`):
+
+```bash
+ADMIN_PASSWORD='choose something long' indexer fleet --database ... --hypersync-token ...
+```
+
+**Without `ADMIN_PASSWORD` the panel is off** and the port is not bound. The
+password is read from the environment only and never from a flag: a flag is
+visible to every user on the host through `ps`.
+
+The page shows, per chain: a status badge, how far behind it is in blocks
+and in time, its speed, when it last wrote and how long that took, the chain
+reorganizations it has seen, and the last problem in plain words. The
+buttons are Start, Stop, Restart, Settings, and Add a chain - and that is
+the whole list. **The panel can not delete, purge, re-index or change the
+schema; there is no endpoint for any of it.** Stop is the same graceful stop
+`ctrl-c` does: the chain writes what it has buffered, lets go of the chain
+and stops, while the others keep indexing.
+
+Settings changed in the panel apply the next time that chain starts; press
+Restart to apply them now. They are validated by the same parser the command
+line uses, so the page cannot accept a configuration `indexer run` would
+refuse.
+
+**What the panel can change is a short list on purpose**: how far behind the
+head to stay, how deep a rollback may go, how big and how frequent the
+writes are, and which decoders run. It cannot change where a chain reads
+from - the HyperSync endpoint and token, the RPC endpoints, the database and
+the cache come from how you started the process, and the panel shows them
+only as "set" or "not set". A web page that could redirect an endpoint could
+send your Envio API token to someone else's server and feed the indexer
+made-up blocks, so that door is closed rather than guarded. It also cannot
+change a chain's start block: that fixes the coverage floor, which is
+decided once, on a chain's first start.
+
+Chains that a DIFFERENT indexer process is writing into the same database
+appear in the list read-only, so you can see the whole database from one
+page without being able to interfere with a process this one does not own.
+
+### Reaching the panel from another machine
+
+The panel speaks plain HTTP and has no TLS of its own, so it binds
+`127.0.0.1` and **refuses any other address** unless you pass
+`--admin-allow-remote`. Two ways to reach it safely.
+
+**An SSH tunnel** - nothing to configure on the server, and the best answer
+for one person:
+
+```bash
+ssh -N -L 8090:127.0.0.1:8090 you@your-indexer-host
+# then open http://127.0.0.1:8090/ in your browser
+```
+
+**A TLS reverse proxy** - for a panel several people use. Bind the panel to
+the loopback address of the proxy's host (or to a private interface with
+`--admin-allow-remote`) and let the proxy do TLS:
+
+```bash
+indexer fleet ... --admin-secure-cookie
+```
+
+`--admin-secure-cookie` marks the session cookie `Secure`, so it is only
+ever sent over HTTPS; set it whenever a proxy terminates TLS in front of the
+panel. If your proxy always sets `X-Forwarded-Proto` and you would rather it
+decide, use `--admin-trust-forwarded-proto` instead - it is off by default,
+because a header any client can set must not be believed.
+
+An nginx server block that is enough:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name indexer.example.com;
+    ssl_certificate     /etc/letsencrypt/live/indexer.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/indexer.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Do not put the panel on the open internet without one of these. It can start
+and stop your indexing.
+
+### In Compose
+
+The bundled [`docker-compose.yml`](docker-compose.yml) has a commented-out
+`fleet` service that replaces the per-chain `indexer` services: one
+container, every chain, the panel on `127.0.0.1:8090` and one metrics port.
+Put `ADMIN_PASSWORD` in your `.env`.
+
 ## Metrics and health checks
 
 `--metrics-addr <ip:port>` (default: off) serves, on a small built-in HTTP server:
@@ -571,7 +734,9 @@ ORDER BY bucket DESC LIMIT 48;
 
 The most useful series: `evm_indexer_head_block`, `evm_indexer_indexed_block`, `evm_indexer_lag_blocks`, `evm_indexer_lag_seconds`, `evm_indexer_rows_inserted_total{table}`, `evm_indexer_flush_duration_seconds`, `evm_indexer_flushes_total{result}`, `evm_indexer_reorgs_total`, `evm_indexer_reorg_last_depth`, `evm_indexer_resolver_queue_depth{worker}` and `evm_indexer_resolver_endpoints_healthy{worker}`. The full reference and ready-made alert rules are in [`src/metrics/README.md`](src/metrics/README.md).
 
-Run one indexer process per chain, each with its own port. In the bundled Compose file every indexer listens on `9090` inside its container, published on `127.0.0.1:9101`, `9102`, ...:
+With `indexer run` there is one process, and one scrape target, per chain. With [`indexer fleet`](#fleet-mode-and-the-control-panel) there is ONE endpoint for every chain in the process: the series are identical and each one carries its own `chain` label, so a dashboard built for one shape works for the other.
+
+In the bundled Compose file every indexer listens on `9090` inside its container, published on `127.0.0.1:9101`, `9102`, ...:
 
 ```yaml
 scrape_configs:
@@ -586,7 +751,12 @@ The Compose health check of the indexer containers calls `/healthz`. The runtime
 bash -c "exec 3<>/dev/tcp/127.0.0.1/9090 && printf 'GET /healthz HTTP/1.0\r\n\r\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"
 ```
 
-The endpoint has no authentication: bind it to localhost or a private network.
+**The metrics endpoint has no authentication and no loopback guard.** Unlike
+`--admin-addr`, `--metrics-addr` accepts any address and a bare `:9090` even
+expands to `0.0.0.0:9090`. It exposes no secret, but in fleet mode that one
+endpoint publishes every chain's position, lag and error counts. Bind it to
+localhost or a private network, or put it behind the same reverse proxy as
+the panel.
 
 ## Performance tuning
 

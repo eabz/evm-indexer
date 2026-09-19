@@ -265,6 +265,41 @@ fn takeover<'a>(
 /// The role of `indexer run`: the process that streams the chain.
 pub const ROLE_RUN: &str = "run";
 
+/// "Another live process already holds this chain."
+///
+/// A typed error and not just a message, because it is the one startup
+/// failure that is a STATE rather than a fault: `indexer run` prints it and
+/// exits, while `indexer fleet` shows the chain as "running elsewhere" and
+/// keeps checking instead of spinning in a restart loop
+/// (docs/design.md section 15).
+#[derive(Debug, Clone)]
+pub struct LeaseHeldElsewhere {
+    pub chain: u64,
+    pub role: String,
+    pub by: String,
+}
+
+impl std::fmt::Display for LeaseHeldElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another '{}' process is already writing chain {} into this \
+             database ({}). Two of them on the same chain corrupt its \
+             aggregates: stop the other one first.",
+            self.role, self.chain, self.by
+        )
+    }
+}
+
+impl std::error::Error for LeaseHeldElsewhere {}
+
+impl LeaseHeldElsewhere {
+    /// Is this (or anything it wraps) a lease held by another process?
+    pub fn is_cause_of(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+}
+
 impl Lease {
     /// Announces this process and makes sure it is alone on the chain.
     /// `fatal` receives the reason when a live older instance shows up
@@ -346,14 +381,12 @@ impl Lease {
             if !alive.is_empty() {
                 // Do not leave a live-looking row behind.
                 let _ = beat(db, &instance, &host, started_ms, true).await;
-                bail!(
-                    "another '{role}' process is already writing chain {} \
-                     into this database ({}). Two of them on the same \
-                     chain corrupt its aggregates: stop the other one \
-                     first.",
-                    db.chain_id,
-                    describe(&alive)
-                );
+                return Err(LeaseHeldElsewhere {
+                    chain: db.chain_id,
+                    role: role.to_string(),
+                    by: describe(&alive),
+                }
+                .into());
             }
 
             info!(

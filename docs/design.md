@@ -521,7 +521,15 @@ src/
   predictions/    DATA MODULE
   launchpads/     DATA MODULE
   svm/            DATA MODULE of the second chain family (the `sol_*` tables)
+  fleet/          `indexer fleet`: the supervisor, one task per chain (§15)
+  admin/          the control panel served by the fleet process (§15)
 ```
+
+`fleet/` and `admin/` are not DATA MODULES: they own no table of chain data
+(only `fleet_chains`, which is desired state, not indexed data), so the
+standard data-module file set does not apply to them. They do follow
+everything else - a `README.md` of their own, their tests next to them - and
+`tests/layout.rs` checks that much.
 
 Every DATA MODULE has the same files and the same public surface, so the pipeline seam
 treats them uniformly: `mod.rs` (API + `BASE_TABLES`, `SIDE_TABLES`, `*_DERIVED`),
@@ -660,6 +668,80 @@ chain without stopping the process, a status surface, and the panel.
   surface with bodies, cookies and routing is not the place for a home-made parser.
 
 Order of work: after the review round 4 core fixes merge (both touch `src/pipeline/mod.rs`).
+
+**As built (2026-09-19), and where it deviates.** `src/fleet/` and
+`src/admin/` implement the above; `src/fleet/README.md` and
+`src/admin/README.md` are the reference. Five deliberate differences:
+
+1. **No shared EVM query budget.** The Solana one is built (one
+   `pipeline::solana::Budget` per process, handed to every Solana chain).
+   The EVM path streams through `hypersync_client`'s own `stream()`, which
+   issues and paces its requests internally: the process never sees "a query
+   is about to be sent", so there is no seam to hold one back. Giving it a
+   budget means replacing the streaming client with manually paged `get()`
+   calls and re-proving ordering, rollback guards and throughput against
+   them - a week of work on the hot path, not a day, and Envio publishes no
+   per-minute EVM quota to respect. Left out on purpose; the memory half of
+   "shared budgets" (`--fleet-max-inflight-mb`, split over the running
+   chains) IS implemented for both families.
+2. **`indexer fleet --chain <id>` (repeatable)** adds a chain the
+   `fleet_chains` table does not list yet. A fresh database has an empty
+   table and no way to reach the panel's "add" button otherwise; after the
+   first start the panel is the place to add chains.
+3. **The per-chain settings parse has clap's environment fallbacks
+   removed.** Section 15 says a chain needs only its id and every `run`
+   default applies. Left as it is, clap would fill anything not named on the
+   generated command line from the process environment, so a `START_BLOCK`
+   in a compose file would silently apply to every chain in the fleet -
+   including chains added months later in the panel. `indexer run` keeps
+   every environment fallback it has.
+4. **No separate route for the settings vocabulary.** `GET /api/chains`
+   returns the field list (name, kind, label, help, secret) next to the
+   chains, so the page's form and the CLI's validator cannot drift and the
+   panel needs one request instead of two.
+5. **`Secure` on the session cookie is a flag** (`--admin-secure-cookie`),
+   with `--admin-trust-forwarded-proto` as the opt-in for believing a
+   proxy's `X-Forwarded-Proto`. The process cannot otherwise know it is
+   behind TLS, and a header any client can set must not decide it.
+
+**After the security review (2026-09-19).** An independent review of
+`src/admin` returned no blocker, five majors and ten minors; all are fixed,
+and five of them changed behaviour this section describes:
+
+6. **The panel's editable settings are an allow-list, and endpoints are not
+   on it.** Section 15 said "settings show them redacted"; redaction was not
+   enough. `--hypersync-token` is process-wide and is attached to whatever
+   url a chain is configured with, so a panel that could set
+   `--hypersync-url` could send the token to any host, reach the indexer
+   host's private network, and - since `verify_chain_id` merely warned when
+   an endpoint failed to answer - feed the indexer fabricated blocks under a
+   real chain's id. Endpoints and credentials are now process-only and shown
+   read-only; the start block, end block and `--new-blocks-only` are out too
+   because they move the section 16 coverage floor. What is left is
+   behaviour while running. `configs::fleet::NOT_PANEL_EDITABLE` records the
+   reason for every excluded flag and a test fails when a new flag is
+   classified as neither.
+7. **`Host` is validated before routing** (`--admin-host <name>`,
+   repeatable; 421 otherwise). The same-origin check compared two headers
+   the client sends, which said nothing about which server was addressed:
+   classic DNS rebinding against a loopback-bound panel.
+8. **The panel has its own accept loop** (`src/admin/server.rs`) with a
+   connection cap and header-read / request / idle timeouts. `axum::serve`
+   has none, and the sockets belong to the process that indexes every chain.
+9. **`ADMIN_PASSWORD` has a 12 character minimum**, below which the panel
+   does not start.
+10. **The login throttle decays and is bounded**, and `X-Forwarded-For` is
+    believed only from `--admin-trusted-proxy <ip>`. As written, an attacker
+    who failed five times every quarter of an hour kept the OWNER out
+    indefinitely - and behind a proxy every client shares one address.
+
+Two additions worth recording: the pipeline's `StatusSink`
+(`src/pipeline/status.rs`) is two methods called on a state CHANGE and on a
+retried failure - everything else the panel shows is read from the
+`metrics::Metrics` handle the chain already keeps; and `lease::acquire`
+now fails with a typed `LeaseHeldElsewhere`, which is what lets the
+supervisor treat "running elsewhere" as a state instead of matching on a
+message.
 
 ## 16. Coverage floor: one consistent window, live data first (owner decision 2026-09-19)
 

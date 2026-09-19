@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Indexer control panel</title>
+<style>
+:root {
+  --bg: #11141a;
+  --card: #1a1f28;
+  --line: #2a313d;
+  --text: #e8ecf2;
+  --dim: #98a2b3;
+  --ok: #3ddc97;
+  --warn: #f5a524;
+  --bad: #f2555a;
+  --idle: #7a8699;
+  --accent: #5b9dff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 16px;
+}
+h1 { font-size: 1.25rem; margin: 0; }
+h2 { font-size: 1.05rem; margin: 0 0 4px; }
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 16px; flex-wrap: wrap;
+}
+.muted { color: var(--dim); font-size: 0.9rem; }
+.card {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 16px; margin-bottom: 12px;
+}
+.badge {
+  display: inline-block; border-radius: 999px; padding: 2px 10px;
+  font-size: 0.82rem; font-weight: 600; color: #0d1117; white-space: nowrap;
+}
+.b-following { background: var(--ok); }
+.b-backfilling { background: var(--accent); }
+.b-starting { background: var(--accent); }
+.b-stopped { background: var(--idle); }
+.b-failed { background: var(--bad); }
+.b-running_elsewhere { background: var(--warn); }
+.grid {
+  display: grid; gap: 10px 18px; margin-top: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+.grid div span { display: block; }
+.k { color: var(--dim); font-size: 0.8rem; }
+.v { font-variant-numeric: tabular-nums; font-size: 1.05rem; }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.spacer { flex: 1 1 auto; }
+button {
+  background: #232a35; color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 9px 14px; font-size: 0.95rem;
+  cursor: pointer; min-height: 40px;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #0d1117; font-weight: 600; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+input, select {
+  background: #0f131a; color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 9px 10px; font-size: 1rem; width: 100%;
+  min-height: 40px;
+}
+label { display: block; margin-bottom: 10px; }
+label .k { margin-bottom: 3px; }
+.error {
+  background: #3a1d20; border: 1px solid var(--bad); color: #ffd9da;
+  border-radius: 8px; padding: 10px 12px; margin-top: 10px;
+  font-size: 0.9rem; word-break: break-word;
+}
+.notice {
+  background: #1d2a3a; border: 1px solid var(--accent);
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 12px;
+  font-size: 0.9rem;
+}
+.hidden { display: none; }
+form.login { max-width: 360px; margin: 10vh auto; }
+.events { margin: 10px 0 0; padding: 0; list-style: none; font-size: 0.88rem; }
+.events li { border-top: 1px solid var(--line); padding: 6px 0; }
+.foreign { opacity: 0.85; }
+@media (max-width: 480px) {
+  body { padding: 10px; }
+  button { width: 100%; }
+  .row button { width: auto; flex: 1 1 30%; }
+}
+</style>
+</head>
+<body>
+
+<div id="login-view" class="hidden">
+  <form class="login card" id="login-form">
+    <h1>Indexer control panel</h1>
+    <p class="muted">Sign in to see and control the chains this process is
+      indexing.</p>
+    <label>
+      <span class="k">Password</span>
+      <input type="password" id="password" autocomplete="current-password"
+             required>
+    </label>
+    <button class="primary" type="submit" id="login-button">Sign in</button>
+    <div class="error hidden" id="login-error"></div>
+  </form>
+</div>
+
+<div id="main-view" class="hidden">
+  <header>
+    <div>
+      <h1>Indexer control panel</h1>
+      <span class="muted" id="summary">Loading...</span>
+    </div>
+    <div class="row">
+      <button id="add-button">Add a chain</button>
+      <button id="logout-button">Sign out</button>
+    </div>
+  </header>
+
+  <div class="notice hidden" id="notice"></div>
+  <div class="error hidden" id="error"></div>
+
+  <div id="chains"></div>
+
+  <div class="card" id="process">
+    <h2>How this process was started</h2>
+    <p class="muted">Endpoints and passwords are set when the indexer is
+      started and cannot be changed from this page. That is deliberate: a
+      web page that could redirect an endpoint could send your API token
+      somewhere else.</p>
+    <div class="grid" id="process-grid"></div>
+  </div>
+
+  <div class="card hidden" id="editor">
+    <h2 id="editor-title">Add a chain</h2>
+    <p class="muted" id="editor-note"></p>
+    <label id="chain-field">
+      <span class="k">Chain</span>
+      <input type="text" id="chain-input"
+             placeholder="a chain id, for example 1, or solana">
+    </label>
+    <div id="settings-fields"></div>
+    <div class="row">
+      <button class="primary" id="editor-save">Save</button>
+      <button id="editor-cancel">Cancel</button>
+    </div>
+    <div class="error hidden" id="editor-error"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var schema = [];
+  var editing = null;
+  var timer = null;
+
+  function $(id) { return document.getElementById(id); }
+
+  function show(node, visible) {
+    node.classList.toggle("hidden", !visible);
+  }
+
+  function text(tag, className, value) {
+    var node = document.createElement(tag);
+    if (className) { node.className = className; }
+    if (value !== undefined && value !== null) {
+      node.textContent = String(value);
+    }
+    return node;
+  }
+
+  function say(node, message) {
+    node.textContent = message || "";
+    show(node, Boolean(message));
+  }
+
+  function api(method, path, body) {
+    var options = {
+      method: method,
+      headers: { "Accept": "application/json" },
+      credentials: "same-origin"
+    };
+    if (body !== undefined) {
+      options.headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(body);
+    }
+    return fetch(path, options).then(function (response) {
+      return response.json().catch(function () { return {}; })
+        .then(function (data) {
+          return { status: response.status, data: data };
+        });
+    });
+  }
+
+  // ---------------------------------------------------------- formatting
+
+  function number(value) {
+    if (value === null || value === undefined) { return "-"; }
+    return Number(value).toLocaleString();
+  }
+
+  function duration(seconds) {
+    if (seconds === null || seconds === undefined) { return "-"; }
+    seconds = Math.max(0, Math.round(seconds));
+    if (seconds < 60) { return seconds + " seconds"; }
+    var minutes = Math.round(seconds / 60);
+    if (minutes < 60) { return minutes + " minutes"; }
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) { return hours + " hours"; }
+    return Math.round(hours / 24) + " days";
+  }
+
+  function ago(unixMs) {
+    if (!unixMs) { return "never"; }
+    return duration((Date.now() - unixMs) / 1000) + " ago";
+  }
+
+  function speed(blocksPerSecond) {
+    if (!blocksPerSecond) { return "0 blocks/s"; }
+    if (blocksPerSecond < 10) {
+      return blocksPerSecond.toFixed(1) + " blocks/s";
+    }
+    return Math.round(blocksPerSecond).toLocaleString() + " blocks/s";
+  }
+
+  function chainTitle(chain) {
+    return chain.name ? chain.name + " (" + chain.chain + ")"
+                      : "Chain " + chain.chain;
+  }
+
+  // ------------------------------------------------------------ the list
+
+  function metric(parent, key, value) {
+    var box = document.createElement("div");
+    box.appendChild(text("span", "k", key));
+    box.appendChild(text("span", "v", value));
+    parent.appendChild(box);
+  }
+
+  function chainCard(chain) {
+    var card = text("div", "card" + (chain.managed ? "" : " foreign"));
+
+    var head = text("div", "row");
+    head.appendChild(text("h2", null, chainTitle(chain)));
+    head.appendChild(text("span", "badge b-" + chain.state,
+                          chain.state_text));
+    head.appendChild(text("div", "spacer"));
+
+    if (chain.managed) {
+      head.appendChild(button("Start", function () {
+        command(chain.chain, "start");
+      }));
+      head.appendChild(button("Stop", function () {
+        command(chain.chain, "stop");
+      }));
+      head.appendChild(button("Restart", function () {
+        command(chain.chain, "restart");
+      }));
+      head.appendChild(button("Settings", function () {
+        openEditor(chain);
+      }));
+    } else {
+      head.appendChild(text("span", "muted",
+        "Another process on " + (chain.host || "another host") +
+        " is indexing this chain. Nothing here can change it."));
+    }
+    card.appendChild(head);
+
+    var grid = text("div", "grid");
+    metric(grid, "Indexed up to block", number(chain.stored_head));
+    metric(grid, "Chain is at block", number(chain.chain_head));
+    metric(grid, "Behind by", chain.lag_blocks === null ||
+                              chain.lag_blocks === undefined
+      ? "-" : number(chain.lag_blocks) + " blocks");
+    metric(grid, "Which is about", duration(chain.lag_seconds));
+    metric(grid, "Speed", speed(chain.blocks_per_second));
+    metric(grid, "Last write", ago(chain.last_flush_unix_ms));
+    metric(grid, "Write took",
+           chain.last_flush_ms === null || chain.last_flush_ms === undefined
+             ? "-" : number(chain.last_flush_ms) + " ms");
+    metric(grid, "Rewinds", number(chain.reorgs) +
+           (chain.reorg_max_depth
+             ? " (deepest " + number(chain.reorg_max_depth) + ")" : ""));
+    if (chain.managed) {
+      metric(grid, "Restarts", number(chain.restarts));
+    }
+    card.appendChild(grid);
+
+    if (chain.retry_at_unix_ms) {
+      var wait = Math.max(0, (chain.retry_at_unix_ms - Date.now()) / 1000);
+      card.appendChild(text("div", "muted",
+        "Starting again in about " + duration(wait) + "."));
+    }
+
+    if (chain.last_error) {
+      var box = text("div", "error",
+        "Last problem (" + ago(chain.last_error_unix_ms) + "): " +
+        chain.last_error);
+      card.appendChild(box);
+    }
+
+    return card;
+  }
+
+  function button(label, onClick) {
+    var node = text("button", null, label);
+    node.addEventListener("click", onClick);
+    return node;
+  }
+
+  function render(body) {
+    schema = body.settings || [];
+    var list = $("chains");
+    list.textContent = "";
+
+    var chains = body.chains || [];
+    if (chains.length === 0) {
+      list.appendChild(text("div", "card",
+        "No chain has been added yet. Press “Add a chain” and " +
+        "type a chain id."));
+    }
+    chains.forEach(function (chain) {
+      list.appendChild(chainCard(chain));
+    });
+
+    var process = body.process || {};
+    var grid = $("process-grid");
+    grid.textContent = "";
+    metric(grid, "Database", process.database || "-");
+    metric(grid, "HyperSync token", process.hypersync_token || "-");
+    metric(grid, "RPC endpoints", process.rpc || "-");
+    metric(grid, "Metadata cache", process.redis || "-");
+    metric(grid, "Metrics", process.metrics_addr || "off");
+    metric(grid, "Memory for writes",
+           (process.max_inflight_mb || 0) + " MB (shared)");
+    metric(grid, "Solana queries", (process.solana_queries_per_minute || 0) +
+           " a minute (shared)");
+
+    var running = chains.filter(function (c) {
+      return c.state === "following" || c.state === "backfilling";
+    }).length;
+    $("summary").textContent = chains.length + " chain" +
+      (chains.length === 1 ? "" : "s") + ", " + running + " indexing now.";
+  }
+
+  function refresh() {
+    return api("GET", "/api/chains").then(function (result) {
+      if (result.status === 401) { signedOut(); return; }
+      if (result.status !== 200) {
+        say($("error"), result.data.error || "Could not read the chains.");
+        return;
+      }
+      say($("error"), "");
+      render(result.data);
+    }).catch(function () {
+      say($("error"), "The indexer is not answering.");
+    });
+  }
+
+  // ----------------------------------------------------------- commands
+
+  function command(chain, verb) {
+    say($("notice"), "Working...");
+    api("POST", "/api/chains/" + chain + "/" + verb)
+      .then(function (result) {
+        if (result.status === 401) { signedOut(); return; }
+        if (result.status !== 200) {
+          say($("error"), result.data.error || "That did not work.");
+        } else {
+          say($("error"), "");
+        }
+        say($("notice"), "");
+        refresh();
+      });
+  }
+
+  // ------------------------------------------------------- the settings
+
+  function openEditor(chain) {
+    editing = chain;
+    say($("editor-error"), "");
+    $("editor-title").textContent = chain
+      ? "Settings for " + chainTitle(chain) : "Add a chain";
+    $("editor-note").textContent = chain
+      ? "Changes take effect the next time this chain starts. Press " +
+        "Restart afterwards to apply them now."
+      : "A chain only needs its id. Everything left empty uses the " +
+        "normal defaults.";
+    show($("chain-field"), !chain);
+
+    var fields = $("settings-fields");
+    fields.textContent = "";
+
+    schema.forEach(function (setting) {
+      var current = chain && chain.settings
+        ? chain.settings[setting.name] : undefined;
+
+      var label = document.createElement("label");
+      label.appendChild(text("span", "k", setting.label));
+
+      var input;
+      if (setting.kind === "flag") {
+        input = document.createElement("select");
+        [["", "No"], ["true", "Yes"]].forEach(function (pair) {
+          var option = document.createElement("option");
+          option.value = pair[0];
+          option.textContent = pair[1];
+          input.appendChild(option);
+        });
+        input.value = (current === "true") ? "true" : "";
+      } else {
+        input = document.createElement("input");
+        input.type = setting.kind === "number" ? "number" : "text";
+        input.value = current === undefined ? "" : current;
+      }
+      input.setAttribute("data-name", setting.name);
+      label.appendChild(input);
+      label.appendChild(text("span", "k", setting.help));
+      fields.appendChild(label);
+    });
+
+    show($("editor"), true);
+    $("editor").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function collect() {
+    var settings = {};
+    var inputs = $("settings-fields").querySelectorAll("[data-name]");
+    Array.prototype.forEach.call(inputs, function (input) {
+      var value = input.value.trim();
+      if (value !== "") {
+        settings[input.getAttribute("data-name")] = value;
+      }
+    });
+    return settings;
+  }
+
+  function saveEditor() {
+    var settings = collect();
+    var request = editing
+      ? api("PATCH", "/api/chains/" + editing.chain, { settings: settings })
+      : api("POST", "/api/chains",
+            { chain: $("chain-input").value.trim(), settings: settings });
+
+    request.then(function (result) {
+      if (result.status === 401) { signedOut(); return; }
+      if (result.status !== 200) {
+        say($("editor-error"),
+            result.data.error || "Those settings were not accepted.");
+        return;
+      }
+      show($("editor"), false);
+      editing = null;
+      $("chain-input").value = "";
+      refresh();
+    });
+  }
+
+  // ------------------------------------------------------------ sign in
+
+  function signedIn() {
+    show($("login-view"), false);
+    show($("main-view"), true);
+    refresh();
+    if (timer) { clearInterval(timer); }
+    timer = setInterval(refresh, 5000);
+  }
+
+  function signedOut() {
+    if (timer) { clearInterval(timer); timer = null; }
+    show($("main-view"), false);
+    show($("login-view"), true);
+    $("password").value = "";
+  }
+
+  $("login-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    say($("login-error"), "");
+    $("login-button").disabled = true;
+
+    api("POST", "/api/login", { password: $("password").value })
+      .then(function (result) {
+        $("login-button").disabled = false;
+        if (result.status === 200) {
+          $("password").value = "";
+          signedIn();
+        } else {
+          say($("login-error"), result.data.error || "Sign in failed.");
+        }
+      })
+      .catch(function () {
+        $("login-button").disabled = false;
+        say($("login-error"), "The indexer is not answering.");
+      });
+  });
+
+  $("logout-button").addEventListener("click", function () {
+    api("POST", "/api/logout").then(signedOut);
+  });
+  $("add-button").addEventListener("click", function () {
+    openEditor(null);
+  });
+  $("editor-save").addEventListener("click", saveEditor);
+  $("editor-cancel").addEventListener("click", function () {
+    show($("editor"), false);
+    editing = null;
+  });
+
+  // Are we already signed in? One request decides which view to show.
+  api("GET", "/api/chains").then(function (result) {
+    if (result.status === 200) {
+      signedIn();
+    } else {
+      signedOut();
+    }
+  }).catch(signedOut);
+})();
+</script>
+</body>
+</html>

@@ -582,6 +582,9 @@ fn fast_lease() -> crate::pipeline::lease::LeaseOptions {
 
 fn runtime(chain: TestChain) -> SolanaRuntime<TestChain> {
     SolanaRuntime {
+        budget: None,
+        metrics: None,
+        status: StatusSink::off(),
         source: chain,
         lease: fast_lease(),
         shutdown: Box::pin(std::future::pending()),

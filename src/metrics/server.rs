@@ -6,10 +6,10 @@
 //! and there are at most `MAX_CONNECTIONS` clients, so a stuck or hostile
 //! client cannot hold resources. Request bodies are never read.
 
-use super::{encode::CONTENT_TYPE, Metrics};
+use super::{encode::CONTENT_TYPE, Exposition, Metrics};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
-use std::{future::Future, net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -33,12 +33,23 @@ const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
 /// caller which port `:0` resolved to.
 pub struct Server {
     listener: TcpListener,
-    metrics: Metrics,
+    /// One chain's `Metrics`, or a whole fleet's (`fleet::metrics`). The
+    /// responder only ever calls `render` and `readiness`.
+    metrics: Arc<dyn Exposition>,
     request_timeout: Duration,
 }
 
-/// Binds the metrics endpoint.
+/// Binds the metrics endpoint of ONE chain (`indexer run`).
 pub async fn bind(addr: SocketAddr, metrics: Metrics) -> Result<Server> {
+    bind_exposition(addr, Arc::new(metrics)).await
+}
+
+/// Binds the metrics endpoint over any [`Exposition`] - what `indexer
+/// fleet` uses to serve every chain from one port.
+pub async fn bind_exposition(
+    addr: SocketAddr,
+    metrics: Arc<dyn Exposition>,
+) -> Result<Server> {
     let listener = TcpListener::bind(addr).await.with_context(|| {
         format!(
             "cannot bind the metrics endpoint to {addr} (is the port \
@@ -151,12 +162,12 @@ enum Head {
 
 async fn handle(
     mut stream: TcpStream,
-    metrics: Metrics,
+    metrics: Arc<dyn Exposition>,
     request_timeout: Duration,
 ) {
     let (response, head_only) =
         match timeout(request_timeout, read_head(&mut stream)).await {
-            Ok(Head::Complete(head)) => respond(&head, &metrics),
+            Ok(Head::Complete(head)) => respond(&head, metrics.as_ref()),
             Ok(Head::TooLarge) => (
                 Response::new(
                     "431 Request Header Fields Too Large",
@@ -207,7 +218,7 @@ fn ends_headers(bytes: &[u8]) -> bool {
 }
 
 /// The response, and whether the body must be left out (`HEAD`).
-fn respond(head: &[u8], metrics: &Metrics) -> (Response, bool) {
+fn respond(head: &[u8], metrics: &dyn Exposition) -> (Response, bool) {
     let bad_request =
         || (Response::new("400 Bad Request", "bad request\n"), false);
 

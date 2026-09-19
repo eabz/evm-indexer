@@ -29,7 +29,7 @@ mod server;
 #[cfg(test)]
 mod tests;
 
-pub use server::{bind, serve, Server};
+pub use server::{bind, bind_exposition, serve, Server};
 
 use encode::{Encoder, Kind};
 use primitives::{Counter, Gauge, Histogram, LabeledCounter};
@@ -146,12 +146,60 @@ pub struct WorkerStatsSnapshot {
     pub endpoints_distrusted: u64,
 }
 
+/// What [`Metrics::snapshot`] hands the control panel: the live numbers of
+/// one chain, already measured for `/metrics`. `None` means "never set",
+/// which the panel prints as a dash rather than as a zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub head_block: Option<u64>,
+    pub indexed_block: Option<u64>,
+    pub head_timestamp: Option<u64>,
+    pub indexed_timestamp: Option<u64>,
+    /// Duration of the most recent flush.
+    pub last_flush_ms: Option<u64>,
+    /// Unix milliseconds of the most recent SUCCESSFUL flush.
+    pub last_flush_ok_unix_ms: Option<u64>,
+    pub flushes_ok: u64,
+    pub flushes_failed: u64,
+    pub reorgs: u64,
+    /// Deepest reorg since the process started; 0 = none.
+    pub reorg_max_depth: u64,
+    /// Addresses waiting in each background resolver, when it reported.
+    pub token_queue: Option<u64>,
+    pub pool_queue: Option<u64>,
+    pub venue_queue: Option<u64>,
+    /// Solana only.
+    pub solana: Option<SolanaStats>,
+}
+
 /// Argument of [`Metrics::set_token_stats`].
 pub type TokenStatsSnapshot = WorkerStatsSnapshot;
 /// Argument of [`Metrics::set_pool_stats`].
 pub type PoolStatsSnapshot = WorkerStatsSnapshot;
 /// Argument of [`Metrics::set_venue_stats`].
 pub type VenueStatsSnapshot = WorkerStatsSnapshot;
+
+/// What the HTTP endpoint asks for. One chain's [`Metrics`] implements it,
+/// and so does a whole fleet (`fleet::metrics`), which is the only reason
+/// it exists: `indexer fleet` serves ONE `/metrics` covering every chain
+/// (docs/design.md section 15) and `indexer run`'s output is unchanged.
+pub trait Exposition: Send + Sync + 'static {
+    /// Prometheus text exposition (format 0.0.4).
+    fn render(&self) -> String;
+
+    /// What `/readyz` answers; the string is the reason it is not ready.
+    fn readiness(&self) -> Result<(), String>;
+}
+
+impl Exposition for Metrics {
+    fn render(&self) -> String {
+        Metrics::render(self)
+    }
+
+    fn readiness(&self) -> Result<(), String> {
+        Metrics::readiness(self)
+    }
+}
 
 /// Handle to the indexer's metrics. Cloning is one `Arc` increment; every
 /// recording method is a handful of atomic operations and never blocks,
@@ -286,6 +334,13 @@ struct Inner {
     reorgs: Counter,
     reorg_blocks: Counter,
     reorg_last_depth: Gauge,
+    /// Deepest reorg since the process started. The control panel shows it
+    /// next to the count, and a histogram cannot answer "how bad did it
+    /// get" without guessing inside a bucket.
+    reorg_max_depth: Gauge,
+    /// Milliseconds the most recent flush took. The histogram answers the
+    /// distribution; the panel wants the last one, in plain numbers.
+    last_flush_ms: Gauge,
     purge_duration: Histogram,
     purged_blocks: Counter,
 
@@ -352,6 +407,8 @@ impl Metrics {
                 reorgs: Counter::default(),
                 reorg_blocks: Counter::default(),
                 reorg_last_depth: Gauge::default(),
+                reorg_max_depth: Gauge::default(),
+                last_flush_ms: Gauge::default(),
                 purge_duration: Histogram::new(PURGE_BUCKETS),
                 purged_blocks: Counter::default(),
                 tokens: WorkerStats::default(),
@@ -456,6 +513,9 @@ impl Metrics {
 
         inner.flush_duration.observe(duration);
         inner.last_flush_rows.set(rows);
+        inner
+            .last_flush_ms
+            .set(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
         inner.flush_started_ms.store(0, Relaxed);
         inner.last_flush_failed.store(!ok, Relaxed);
 
@@ -490,6 +550,9 @@ impl Metrics {
         inner.reorgs.add(1);
         inner.reorg_blocks.add(depth);
         inner.reorg_last_depth.set(depth);
+        if inner.reorg_max_depth.get().is_none_or(|max| depth > max) {
+            inner.reorg_max_depth.set(depth);
+        }
     }
 
     /// A `purge_range` (reorg rollback or gap healing) finished.
@@ -614,6 +677,43 @@ impl Metrics {
         }
 
         Ok(())
+    }
+
+    /// The numbers the control panel prints, read from what the pipeline
+    /// already records. `None` for a disabled handle.
+    ///
+    /// This is the reason fleet mode needed almost no new instrumentation:
+    /// everything below was already being measured for `/metrics`, so the
+    /// panel reads the same atomics instead of adding a second counter to
+    /// the hot path (docs/design.md section 15, `pipeline::status`).
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        let inner = self.inner.as_ref()?;
+
+        Some(Snapshot {
+            head_block: inner.head_block.get(),
+            indexed_block: inner.indexed_block.get(),
+            head_timestamp: inner.head_timestamp.get(),
+            indexed_timestamp: inner.indexed_timestamp.get(),
+            last_flush_ms: inner.last_flush_ms.get(),
+            last_flush_ok_unix_ms: match inner
+                .last_flush_ok_ms
+                .load(Relaxed)
+            {
+                0 => None,
+                ms => Some(ms),
+            },
+            flushes_ok: inner.flushes_ok.get(),
+            flushes_failed: inner.flushes_failed.get(),
+            reorgs: inner.reorgs.get(),
+            reorg_max_depth: inner.reorg_max_depth.get().unwrap_or(0),
+            token_queue: inner.tokens.get().map(|s| s.queue_depth),
+            pool_queue: inner.pools.get().map(|s| s.queue_depth),
+            venue_queue: inner.venues.get().map(|s| s.queue_depth),
+            solana: *inner
+                .solana
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        })
     }
 
     /// Prometheus text exposition (format 0.0.4) of the current state.
@@ -823,6 +923,13 @@ impl Metrics {
                 depth,
             );
         }
+        // `reorg_max_depth` and `last_flush_ms` are recorded but NOT
+        // exposed: the Prometheus output of `indexer run` is unchanged by
+        // fleet mode, and both numbers are already answerable from the
+        // series above (`reorg_last_depth` over time,
+        // `flush_duration_seconds`). They exist for the control panel,
+        // which shows one number rather than a query
+        // ([`Metrics::snapshot`]).
 
         e.histogram(
             "purge_duration_seconds",
