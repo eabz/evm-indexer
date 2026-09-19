@@ -614,10 +614,14 @@ fn fast_workers() -> WorkerOptions {
     options
 }
 
+/// Quick heartbeats so a scenario is not slowed down by them, but a ttl
+/// that survives a saturated test machine: past the ttl the writer's fence
+/// (`pipeline::lease`) refuses to flush, which is right in production and
+/// would only be a flake here.
 fn fast_lease() -> LeaseOptions {
     LeaseOptions {
         heartbeat: Duration::from_millis(100),
-        ttl: Duration::from_millis(400),
+        ttl: Duration::from_secs(10),
     }
 }
 
