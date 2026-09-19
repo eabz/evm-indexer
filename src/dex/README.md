@@ -237,11 +237,19 @@ The indexer never issues DELETE / ALTER DELETE / DROP PARTITION.
 * **`dex_pools`** is purged by `created_block`, event rows only
   (`dex::purge_filter`). Resolver rows are chain STATE, no purge touches them.
 * **Aggregates** carry `epoch` as the last key column, their views only
-  aggregate live rows. A purge records `(chain, epoch, from_ts)` in `reorgs` and
-  runs `dex::derived::rebuild_statements(table, chain, from_ts, to_ts, epoch)`
+  aggregate live rows. A purge records `(chain, epoch, from_ts, to_ts)` in
+  `reorgs` and runs
+  `dex::derived::rebuild_statements(table, chain, from_ts, to_ts, epoch, purged)`
   for every `DEX_DERIVED` table - **one INSERT per month**: a single INSERT over
   more than 100 monthly partitions (a gap heal deep in history) is refused by
-  ClickHouse. The `*_v` views apply the validity rule BEFORE merging states:
+  ClickHouse. `to_ts` is `reorgs.to_ts`, the exclusive end of the repaired
+  window (never `u32::MAX`): past it the validity rule double counts, short of
+  it a bucket is zeroed for ever. `purged` is the BLOCK range the purge is
+  removing, `(from, None)` when it is open ended; the statement excludes it
+  itself, because **a rebuild never depends on seeing the tombstones**
+  (docs/design.md §2, "No read-your-writes"). The canonical rows of that range
+  add themselves through the materialized view when they are streamed again.
+  The `*_v` views apply the validity rule BEFORE merging states:
 
 ```sql
 FROM dex_candles_1h AS a
