@@ -311,6 +311,54 @@ fn range_predicate(
     predicate
 }
 
+/// TEST ONLY: makes [`SolanaReorgStore::checkpoint_ends_at`] answer "no"
+/// although a checkpoint does end there.
+///
+/// That is the shape of the one read ClickHouse is allowed to answer
+/// stale in this loop (design section 2, measured ~3%): at the head the
+/// question is asked about the checkpoint row the PREVIOUS pass wrote a
+/// moment ago. There is no way to provoke it from the outside - it
+/// depends on part visibility - so it is armed here, and the test that
+/// needs it (`the_carried_anchor_checks_a_fork_a_stale_checkpoint_read_
+/// would_have_missed`) is the reason the in-memory anchor exists.
+///
+/// The counter is per PROCESS, so the Solana database suite has to run
+/// with `--test-threads=1` - which it does, and must, for its ClickHouse
+/// budget anyway.
+#[cfg(test)]
+pub mod stale {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ARMED: AtomicU64 = AtomicU64::new(0);
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+
+    /// The next `count` checkpoint-adjacency reads are answered stale.
+    pub fn arm_checkpoint_reads(count: u64) {
+        TAKEN.store(0, Ordering::SeqCst);
+        ARMED.store(count, Ordering::SeqCst);
+    }
+
+    /// How many of them were actually used. Zero means the loop never had
+    /// to ask the database at all.
+    pub fn checkpoint_reads_taken() -> u64 {
+        TAKEN.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn take() -> bool {
+        let armed = ARMED
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
+                armed.checked_sub(1)
+            })
+            .is_ok();
+
+        if armed {
+            TAKEN.fetch_add(1, Ordering::SeqCst);
+        }
+
+        armed
+    }
+}
+
 // ------------------------------------------------------------- the store
 
 #[derive(Clone)]
@@ -445,6 +493,14 @@ impl SolanaReorgStore {
         chain: u64,
         slot: u64,
     ) -> Result<bool> {
+        #[cfg(test)]
+        if stale::take() {
+            // The measured no-read-your-writes miss, on demand: at the
+            // head this read asks for the row the previous pass wrote a
+            // moment ago (see [`stale`]).
+            return Ok(false);
+        }
+
         Ok(self
             .count(&format!(
                 "SELECT toUInt64(count()) FROM (SELECT to_block FROM \

@@ -98,6 +98,12 @@ struct TestChain {
     slots: Arc<Vec<SvmSlotBatch>>,
     /// Exclusive: the head the fake `/height` reports.
     head: u64,
+    /// `(head, calls)`: the first `calls` reads of `/height` report this
+    /// lower head instead, so ONE process makes two passes with the
+    /// boundary exactly there - which is what a head follower does every
+    /// few seconds, and the only situation the carried anchor is about.
+    staged_head: Option<(u64, u64)>,
+    head_calls: Arc<AtomicU64>,
     /// Metered queries served, so a scenario can assert the loop is not
     /// spinning.
     queries: Arc<AtomicU64>,
@@ -188,6 +194,8 @@ fn chain(count: u64) -> TestChain {
     TestChain {
         slots: Arc::new(slots),
         head,
+        staged_head: None,
+        head_calls: Arc::new(AtomicU64::new(0)),
         queries: Arc::new(AtomicU64::new(0)),
     }
 }
@@ -212,6 +220,18 @@ impl TestChain {
         Self { slots: Arc::new(slots), ..self.clone() }
     }
 
+    /// The same chain whose `/height` reports `staged` for the first
+    /// `calls` reads: the process then indexes up to `staged`, asks again,
+    /// and makes a SECOND pass that starts exactly where the first
+    /// stopped.
+    fn with_staged_head(&self, staged: u64, calls: u64) -> Self {
+        Self {
+            staged_head: Some((staged, calls)),
+            head_calls: Arc::new(AtomicU64::new(0)),
+            ..self.clone()
+        }
+    }
+
     fn slot_at(&self, index: usize) -> u64 {
         self.slots[index].slot
     }
@@ -223,6 +243,12 @@ impl TestChain {
 
 impl SlotSource for TestChain {
     async fn head(&self) -> Result<u64> {
+        if let Some((staged, calls)) = self.staged_head {
+            if self.head_calls.fetch_add(1, Ordering::Relaxed) < calls {
+                return Ok(staged);
+            }
+        }
+
         Ok(self.head)
     }
 
@@ -1144,6 +1170,87 @@ async fn a_parent_hash_break_trips_the_tripwire_too() {
         ))
         .await;
     assert_eq!(above, 0);
+}
+
+/// The tripwire at a PASS BOUNDARY, with the database read that used to
+/// supply the predecessor answering stale (docs/review-round-4.md,
+/// MAJOR 9).
+///
+/// At the head every pass starts exactly where the previous one stopped,
+/// and `anchor_for` used to ask `checkpoints FINAL` whether a checkpoint
+/// ends there - a read of the row the previous pass had just written,
+/// i.e. the one read ClickHouse is allowed to answer stale (~3%
+/// measured). When it did, the first block of the new pass was not
+/// checked at all and the only fork check this chain has was off, with no
+/// log line.
+///
+/// This forces that stale answer and puts a forked block exactly at the
+/// boundary. It passes only because the loop carries the last
+/// `Continuity` in memory: delete `SolanaIndexer::last_continuity` and
+/// the run finishes happily with a different block stored, which is the
+/// whole point - the pure-function test of `carried_anchor` would still
+/// pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_carried_anchor_checks_a_fork_a_stale_checkpoint_read_misses()
+{
+    use crate::pipeline::solana_store::stale;
+
+    let scenario = Scenario::new("d_stale_anchor").await;
+
+    // The block at index 25 does not build on the one below it. The head
+    // stops just under it for the first two `/height` reads, so the first
+    // pass ends exactly at the boundary and the second pass begins with
+    // the forked block.
+    let broken = chain(40).with_parent_hash_break(25);
+    let boundary = broken.slot_at(25);
+    let broken = broken.with_staged_head(boundary, 2);
+
+    // Every checkpoint-adjacency read of this run is answered stale, so
+    // the database can supply no anchor at all.
+    stale::arm_checkpoint_reads(64);
+
+    let error = scenario
+        .index_until(&broken, broken.head)
+        .await
+        .expect_err("the fork at the pass boundary must be fatal");
+
+    assert!(
+        Tripwire::is_cause_of(&error),
+        "the first block of the second pass was not checked against the \
+         last block of the first: {error:#}"
+    );
+    let text = format!("{error:#}");
+    assert!(text.contains("parent_blockhash"), "{text}");
+    assert!(text.contains(&boundary.to_string()), "{text}");
+
+    // The forked block reached no table.
+    let above = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM `{COMMIT_MARKER}` FINAL \
+             WHERE chain = {CHAIN} AND block_number >= {boundary}"
+        ))
+        .await;
+    assert_eq!(above, 0);
+
+    // ... and the run really did go through two passes, with the slots
+    // below the boundary stored by the first one.
+    let below = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM `{COMMIT_MARKER}` FINAL \
+             WHERE chain = {CHAIN} AND block_number < {boundary}"
+        ))
+        .await;
+    assert_eq!(below, 25, "the first pass stored 25 produced slots");
+
+    // The anchor came from memory, not from the database: had the loop
+    // asked, it would have been told "no checkpoint ends here" and would
+    // have skipped the check.
+    assert!(
+        stale::checkpoint_reads_taken() > 0,
+        "the loop never even asked the database - arm the knob against \
+         the read that is actually taken"
+    );
 }
 
 // ------------------------------------------------------------------- (e)
