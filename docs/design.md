@@ -269,8 +269,9 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    - `checkpoints` are compacted (insert-only cover + tombstones, lease-fenced, bounded).
    - Every module's rebuild SQL excludes the purged block range itself
      (`{purge_from}`/`{purge_to}`): a rebuild never depends on seeing tombstones.
-   - Test harnesses must re-issue tombstones until a count says 0 and re-read after an
-     insert: ClickHouse 25.12 misses ~3% of reads issued right after an acknowledged INSERT.
+   - Test harnesses must re-issue tombstones until a count says 0 twice in a row and
+     re-read after an insert: ClickHouse 25.12 misses ~3% of reads issued right after an
+     acknowledged INSERT, so one zero can be the answer from before the insert.
    - The sink's queue of flush spans that raced another process's purge is drained
      NON-DESTRUCTIVELY: a span leaves it only after its purge succeeded, so a transient
      error does not lose it (nothing else asks for those blocks again - their rows are
@@ -279,7 +280,9 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
      the live base rows inside a purge's `[from_ts, to_ts)` whose `epoch` is below that
      purge's and whose `_version` is above its `tombstone_version`, i.e. rows written
      after the rebuild had read its input. Conservative and self-terminating: the rows
-     come back stamped with the newest epoch, which no `reorgs` row is above.
+     come back stamped with the newest epoch, which no `reorgs` row is above. BOTH
+     families: the drain is `reorg::Purger::purge_queued` and the query reads the
+     family's commit marker (`blocks`, or `sol_slots` on Solana).
 
 **No read-your-writes (ClickHouse 25.12, observed on the macOS build).** Right after an
 `INSERT` returns, the next query can miss the new part for a few milliseconds when
