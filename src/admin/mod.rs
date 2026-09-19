@@ -157,17 +157,13 @@ pub async fn start(
         );
     }
 
-    let app = router(admin);
+    let limits = server::Limits::default();
+    let app = router(admin, limits);
 
-    Ok(Some(tokio::spawn(server::serve(
-        listener,
-        app,
-        server::Limits::default(),
-        shutdown,
-    ))))
+    Ok(Some(tokio::spawn(server::serve(listener, app, limits, shutdown))))
 }
 
-pub fn router(admin: Arc<Admin>) -> Router {
+pub fn router(admin: Arc<Admin>, limits: server::Limits) -> Router {
     Router::new()
         .route("/", get(serve_page))
         .route("/api/login", post(login))
@@ -185,6 +181,12 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             admin.clone(),
             known_host,
+        ))
+        // One request may take this long, head to response. Inside the
+        // header layer on purpose, so the 408 carries them too.
+        .layer(axum::middleware::from_fn_with_state(
+            limits.request,
+            within_the_request_limit,
         ))
         // OUTERMOST, so it also covers what never reaches a handler: a
         // path segment that will not parse, a method a route does not
@@ -210,6 +212,30 @@ async fn add_security_headers(
 ) -> Response {
     let response = next.run(request).await;
     secured(&admin, response)
+}
+
+/// Bounds ONE request: the body arriving, the handler running, the
+/// response being built.
+///
+/// This is where `server::Limits::request` actually lives. It used to be
+/// `max(request, idle)` around the whole connection in the accept loop,
+/// which meant the 30 s value never applied to anything and a body that
+/// dribbled in got the 60 s idle value instead (re-check residual 2). A
+/// whole-connection cap cannot do this job: a keep-alive connection is
+/// allowed to carry several requests and to sit between them, so the only
+/// honest place to time ONE request is around one request.
+async fn within_the_request_limit(
+    State(limit): State<std::time::Duration>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match tokio::time::timeout(limit, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => json_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "That request took too long and was dropped.",
+        ),
+    }
 }
 
 /// The chain id out of a path segment, with OUR message when it is not one.

@@ -72,7 +72,7 @@ impl Panel {
         };
         tweak(&mut admin);
 
-        let app = router(Arc::new(admin));
+        let app = router(Arc::new(admin), limits);
 
         // The REAL accept loop, with its real limits: a test that spoke to
         // a bare `axum::serve` would not have caught MAJOR 1.
@@ -318,6 +318,149 @@ async fn a_flood_of_half_open_sockets_does_not_keep_the_owner_out() {
     assert_eq!(reply.status, 200, "the owner could not reach the panel");
 
     drop(flood);
+    panel.stop().await;
+}
+
+/// Re-check residual 2: the whole-connection cap was
+/// `max(request, idle)`, so the request limit never applied to anything
+/// and a body that dribbles in got the (longer) idle value instead.
+///
+/// The head here is complete and announces a body that never comes. Only
+/// the REQUEST limit can end it: the header timeout has already been
+/// satisfied, and the idle value is thirty times longer than the deadline
+/// this test waits for.
+#[tokio::test]
+async fn a_body_that_never_arrives_is_cut_off_by_the_request_limit() {
+    let panel = Panel::start_limited(
+        &[],
+        server::Limits {
+            header_read: Duration::from_secs(30),
+            request: Duration::from_millis(300),
+            idle: Duration::from_secs(30),
+            ..server::Limits::default()
+        },
+        |_| {},
+    )
+    .await;
+
+    let mut stream = TcpStream::connect(panel.addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /api/login HTTP/1.1\r\nHost: {}\r\nContent-Type: \
+                 application/json\r\nContent-Length: 4000\r\n\r\n{{",
+                panel.addr
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    assert!(
+        was_closed(&mut stream, Duration::from_secs(5)).await,
+        "the request limit never applied: the connection was still open \
+         long after it should have been cut"
+    );
+
+    panel.stop().await;
+}
+
+/// ... and the answer it gets is a proper one, with the same headers every
+/// other response carries. A 408 produced outside the router would have
+/// none of them.
+#[tokio::test]
+async fn a_request_that_times_out_still_answers_like_the_panel() {
+    let panel = Panel::start_limited(
+        &[],
+        server::Limits {
+            header_read: Duration::from_secs(30),
+            request: Duration::from_millis(300),
+            idle: Duration::from_secs(30),
+            ..server::Limits::default()
+        },
+        |_| {},
+    )
+    .await;
+
+    let mut stream = TcpStream::connect(panel.addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /api/login HTTP/1.1\r\nHost: {}\r\nContent-Type: \
+                 application/json\r\nContent-Length: 4000\r\n\r\n{{",
+                panel.addr
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    let mut raw = Vec::new();
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.read_to_end(&mut raw),
+    )
+    .await;
+    assert!(read.is_ok(), "the connection was never closed");
+
+    let answer = String::from_utf8_lossy(&raw).to_lowercase();
+    assert!(answer.contains("408"), "{answer}");
+    assert!(answer.contains("content-security-policy"), "{answer}");
+    assert!(answer.contains("x-content-type-options"), "{answer}");
+
+    panel.stop().await;
+}
+
+/// Re-check residual 1: the global cap is itself a way to lock the owner
+/// out. Eighty sockets from one address left the owner's `GET /`
+/// unanswered until the header timeout cleared them, and re-opening every
+/// ten seconds kept the panel unreachable for as long as the attacker
+/// liked.
+///
+/// Everything in a unit test comes from one address, so what is checked
+/// here is the half that a socket can see: an address past its share is
+/// refused at once while the cap still has room. That the room is then
+/// usable by a DIFFERENT address is
+/// `server::tests::one_address_can_not_take_every_slot`, which is where it
+/// can be checked without a second loopback address on the machine.
+#[tokio::test]
+async fn one_address_is_held_to_its_share_of_the_connection_cap() {
+    let share = 3;
+    let panel = Panel::start_limited(
+        &[],
+        server::Limits {
+            max_connections: 32,
+            max_per_address: share,
+            // No timeout may fire during this test: the share alone has to
+            // do the work.
+            header_read: Duration::from_secs(30),
+            idle: Duration::from_secs(30),
+            ..server::Limits::default()
+        },
+        |_| {},
+    )
+    .await;
+
+    let mut sockets = Vec::new();
+    for _ in 0..(share * 6) {
+        sockets.push(half_open(panel.addr).await);
+    }
+
+    let mut still_held = 0;
+    for socket in &mut sockets {
+        if !was_closed(socket, Duration::from_millis(300)).await {
+            still_held += 1;
+        }
+    }
+
+    assert!(
+        still_held <= share,
+        "{still_held} connections held from one address with a share of \
+         {share} (the global cap is 32, so the share is what has to bite)"
+    );
+
     panel.stop().await;
 }
 

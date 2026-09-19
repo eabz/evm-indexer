@@ -74,7 +74,7 @@ reaches the chain supervisors.
 | Threat | Answer |
 |---|---|
 | the password in `ps`, in a shell history, in `docker inspect` | `ADMIN_PASSWORD` is read from the environment only. It is not a clap argument, so it cannot reach a `--help` text or a `Debug` print either |
-| a password short enough to guess | under 12 characters and the panel does not start; the log says why |
+| a password short enough to guess | under 12 characters, one character repeated, or on a small built-in denylist, and the panel does not start. The log says why and prints `openssl rand -base64 18` |
 | a memory dump hands out the password | only a salted SHA-256 of it is kept |
 | timing says how much of a guess was right | the PASSWORD comparison is constant time (`subtle`) over two 32-byte digests. The session lookup is an ordinary hash-map probe, which is safe for a different reason: its key is a SHA-256 of the token, so a timing signal reveals nothing invertible |
 | a guessable session token | 256 bits from the operating system's CSPRNG (`getrandom`) |
