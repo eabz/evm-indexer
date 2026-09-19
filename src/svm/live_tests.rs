@@ -49,8 +49,51 @@ const SLOTS: u64 = 150;
 /// with "no progress" at the tip.
 const HEAD_MARGIN: u64 = 400;
 
+/// The API token, from the environment or from the git-ignored `.env`.
+///
+/// The file fallback exists because a git WORKTREE has no `.env` of its
+/// own - the file lives once, at the main checkout - and because putting a
+/// secret on a command line publishes it to every process table on the
+/// machine. The value is never printed, logged or written anywhere.
 fn token() -> Option<String> {
-    std::env::var("ENVIO_API_TOKEN").ok().filter(|t| !t.trim().is_empty())
+    if let Some(value) = std::env::var("ENVIO_API_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(value);
+    }
+    dotenv_token()
+}
+
+/// Reads `ENVIO_API_TOKEN` out of the nearest `.env`, searching this crate's
+/// directory and its parents (a worktree sits three levels under the main
+/// checkout, which is where the file is).
+fn dotenv_token() -> Option<String> {
+    let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for _ in 0..5 {
+        let candidate = dir.join(".env");
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            for line in text.lines() {
+                let line = line.trim();
+                let Some(value) = line.strip_prefix("ENVIO_API_TOKEN=")
+                else {
+                    continue;
+                };
+                let value = value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_owned();
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
 
 /// What one live run measured, beyond the rows themselves.
@@ -228,6 +271,307 @@ async fn live_response_caps_decide_slots_per_query() {
         !after.logs.is_empty(),
         "no log rows came back, so no Raydium or Orca event can ever decode"
     );
+}
+
+/// Every pump.fun curve instruction in a live window, bucketed by what the
+/// decoder did with it and WHY.
+///
+/// The README reported 98.2% agreement on the pump.fun curve and left the
+/// remaining 1.8% unexplained. A rate is a symptom; this prints the
+/// diagnosis, per instruction rather than per row, because the interesting
+/// cases are the ones that produced NO row at all and therefore never
+/// reached the agreement statistic.
+///
+/// Run with `PUMPFUN_SLOTS` to widen the window (default 120).
+#[tokio::test]
+#[ignore]
+async fn live_explain_pumpfun() {
+    use crate::svm::{
+        events::PumpFunTrade,
+        programs::{registry, to_base58, Venue, EVENT_CPI_PREFIX},
+    };
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+    let slots: u64 = std::env::var("PUMPFUN_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+    let curve = crate::svm::programs::pubkey(Venue::PumpFun.program_b58());
+    let wsol = registry().wsol;
+
+    let mut buckets: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut examples: BTreeMap<&'static str, Vec<String>> =
+        BTreeMap::new();
+    let note =
+        |bucket: &'static str,
+         line: String,
+         buckets: &mut BTreeMap<&'static str, u64>,
+         examples: &mut BTreeMap<&'static str, Vec<String>>| {
+            *buckets.entry(bucket).or_insert(0) += 1;
+            let shown = examples.entry(bucket).or_default();
+            if shown.len() < 4 {
+                shown.push(line);
+            }
+        };
+
+    let mut cursor = head - HEAD_MARGIN - slots;
+    let end = cursor + slots;
+    let mut instructions_seen = 0u64;
+
+    while cursor < end {
+        let batch = source.fetch(cursor, end).await.expect("fetch");
+        assert!(batch.next_slot > cursor, "no progress at {cursor}");
+
+        for slot in &batch.batches {
+            for tx in &slot.transactions {
+                let has_curve =
+                    tx.instructions.iter().any(|ix| ix.program == curve);
+                if !has_curve {
+                    continue;
+                }
+                let outcome = crate::svm::decode::decode_transaction(
+                    SOLANA_CHAIN,
+                    slot.timestamp,
+                    tx,
+                );
+                let signature = bs58::encode(tx.signature).into_string();
+
+                // The curve instructions of this transaction, excluding the
+                // self-CPI event rows (which are not instructions).
+                let calls: Vec<&crate::svm::decode::SvmInstruction> = tx
+                    .instructions
+                    .iter()
+                    .filter(|ix| {
+                        ix.program == curve
+                            && !ix.data.starts_with(&EVENT_CPI_PREFIX)
+                    })
+                    .collect();
+
+                for call in &calls {
+                    instructions_seen += 1;
+                    let ordinal =
+                        crate::svm::models::pack_ordinal(&call.path)
+                            .unwrap_or(0);
+                    let row = outcome.swaps.iter().find(|swap| {
+                        swap.ordinal == ordinal
+                            && swap.protocol == Venue::PumpFun.as_str()
+                    });
+
+                    // The event the curve emitted for THIS instruction.
+                    let event = tx
+                        .instructions
+                        .iter()
+                        .find(|candidate| {
+                            candidate.program == curve
+                                && candidate.path.len()
+                                    == call.path.len() + 1
+                                && candidate.path.starts_with(&call.path)
+                                && candidate
+                                    .data
+                                    .starts_with(&EVENT_CPI_PREFIX)
+                        })
+                        .and_then(|ix| PumpFunTrade::parse(&ix.data));
+
+                    let Some(event) = event else {
+                        // No TradeEvent: `create`, `migrate`, `withdraw`,
+                        // `collect_creator_fee` and the other non-trade
+                        // instructions all land here, so they are named
+                        // rather than counted as failures.
+                        let kind = match row {
+                            Some(_) => "no_event_but_row",
+                            None => "not_a_trade_instruction",
+                        };
+                        note(
+                            kind,
+                            format!(
+                                "{signature} path {:?} disc {}",
+                                call.path,
+                                hex::encode(
+                                    call.data.get(..8).unwrap_or_default()
+                                )
+                            ),
+                            &mut buckets,
+                            &mut examples,
+                        );
+                        continue;
+                    };
+
+                    let Some(row) = row else {
+                        // A real trade the decoder produced no row for.
+                        // Which curves this transaction touches more than
+                        // once is the thing to look at: a lamport delta
+                        // cannot be split between two trades.
+                        let same_curve = calls
+                            .iter()
+                            .filter(|other| {
+                                tx.instructions
+                                    .iter()
+                                    .find(|ix| {
+                                        ix.program == curve
+                                            && ix.path.len()
+                                                == other.path.len() + 1
+                                            && ix
+                                                .path
+                                                .starts_with(&other.path)
+                                            && ix.data.starts_with(
+                                                &EVENT_CPI_PREFIX,
+                                            )
+                                    })
+                                    .and_then(|ix| {
+                                        PumpFunTrade::parse(&ix.data)
+                                    })
+                                    .is_some_and(|other_event| {
+                                        other_event.mint == event.mint
+                                    })
+                            })
+                            .count();
+                        // The exact flows the movement layer saw inside
+                        // this subtree, which is what says whether a fee
+                        // leg, a refund or a second mint broke the rule.
+                        let all = crate::svm::decode::Movements::new(
+                            tx,
+                            registry(),
+                        );
+                        let mut flows = String::new();
+                        for movement in all.movements.iter().filter(|m| {
+                            m.path.len() > call.path.len()
+                                && m.path.starts_with(&call.path)
+                        }) {
+                            flows.push_str(&format!(
+                                "\n        {} {} {} -> {}",
+                                &to_base58(&movement.mint)[..8],
+                                movement.amount,
+                                &to_base58(
+                                    &movement
+                                        .source_owner
+                                        .unwrap_or_default()
+                                )[..8],
+                                &to_base58(
+                                    &movement
+                                        .destination_owner
+                                        .unwrap_or_default()
+                                )[..8],
+                            ));
+                        }
+                        note(
+                            if same_curve > 1 {
+                                "dropped_same_curve_twice"
+                            } else {
+                                "dropped_other"
+                            },
+                            format!(
+                                "{signature} path {:?} mint {} buy {} \
+                                 sol {} token {} curve_calls {same_curve} \
+                                 unclassified {} ambiguous {} \
+                                 liquidity {}{flows}",
+                                call.path,
+                                to_base58(&event.mint),
+                                event.is_buy,
+                                event.sol_amount,
+                                event.token_amount,
+                                outcome.diagnostics.unclassified,
+                                outcome.diagnostics.ambiguous_native,
+                                outcome.diagnostics.liquidity,
+                            ),
+                            &mut buckets,
+                            &mut examples,
+                        );
+                        continue;
+                    };
+
+                    if row.confidence == "decoded" {
+                        note(
+                            "agreed",
+                            signature.clone(),
+                            &mut buckets,
+                            &mut examples,
+                        );
+                        continue;
+                    }
+
+                    // A row that stayed `movement`: run the three checks of
+                    // `events::enrich_pumpfun` by hand and say which failed.
+                    let (expected_in, expected_out) = if event.is_buy {
+                        (wsol, event.mint)
+                    } else {
+                        (event.mint, wsol)
+                    };
+                    let mints_ok = row.token_in == expected_in
+                        && row.token_out == expected_out;
+                    let movement_sol: u128 = if event.is_buy {
+                        row.amount_in.to::<u128>()
+                    } else {
+                        row.amount_out_gross.to::<u128>()
+                    };
+                    let movement_token: u128 = if event.is_buy {
+                        row.amount_out_gross.to::<u128>()
+                    } else {
+                        row.amount_in.to::<u128>()
+                    };
+                    let token_ok =
+                        movement_token == u128::from(event.token_amount);
+                    let sol_gap = movement_sol
+                        .abs_diff(u128::from(event.sol_amount));
+                    let sol_ok = sol_gap <= u128::from(event.total_fee());
+
+                    let bucket = match (mints_ok, token_ok, sol_ok) {
+                        (false, _, _) => "disagreed_mints",
+                        (_, false, _) => "disagreed_token_leg",
+                        (_, _, false) => "disagreed_sol_leg",
+                        _ => "movement_but_all_checks_pass",
+                    };
+                    note(
+                        bucket,
+                        format!(
+                            "{signature} path {:?} buy {} | movement sol \
+                             {movement_sol} token {movement_token} | event \
+                             sol {} token {} fee {} creator_fee {} | \
+                             sol_gap {sol_gap} (tolerance {}) | in {} out {}",
+                            call.path,
+                            event.is_buy,
+                            event.sol_amount,
+                            event.token_amount,
+                            event.fee,
+                            event.creator_fee,
+                            event.total_fee(),
+                            to_base58(&row.token_in),
+                            to_base58(&row.token_out),
+                        ),
+                        &mut buckets,
+                        &mut examples,
+                    );
+                }
+            }
+        }
+        cursor = batch.next_slot;
+    }
+
+    println!(
+        "\n=== pump.fun curve: {instructions_seen} instructions over \
+         {slots} slots ==="
+    );
+    let total: u64 = buckets.values().sum();
+    for (bucket, count) in &buckets {
+        println!(
+            "  {bucket:<28} {count:>6}  ({:>5.2}%)",
+            100.0 * *count as f64 / total.max(1) as f64
+        );
+    }
+    for (bucket, lines) in &examples {
+        if *bucket == "agreed" {
+            continue;
+        }
+        println!("\n  --- {bucket} ---");
+        for line in lines {
+            println!("    {line}");
+        }
+    }
 }
 
 /// Why a venue's event contradicted the movement layer, in its own numbers.

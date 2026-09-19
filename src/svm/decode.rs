@@ -374,7 +374,9 @@ pub struct Movement {
 pub struct Movements<'a> {
     tx: &'a SvmTransaction,
     registry: &'a Registry,
-    movements: Vec<Movement>,
+    /// Public so the live diagnostics can print the exact flows an
+    /// instruction produced; nothing outside this module mutates it.
+    pub movements: Vec<Movement>,
     /// For each movement, the path of its NEAREST registered venue ancestor.
     ///
     /// Computed once here rather than per lookup. It used to be recomputed
