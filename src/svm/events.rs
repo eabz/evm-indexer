@@ -428,7 +428,12 @@ pub fn enrich(
         | Venue::RaydiumClmm
         | Venue::OrcaWhirlpool
         | Venue::MeteoraDlmm
-        | Venue::MeteoraDammV2 => crate::svm::venues::enrich(
+        | Venue::MeteoraDammV2
+        // The two launchpad curves are markets too, and both publish a
+        // self-CPI swap event: Meteora DBC's `EvtSwap2` and Raydium
+        // LaunchLab's `TradeEvent`.
+        | Venue::MeteoraDbc
+        | Venue::RaydiumLaunchlab => crate::svm::venues::enrich(
             tx,
             instruction,
             venue,

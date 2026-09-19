@@ -496,6 +496,40 @@ impl<'a> Movements<'a> {
     fn received_by(&self, account: &Pubkey) -> Option<i128> {
         self.by_account.get(account).and_then(|row| row.token_delta())
     }
+
+    /// What the pool's vault was actually CREDITED on the input leg.
+    ///
+    /// The mirror of `SvmSwap::with_received`. A Token-2022 transfer fee
+    /// comes out of the receiver's credit on BOTH legs, and until this was
+    /// measured the only way to check an event that reports the credited
+    /// figure - Raydium LaunchLab does - was to invent a tolerance.
+    ///
+    /// Returns the amount sent when the vault's delta is not readable or
+    /// not smaller, so a caller always gets a usable number and the gap it
+    /// implies is never negative.
+    fn input_received(&self, swap: &MovementSwap) -> u64 {
+        let credited = self
+            .movements
+            .iter()
+            .filter(|movement| {
+                movement.destination_owner == Some(swap.authority)
+                    && movement.mint == swap.mint_in
+                    && swap.path.len() < movement.path.len()
+                    && movement.path.starts_with(&swap.path)
+            })
+            .filter_map(|movement| self.received_by(&movement.destination))
+            .next();
+
+        match credited {
+            Some(delta)
+                if delta > 0
+                    && (delta as u128) <= u128::from(swap.amount_in) =>
+            {
+                delta as u64
+            }
+            _ => swap.amount_in,
+        }
+    }
 }
 
 /// Parses an SPL Token / Token-2022 / System transfer instruction.
@@ -608,8 +642,21 @@ pub struct MovementSwap {
     pub authority: Pubkey,
     pub mint_in: Pubkey,
     pub mint_out: Pubkey,
-    /// Into the pool.
+    /// Into the pool, as SENT by the taker.
     pub amount_in: u64,
+    /// Into the pool, as CREDITED to the pool's vault.
+    ///
+    /// The mirror image of [`Self::amount_out`] / [`Self::amount_out_gross`],
+    /// and it exists for the same reason: a Token-2022 transfer fee comes
+    /// out of what the RECEIVER is credited. Equal to `amount_in` on a
+    /// classic SPL mint.
+    ///
+    /// It is not a stored column - what the taker sent is the trade - but
+    /// it is what lets a venue's event be checked without inventing a
+    /// tolerance. Raydium LaunchLab states no transfer fee anywhere, and
+    /// its agreement with the movement layer was 4.8% until the gap was
+    /// measured from the chain instead of guessed at.
+    pub amount_in_received: u64,
     /// Out of the pool, as SENT.
     pub amount_out_gross: u64,
     /// Out of the pool, as RECEIVED by the taker. Differs from the gross
@@ -701,7 +748,10 @@ pub fn decode_transaction_with(
             &natives,
             &authority_uses,
         ) {
-            Classified::Swap(swap) => {
+            Classified::Swap(mut swap) => {
+                // What the vault was CREDITED, which a Token-2022 transfer
+                // fee makes smaller than what the taker sent.
+                swap.amount_in_received = movements.input_received(&swap);
                 let mut row =
                     build_row(chain, timestamp, tx, &movements, &swap);
                 let enriched = crate::svm::events::enrich(
@@ -729,6 +779,10 @@ pub fn decode_transaction_with(
                 let mut accepted = None;
                 let mut verdict = crate::svm::events::Enrichment::None;
                 for swap in &proposals {
+                    let mut swap = swap.clone();
+                    swap.amount_in_received =
+                        movements.input_received(&swap);
+                    let swap = &swap;
                     let mut row =
                         build_row(chain, timestamp, tx, &movements, swap);
                     match crate::svm::events::enrich(
@@ -837,6 +891,10 @@ fn record(
     }
 }
 
+/// `Swap` is much larger than the other variants, and boxing it would cost
+/// an allocation on the hot path for every swap on the chain to save a few
+/// bytes of stack in a value that never leaves this function.
+#[allow(clippy::large_enum_variant)]
 enum Classified {
     Swap(MovementSwap),
     /// A trade whose pool side the movement layer cannot pick on its own.
@@ -1173,6 +1231,9 @@ fn classify_native(
         mint_in,
         mint_out,
         amount_in,
+        // A native lamport leg has no token account and therefore no
+        // transfer fee.
+        amount_in_received: amount_in,
         amount_out_gross: amount_out,
         amount_out,
         fee_amount: 0,
@@ -1243,9 +1304,11 @@ fn classify_two_sided(
         mint_in,
         mint_out,
         amount_in,
+        // Both "received" figures are filled in by the caller, which can
+        // see the destination's real balance delta (a Token-2022 transfer
+        // fee makes it smaller than what was sent).
+        amount_in_received: amount_in,
         amount_out_gross,
-        // Filled in by the caller, which can see the destination's real
-        // balance delta (a Token-2022 transfer fee makes it smaller).
         amount_out: amount_out_gross,
         fee_amount: fees,
         payer,

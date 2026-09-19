@@ -46,8 +46,9 @@ use crate::svm::{
     events::Enrichment,
     models::{Pubkey, SvmSwap},
     programs::{
-        Venue, DISC_DAMM2_SWAP, DISC_DLMM_SWAP, DISC_DLMM_SWAP2,
-        DISC_ORCA_TRADED, DISC_RAYDIUM_SWAP_EVENT, EVENT_CPI_PREFIX,
+        Venue, DISC_DAMM2_SWAP, DISC_DBC_SWAP2, DISC_DLMM_SWAP,
+        DISC_DLMM_SWAP2, DISC_LAUNCHLAB_TRADE, DISC_ORCA_TRADED,
+        DISC_RAYDIUM_SWAP_EVENT, EVENT_CPI_PREFIX,
         RAY_DIRECTION_PC_TO_COIN, RAY_LOG_PREFIX, RAY_LOG_SWAP_BASE_IN,
         RAY_LOG_SWAP_BASE_OUT, RAY_LOG_SWAP_LEN,
     },
@@ -1008,6 +1009,301 @@ pub fn enrich_meteora_damm2(
     Enrichment::Applied
 }
 
+// --- Meteora Dynamic Bonding Curve: `EvtSwap2` ---------------------------
+
+/// `EvtSwap2` of `MeteoraAg/dynamic-bonding-curve` v0.2.1
+/// `programs/dynamic-bonding-curve/src/event.rs`.
+///
+/// A DBC swap emits BOTH `EvtSwap` and `EvtSwap2`, and only the second one
+/// carries `quote_reserve_amount` and `migration_threshold` - the curve's
+/// progress towards graduation, which is the number a launchpad UI needs
+/// and the reason this decoder reads `EvtSwap2` rather than the older one.
+///
+/// Its discriminator is the SAME as Meteora DAMM v2's `EvtSwap2` (one
+/// vendor, one event name, two programs), and the two are not even the same
+/// length. `cpi_event_of` matches on the emitting PROGRAM, which is what
+/// keeps them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbcSwap2 {
+    pub pool: Pubkey,
+    pub config: Pubkey,
+    /// 0 = base to quote (a SELL), 1 = quote to base (a BUY).
+    pub trade_direction: u8,
+    /// 0 = exact in, 1 = partial fill, 2 = exact out.
+    pub swap_mode: u8,
+    /// The input as the taker SENT it, transfer fee included - which is
+    /// exactly what the movement layer reads off the transfer instruction.
+    pub included_fee_input_amount: u64,
+    pub excluded_fee_input_amount: u64,
+    /// Unspent input on a partial fill.
+    pub amount_left: u64,
+    pub output_amount: u64,
+    pub trading_fee: u64,
+    pub protocol_fee: u64,
+    pub referral_fee: u64,
+    /// Quote raised so far, and the threshold it has to reach. Together
+    /// they ARE the curve progress.
+    pub quote_reserve_amount: u64,
+    pub migration_threshold: u64,
+}
+
+impl DbcSwap2 {
+    /// 179 payload bytes behind the 16-byte self-CPI header.
+    pub const LEN: usize = CPI_BODY + 179;
+
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() != Self::LEN {
+            return None;
+        }
+        Some(Self {
+            pool: pubkey_at(data, CPI_BODY)?,
+            config: pubkey_at(data, CPI_BODY + 32)?,
+            trade_direction: *data.get(CPI_BODY + 64)?,
+            // CPI_BODY + 65 has_referral, + 66 amount_0, + 74 amount_1.
+            swap_mode: *data.get(CPI_BODY + 82)?,
+            included_fee_input_amount: u64_at(data, CPI_BODY + 83)?,
+            excluded_fee_input_amount: u64_at(data, CPI_BODY + 91)?,
+            amount_left: u64_at(data, CPI_BODY + 99)?,
+            output_amount: u64_at(data, CPI_BODY + 107)?,
+            // CPI_BODY + 115 is next_sqrt_price, a u128.
+            trading_fee: u64_at(data, CPI_BODY + 131)?,
+            protocol_fee: u64_at(data, CPI_BODY + 139)?,
+            referral_fee: u64_at(data, CPI_BODY + 147)?,
+            quote_reserve_amount: u64_at(data, CPI_BODY + 155)?,
+            migration_threshold: u64_at(data, CPI_BODY + 163)?,
+            // CPI_BODY + 171 is current_timestamp.
+        })
+    }
+
+    pub fn total_fee(&self) -> u64 {
+        self.trading_fee
+            .saturating_add(self.protocol_fee)
+            .saturating_add(self.referral_fee)
+    }
+
+    /// Curve progress as a wad, `1e18` = the migration threshold reached.
+    /// Zero when the config sets no threshold, never a guess.
+    pub fn progress_wad(&self) -> U256 {
+        if self.migration_threshold == 0 {
+            return U256::ZERO;
+        }
+        U256::from(self.quote_reserve_amount)
+            .saturating_mul(U256::from(1_000_000_000_000_000_000u64))
+            / U256::from(self.migration_threshold)
+    }
+}
+
+pub fn enrich_meteora_dbc(
+    tx: &SvmTransaction,
+    instruction: &SvmInstruction,
+    swap: &MovementSwap,
+    row: &mut SvmSwap,
+) -> Enrichment {
+    let Some(event) = cpi_event_of(tx, instruction, DISC_DBC_SWAP2)
+        .and_then(|event| DbcSwap2::parse(&event.data))
+    else {
+        return Enrichment::None;
+    };
+
+    // The input leg is stated as SENT, so it needs no tolerance - except on
+    // a partial fill, where the program hands `amount_left` back and the
+    // transfer the movement layer saw is smaller by exactly that.
+    if !amounts_agree(
+        swap,
+        event.included_fee_input_amount,
+        event.amount_left,
+        event.output_amount,
+        0,
+    ) {
+        return Enrichment::Disagreed;
+    }
+
+    // Only the QUOTE reserve is in the event; the base side stays 0, which
+    // is what this schema means by "not available" (docs/design.md §1 has
+    // no nullable amounts).
+    let quote_mint = if event.trade_direction == 0 {
+        swap.mint_out
+    } else {
+        swap.mint_in
+    };
+    let base_mint = if event.trade_direction == 0 {
+        swap.mint_in
+    } else {
+        swap.mint_out
+    };
+    apply_reserves(
+        row,
+        base_mint,
+        U256::ZERO,
+        quote_mint,
+        U256::from(event.quote_reserve_amount),
+    );
+    row.fee_amount = U256::from(event.total_fee());
+    row.mark_decoded(event.pool);
+    Enrichment::Applied
+}
+
+// --- Raydium LaunchLab: `TradeEvent` -------------------------------------
+
+/// `TradeEvent` of the DEPLOYED Raydium LaunchLab program (its own on-chain
+/// IDL, version 0.2.0; the public `raydium-io/raydium-idl` copy is stale).
+///
+/// **Its discriminator is byte for byte pump.fun's `TradeEvent`** - Anchor
+/// hashes only the struct name and both programs chose it. The payloads
+/// share nothing: 139 fixed bytes here against 363 plus two variable-length
+/// fields there. `cpi_event_of` matches the emitting PROGRAM first, and the
+/// exact-length check below is the second line of defence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchlabTrade {
+    pub pool_state: Pubkey,
+    pub total_base_sell: u64,
+    pub virtual_base: u64,
+    pub virtual_quote: u64,
+    pub real_base_before: u64,
+    pub real_quote_before: u64,
+    pub real_base_after: u64,
+    pub real_quote_after: u64,
+    pub amount_in: u64,
+    pub amount_out: u64,
+    pub protocol_fee: u64,
+    pub platform_fee: u64,
+    pub creator_fee: u64,
+    /// The share a front end's router claimed on this fill.
+    pub share_fee: u64,
+    /// 0 = Buy, 1 = Sell.
+    pub trade_direction: u8,
+    /// 0 = Fund (still on the curve), 1 = Migrate (it just filled),
+    /// 2 = Trade (migrated).
+    pub pool_status: u8,
+    pub exact_in: bool,
+}
+
+impl LaunchlabTrade {
+    /// 139 payload bytes behind the 16-byte self-CPI header.
+    pub const LEN: usize = CPI_BODY + 139;
+    /// `PoolStatus::Migrate`: the curve filled in THIS trade.
+    pub const STATUS_MIGRATE: u8 = 1;
+    /// `TradeDirection::Buy`, as the IDL's enum orders it.
+    pub const DIRECTION_BUY: u8 = 0;
+
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() != Self::LEN {
+            return None;
+        }
+        Some(Self {
+            pool_state: pubkey_at(data, CPI_BODY)?,
+            total_base_sell: u64_at(data, CPI_BODY + 32)?,
+            virtual_base: u64_at(data, CPI_BODY + 40)?,
+            virtual_quote: u64_at(data, CPI_BODY + 48)?,
+            real_base_before: u64_at(data, CPI_BODY + 56)?,
+            real_quote_before: u64_at(data, CPI_BODY + 64)?,
+            real_base_after: u64_at(data, CPI_BODY + 72)?,
+            real_quote_after: u64_at(data, CPI_BODY + 80)?,
+            amount_in: u64_at(data, CPI_BODY + 88)?,
+            amount_out: u64_at(data, CPI_BODY + 96)?,
+            protocol_fee: u64_at(data, CPI_BODY + 104)?,
+            platform_fee: u64_at(data, CPI_BODY + 112)?,
+            creator_fee: u64_at(data, CPI_BODY + 120)?,
+            share_fee: u64_at(data, CPI_BODY + 128)?,
+            trade_direction: *data.get(CPI_BODY + 136)?,
+            pool_status: *data.get(CPI_BODY + 137)?,
+            exact_in: bool_at(data, CPI_BODY + 138)?,
+        })
+    }
+
+    /// Did the TAKER buy the base token?
+    ///
+    /// Read off the pool's own reserves rather than off `trade_direction`,
+    /// and that is not paranoia: keying on the enum put this decoder's
+    /// agreement with the movement layer at **4.8%** live, because the
+    /// fee tolerance was then applied to the wrong leg on every trade. The
+    /// reserves cannot be misread - the pool gains quote on a buy and loses
+    /// it on a sell - and `launchlab_direction_agrees_with_its_reserves`
+    /// reports when the enum disagrees rather than silently preferring one.
+    pub fn is_buy(&self) -> bool {
+        if self.real_quote_after != self.real_quote_before {
+            return self.real_quote_after > self.real_quote_before;
+        }
+        self.trade_direction == Self::DIRECTION_BUY
+    }
+
+    /// What the IDL's `TradeDirection` enum claims.
+    pub fn direction_says_buy(&self) -> bool {
+        self.trade_direction == Self::DIRECTION_BUY
+    }
+
+    pub fn total_fee(&self) -> u64 {
+        self.protocol_fee
+            .saturating_add(self.platform_fee)
+            .saturating_add(self.creator_fee)
+            .saturating_add(self.share_fee)
+    }
+}
+
+pub fn enrich_raydium_launchlab(
+    tx: &SvmTransaction,
+    instruction: &SvmInstruction,
+    swap: &MovementSwap,
+    row: &mut SvmSwap,
+) -> Enrichment {
+    let Some(event) = cpi_event_of(tx, instruction, DISC_LAUNCHLAB_TRADE)
+        .and_then(|event| LaunchlabTrade::parse(&event.data))
+    else {
+        return Enrichment::None;
+    };
+
+    // Two independent gaps, and BOTH were measured live rather than
+    // assumed - the decoder agreed with the movement layer on 4.8% of
+    // trades until they were understood.
+    //
+    // * The QUOTE leg differs by the venue's own fees. On a sell the
+    //   platform fee leaves the vault in the same subtree, so the movement
+    //   layer counts it as having left the pool; on a buy it is taken
+    //   before the rest reaches the vault. Either way the gap is at most
+    //   `total_fee`, which the event itself states.
+    // * The BASE leg differs by a Token-2022 TRANSFER fee, which LaunchLab
+    //   states nowhere at all - `initialize_with_token_2022` takes a
+    //   transfer-fee extension and the event has no field for it. Measured
+    //   at 1% and 3% on live launches. The tolerance is therefore the gap
+    //   the CHAIN reports between what was sent and what was credited, not
+    //   a number invented here: zero on a classic SPL mint, and exact on a
+    //   Token-2022 one.
+    let transfer_fee_in =
+        swap.amount_in.saturating_sub(swap.amount_in_received);
+    let transfer_fee_out =
+        swap.amount_out_gross.saturating_sub(swap.amount_out);
+    let (in_slack, out_slack) = if event.is_buy() {
+        (event.total_fee(), transfer_fee_out)
+    } else {
+        (transfer_fee_in, event.total_fee())
+    };
+    if !amounts_agree(
+        swap,
+        event.amount_in,
+        in_slack,
+        event.amount_out,
+        out_slack,
+    ) {
+        return Enrichment::Disagreed;
+    }
+
+    let (base_mint, quote_mint) = if event.is_buy() {
+        (swap.mint_out, swap.mint_in)
+    } else {
+        (swap.mint_in, swap.mint_out)
+    };
+    apply_reserves(
+        row,
+        base_mint,
+        U256::from(event.real_base_after),
+        quote_mint,
+        U256::from(event.real_quote_after),
+    );
+    row.fee_amount = U256::from(event.total_fee());
+    row.mark_decoded(event.pool_state);
+    Enrichment::Applied
+}
+
 /// Dispatch for the phase 2 venues.
 pub fn enrich(
     tx: &SvmTransaction,
@@ -1035,6 +1331,12 @@ pub fn enrich(
         }
         Venue::MeteoraDammV2 => {
             enrich_meteora_damm2(tx, instruction, swap, row)
+        }
+        Venue::MeteoraDbc => {
+            enrich_meteora_dbc(tx, instruction, swap, row)
+        }
+        Venue::RaydiumLaunchlab => {
+            enrich_raydium_launchlab(tx, instruction, swap, row)
         }
         // Handled in `events.rs`, or not decodable at all.
         Venue::PumpSwap | Venue::PumpFun | Venue::BisonFi => {

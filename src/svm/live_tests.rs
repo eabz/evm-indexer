@@ -273,6 +273,178 @@ async fn live_response_caps_decide_slots_per_query() {
     );
 }
 
+/// The four launchpad row kinds, live, for all three Solana launchpads.
+///
+/// Prints what a UI would actually have, per family, and asserts the three
+/// properties that make the rows usable at all:
+///
+/// 1. every launch's curve was RE-DERIVED as a PDA of the launch's own
+///    fields, so no row rests on an account meta index being right;
+/// 2. every curve trade's token leg is corroborated by the movement layer;
+/// 3. a pump.fun graduation names a PumpSwap pool that the DEX decoder
+///    also wrote a swap for - the join that makes a token's chart continue
+///    after the curve is gone.
+///
+/// `LAUNCHPAD_SLOTS` widens the window (default 400). Graduations are rare -
+/// a few hundred a day against millions of trades - so property 3 needs a
+/// wide one and reports rather than fails when the window holds none.
+#[tokio::test]
+#[ignore]
+async fn live_launchpad_rows() {
+    use crate::svm::launchpads::SolFamily;
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+    let slots: u64 = std::env::var("LAUNCHPAD_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+    let mut cursor = head - HEAD_MARGIN - slots;
+    let end = cursor + slots;
+
+    let mut rows = svm::SvmRows::default();
+    let mut queries = 0u32;
+    while cursor < end {
+        let batch = source.fetch(cursor, end).await.expect("fetch");
+        assert!(batch.next_slot > cursor, "no progress at {cursor}");
+        queries += 1;
+        let mut decoded = svm::decode(SOLANA_CHAIN, &batch.batches);
+        rows.append(&mut decoded);
+        cursor = batch.next_slot;
+    }
+
+    let pads = &rows.launchpads;
+    println!(
+        "\n=== Solana launchpads: {slots} slots, {queries} queries ==="
+    );
+    println!(
+        "launches {}  curve trades {}  graduations {}  fee rows {}  \
+         configs {}  holder balances {}",
+        pads.tokens.len(),
+        pads.trades.len(),
+        pads.graduations.len(),
+        pads.creator_fees.len(),
+        pads.configs.len(),
+        pads.balances.len(),
+    );
+    println!("diagnostics {:?}", pads.diagnostics);
+
+    for family in SolFamily::ALL {
+        let name = family.as_str();
+        let launches =
+            pads.tokens.iter().filter(|r| r.family == name).count();
+        let trades =
+            pads.trades.iter().filter(|r| r.family == name).count();
+        let verified = pads
+            .trades
+            .iter()
+            .filter(|r| r.family == name && r.token_verified == 1)
+            .count();
+        let graduating = pads
+            .trades
+            .iter()
+            .filter(|r| r.family == name && r.graduating == 1)
+            .count();
+        let graduations =
+            pads.graduations.iter().filter(|r| r.family == name).count();
+        let fees =
+            pads.creator_fees.iter().filter(|r| r.family == name).count();
+        let with_progress = pads
+            .trades
+            .iter()
+            .filter(|r| r.family == name && !r.progress_wad.is_zero())
+            .count();
+        println!(
+            "  {name:<18} launches {launches:>4}  trades {trades:>6} \
+             ({verified} token-verified, {with_progress} with progress)  \
+             curve filled {graduating:>3}  graduations {graduations:>3}  \
+             fee rows {fees:>4}"
+        );
+    }
+
+    // (1) Every launch was proven, not claimed: a row only exists when the
+    //     curve re-derived from the launch's own fields.
+    assert_eq!(
+        pads.diagnostics.curve_not_derived, 0,
+        "a launch whose curve could not be re-derived was refused; if this \
+         is not zero an account meta index has moved"
+    );
+    assert_eq!(
+        pads.diagnostics.bad_length, 0,
+        "an event arrived at a length no layout here expects, i.e. a \
+         program appended a field"
+    );
+
+    // (2) The movement layer corroborates the curve trades.
+    let trades = pads.trades.len();
+    assert!(trades > 0, "no curve trades in {slots} slots");
+    let verified =
+        pads.trades.iter().filter(|r| r.token_verified == 1).count();
+    println!(
+        "\ntoken leg corroborated by real token movement: {verified} of \
+         {trades} ({:.2}%)",
+        100.0 * verified as f64 / trades as f64
+    );
+    assert!(
+        verified * 100 >= trades * 95,
+        "only {verified} of {trades} curve trades were corroborated"
+    );
+
+    // Every trade's emitter must be a curve some launch announced, or the
+    // token join and the trusted-curve filter would both miss it.
+    let curves: std::collections::HashSet<Pubkey> =
+        pads.tokens.iter().map(|row| row.curve).collect();
+    let known = pads
+        .trades
+        .iter()
+        .filter(|row| curves.contains(&row.emitter))
+        .count();
+    println!(
+        "trades whose curve was ALSO launched inside this window: {known} \
+         (the rest launched earlier, exactly as on EVM)"
+    );
+
+    // (3) The graduation join. This is the whole point of the module.
+    let pools: std::collections::HashSet<Pubkey> =
+        rows.swaps.iter().map(|swap| swap.pool_id).collect();
+    let mut joined = 0;
+    for row in &pads.graduations {
+        if row.pool_id == crate::svm::models::ZERO_PUBKEY {
+            continue;
+        }
+        println!(
+            "\n  graduation: {} -> pool {} ({} in the same window: {})",
+            to_base58(&row.token),
+            to_base58(&row.pool_id),
+            row.family,
+            if pools.contains(&row.pool_id) {
+                "the DEX decoder wrote swaps for that pool too"
+            } else {
+                "no swap on that pool in this window yet"
+            }
+        );
+        if pools.contains(&row.pool_id) {
+            joined += 1;
+        }
+    }
+    println!(
+        "\ngraduations naming a destination pool: {} of {} (pump.fun's \
+         CompletePumpAmmMigrationEvent names one; DBC and LaunchLab emit \
+         nothing at migration)",
+        pads.graduations
+            .iter()
+            .filter(|r| r.pool_id != crate::svm::models::ZERO_PUBKEY)
+            .count(),
+        pads.graduations.len()
+    );
+    println!("of those, {joined} already join a sol_dex_swaps pool id");
+}
+
 /// Every pump.fun curve instruction in a live window, bucketed by what the
 /// decoder did with it and WHY.
 ///
@@ -621,6 +793,71 @@ async fn live_explain_disagreements() {
         else {
             continue;
         };
+
+        // A self-CPI venue keeps its event in an INSTRUCTION, not a log.
+        if venue_filter == "raydium_launchlab"
+            || venue_filter == "meteora_dbc"
+        {
+            let cpi = tx.instructions.iter().find(|candidate| {
+                candidate.program == instruction.program
+                    && candidate.path.len() == path.len() + 1
+                    && candidate.path.starts_with(&path)
+                    && candidate.data.starts_with(
+                        &crate::svm::programs::EVENT_CPI_PREFIX,
+                    )
+            });
+            println!(
+                "\n  {} ordinal {:?}\n    movement : in {:>20} out(gross) \
+                 {:>20} pool {}",
+                bs58::encode(&swap.tx_id).into_string(),
+                path,
+                swap.amount_in,
+                swap.amount_out_gross,
+                to_base58(&swap.pool_id),
+            );
+            match cpi.map(|ix| (ix.data.len(), ix)) {
+                Some((len, ix)) => {
+                    match crate::svm::venues::LaunchlabTrade::parse(
+                        &ix.data,
+                    ) {
+                        Some(event) => println!(
+                            "    event({len}) : in {:>20} out {:>20}\n    \
+                             fees     : protocol {} platform {} creator {} \
+                             share {}\n    reserves : base {} -> {} quote \
+                             {} -> {}\n    flags    : direction {} status \
+                             {} exact_in {} pool {}",
+                            event.amount_in,
+                            event.amount_out,
+                            event.protocol_fee,
+                            event.platform_fee,
+                            event.creator_fee,
+                            event.share_fee,
+                            event.real_base_before,
+                            event.real_base_after,
+                            event.real_quote_before,
+                            event.real_quote_after,
+                            event.trade_direction,
+                            event.pool_status,
+                            event.exact_in,
+                            to_base58(&event.pool_state),
+                        ),
+                        None => println!(
+                            "    event({len}) : did not parse at this \
+                             length (disc {})",
+                            hex::encode(
+                                ix.data.get(8..16).unwrap_or_default()
+                            )
+                        ),
+                    }
+                }
+                None => println!("    event    : no self-CPI child"),
+            }
+            shown += 1;
+            if shown >= 12 {
+                break;
+            }
+            continue;
+        }
 
         let event = tx
             .logs
