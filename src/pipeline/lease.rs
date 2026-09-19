@@ -271,6 +271,14 @@ impl Lease {
     }
 }
 
+/// Dropped without [`Lease::release`] (a fatal error path): the heartbeat
+/// stops, and the next start takes over after one `ttl`.
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 fn describe(others: &[Other]) -> String {
     others
         .iter()

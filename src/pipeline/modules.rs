@@ -441,6 +441,43 @@ pub struct ModuleSpec {
     /// The tombstone INSERT for `[from, to)` of a base table.
     pub tombstone_sql:
         fn(&str, u64, u64, Option<u64>, u64) -> Result<String>,
+    /// The statements that rebuild one of `derived`, see [`Rebuild`].
+    pub rebuild_sql: fn(&DerivedTable, &Rebuild) -> Vec<String>,
+}
+
+/// One bucket repair (docs/design.md, section 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebuild {
+    pub chain: u64,
+    /// Start of the first bucket to rebuild (start of day, unix seconds).
+    pub from_ts: u32,
+    /// Exclusive: timestamp of the newest stored block + 1.
+    pub to_ts: u32,
+    pub epoch: u32,
+    /// The block range being purged, which the rebuild must leave out.
+    pub purged_from: u64,
+    pub purged_to: Option<u64>,
+}
+
+/// The rebuild of a table whose `rebuild_sql` follows the core convention
+/// (`{chain}`, `{from_ts}`, `{epoch}`, `{purge_from}`, `{purge_to}`).
+pub fn plain_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
+    vec![table.rebuild_sql(
+        r.chain,
+        r.from_ts,
+        r.epoch,
+        r.purged_from,
+        r.purged_to,
+    )]
+}
+
+/// DEX: one statement per month, bounded by `to_ts`. Its SQL has no
+/// purge-range exclusion: it relies on the tombstones of `dex_swaps`
+/// (which the purge verifies with `live_children` before it rebuilds).
+fn dex_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
+    dex::derived::rebuild_statements(
+        table, r.chain, r.from_ts, r.to_ts, r.epoch,
+    )
 }
 
 fn no_filter(_table: &str) -> Option<&'static str> {
@@ -464,6 +501,7 @@ pub const DEX: ModuleSpec = ModuleSpec {
     block_column: dex::block_column,
     purge_filter: dex::purge_filter,
     tombstone_sql: dex_tombstone_sql,
+    rebuild_sql: dex_rebuild,
 };
 
 pub const PREDICTIONS: ModuleSpec = ModuleSpec {
@@ -475,6 +513,7 @@ pub const PREDICTIONS: ModuleSpec = ModuleSpec {
     // Plain `block_number` tables: the generic statement built from the
     // embedded migration DDL.
     tombstone_sql: db::tombstone_sql,
+    rebuild_sql: plain_rebuild,
 };
 
 // MODULE: pub const LAUNCHPADS: ModuleSpec = ...
