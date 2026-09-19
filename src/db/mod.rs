@@ -356,6 +356,11 @@ pub struct Database {
     metrics: Metrics,
     /// The chain's purge generation, stamped on every row of a flush.
     epoch: Arc<AtomicU32>,
+    /// Lowest `from_block` the next checkpoint compaction reads. A pass is
+    /// bounded, so the cursor is what makes successive passes SWEEP the
+    /// table instead of re-reading its lowest rows for ever (see
+    /// [`Self::compact_checkpoints`]).
+    compact_from: Arc<AtomicU64>,
 }
 
 impl Database {
@@ -389,6 +394,7 @@ impl Database {
             small,
             metrics: Metrics::disabled(),
             epoch: Arc::new(AtomicU32::new(0)),
+            compact_from: Arc::new(AtomicU64::new(0)),
         };
 
         database.wait_until_ready().await?;
@@ -408,6 +414,7 @@ impl Database {
             db,
             metrics: Metrics::disabled(),
             epoch: Arc::new(AtomicU32::new(0)),
+            compact_from: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -681,24 +688,63 @@ impl Database {
     /// the rest waits for the next one. Nothing below
     /// [`COMPACT_CHECKPOINTS_ABOVE`] rows is touched.
     ///
+    /// Successive calls SWEEP the table: each one starts where the last
+    /// one stopped and wraps round at the end. Always reading the LOWEST
+    /// rows instead meant that on a chain with more non-contiguous live
+    /// ranges than one pass reads (a partial backfill: holes everywhere,
+    /// nothing to merge down there) the head's fast growing contiguous
+    /// run was never reached, so the table grew without bound and
+    /// `resume_point` got slower and slower
+    /// (docs/review-round-4.md, MINOR 15).
+    ///
     /// The CALLER must hold the chain's lease: this rewrites rows a purge
     /// of another process could be splitting at the same moment.
     pub async fn compact_checkpoints(&self) -> Result<u64> {
-        let live: Vec<DatabaseCheckpoint> = self
-            .db
-            .query(&format!(
+        let cursor = self.compact_from.load(Ordering::Relaxed);
+
+        let page = |from_block: u64| {
+            format!(
                 "SELECT chain, from_block, to_block, epoch, _version \
                  FROM checkpoints FINAL WHERE chain = {} \
+                 AND from_block >= {from_block} \
                  ORDER BY from_block ASC, to_block ASC LIMIT {}",
                 self.chain_id, MAX_CHECKPOINTS_PER_COMPACTION
-            ))
+            )
+        };
+
+        let mut live: Vec<DatabaseCheckpoint> = self
+            .db
+            .query(&page(cursor))
             .fetch_all()
             .await
             .context("read the live checkpoints to compact")?;
 
+        // The end of the table: start over at the bottom next time, and
+        // now, so a wrap costs no pass.
+        if live.len() <= COMPACT_CHECKPOINTS_ABOVE && cursor > 0 {
+            self.compact_from.store(0, Ordering::Relaxed);
+            live = self
+                .db
+                .query(&page(0))
+                .fetch_all()
+                .await
+                .context("read the live checkpoints to compact")?;
+        }
+
         if live.len() <= COMPACT_CHECKPOINTS_ABOVE {
             return Ok(0);
         }
+
+        // Where the next pass picks up. A full page means there is more
+        // above it; anything else has been swept.
+        self.compact_from.store(
+            if live.len() < MAX_CHECKPOINTS_PER_COMPACTION {
+                0
+            } else {
+                live.last().map(|row| row.from_block).unwrap_or(0)
+            },
+            Ordering::Relaxed,
+        );
 
         let writes = compaction_writes(&live, next_version());
         let replaced =

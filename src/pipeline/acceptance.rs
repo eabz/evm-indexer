@@ -2647,7 +2647,7 @@ async fn a_second_process_on_the_same_chain_refuses_to_start() {
             .await
             .err()
             .expect("the second instance must refuse");
-    assert!(format!("{error:#}").contains("already indexing chain 1"));
+    assert!(format!("{error:#}").contains("already writing chain 1"));
 
     // After a clean shutdown the next start does not even wait.
     first.release().await;
@@ -2668,4 +2668,74 @@ async fn a_second_process_on_the_same_chain_refuses_to_start() {
             .unwrap();
     assert!(started.elapsed() >= patient_lease().ttl);
     third.release().await;
+}
+
+/// `indexer backfill --module X` is a WRITER: it purges, bumps the chain's
+/// epoch and rebuilds every aggregate. Two of them on one chain and module
+/// corrupt it exactly as two indexers would - both write a `reorgs` row,
+/// and the lower-epoch rebuild ends up hidden by the higher floor
+/// (docs/review-round-4.md, MINOR 16). It took no lease at all.
+///
+/// It must still be able to run NEXT TO a live `indexer run`, which is
+/// documented and handled (`pipeline::backfill`), so it holds a lease of
+/// its own role instead of the indexer's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn two_backfills_of_one_module_refuse_to_run_together() {
+    use crate::pipeline::lease::ROLE_RUN;
+
+    let scenario = Scenario::new("backfill_lease").await;
+    let (fatal, _) = watch::channel(None);
+
+    let dex = Lease::acquire_as(
+        &scenario.db,
+        "backfill:dex",
+        patient_lease(),
+        fatal.clone(),
+    )
+    .await
+    .unwrap();
+
+    // A live indexer is unaffected, and so is a backfill of a DIFFERENT
+    // module: neither waits, neither is refused.
+    let started = std::time::Instant::now();
+    let running =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
+    let predictions = Lease::acquire_as(
+        &scenario.db,
+        "backfill:predictions",
+        patient_lease(),
+        fatal.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() < patient_lease().ttl);
+
+    // A second backfill of the SAME module is refused.
+    let error = Lease::acquire_as(
+        &scenario.db,
+        "backfill:dex",
+        patient_lease(),
+        fatal.clone(),
+    )
+    .await
+    .err()
+    .expect("a second backfill of 'dex' must refuse");
+    let message = format!("{error:#}");
+    assert!(message.contains("'backfill:dex'"), "{message}");
+    assert!(message.contains("already writing chain 1"), "{message}");
+
+    // And a second indexer still is, by its own role.
+    let error =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .err()
+            .expect("the second indexer must refuse");
+    assert!(format!("{error:#}").contains(&format!("'{ROLE_RUN}'")));
+
+    dex.release().await;
+    predictions.release().await;
+    running.release().await;
 }

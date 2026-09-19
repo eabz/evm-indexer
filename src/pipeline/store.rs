@@ -579,8 +579,7 @@ impl ReorgStore for ClickhouseReorgStore {
             // chain (docs/review-round-4.md, MAJOR 6). It reads 0 when
             // the table has no row with a real timestamp in the range,
             // which is why the row count and the zero count come too.
-            const COUNTED: &str =
-                "SELECT toUInt64(count()), \
+            const COUNTED: &str = "SELECT toUInt64(count()), \
                  toUInt32(minIf(timestamp, timestamp > 0)), \
                  toUInt32(max(timestamp)), \
                  toUInt64(countIf(timestamp = 0))";

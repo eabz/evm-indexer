@@ -204,6 +204,15 @@ async fn beat(
 
 /// Other instances of the chain with a heartbeat younger than `ttl` that
 /// did not release.
+/// The instance ids of a role all start with `<role>|`, and a lease only
+/// ever looks at its own role. `indexer run` is [`ROLE_RUN`]; `indexer
+/// backfill --module X` is a role of its own, so a second backfill of the
+/// same module is refused while the documented combination "a backfill
+/// next to a live indexer" keeps working.
+fn role_of(instance: &str) -> &str {
+    instance.split_once('|').map_or(ROLE_RUN, |(role, _)| role)
+}
+
 async fn others_alive(
     db: &Database,
     instance: &str,
@@ -216,11 +225,13 @@ async fn others_alive(
              toUnixTimestamp64Milli(max(heartbeat)) AS heartbeat_ms \
              FROM indexer_instances \
              WHERE chain = {} AND instance != {} \
+             AND startsWith(instance, {}) \
              GROUP BY instance \
              HAVING argMax(released, heartbeat) = 0 \
              AND max(heartbeat) > now64(3) - toIntervalMillisecond({})",
             db.chain_id,
             sql_string(instance),
+            sql_string(&format!("{}|", role_of(instance))),
             ttl.as_millis()
         ))
         .fetch_all::<Other>()
@@ -251,6 +262,9 @@ fn takeover<'a>(
         .collect()
 }
 
+/// The role of `indexer run`: the process that streams the chain.
+pub const ROLE_RUN: &str = "run";
+
 impl Lease {
     /// Announces this process and makes sure it is alone on the chain.
     /// `fatal` receives the reason when a live older instance shows up
@@ -260,8 +274,29 @@ impl Lease {
         options: LeaseOptions,
         fatal: watch::Sender<Option<String>>,
     ) -> Result<Self> {
+        Self::acquire_as(db, ROLE_RUN, options, fatal).await
+    }
+
+    /// [`Self::acquire`] for a writer that is not `indexer run`.
+    ///
+    /// A role only excludes OTHER processes of the SAME role. `indexer
+    /// backfill --module X` is a writer too - it purges, bumps the epoch
+    /// and rebuilds every aggregate - so two of them on one chain corrupt
+    /// it exactly as two indexers would (the lower-epoch rebuild ends up
+    /// hidden by the higher floor, docs/review-round-4.md, MINOR 16). It
+    /// may however run NEXT TO a live indexer, which is documented and
+    /// handled (`pipeline::backfill`), so it must not take the run role's
+    /// lease.
+    pub async fn acquire_as(
+        db: &Database,
+        role: &str,
+        options: LeaseOptions,
+        fatal: watch::Sender<Option<String>>,
+    ) -> Result<Self> {
+        debug_assert!(!role.contains('|'), "'|' separates role and id");
+
         let instance = format!(
-            "{:016x}{:016x}",
+            "{role}|{:016x}{:016x}",
             random_u64(),
             random_u64() ^ u64::from(std::process::id())
         );
@@ -312,8 +347,8 @@ impl Lease {
                 // Do not leave a live-looking row behind.
                 let _ = beat(db, &instance, &host, started_ms, true).await;
                 bail!(
-                    "another indexer process is already indexing chain {} \
-                     into this database ({}). Two processes on the same \
+                    "another '{role}' process is already writing chain {} \
+                     into this database ({}). Two of them on the same \
                      chain corrupt its aggregates: stop the other one \
                      first.",
                     db.chain_id,

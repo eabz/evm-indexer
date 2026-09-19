@@ -402,7 +402,8 @@ impl Purger {
         // in old buckets, incomparably better than hiding every bucket
         // of the chain behind a rebuild that takes hours.
         if from_ts == 0 && to_ts > super::REPAIR_ALIGNMENT_SECONDS {
-            from_ts = to_ts.saturating_sub(super::REPAIR_ALIGNMENT_SECONDS);
+            from_ts =
+                to_ts.saturating_sub(super::REPAIR_ALIGNMENT_SECONDS);
             warn!(
                 "Chain {chain}: a row of blocks [{from}, {}) has \
                  `timestamp` 0, which is not a block time. Repairing \

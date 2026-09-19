@@ -16,7 +16,7 @@ use super::{
     block_number_column,
     derived::repair_start,
     next_version,
-    ranges::BlockRange,
+    ranges::{BlockRange, DatabaseCheckpoint},
     schema::{live_rows_sql, min_timestamp_sql},
     tombstone_sql, Database, DatabaseParams,
 };
@@ -2190,7 +2190,8 @@ async fn missing_ranges_are_computed_in_clickhouse() {
 /// them (docs/review-round-4.md, MAJOR 3).
 #[tokio::test]
 #[ignore = "needs TEST_DATABASE_URL"]
-async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart() {
+async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart()
+{
     const CHAIN: u64 = 990_013;
 
     let database = database(CHAIN).await;
@@ -2239,4 +2240,86 @@ async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart() {
         database.stale_flush_ranges().await.unwrap().is_empty(),
         "a range re-indexed under the epoch in force is not stale"
     );
+}
+
+/// Checkpoint compaction reads a bounded page, so successive passes have
+/// to SWEEP the table. Always reading the lowest rows meant that a chain
+/// with more non-contiguous live ranges than one page holds (a partial
+/// backfill: holes everywhere, nothing to merge down there) never reached
+/// the head's fast growing contiguous run, and the table grew without
+/// bound (docs/review-round-4.md, MINOR 15).
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn checkpoint_compaction_sweeps_past_a_page_of_holes() {
+    use super::ranges::MAX_CHECKPOINTS_PER_COMPACTION;
+
+    const CHAIN: u64 = 990_014;
+    const HEAD: u64 = 10_000_000;
+    const RUN: u64 = 400;
+
+    let database = database(CHAIN).await;
+
+    // A full page of live ranges with a hole between each pair: nothing
+    // to merge, and reading them again changes nothing.
+    let holes = MAX_CHECKPOINTS_PER_COMPACTION as u64 + 10;
+    let mut rows: Vec<DatabaseCheckpoint> = (0..holes)
+        .map(|i| DatabaseCheckpoint {
+            chain: CHAIN,
+            from_block: i * 10,
+            to_block: i * 10 + 1,
+            epoch: 0,
+            _version: next_version(),
+        })
+        .collect();
+
+    // The head: one contiguous run, one row per flush.
+    rows.extend((0..RUN).map(|i| DatabaseCheckpoint {
+        chain: CHAIN,
+        from_block: HEAD + i,
+        to_block: HEAD + i + 1,
+        epoch: 0,
+        _version: next_version(),
+    }));
+
+    for page in rows.chunks(500) {
+        database.insert_rows("checkpoints", page).await.unwrap();
+    }
+
+    let covered = format!(
+        "SELECT toUInt64(count()) FROM checkpoints FINAL WHERE chain = \
+         {CHAIN} AND is_deleted = 0 AND from_block = {HEAD} AND \
+         to_block = {}",
+        HEAD + RUN
+    );
+
+    // A handful of passes is enough to sweep past the page of holes and
+    // collapse the head's run into one covering row.
+    let mut swept = false;
+    for _ in 0..6 {
+        database.compact_checkpoints().await.unwrap();
+        if database.db.query(&covered).fetch_one::<u64>().await.unwrap()
+            > 0
+        {
+            swept = true;
+            break;
+        }
+    }
+
+    assert!(
+        swept,
+        "the head's contiguous run was never reached: the compaction \
+         keeps re-reading the lowest rows"
+    );
+
+    // The holes are untouched: the union of the live ranges never changes.
+    let live_holes: u64 = database
+        .db
+        .query(&format!(
+            "SELECT toUInt64(count()) FROM checkpoints FINAL WHERE chain \
+             = {CHAIN} AND is_deleted = 0 AND from_block < {HEAD}"
+        ))
+        .fetch_one()
+        .await
+        .unwrap();
+    assert_eq!(live_holes, holes);
 }

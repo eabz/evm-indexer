@@ -18,6 +18,9 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+/// `(from, exclusive to)` of a range the purger was asked to remove.
+type PurgedRange = (u64, Option<u64>);
+
 fn hash_of(number: u64) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash[..8].copy_from_slice(&number.to_be_bytes());
@@ -34,7 +37,7 @@ struct MemoryStore {
     /// A purge that fails half way: the transient database error of
     /// `purge_stale_flushes`.
     fail_purge: Arc<AtomicBool>,
-    purged: Arc<Mutex<Vec<(u64, Option<u64>)>>>,
+    purged: Arc<Mutex<Vec<PurgedRange>>>,
 }
 
 impl MemoryStore {
@@ -700,8 +703,7 @@ async fn a_failed_purge_keeps_the_stale_flush_spans() {
     let mut indexer =
         indexer(source.clone(), store.clone(), settings(0, 50)).await;
 
-    let queued =
-        vec![BlockRange::new(10, 20), BlockRange::new(30, 40)];
+    let queued = vec![BlockRange::new(10, 20), BlockRange::new(30, 40)];
     *indexer.stale.lock().unwrap() = queued.clone();
 
     // The first purge fails: nothing may be forgotten.
@@ -715,7 +717,7 @@ async fn a_failed_purge_keeps_the_stale_flush_spans() {
     assert_eq!(indexer.purge_stale_flushes().await.unwrap(), Some(10));
     assert!(indexer.stale.lock().unwrap().is_empty());
 
-    let mut purged: Vec<(u64, Option<u64>)> =
+    let mut purged: Vec<PurgedRange> =
         store.purged.lock().unwrap().clone();
     purged.dedup();
     assert_eq!(purged, vec![(10, Some(20)), (30, Some(40))]);

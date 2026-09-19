@@ -1105,8 +1105,7 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
         let mut lowest = None;
 
         loop {
-            let Some(range) =
-                self.stale.lock().unwrap().first().copied()
+            let Some(range) = self.stale.lock().unwrap().first().copied()
             else {
                 return Ok(lowest);
             };
