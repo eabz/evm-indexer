@@ -296,13 +296,26 @@ pub struct VerifyArgs {
     )]
     pub database: String,
 
+    // NO DEFAULT, on purpose: "not given" and "block 0" are different
+    // answers now that a chain has a coverage floor. Unset means "start
+    // where this database's promise starts"; `--start-block 0` means the
+    // beginning of the chain, including everything below the floor that
+    // was never meant to be there (docs/design.md section 16).
     #[arg(
         long,
         env = "START_BLOCK",
-        help = "First block to verify.",
-        default_value_t = 0
+        help = "First block to verify. Unset (the default) starts at the chain's coverage floor, which is what the database promises; a value below the floor is honoured and the blocks below it are reported as missing."
     )]
-    pub start_block: u64,
+    pub start_block: Option<u64>,
+
+    #[arg(
+        long,
+        env = "START_DATE",
+        conflicts_with = "start_block",
+        value_parser = parse_date,
+        help = "First DAY to verify, as YYYY-MM-DD in UTC: the earliest stored block of that day or later. The day form of --start-block."
+    )]
+    pub start_date: Option<crate::coverage::date::Date>,
 
     #[arg(
         long,
@@ -350,13 +363,16 @@ pub struct BackfillArgs {
 
     // No env fallback on purpose: START_BLOCK / END_BLOCK of a compose
     // file describe the sync, not a one-off backfill.
+    // NO DEFAULT, for the same reason as `VerifyArgs::start_block`:
+    // "not given" means the coverage floor, and `--from-block 0` means
+    // genesis, which is a request to lower the floor and not the same
+    // thing at all (docs/design.md section 16).
     #[arg(
         long,
         visible_alias = "start-block",
-        help = "First block to re-decode. Below the chain's coverage floor this lowers the floor too, but only after a check that every block in between really is stored and gap-free.",
-        default_value_t = 0
+        help = "First block to re-decode. Unset (the default) starts at the chain's coverage floor, below which this database stores no logs to re-decode. Below the floor this lowers the floor too, but only after a check that every block in between really is stored and gap-free."
     )]
-    pub from_block: u64,
+    pub from_block: Option<u64>,
 
     #[arg(
         long,
@@ -624,7 +640,11 @@ pub struct MigrateConfig {
 pub struct VerifyConfig {
     pub chain_id: u64,
     pub database_url: String,
-    pub start_block: u64,
+    /// `None` = the operator gave no start, so the check begins at the
+    /// chain's coverage floor (docs/design.md section 16).
+    pub start_block: Option<u64>,
+    /// `--start-date`, if it was given instead of `--start-block`.
+    pub start_date: Option<crate::coverage::date::Date>,
     /// Exclusive. 0 = up to the highest indexed block.
     pub end_block: u64,
     pub debug: bool,
@@ -636,7 +656,9 @@ pub struct BackfillConfig {
     pub module: String,
     pub chain_id: u64,
     pub database_url: String,
-    pub from_block: u64,
+    /// `None` = the operator gave no start, so the re-decode begins at the
+    /// chain's coverage floor (docs/design.md section 16).
+    pub from_block: Option<u64>,
     /// `--from-date`, if it was given instead of `--from-block`.
     pub from_date: Option<crate::coverage::date::Date>,
     /// Exclusive. 0 = up to the highest indexed block.
@@ -747,6 +769,7 @@ impl From<VerifyArgs> for VerifyConfig {
             chain_id: args.chain,
             database_url: args.database,
             start_block: args.start_block,
+            start_date: args.start_date,
             end_block: args.end_block,
             debug: args.debug,
         }
@@ -1159,7 +1182,7 @@ mod tests {
         };
         assert_eq!(config.module, "dex");
         assert_eq!(config.chain_id, 10);
-        assert_eq!((config.from_block, config.to_block), (5, 50));
+        assert_eq!((config.from_block, config.to_block), (Some(5), 50));
         assert_eq!(config.chunk_blocks, 2_000);
 
         // The sync's START_BLOCK / END_BLOCK never leak into a backfill.
@@ -1172,7 +1195,9 @@ mod tests {
         let Command::Backfill(config) = command else {
             panic!("{command:?}");
         };
-        assert_eq!((config.from_block, config.to_block), (0, 0));
+        // And no start at all means "the coverage floor", which only the
+        // database knows: the parser says `None` and nothing else.
+        assert_eq!((config.from_block, config.to_block), (None, 0));
 
         // The module is required and must exist.
         assert!(parse_command(
@@ -1326,7 +1351,7 @@ mod tests {
             })
         );
         assert!(config.registry_only);
-        assert_eq!(config.from_block, 0);
+        assert_eq!(config.from_block, None);
     }
 
     #[test]
@@ -1715,9 +1740,53 @@ mod tests {
         };
         assert_eq!(config.chain_id, 10);
         assert_eq!(config.database_url, DATABASE);
-        assert_eq!(config.start_block, 5);
+        assert_eq!(config.start_block, Some(5));
         assert_eq!(config.end_block, 50);
         assert!(!config.debug);
+    }
+
+    /// The two spellings of "start here" are one decision, so both at once
+    /// is a question nobody can answer. And with NEITHER, the parser says
+    /// so: `verify` then starts at the chain's coverage floor, which only
+    /// the database knows (docs/design.md section 16).
+    #[test]
+    fn verify_takes_a_start_block_or_a_start_date_and_neither_by_default() {
+        let error = parse_command(
+            &[("DATABASE_URL", DATABASE)],
+            &[
+                "verify",
+                "--start-block",
+                "5",
+                "--start-date",
+                "2024-03-01",
+            ],
+            false,
+        )
+        .expect_err("both were accepted");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{error}"
+        );
+
+        let command = parse_command(
+            &[("DATABASE_URL", DATABASE)],
+            &["verify", "--start-date", "2024-03-01"],
+            false,
+        )
+        .unwrap();
+        let Command::Verify(config) = command else {
+            panic!("{command:?}");
+        };
+        assert_eq!(config.start_block, None);
+        assert_eq!(
+            config.start_date,
+            Some(crate::coverage::date::Date {
+                year: 2024,
+                month: 3,
+                day: 1
+            })
+        );
     }
 
     #[test]
@@ -1730,7 +1799,7 @@ mod tests {
         };
         assert_eq!(config.chain_id, 8453);
         assert_eq!(config.database_url, "http://u:p@ch:8123/from_env");
-        assert_eq!(config.start_block, 0);
+        assert_eq!(config.start_block, None);
         assert_eq!(config.end_block, 0);
 
         assert!(parse_command(&[], &["verify"], false).is_err());

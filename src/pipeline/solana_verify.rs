@@ -23,6 +23,16 @@
 //! values. It is the only check that costs metered queries and needs the
 //! network, so it is deliberately not part of a read-only `verify`; see the
 //! final report.
+//!
+//! # Where a verification starts
+//!
+//! At the chain's **coverage floor** (docs/design.md section 16), which on
+//! Solana is the head slot of the chain's first start. Below it nothing was
+//! ever asked for, so a check from slot 0 reported hundreds of millions of
+//! slots as "never asked for" and printed `PROBLEMS FOUND` about a database
+//! with nothing wrong with it. An explicit `--start-block` still means what
+//! it says, floor or no floor. The rule and its one helper are shared with
+//! the EVM twin (`pipeline::verify::start_of`).
 
 use crate::{
     db::{ranges::BlockRange, Database},
@@ -99,6 +109,9 @@ pub struct SolanaVerifyReport {
     pub candles: Vec<CandleReport>,
     pub candles_skipped: Option<&'static str>,
     pub epoch: u32,
+    /// The operator asked for a start BELOW the coverage floor, and this is
+    /// the floor. The slots down there were never asked for on purpose.
+    pub below_floor: Option<u64>,
 }
 
 impl SolanaVerifyReport {
@@ -143,6 +156,18 @@ impl fmt::Display for SolanaVerifyReport {
             self.skipped_slots,
             self.epoch
         )?;
+
+        if let Some(floor) = self.below_floor {
+            writeln!(
+                f,
+                "--start-block {} is BELOW this chain's coverage floor \
+                 (slot {floor}). Slots [{}, {floor}) were never asked for \
+                 on purpose, and are listed below because that is what was \
+                 asked for. Without --start-block the check starts at the \
+                 floor.",
+                self.range.from, self.range.from
+            )?;
+        }
 
         if self.unasked.is_empty() {
             writeln!(
@@ -289,14 +314,27 @@ struct BreakRow {
     parent_hash_broken: u8,
 }
 
-/// Runs the checks. `end_slot` 0 = up to the highest stored slot.
+/// Runs the checks.
+///
+/// `start_slot` `None` = start at the coverage floor (see the module
+/// header); `end_slot` 0 = up to the highest stored slot.
 pub async fn verify(
     db: &Database,
-    start_slot: u64,
+    start_slot: Option<u64>,
     end_slot: u64,
 ) -> Result<SolanaVerifyReport> {
     let chain = db.chain_id;
     let store = SolanaReorgStore::new(db.clone());
+
+    let floor = match crate::coverage::store::stored(db).await {
+        Ok(floor) => floor.map(|floor| floor.block),
+        Err(e) => {
+            log::debug!("could not read the coverage floor: {e:#}");
+            None
+        }
+    };
+    let start_slot = start_slot.unwrap_or(floor.unwrap_or(0));
+    let below_floor = floor.filter(|floor| start_slot < *floor);
 
     let end = if end_slot > 0 {
         end_slot
@@ -454,8 +492,21 @@ pub async fn verify(
         );
     } else if !breaks.is_empty() {
         candles_skipped = Some("the stored slots do not form a chain");
-    } else if let Some((first_day, last_day)) =
-        complete_days(db, range).await?
+    } else if let Some((first_day, last_day)) = complete_days(
+        db,
+        range,
+        // The day of the FLOOR is compared, from the floor onwards, for
+        // the reason spelled out in the EVM twin (`pipeline::verify`):
+        // the comparison is exact as long as nothing is stored below
+        // where the range starts, and on Solana the floor is the head of
+        // the chain's first start - so skipping that day would leave a
+        // fresh chain with nothing checked at all for two days.
+        crate::coverage::store::lowest_stored(db)
+            .await
+            .unwrap_or(None)
+            .is_none_or(|lowest| range.from <= lowest),
+    )
+    .await?
     {
         if let Some(report) =
             check_candles(db, range, first_day, last_day).await?
@@ -481,13 +532,17 @@ pub async fn verify(
         candles,
         candles_skipped,
         epoch: db.current_epoch().await?,
+        below_floor,
     })
 }
 
-/// `[first, last)`: the UTC days the verified range covers COMPLETELY.
+/// `[first, last)`: the UTC days of `range` whose stored slots can be
+/// compared with the candles exactly. See the EVM twin
+/// (`pipeline::verify::complete_days`): the two decide this identically.
 async fn complete_days(
     db: &Database,
     range: BlockRange,
+    first_day_complete: bool,
 ) -> Result<Option<(u32, u32)>> {
     const DAY: u32 = 86_400;
 
@@ -507,16 +562,8 @@ async fn complete_days(
         return Ok(None);
     }
 
-    // The first day is complete only when the range starts at the very
-    // beginning of the served history: otherwise the slots before
-    // `range.from` belong to it too.
-    let first = if range.from <= crate::pipeline::solana::FIRST_SERVED_SLOT
-        && low % DAY == 0
-    {
-        low
-    } else {
-        low - low % DAY + DAY
-    };
+    let first =
+        if first_day_complete { low - low % DAY } else { low - low % DAY + DAY };
     let last = high - high % DAY;
 
     Ok((first < last).then_some((first, last)))
@@ -612,7 +659,31 @@ mod tests {
             candles: Vec::new(),
             candles_skipped: None,
             epoch: 0,
+            below_floor: None,
         }
+    }
+
+    /// A start below the floor is honoured, and the holes it exposes are
+    /// explained rather than left to look like damage.
+    #[test]
+    fn a_start_below_the_floor_names_the_floor() {
+        let below = SolanaVerifyReport {
+            range: BlockRange::new(0, 1_100),
+            unasked: vec![BlockRange::new(0, 1_000)],
+            below_floor: Some(1_000),
+            ..report()
+        };
+
+        assert!(!below.is_consistent());
+        let text = below.to_string();
+        assert!(
+            text.contains("BELOW this chain's coverage floor"),
+            "{text}"
+        );
+        assert!(text.contains("slot 1000"), "{text}");
+
+        // And nothing of the sort when the start IS the floor.
+        assert!(!report().to_string().contains("BELOW this chain's"));
     }
 
     #[test]

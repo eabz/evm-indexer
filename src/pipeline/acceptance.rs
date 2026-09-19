@@ -846,7 +846,7 @@ impl Scenario {
     }
 
     async fn assert_consistent(&self) {
-        let report = verify::verify(&self.db, 0, 0).await.unwrap();
+        let report = verify::verify(&self.db, None, 0).await.unwrap();
         assert!(report.is_consistent(), "{report}");
     }
 }
@@ -1115,7 +1115,7 @@ async fn a_flush_killed_before_blocks_is_healed_on_restart() {
         .unwrap();
 
     // The orphans are there, and they already inflated the aggregates.
-    let report = verify::verify(db, 0, 0).await.unwrap();
+    let report = verify::verify(db, None, 0).await.unwrap();
     assert!(!report.is_consistent());
     assert_eq!(scenario.rows("blocks").await, 5);
     assert!(scenario.rows("dex_swaps").await > 4);
@@ -1604,7 +1604,7 @@ async fn verify_catches_a_doubled_aggregate() {
     assert_eq!(scenario.rows("blocks").await, 10);
 
     // ... and verify says so.
-    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    let report = verify::verify(&scenario.db, None, 0).await.unwrap();
     assert!(!report.is_consistent(), "{report}");
     assert!(report.gaps.is_empty(), "{report}");
     assert!(report.orphans.is_empty(), "{report}");
@@ -2849,7 +2849,7 @@ async fn a_gap_elsewhere_does_not_switch_the_aggregate_check_off() {
         .await
         .unwrap();
 
-    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    let report = verify::verify(&scenario.db, None, 0).await.unwrap();
     assert_eq!(report.gaps, vec![BlockRange::new(9, 10)], "{report}");
     assert!(
         report.aggregates_skipped.is_none(),
@@ -2871,7 +2871,7 @@ async fn a_gap_elsewhere_does_not_switch_the_aggregate_check_off() {
     batch.set_epoch(scenario.db.current_epoch().await.unwrap());
     crate::core::store(&scenario.db, &batch).await.unwrap();
 
-    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    let report = verify::verify(&scenario.db, None, 0).await.unwrap();
     assert!(!report.is_consistent(), "{report}");
     let wrong: Vec<&str> =
         report.aggregates.iter().map(|a| a.view).collect();
@@ -2879,5 +2879,147 @@ async fn a_gap_elsewhere_does_not_switch_the_aggregate_check_off() {
     assert!(
         report.to_string().contains("Aggregates DISAGREE"),
         "{report}"
+    );
+}
+
+// --------------------------------------------- the floor starts the check
+
+/// THE LIVE-RUN BUG. `indexer fleet --chain 1` on a fresh database placed
+/// the coverage floor one year back, indexed perfectly from there - and
+/// then `indexer verify` checked from block 0, called the 23 million blocks
+/// below the floor a missing range and printed `PROBLEMS FOUND` about a
+/// database with nothing wrong with it.
+///
+/// The floor is what this database promises (docs/design.md section 16), so
+/// it is where every check starts. Four things are pinned here:
+///
+/// * the range header, the gap list, the checkpoint contiguity line and the
+///   aggregate cross-check all start at the floor;
+/// * the aggregates ARE cross-checked, including over the floor's own
+///   (partial) day - nothing is stored below the floor, so the comparison
+///   is exact;
+/// * a restart with no flags keeps the floor and heals from it, leaving
+///   what is below it alone;
+/// * an explicit `--start-block` below the floor is still honoured, reports
+///   the hole, and says whose choice it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn verify_starts_at_the_coverage_floor_and_not_at_block_zero() {
+    use crate::coverage::store;
+
+    const FLOOR: u64 = 20;
+
+    let scenario = Scenario::new("floor_verify").await;
+
+    // Two-hour blocks: the 40 indexed blocks span three whole UTC days,
+    // which is what gives the aggregate cross-check something to compare.
+    let chain = TestChain::with_block_time(60, 7_200);
+
+    let started = scenario.config(&[
+        "--start-block",
+        "20",
+        "--end-block",
+        "60",
+        "--rpc",
+        "none",
+    ]);
+    scenario
+        .run(started, &chain, &FakeRpc::new(), |_| async { false })
+        .await
+        .unwrap();
+
+    let floor = store::stored(&scenario.db).await.unwrap().unwrap();
+    assert_eq!(floor.block, FLOOR);
+    assert_eq!(floor.reason, store::Reason::StartBlock);
+
+    // ---- with no flags, every check starts at the floor.
+    let report = verify::verify(&scenario.db, None, 0).await.unwrap();
+
+    assert_eq!(report.range.from, FLOOR, "{report}");
+    assert!(report.gaps.is_empty(), "{report}");
+    assert!(report.below_floor.is_none(), "{report}");
+    assert_eq!(report.indexed_blocks, 60 - FLOOR, "{report}");
+    assert_eq!(report.checkpoint_resume, 60, "{report}");
+    assert!(report.is_consistent(), "{report}");
+    assert!(
+        report.fully_checked(),
+        "the aggregate cross-check did not run: {:?}",
+        report.aggregates_skipped
+    );
+
+    let text = report.to_string();
+    assert!(
+        text.contains(
+            "Checkpoints: consistent (contiguous from block 20 to block \
+             60)."
+        ),
+        "{text}"
+    );
+    assert!(text.contains("Gaps: none."), "{text}");
+    assert!(text.ends_with("Result: CONSISTENT"), "{text}");
+
+    // ---- a restart with NO start flag keeps the floor and heals from it.
+    //
+    // One orphan row below the floor: a child with no block, which is what
+    // a flush that died before its `blocks` insert leaves. The heal must
+    // not go looking down there - the floor is the bottom of everything
+    // this process does - and `verify` must not see it either.
+    let version = next_version();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO logs SELECT * REPLACE (toUInt64(5) AS \
+             block_number, toUInt64({version}) AS _version) FROM (\
+             SELECT * FROM logs FINAL WHERE chain = {CHAIN} LIMIT 1)"
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    let restarted =
+        scenario.config(&["--end-block", "60", "--rpc", "none"]);
+    scenario
+        .run(restarted, &chain, &FakeRpc::new(), |_| async { false })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store::stored(&scenario.db).await.unwrap().unwrap().block,
+        FLOOR,
+        "the floor moved on a restart with no flags"
+    );
+    assert_eq!(
+        scenario
+            .count(&format!(
+                "SELECT toUInt64(count()) FROM logs FINAL WHERE chain = \
+                 {CHAIN} AND block_number = 5"
+            ))
+            .await,
+        1,
+        "the gap heal purged a row BELOW the coverage floor"
+    );
+
+    let report = verify::verify(&scenario.db, None, 0).await.unwrap();
+    assert!(report.is_consistent(), "{report}");
+    assert!(report.orphans.is_empty(), "{report}");
+    assert!(!report.heal_pending, "{report}");
+
+    // ---- and an explicit start below the floor is honoured, and honest.
+    let report = verify::verify(&scenario.db, Some(0), 0).await.unwrap();
+
+    assert_eq!(report.range.from, 0, "{report}");
+    assert_eq!(report.below_floor, Some(FLOOR), "{report}");
+    assert_eq!(report.gaps, vec![BlockRange::new(0, FLOOR)], "{report}");
+    assert!(!report.is_consistent(), "{report}");
+
+    let text = report.to_string();
+    assert!(text.contains("BELOW this chain's coverage floor"), "{text}");
+    assert!(text.contains("block 20"), "{text}");
+    // The orphan below the floor IS reported when the operator asks about
+    // that range: it really is down there.
+    assert!(
+        report.orphans.iter().any(|orphan| orphan.table == "logs"),
+        "{text}"
     );
 }

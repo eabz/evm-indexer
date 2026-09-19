@@ -489,8 +489,11 @@ impl Scenario {
         panic!("verify still reports a consistent index:\n{report}");
     }
 
+    /// Exactly what `indexer verify --chain solana` does with no flags:
+    /// the start comes from the stored coverage floor, not from a constant
+    /// this test happens to know.
     async fn verify(&self) -> solana_verify::SolanaVerifyReport {
-        solana_verify::verify(&self.db, FIRST_SLOT, 0).await.unwrap()
+        solana_verify::verify(&self.db, None, 0).await.unwrap()
     }
 
     async fn assert_consistent(&self) {
@@ -1568,6 +1571,129 @@ async fn verify_tells_a_consistent_index_from_an_inconsistent_one() {
         "{report}"
     );
     assert!(report.to_string().contains("never asked for"), "{report}");
+}
+
+/// THE LIVE-RUN BUG, Solana half. `indexer fleet --chain solana` on a
+/// fresh database puts the coverage floor at the head slot and indexes
+/// forward from there - and `indexer verify` then checked from slot 0,
+/// called the 448 million slots below the floor "never asked for" and
+/// printed `PROBLEMS FOUND` about a database with nothing wrong with it.
+/// The candle cross-check was switched off with it, because a tiling with
+/// holes cannot be compared.
+///
+/// Pinned here, in the same order as the EVM twin
+/// (`pipeline::acceptance::verify_starts_at_the_coverage_floor_and_not_at_block_zero`):
+///
+/// * every check starts at the floor;
+/// * the candles ARE checked, over complete days including the floor's own
+///   partial one (nothing is stored below the floor, so both sides count
+///   the same swaps);
+/// * a restart with no start flag keeps the floor and heals from it;
+/// * an explicit `--start-block` below the floor is honoured and honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn verify_starts_at_the_coverage_floor_and_not_at_slot_zero() {
+    use crate::coverage::store;
+
+    let scenario = Scenario::new("f_floor").await;
+    let chain = chain(40);
+
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    let floor = store::stored(&scenario.db).await.unwrap().unwrap();
+    assert_eq!(floor.block, FIRST_SLOT);
+
+    // ---- with no flags, every check starts at the floor.
+    let report =
+        solana_verify::verify(&scenario.db, None, 0).await.unwrap();
+
+    assert_eq!(report.range.from, FIRST_SLOT, "{report}");
+    assert!(report.unasked.is_empty(), "{report}");
+    assert!(report.below_floor.is_none(), "{report}");
+    assert!(report.is_consistent(), "{report}");
+    assert!(
+        report.fully_checked(),
+        "the candle cross-check did not run: {:?}",
+        report.candles_skipped
+    );
+    assert!(
+        report.to_string().contains("Candles: they agree"),
+        "{report}"
+    );
+
+    // ---- a restart with NO start flag keeps the floor and heals from it.
+    //
+    // One orphan child below the floor: the heal must leave it alone, and
+    // `verify` must not see it either.
+    let below = FIRST_SLOT - 100;
+    let version = next_version();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO sol_transactions SELECT * REPLACE (\
+             toUInt64({below}) AS block_number, \
+             toUInt64({version}) AS _version) FROM (\
+             SELECT * FROM sol_transactions FINAL WHERE chain = {CHAIN} \
+             LIMIT 1)"
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    let end = chain.head.to_string();
+    let restarted = scenario.config(&[
+        "--end-block",
+        &end,
+        "--flush-interval-ms",
+        "200",
+    ]);
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        run_with(restarted, runtime(chain.clone())),
+    )
+    .await
+    .expect("the Solana pipeline did not finish in time")
+    .unwrap();
+
+    assert_eq!(
+        store::stored(&scenario.db).await.unwrap().unwrap().block,
+        FIRST_SLOT,
+        "the floor moved on a restart with no flags"
+    );
+    assert_eq!(
+        scenario
+            .count(&format!(
+                "SELECT toUInt64(count()) FROM sol_transactions FINAL \
+                 WHERE chain = {CHAIN} AND block_number = {below}"
+            ))
+            .await,
+        1,
+        "the gap heal purged a row BELOW the coverage floor"
+    );
+
+    let report =
+        solana_verify::verify(&scenario.db, None, 0).await.unwrap();
+    assert!(report.is_consistent(), "{report}");
+    assert!(report.orphans.is_empty(), "{report}");
+    assert!(!report.heal_pending, "{report}");
+
+    // ---- and an explicit start below the floor is honoured, and honest.
+    let report =
+        solana_verify::verify(&scenario.db, Some(0), 0).await.unwrap();
+
+    assert_eq!(report.range.from, 0, "{report}");
+    assert_eq!(report.below_floor, Some(FIRST_SLOT), "{report}");
+    assert!(!report.unasked.is_empty(), "{report}");
+    assert!(!report.is_consistent(), "{report}");
+    assert!(
+        report.to_string().contains("BELOW this chain's coverage floor"),
+        "{report}"
+    );
+    assert!(
+        report.orphans.iter().any(|o| o.table == "sol_transactions"),
+        "{report}"
+    );
 }
 
 /// A break in the STORED data (not in the stream) is what `verify` has to
