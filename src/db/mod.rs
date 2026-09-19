@@ -239,7 +239,13 @@ impl DatabaseParams {
 pub const MAX_MONTHS_PER_FLUSH: usize = 90;
 
 /// A slice of a flush: the rows whose `timestamp` is in `[from, to)`.
-/// Whole months, so no monthly partition is ever written by two of them.
+/// Whole UTC months, so no monthly partition is ever written by two of
+/// them - which holds because every partition key names UTC explicitly
+/// (`toYYYYMM(timestamp, 'UTC')` on the base tables, `DateTime('UTC')`
+/// bucket columns on the aggregates). Without that, the month of a plain
+/// `DateTime` would be taken in the SERVER's timezone and a 90-UTC-month
+/// slice could touch 91 local partitions (docs/review-round-4.md,
+/// MINOR 18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushWindow {
     pub from: u32,

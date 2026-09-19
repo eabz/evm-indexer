@@ -555,4 +555,59 @@ mod tests {
             vec!["things", "blocks"]
         );
     }
+
+    /// A table partitioned by the MONTH of a column must declare that
+    /// column `DateTime('UTC')`.
+    ///
+    /// `toYYYYMM` of a plain `DateTime` takes the month in the SERVER's
+    /// timezone, while the writer splits a flush into whole UTC months so
+    /// that no insert touches more monthly partitions than ClickHouse
+    /// allows (`db::flush_windows`, `MAX_MONTHS_PER_FLUSH`). On a server
+    /// that is not on UTC the two disagree at every month boundary, so a
+    /// 90-UTC-month slice could land in 91 partitions
+    /// (docs/review-round-4.md, MINOR 18).
+    #[test]
+    fn every_monthly_partition_key_is_in_utc() {
+        let mut checked = 0;
+
+        for migration in super::super::migrate::embedded().unwrap() {
+            for statement in split_sql_statements(&migration.sql) {
+                let normalized = statement
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                let Some(rest) =
+                    normalized.split("PARTITION BY toYYYYMM(").nth(1)
+                else {
+                    continue;
+                };
+                let Some(column) = rest.split(')').next() else {
+                    continue;
+                };
+                // Already explicit: `toYYYYMM(x, 'UTC')`.
+                if column.contains(',') {
+                    checked += 1;
+                    continue;
+                }
+
+                let table = normalized
+                    .split("CREATE TABLE IF NOT EXISTS ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or("?");
+
+                assert!(
+                    normalized
+                        .contains(&format!("{column} DateTime('UTC')")),
+                    "{table} is PARTITION BY toYYYYMM({column}) but \
+                     '{column}' is not DateTime('UTC'): the month would \
+                     be taken in the server's timezone, not in UTC"
+                );
+                checked += 1;
+            }
+        }
+
+        assert!(checked > 30, "only {checked} monthly partition keys");
+    }
 }

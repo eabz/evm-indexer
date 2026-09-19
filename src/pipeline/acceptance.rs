@@ -2739,3 +2739,69 @@ async fn two_backfills_of_one_module_refuse_to_run_together() {
     predictions.release().await;
     running.release().await;
 }
+
+/// The aggregate cross-check is the only thing that finds a DOUBLED
+/// aggregate, and it used to be switched off by ANY gap in the range -
+/// i.e. essentially always while a backfill is in progress
+/// (docs/review-round-4.md, MINOR 14). It runs over the complete UTC days
+/// of the GAP-FREE parts now, which is exact: a complete day of a gap-free
+/// part holds only blocks of that part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_gap_elsewhere_does_not_switch_the_aggregate_check_off() {
+    const DAY: u32 = 86_400;
+
+    let scenario = Scenario::new("gap_aggregates").await;
+    // One block per day, so the range holds complete UTC days.
+    let chain = TestChain::with_block_time(12, DAY);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+
+    // A clean hole in the middle: block 9 is purged and not streamed
+    // again, so the range has a gap and no orphan.
+    purger
+        .purge_range(CHAIN, 9, Some(10), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+
+    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    assert_eq!(report.gaps, vec![BlockRange::new(9, 10)], "{report}");
+    assert!(
+        report.aggregates_skipped.is_none(),
+        "the gap-free parts are still checkable: {report}"
+    );
+
+    // Now double a range that lies in the FIRST gap-free part: the check
+    // has to find it although the range has a gap above it.
+    let mut batch = transform::transform_with(
+        CHAIN,
+        &chain.response(BlockRange::new(4, 6)),
+        BlockRange::new(4, 6),
+        EnabledModules::default(),
+        &mut DecodeState::default(),
+    )
+    .unwrap()
+    .rows;
+    batch.set_version(next_version());
+    batch.set_epoch(scenario.db.current_epoch().await.unwrap());
+    crate::core::store(&scenario.db, &batch).await.unwrap();
+
+    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    assert!(!report.is_consistent(), "{report}");
+    let wrong: Vec<&str> =
+        report.aggregates.iter().map(|a| a.view).collect();
+    assert!(wrong.contains(&"daily_block_stats_v"), "{report}");
+    assert!(
+        report.to_string().contains("Aggregates DISAGREE"),
+        "{report}"
+    );
+}
