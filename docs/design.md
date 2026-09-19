@@ -38,7 +38,7 @@ Deferred (NOT in scope): F1 Arrow passthrough.
   non-null columns defaulting to 32 zero bytes. Everything else non-null with a default.
 - Dead columns are removed: `log_type`, `removed`, the duplicated `address` on transfer
   tables (keep `token_address`), `is_uncle`, `blocks.logs_bloom`. `logs.transaction_log_index`
-  becomes `transaction_index`. `contracts` and `traces` get `timestamp`.
+  becomes `transaction_index`. Traces do not exist and `contracts` is a view (§9).
 - Every block-scoped table: `ENGINE = ReplacingMergeTree(_version, is_deleted)`,
   `_version UInt64` (strictly increasing per process, unix-ms based), `is_deleted UInt8
   DEFAULT 0`, plus `epoch UInt32` (§2). **Target scale is 50+ chains in one database**, so
@@ -54,9 +54,8 @@ Deferred (NOT in scope): F1 Arrow passthrough.
 | blocks | (chain, number) |
 | transactions | (chain, block_number, transaction_index) |
 | logs, erc20/721/1155_transfers | (chain, block_number, log_index) |
-| traces | (chain, block_number, transaction_position, trace_address) — `transaction_position = 4294967295` for reward traces |
 | withdrawals | (chain, block_number, withdrawal_index) |
-| contracts | (chain, block_number, contract_address) |
+| contracts | — a VIEW over `transactions` (§9) |
 | tokens | (chain, address) — not block scoped |
 
 - Codecs: `ZSTD(3)` on large byte columns (not 9); `Delta`/`DoubleDelta` + `ZSTD` on
@@ -78,7 +77,6 @@ through, so it follows rollbacks automatically:
 | `logs_by_address` (slim: keys + topic0) | logs | (chain, address, topic0, block_number, log_index) |
 | `erc20_transfers_by_account` (2 rows/transfer, signed direction) | erc20_transfers | (chain, account, token_address, block_number, log_index, direction) |
 | `nft_transfers_by_account` | erc721 + erc1155 | same shape |
-| `traces_by_tx` | traces | (chain, transaction_hash, trace_address) |
 
 Only skip index allowed: `bloom_filter GRANULARITY 1` on a unique-ish hash column when a
 lookup table would be overkill.
@@ -95,12 +93,22 @@ pub struct DerivedTable {
     pub name: &'static str,          // target table
     pub bucket_seconds: u32,         // 60, 3600, 86400
     pub bucket_column: &'static str, // DateTime column holding the bucket start
-    /// `INSERT INTO <name> SELECT ... FROM <base> FINAL WHERE chain = {chain}
-    ///  AND timestamp >= {from_ts} GROUP BY ...` — must produce exactly what the MV produces.
+    /// `INSERT INTO <name> SELECT ..., toUInt32({epoch}) AS epoch FROM <base> FINAL
+    ///  WHERE chain = {chain} AND timestamp >= {from_ts} GROUP BY ...` — must produce
+    ///  exactly what the MV produces. Blocks-sourced aggregates also use
+    ///  {purge_from}/{purge_to} (§2). There is no delete SQL.
     pub rebuild_sql: &'static str,
 }
 pub const CORE_DERIVED: &[DerivedTable] = &[ /* daily block / transaction / erc20-transfer stats */ ];
 ```
+
+Aggregate tables are `PARTITION BY toYYYYMM(<bucket column>)` in every module (never by
+chain or year), with `epoch` as the LAST sorting-key column. All modules apply the
+validity rule with the same pattern: a per-chain running-max "epoch floor" view over
+`reorgs` + `ASOF LEFT JOIN ... ON f.chain = a.chain AND f.from_ts <= a.bucket WHERE
+a.epoch >= f.epoch_floor`, applied BEFORE aggregate states are merged (so a stale epoch
+can never leak an open/close). The shared view is `epoch_floor_v`, created in migration
+0004 next to `reorgs`.
 
 Distinct counts use `uniqState`/`uniqMerge` (never `uniqExact` in a Summing table).
 `status` comparisons use the real stored values. Provide plain SQL `VIEW`s on top that
@@ -165,8 +173,35 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    4. Bucket repair for every `DerivedTable` at `new_epoch`.
    5. Tombstone `blocks`, then overlapping `checkpoints`; adopt `new_epoch` in the writer;
       evict cached discoveries from the range.
+   Two subtleties (found by the schema engineer):
+   - `from_ts` is computed over ALL row versions, **without `FINAL`** (tombstoned rows
+     included): after a crash mid-purge the early part of the range is already dead, and
+     a minimum over live rows would move forward and leave the first bucket stale forever.
+   - Because `blocks` is tombstoned last, the rebuild of any aggregate sourced from
+     `blocks` still sees the orphaned blocks. Such `rebuild_sql` takes
+     `{purge_from}`/`{purge_to}` and excludes that block range; child-sourced aggregates
+     (transactions, transfers, swaps, trades) do not need it.
+   Accepted trade-offs: (1) the `reorgs` row lands before the rebuild, so readers
+   briefly UNDER-count the repaired buckets (the opposite order would double count;
+   neither is atomic across aggregates, and under-counting for a moment is the safe
+   side). (2) The rule is open ended (`from_ts` only), so a rebuild re-aggregates the
+   chain from `from_ts` to now: trivial for tip reorgs (today's bucket), expensive only
+   for a purge deep in history, which needs a crash mid-flush during a backfill of old
+   blocks. Kept for simplicity; bound it with a `to_ts` if it ever hurts.
    A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
    the abandoned partial epoch invisible.
+
+**Disk hygiene (operator note).** Tombstones and the rows they hide stay on disk until
+ClickHouse merges them away; the indexer never issues `OPTIMIZE ... FINAL CLEANUP`.
+Volume is negligible (only reorged/orphaned rows). An operator may run a cleanup during
+maintenance; it is never required for correctness.
+
+**Retried inserts must not double count.** A timed-out insert that was actually applied
+and is retried would fire the MVs twice. Every insert therefore carries a deterministic
+`insert_deduplication_token` (table, chain, block span, `_version`), base tables set
+`non_replicated_deduplication_window`, and inserts run with
+`deduplicate_blocks_in_dependent_materialized_views = 1`; if an insert outcome stays
+ambiguous after retries, the affected range is purged (`gap_heal`) rather than trusted.
 
 Gap queries, checkpoint reads and `block_hash` lookups use `FINAL` so tombstoned blocks
 count as missing.
@@ -190,7 +225,7 @@ ARE purged when created inside the purged range.
 `checkpoints (chain, from_block, to_block, _version)` — one row per contiguous committed
 range per flush, written after `blocks`. Resume = max contiguous `to_block` from
 `start_block`. The gap query over `blocks` remains as the first-pass verifier/repair and
-as `indexer verify`. `purge_range` deletes/truncates overlapping checkpoints first.
+as `indexer verify`. `purge_range` tombstones overlapping checkpoints (insert-only, like everything else).
 
 ## 4. Token metadata without trusting one RPC (F3)
 
@@ -205,6 +240,12 @@ calls). So the RPC must never be able to block or lose anything:
   transfer tables (and `dex_pools`) with no `tokens` row and feeds them to the worker. An
   RPC outage of any length self-heals; nothing depends on having seen the transfer live.
   Expose as a trait (`MissingTokenSource`) so the pipeline wires ClickHouse in.
+- **`--rpc` defaults to `auto`** (owner decision: DEX analytics are on by default and
+  are meaningless without token decimals). Unset/blank = `auto`; `none` disables RPC
+  features explicitly; `https://mine,auto` = own endpoint first, public fallback
+  (recommended for production). Discovery can never fail startup. README must state
+  that the default fetches `https://chainid.network/chains.json` and that public
+  endpoints are best-effort.
 - **Multi-endpoint failover.** `--rpc` takes a comma-separated list; per-endpoint circuit
   breakers, rotate on failure, chain-id checked per endpoint. `--rpc auto` discovers
   public endpoints for the chain id from `https://chainid.network/chains.json` (filter
@@ -219,7 +260,7 @@ redaction) stays as the engine underneath.
 
 Principle: **decode by event family from `logs`, never by router/factory registry.** A
 fork of Uniswap V2 on a chain nobody has heard of works on day one. Module `src/dex/`,
-enabled by `--dex`, pure function `decode(&[DatabaseLog]) -> DexRows` inside transform.
+**ON by default** (owner decision; opt out with `--no-dex` / env `NO_DEX=true`), pure function `decode(&[DatabaseLog]) -> DexRows` inside transform.
 
 Families (topic0 + shape validated; wrong shape → not decoded, never panic):
 `uniswap_v2` (PairCreated, Swap, Sync, Mint, Burn), `solidly` (its own Swap/Sync
@@ -291,3 +332,32 @@ out of scope by design. There is NO contract-deployment aggregate (the data is p
 
 Everywhere else in this document, references to traces / `traces_by_tx` / a `contracts`
 table are superseded by this section.
+
+## 10. Prediction markets — display-first
+
+Module `src/predictions/`, ON by default like DEX (opt out with `--no-predictions` /
+env `NO_PREDICTIONS=true`), same shape as `src/dex/` (pure decoders
+by event family, tables under the §1–§2 storage rules incl. tombstones + epochs,
+aggregates as `DerivedTable`s, background resolver off the commit path, re-decodable
+from stored `logs`). Migrations `0020`–`0029`.
+
+**The tables are designed backwards from the screens of a trading UI.** Each screen must
+be servable by ONE cheap query against a view, with no client-side joins or math:
+
+| Screen | Must show | Served by |
+|---|---|---|
+| Market list / search | title, category/tags if known, outcomes with **current price = implied probability**, 24h volume, total volume, open interest, trader count, end date, status (open / resolved / disputed), venue | `prediction_markets_v` (one row per market, outcome arrays) |
+| Market page header | same + resolution source/oracle, creation time, winning outcome + payout vector once resolved | `prediction_markets_v` |
+| Price chart | per-outcome candles 1m / 1h / 1d (OHLC of probability 0..1, volume in collateral units, trades) | `prediction_candles_*_v` |
+| Trades tape | time, outcome, side (buy/sell from the taker's view), price, size, collateral amount, trader, tx hash | `prediction_trades` by (market, time desc) side table |
+| Holders / top positions | per outcome: holder, net position, avg entry price | `prediction_positions_v` |
+| Portfolio (a wallet) | open positions with avg entry, current price, unrealised PnL; realised PnL; redeemable winnings; trade history | `prediction_positions_v`, `prediction_trades` by trader |
+| Leaderboard | volume and realised PnL per trader per period | daily aggregate |
+
+Principles: prices are stored as the raw amounts AND exposed as Float64 probability in
+views; collateral is decimals-adjusted in views via `tokens`; one normalised `market_id`
+(`FixedString(32)`) per venue-market with outcome index → outcome token id mapping;
+multi-outcome / negative-risk groupings are first class (an "event" groups markets);
+everything is source-agnostic (`venue`, `protocol` columns) so a non-EVM venue could be
+fed by an API adapter later. What is NOT on chain (order book depth, off-chain titles)
+is explicitly out of scope — record what would be needed and where it lives; never fake it.
