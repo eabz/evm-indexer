@@ -116,12 +116,13 @@ async fn the_desired_state_of_a_chain_survives_a_round_trip() {
         chain: 8453,
         desired: Desired::Running,
         settings: settings(&[
-            ("start-block", "18000000"),
             ("confirmations", "12"),
             ("no-predictions", "true"),
             // A value with the characters that would break a hand written
-            // INSERT, to prove the escaping.
-            ("rpc", "https://o'neil.example/a\\b,auto"),
+            // INSERT, to prove the escaping. (It is not a value the
+            // command line would accept, but this test is about the
+            // ClickHouse round trip, not about validation.)
+            ("max-reorg-depth", "o'neil\\"),
         ]),
     };
 
@@ -231,7 +232,10 @@ async fn several_chains_come_back_in_order_and_unmixed() {
             &DesiredChain {
                 chain,
                 desired,
-                settings: settings(&[("start-block", &chain.to_string())]),
+                settings: settings(&[(
+                    "confirmations",
+                    &chain.to_string(),
+                )]),
             },
         )
         .await
@@ -246,7 +250,7 @@ async fn several_chains_come_back_in_order_and_unmixed() {
         [1_u64, 10, 8453].to_vec()
     );
     for row in &rows {
-        assert_eq!(row.settings["start-block"], row.chain.to_string());
+        assert_eq!(row.settings["confirmations"], row.chain.to_string());
     }
     assert_eq!(
         rows.iter().find(|row| row.chain == 10).unwrap().desired,

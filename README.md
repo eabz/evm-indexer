@@ -178,7 +178,7 @@ Options of `indexer run`:
 |------|----------------------|---------|-------------|
 | `--chain` | `CHAIN_ID` | `1` | Chain ID to index. One process per chain: a second `indexer run` on the same chain and database refuses to start (any number of chains can share a database) |
 | `--database` | `DATABASE_URL` | *required* | ClickHouse HTTP endpoint: `http://user:pass@host:port/db` (use `https://` for TLS). Always include the port (usually `8123`). The database is created when missing |
-| `--hypersync-url` | `HYPERSYNC_URL` | derived from the chain ID | HyperSync endpoint. Only needed to override the default endpoint for the chain |
+| `--hypersync-url` | `HYPERSYNC_URL` | derived from the chain ID | HyperSync endpoint. Only needed to override the default endpoint for the chain. **A custom endpoint must be able to say which chain it serves**: the indexer asks it at startup and refuses to start if it answers with a different chain, or cannot answer at all. Your API token is sent to whatever endpoint you name here, and an endpoint that cannot be checked could feed the indexer blocks from anywhere |
 | `--hypersync-token` | `ENVIO_API_TOKEN` | *required* | [Envio API token](https://docs.envio.dev/docs/HyperSync/api-tokens) |
 | `--rpc` | `RPC_URL` | `auto` | Comma-separated JSON-RPC endpoints for token / pool metadata `eth_call`s. `auto` = discover public endpoints, `none` = disable. See [Token metadata and RPC endpoints](#token-metadata-and-rpc-endpoints) |
 | `--redis` | `REDIS_URL` | *none* | Redis or Dragonfly URL for the token metadata cache. Without it an in-memory cache is used |
