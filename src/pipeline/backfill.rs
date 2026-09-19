@@ -33,11 +33,10 @@
 //! readers see the module's rows of that range missing, never doubled.
 
 use crate::{
-    core::models::log::DatabaseLog,
+    core::{models::log::DatabaseLog, RowBatch},
     db::format::{SerAddress, SerB256, SerU256},
     db::{
         next_version, ranges::BlockRange, Database, FlushKey, FlushWindow,
-        RowBatch,
     },
     pipeline::{
         modules::{

@@ -8,6 +8,7 @@
 //! batch); the rows themselves are `core::models`.
 
 use crate::{
+    core::RowBatch,
     core::{
         convert::{
             address_to_alloy, data_to_bytes, hash_to_b256, nonce_to_b64,
@@ -30,7 +31,7 @@ use crate::{
             withdrawal::DatabaseWithdrawal,
         },
     },
-    db::{format::method_selector, ranges::BlockRange, RowBatch},
+    db::{format::method_selector, ranges::BlockRange},
     pipeline::transform::{ResponseRows, Transformed},
     tokens::TokenStandard,
 };

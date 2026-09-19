@@ -20,9 +20,10 @@
 //!   statements and derived tables of [`ModuleSpec`].
 
 use crate::{
+    core::RowBatch,
     db::{
         self, derived::DerivedTable, select, Database, FlushKey,
-        FlushWindow, RowBatch, Timestamped,
+        FlushWindow, Timestamped,
     },
     dex::{self, DexRows},
     launchpads::{self, LaunchpadRows},

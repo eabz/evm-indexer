@@ -18,7 +18,7 @@ use super::{
     next_version,
     ranges::BlockRange,
     schema::{live_rows_sql, min_timestamp_sql},
-    tombstone_sql, Database, DatabaseParams, RowBatch,
+    tombstone_sql, Database, DatabaseParams,
 };
 use crate::{
     core::events::{
@@ -30,7 +30,7 @@ use crate::{
         erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
         transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
     },
-    core::{BASE_TABLES, CORE_DERIVED, SIDE_TABLES},
+    core::{self, RowBatch, BASE_TABLES, CORE_DERIVED, SIDE_TABLES},
     pipeline::transform::{transform, ResponseRows},
     tokens::models::DatabaseToken,
 };
@@ -536,7 +536,7 @@ async fn stores_and_reads_back_every_table() {
         .await
         .unwrap();
 
-    database.store(&batch).await.unwrap();
+    core::store(&database, &batch).await.unwrap();
 
     // wait_for_async_insert=1: rows (and what the materialized views derive
     // from them) are visible as soon as store returns.
@@ -835,7 +835,7 @@ async fn materialized_views_feed_the_read_path_tables() {
     const CHAIN: u64 = 990_003;
     let database = database(CHAIN).await;
 
-    database.store(&rows(CHAIN, 20, 22)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 20, 22)).await.unwrap();
 
     let query = |sql: &str| sql.replace("{chain}", &CHAIN.to_string());
 
@@ -985,8 +985,8 @@ async fn aggregate_views_return_correct_numbers() {
 
     // Blocks 4-6 on the first day, 7-8 on the second, in two flushes that
     // split the first day: states must merge, not add up distinct counts.
-    database.store(&rows(CHAIN, 4, 6)).await.unwrap();
-    database.store(&rows(CHAIN, 6, 9)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 4, 6)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 6, 9)).await.unwrap();
 
     #[derive(Debug, Row, Deserialize, PartialEq)]
     struct BlockStats {
@@ -1174,7 +1174,7 @@ async fn aggregates_do_not_wrap_on_hostile_amounts() {
         transaction.value = U256::MAX;
         transaction.effective_gas_price = U256::MAX;
     }
-    database.store(&batch).await.unwrap();
+    core::store(&database, &batch).await.unwrap();
 
     // The premise: the exact values are stored, and summing them as
     // integers silently wraps (3 * (2^256-1) mod 2^256 = 2^256-3).
@@ -1252,14 +1252,14 @@ async fn a_reinserted_block_replaces_itself_under_final() {
     const CHAIN: u64 = 990_005;
     let database = database(CHAIN).await;
 
-    database.store(&rows(CHAIN, 30, 32)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 30, 32)).await.unwrap();
     assert_blocks_stored(&database, 2, 0).await;
 
     // The same heights again, later (higher _version), different content.
     let again =
         rows_at(CHAIN, 30, 32, Shape { salt: 0x55, slim: false }, 0);
     assert_ne!(again.blocks[0].hash, rows(CHAIN, 30, 31).blocks[0].hash);
-    database.store(&again).await.unwrap();
+    core::store(&database, &again).await.unwrap();
 
     // Both copies exist until a merge gets to them (which can be any
     // time) ...
@@ -1473,7 +1473,7 @@ async fn tombstones_reach_every_side_table_with_exactly_the_same_keys() {
     const CHAIN: u64 = 990_006;
     let database = database(CHAIN).await;
 
-    database.store(&rows(CHAIN, 40, 46)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 40, 46)).await.unwrap();
     assert_blocks_stored(&database, 6, 0).await;
 
     // Tombstones go into the BASE tables only, children first.
@@ -1558,8 +1558,8 @@ async fn tombstones_reach_every_side_table_with_exactly_the_same_keys() {
     assert!(database.block_hash(42).await.unwrap().is_some());
 
     // The purged range can be streamed again: same keys, newer version.
-    database.store(&rows(CHAIN, 41, 42)).await.unwrap();
-    database.store(&rows(CHAIN, 43, 46)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 41, 42)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 43, 46)).await.unwrap();
     assert_blocks_stored(&database, 6, 0).await;
 
     // And it all survives the merges.
@@ -1848,9 +1848,9 @@ async fn rebuild_sql_reproduces_what_the_views_wrote() {
     let database = database(CHAIN).await;
 
     // Two days, several flushes.
-    database.store(&rows(CHAIN, 3, 5)).await.unwrap();
-    database.store(&rows(CHAIN, 5, 8)).await.unwrap();
-    database.store(&rows(CHAIN, 8, 10)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 3, 5)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 5, 8)).await.unwrap();
+    core::store(&database, &rows(CHAIN, 8, 10)).await.unwrap();
 
     let mut written_by_the_views = Vec::new();
     for table in CORE_DERIVED {
@@ -1956,21 +1956,24 @@ async fn reorg_scenario(
     let fork = first + 5;
     let end = first + 8;
 
-    clean.store(&rows(clean.chain_id, first, fork)).await.unwrap();
-    clean
-        .store(&rows_at(clean.chain_id, fork, end, CANONICAL, 0))
+    core::store(clean, &rows(clean.chain_id, first, fork)).await.unwrap();
+    core::store(clean, &rows_at(clean.chain_id, fork, end, CANONICAL, 0))
         .await
         .unwrap();
 
     // Rows streamed before the purge carry the previous epoch.
-    database
-        .store(&rows_at(chain, first, first + 3, FULL, epoch - 1))
-        .await
-        .unwrap();
-    database
-        .store(&rows_at(chain, first + 3, end, FULL, epoch - 1))
-        .await
-        .unwrap();
+    core::store(
+        database,
+        &rows_at(chain, first, first + 3, FULL, epoch - 1),
+    )
+    .await
+    .unwrap();
+    core::store(
+        database,
+        &rows_at(chain, first + 3, end, FULL, epoch - 1),
+    )
+    .await
+    .unwrap();
 
     // A purge reads what was flushed: wait until the last flush is
     // visible (see [`SETTLE`]; the pipeline has to do the same).
@@ -2008,14 +2011,18 @@ async fn reorg_scenario(
         "{chain}"
     );
 
-    database
-        .store(&rows_at(chain, fork, fork + 1, CANONICAL, epoch))
-        .await
-        .unwrap();
-    database
-        .store(&rows_at(chain, fork + 1, end, CANONICAL, epoch))
-        .await
-        .unwrap();
+    core::store(
+        database,
+        &rows_at(chain, fork, fork + 1, CANONICAL, epoch),
+    )
+    .await
+    .unwrap();
+    core::store(
+        database,
+        &rows_at(chain, fork + 1, end, CANONICAL, epoch),
+    )
+    .await
+    .unwrap();
 
     let started = std::time::Instant::now();
     loop {
@@ -2118,10 +2125,10 @@ async fn missing_ranges_are_computed_in_clickhouse() {
     assert_eq!(missing.ranges, vec![whole]);
 
     // 5..10, 20..30 and 40 indexed; 20..30 twice (duplicates before merge).
-    database.store(&rows(990_002, 5, 10)).await.unwrap();
-    database.store(&rows(990_002, 20, 30)).await.unwrap();
-    database.store(&rows(990_002, 20, 30)).await.unwrap();
-    database.store(&rows(990_002, 40, 41)).await.unwrap();
+    core::store(&database, &rows(990_002, 5, 10)).await.unwrap();
+    core::store(&database, &rows(990_002, 20, 30)).await.unwrap();
+    core::store(&database, &rows(990_002, 20, 30)).await.unwrap();
+    core::store(&database, &rows(990_002, 40, 41)).await.unwrap();
 
     let missing = database.missing_ranges(whole).await.unwrap();
     assert_eq!(
@@ -2147,7 +2154,7 @@ async fn missing_ranges_are_computed_in_clickhouse() {
 
     // Fill everything: nothing left.
     for (from, to) in [(0, 5), (10, 20), (30, 40), (41, 100)] {
-        database.store(&rows(990_002, from, to)).await.unwrap();
+        core::store(&database, &rows(990_002, from, to)).await.unwrap();
     }
     let missing = database.missing_ranges(whole).await.unwrap();
     assert!(missing.ranges.is_empty());

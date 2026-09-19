@@ -6,9 +6,8 @@
 //! the two and hands back one [`Transformed`]. Pure, no I/O.
 
 use crate::{
-    core,
+    core::{self, RowBatch},
     db::ranges::BlockRange,
-    db::RowBatch,
     pipeline::modules::{self, DecodeState, EnabledModules},
     tokens::TokenStandard,
 };

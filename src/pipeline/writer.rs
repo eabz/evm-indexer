@@ -6,10 +6,7 @@
 //! bounded, so a slow database slows the HyperSync stream down instead of
 //! growing memory.
 
-use crate::{
-    db::{next_version, RowBatch},
-    metrics::Metrics,
-};
+use crate::{core::RowBatch, db::next_version, metrics::Metrics};
 use anyhow::{Context, Result};
 use log::{error, info};
 use std::{future::Future, time::Duration};

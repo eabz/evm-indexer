@@ -1140,8 +1140,8 @@ async fn a_retried_insert_does_not_double_count() {
     // The flush is applied, the answer is lost, the flush is retried -
     // as a whole and table by table.
     let db = &scenario.db;
-    db.store(&batch).await.unwrap();
-    db.store(&batch).await.unwrap();
+    crate::core::store(db, &batch).await.unwrap();
+    crate::core::store(db, &batch).await.unwrap();
 
     let key =
         FlushKey { chain: CHAIN, span: (0, 11), version: batch.version() };
@@ -1174,7 +1174,7 @@ async fn a_retried_insert_does_not_double_count() {
     // A LATER flush of the same blocks (another `_version`) is not a
     // retry: it is written - that is what re-streaming after a purge does.
     batch.set_version(next_version());
-    db.store(&batch).await.unwrap();
+    crate::core::store(db, &batch).await.unwrap();
     assert_eq!(
         scenario.count("SELECT toUInt64(count()) FROM dex_swaps").await,
         30
@@ -1580,7 +1580,7 @@ async fn verify_catches_a_doubled_aggregate() {
     .rows;
     batch.set_version(next_version());
     batch.set_epoch(0);
-    scenario.db.store(&batch).await.unwrap();
+    crate::core::store(&scenario.db, &batch).await.unwrap();
 
     // The base tables are untouched ...
     assert_eq!(scenario.rows("blocks").await, 10);
