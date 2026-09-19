@@ -7,11 +7,12 @@
 
 use std::{collections::HashMap, sync::OnceLock};
 
-use alloy::primitives::{Address, B256, I256, U256};
+use alloy::primitives::{keccak256, Address, B256, I256, U256};
 
 use crate::db::models::log::DatabaseLog;
 
 use super::{
+    corroborate::Evidence,
     events::{self, EventDef},
     models::{
         pool_id_of, DexLiquidity, DexPool, DexSwap, LiquidityKind,
@@ -81,13 +82,27 @@ impl Topics {
     fn get(&self, index: usize) -> B256 {
         self.values.get(index).copied().unwrap_or_default()
     }
+
+    /// `topic0` (zero when the log has no topics).
+    pub(super) fn first(&self) -> B256 {
+        self.get(0)
+    }
+
+    /// Number of topics (a lower bound in zero-default mode).
+    pub(super) fn len(&self) -> usize {
+        self.count
+    }
+
+    pub(super) fn at(&self, index: usize) -> B256 {
+        self.get(index)
+    }
 }
 
-/// THE place that reads the topic columns of [`DatabaseLog`]. When they
-/// become non-`Option` (zero default) this body turns into
-/// `Topics::from_zero_default([log.topic0, log.topic1, log.topic2,
-/// log.topic3])` and nothing else changes.
-fn topics_of(log: &DatabaseLog) -> Topics {
+/// THE place that reads the topic columns of [`DatabaseLog`]. The Rust
+/// model keeps `Option<B256>` (the stored columns are zero-default plus
+/// `topic_count`), so shape validation always sees the REAL topic count.
+/// [`Topics::from_zero_default`] only exists for a model without it.
+pub(super) fn topics_of(log: &DatabaseLog) -> Topics {
     Topics::from_optional([log.topic0, log.topic1, log.topic2, log.topic3])
 }
 
@@ -213,7 +228,9 @@ fn int(bytes: &[u8; 32], bits: usize) -> Option<I256> {
     let value = I256::from_be_bytes(*bytes);
 
     if bits >= 256 {
-        return Some(value);
+        // -2^255 has no absolute value (it wraps, in Rust and in SQL
+        // `abs()`), and no pool ever moved it.
+        return (value != I256::MIN).then_some(value);
     }
 
     let limit = I256::from_raw(U256::from(1u8) << (bits - 1));
@@ -322,6 +339,7 @@ impl Event<'_> {
             transaction_hash: self.log.transaction_hash,
             log_index,
             source: PoolSource::Event,
+            attempts: 0,
             epoch: 0,
             _version: 0,
         }
@@ -369,6 +387,10 @@ impl Event<'_> {
             token_out: Address::ZERO,
             amount_in: U256::ZERO,
             amount_out: U256::ZERO,
+            verified_in: Address::ZERO,
+            verified_out: Address::ZERO,
+            reserve0: U256::ZERO,
+            reserve1: U256::ZERO,
             coin_in: 0,
             coin_out: 0,
             underlying: false,
@@ -427,6 +449,15 @@ enum Decoded {
 }
 
 fn finish_swap(mut swap: DexSwap) -> Decoded {
+    // Two token families: what went in / came out, when the signs say so.
+    if swap.amount0.is_positive() && swap.amount1.is_negative() {
+        swap.amount_in = swap.amount0.unsigned_abs();
+        swap.amount_out = swap.amount1.unsigned_abs();
+    } else if swap.amount1.is_positive() && swap.amount0.is_negative() {
+        swap.amount_in = swap.amount1.unsigned_abs();
+        swap.amount_out = swap.amount0.unsigned_abs();
+    }
+
     swap.trader = if swap.recipient.is_zero() {
         swap.sender
     } else {
@@ -516,8 +547,16 @@ fn decode_event(event: &Event<'_>, kind: Kind) -> Option<Decoded> {
             let currency0 = event.topic_address(2)?;
             let currency1 = event.topic_address(3)?;
 
-            // The PoolManager enforces currency0 < currency1.
-            if currency0 >= currency1 {
+            // The PoolManager enforces currency0 < currency1, and the id
+            // IS keccak256(abi.encode(PoolKey)): topic2, topic3 and the
+            // first three data words are exactly that encoding.
+            let mut key = [0u8; 160];
+            key[..32].copy_from_slice(&event.topic(2));
+            key[32..64].copy_from_slice(&event.topic(3));
+            key[64..].copy_from_slice(event.data.get(..96)?);
+
+            if currency0 >= currency1 || keccak256(key).0 != event.topic(1)
+            {
                 return None;
             }
 
@@ -620,7 +659,14 @@ fn decode_event(event: &Event<'_>, kind: Kind) -> Option<Decoded> {
             swap.amount_in = uint(event.data(0)?, 256)?;
             swap.amount_out = uint(event.data(1)?, 256)?;
 
-            if swap.token_in == swap.token_out {
+            // ComposableStable joins / exits are reported as swaps against
+            // the pool's own BPT (the pool id starts with its address).
+            let own_token = Address::from_slice(&swap.pool_id.0[..20]);
+
+            if swap.token_in == swap.token_out
+                || swap.token_in == own_token
+                || swap.token_out == own_token
+            {
                 return None;
             }
 
@@ -743,6 +789,10 @@ fn decode_event(event: &Event<'_>, kind: Kind) -> Option<Decoded> {
 
 /// Decodes every DEX event of `logs` (any order, any mix of contracts).
 ///
+/// `logs` must hold WHOLE transactions (the pipeline's batches hold whole
+/// blocks): swap legs are corroborated against the ERC-20 `Transfer`s of
+/// their transaction, see [`super::corroborate`].
+///
 /// Rows come out in input order with `_version = 0` and `epoch = 0`: stamp
 /// them with [`DexRows::set_version`] and [`DexRows::set_epoch`].
 pub fn decode(chain: u64, logs: &[DatabaseLog]) -> DexRows {
@@ -796,6 +846,12 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> DexRows {
             Some(Decoded::Liquidity(row)) => rows.liquidity.push(row),
             None => {}
         }
+    }
+
+    // A swap event is a claim: look for the token transfers that prove it
+    // (and the reserves a V2 pair reports right before its swap).
+    if !rows.swaps.is_empty() {
+        Evidence::collect(logs).apply(&mut rows.swaps);
     }
 
     rows
@@ -976,6 +1032,308 @@ mod tests {
         assert_eq!(
             address_array(&data, 0),
             Some(vec![Address::from_word(B256::from(U256::from(7u8)))])
+        );
+    }
+
+    // ------------------------------------------- structured adversarial input
+
+    fn tokens_registered(pool_id: B256, data: Vec<u8>) -> DatabaseLog {
+        log_with(
+            &[events::BALANCER_TOKENS_REGISTERED.topic0, pool_id],
+            data,
+        )
+    }
+
+    fn pool_registered(pool_id: B256) -> DatabaseLog {
+        let pool = Address::from_slice(&pool_id.0[..20]);
+        log_with(
+            &[
+                events::BALANCER_POOL_REGISTERED.topic0,
+                pool_id,
+                pool.into_word(),
+            ],
+            word_of(2),
+        )
+    }
+
+    #[test]
+    fn hostile_abi_offsets_are_refused_or_read_within_bounds() {
+        let id = B256::repeat_byte(0x11);
+        let token = |n: u64| word_of(n);
+
+        let cases: Vec<(&str, Vec<u8>, Option<usize>)> = vec![
+            // Both arrays are THE SAME bytes (overlapping offsets): legal
+            // ABI, equal lengths, decoded as one token list.
+            (
+                "overlapping",
+                [word_of(64), word_of(64), word_of(2), token(7), token(8)]
+                    .concat(),
+                Some(2),
+            ),
+            // The offset points at the head itself: the first head word
+            // (0) is then the length -> an empty token list -> refused.
+            ("self referential", [word_of(0), word_of(0)].concat(), None),
+            // The offset points at the second head word: its value (32)
+            // becomes the length, far more items than there are bytes.
+            ("head as length", [word_of(32), word_of(32)].concat(), None),
+            // Offset + length overflow usize / leave the data.
+            (
+                "offset near 2^32",
+                [word_of(0xffff_ffe0), word_of(64), word_of(1), token(7)]
+                    .concat(),
+                None,
+            ),
+            (
+                "offset above 2^32",
+                [vec![0xff; 32], word_of(64), word_of(1), token(7)]
+                    .concat(),
+                None,
+            ),
+            // Array body cut in the middle of an item.
+            (
+                "truncated item",
+                [word_of(64), word_of(64), word_of(1), vec![0u8; 31]]
+                    .concat(),
+                None,
+            ),
+            // Different lengths for tokens and asset managers.
+            (
+                "length mismatch",
+                [
+                    word_of(64),
+                    word_of(128),
+                    word_of(1),
+                    token(7),
+                    word_of(2),
+                    token(1),
+                    token(2),
+                ]
+                .concat(),
+                None,
+            ),
+            // A "token" with dirty upper bytes.
+            (
+                "dirty address",
+                [word_of(64), word_of(64), word_of(1), vec![0xff; 32]]
+                    .concat(),
+                None,
+            ),
+            // More tokens than any pool has.
+            (
+                "too many",
+                [
+                    vec![word_of(64), word_of(64), word_of(65)],
+                    (0..65).map(token).collect(),
+                ]
+                .concat()
+                .concat(),
+                None,
+            ),
+        ];
+
+        for (name, data, expected) in cases {
+            let pools = decode(1, &[tokens_registered(id, data)]).pools;
+            assert_eq!(
+                pools.first().map(|pool| pool.tokens.len()),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn balancer_tokens_merge_into_the_right_registration() {
+        let first = B256::repeat_byte(0x11);
+        let second = B256::repeat_byte(0x22);
+        let tokens = |a: u64, b: u64| {
+            [word_of(64), word_of(64), word_of(2), word_of(a), word_of(b)]
+                .concat()
+        };
+
+        let mut other_vault = tokens_registered(first, tokens(5, 6));
+        other_vault.address = Address::repeat_byte(0xbb);
+
+        let rows = decode(
+            1,
+            &[
+                pool_registered(first),
+                pool_registered(second),
+                // Out of order, twice for the same pool, and once from
+                // ANOTHER emitter claiming the same pool id.
+                tokens_registered(second, tokens(3, 4)),
+                tokens_registered(first, tokens(1, 2)),
+                tokens_registered(first, tokens(8, 9)),
+                other_vault,
+            ],
+        );
+
+        let tokens_of = |index: usize| -> Vec<u8> {
+            rows.pools[index]
+                .tokens
+                .iter()
+                .map(|token| token.0[19])
+                .collect()
+        };
+
+        assert_eq!(rows.pools.len(), 3);
+        assert_eq!(tokens_of(0), vec![8, 9]);
+        assert_eq!(tokens_of(1), vec![3, 4]);
+        // The other emitter got a row of its own, it merged into nothing.
+        assert_eq!(rows.pools[2].emitter, Address::repeat_byte(0xbb));
+        assert_eq!(tokens_of(2), vec![5, 6]);
+    }
+
+    #[test]
+    fn the_most_negative_integer_is_refused_on_every_signed_path() {
+        let min = I256::MIN.to_be_bytes::<32>().to_vec();
+        let one = address_topic(1);
+        let tick = B256::from(U256::from(60u8));
+
+        // V3 swap amounts (int256).
+        for amounts in
+            [[min.clone(), word_of(5)], [word_of(5), min.clone()]]
+        {
+            let data = [
+                amounts[0].clone(),
+                amounts[1].clone(),
+                word_of(1 << 40),
+                word_of(1),
+                word_of(0),
+            ]
+            .concat();
+            let log = log_with(&[events::V3_SWAP.topic0, one, one], data);
+            assert!(decode(1, &[log]).is_empty());
+        }
+
+        // V4 ModifyLiquidity liquidityDelta (int256).
+        let log = log_with(
+            &[
+                events::V4_MODIFY_LIQUIDITY.topic0,
+                B256::repeat_byte(9),
+                one,
+            ],
+            [word_of(0), word_of(60), min.clone(), word_of(0)].concat(),
+        );
+        assert!(decode(1, &[log]).is_empty());
+
+        // V4 swap amounts are int128: -2^255 is out of range anyway, and
+        // -2^127 (the int128 minimum) negates fine in 256 bits.
+        let mut int128_min = vec![0xffu8; 16];
+        int128_min.extend([0x80u8]);
+        int128_min.extend(vec![0u8; 15]);
+        for amount in [min.clone(), int128_min] {
+            let refused = amount == min;
+            let data = [
+                amount,
+                word_of(5),
+                word_of(1 << 40),
+                word_of(1),
+                word_of(0),
+                word_of(0),
+            ]
+            .concat();
+            let log = log_with(
+                &[events::V4_SWAP.topic0, B256::repeat_byte(9), one],
+                data,
+            );
+            let rows = decode(1, &[log]);
+            assert_eq!(rows.swaps.is_empty(), refused);
+            if let Some(swap) = rows.swaps.first() {
+                assert!(swap.amount0.is_positive());
+            }
+        }
+
+        // Unsigned amounts above Int256 max never become negative: V2
+        // swaps, mints and burns, V3 mint / burn amounts.
+        let huge = vec![0xffu8; 32];
+        for log in [
+            log_with(
+                &[events::V2_MINT.topic0, one],
+                [huge.clone(), word_of(1)].concat(),
+            ),
+            log_with(
+                &[events::V2_BURN.topic0, one, one],
+                [word_of(1), huge.clone()].concat(),
+            ),
+            log_with(
+                &[events::V3_BURN.topic0, one, tick, tick],
+                [word_of(1), huge.clone(), word_of(1)].concat(),
+            ),
+            log_with(
+                &[events::V3_MINT.topic0, one, tick, tick],
+                [one.to_vec(), word_of(1), word_of(1), huge.clone()]
+                    .concat(),
+            ),
+        ] {
+            assert!(decode(1, &[log]).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_v4_pool_id_must_be_the_hash_of_its_key() {
+        let currency0 = Address::repeat_byte(1);
+        let currency1 = Address::repeat_byte(2);
+        let key = [
+            currency0.into_word().to_vec(),
+            currency1.into_word().to_vec(),
+            word_of(3000),
+            word_of(60),
+            word_of(0),
+        ]
+        .concat();
+        let id = keccak256(&key);
+        let tail =
+            [key[64..].to_vec(), word_of(1 << 40), word_of(0)].concat();
+
+        let honest = log_with(
+            &[
+                events::V4_INITIALIZE.topic0,
+                id,
+                currency0.into_word(),
+                currency1.into_word(),
+            ],
+            tail.clone(),
+        );
+        assert_eq!(decode(1, &[honest]).pools.len(), 1);
+
+        // Same event, somebody else's id.
+        let forged = log_with(
+            &[
+                events::V4_INITIALIZE.topic0,
+                B256::repeat_byte(0x44),
+                currency0.into_word(),
+                currency1.into_word(),
+            ],
+            tail,
+        );
+        assert!(decode(1, &[forged]).is_empty());
+    }
+
+    #[test]
+    fn balancer_joins_and_exits_through_the_bpt_are_not_swaps() {
+        let pool = Address::repeat_byte(0x77);
+        let mut id = [0u8; 32];
+        id[..20].copy_from_slice(pool.as_slice());
+        id[21] = 2;
+
+        let swap = |token_in: Address, token_out: Address| {
+            log_with(
+                &[
+                    events::BALANCER_SWAP.topic0,
+                    B256::from(id),
+                    token_in.into_word(),
+                    token_out.into_word(),
+                ],
+                [word_of(5), word_of(6)].concat(),
+            )
+        };
+        let usdc = Address::repeat_byte(1);
+
+        assert!(decode(1, &[swap(usdc, pool)]).is_empty());
+        assert!(decode(1, &[swap(pool, usdc)]).is_empty());
+        assert_eq!(
+            decode(1, &[swap(usdc, Address::repeat_byte(2))]).swaps.len(),
+            1
         );
     }
 }

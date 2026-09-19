@@ -48,11 +48,17 @@ impl Protocol {
         }
     }
 
-    /// Whether the pool's tokens can only be learnt through `eth_call`
-    /// when its creation event was not indexed. V4 and Balancer pools are
-    /// described by events of their singleton and are never called.
+    /// Families whose pools are their own contract: the pool answers
+    /// `token0()` / `coins(i)` itself, which is the only thing that can
+    /// not be forged by a third party's event. V4 and Balancer pools live
+    /// inside a singleton and are described by its events only.
     pub const fn resolvable_by_rpc(&self) -> bool {
         !matches!(self, Protocol::UniswapV4 | Protocol::BalancerV2)
+    }
+
+    /// The emitter is a singleton shared by every pool of the family.
+    pub const fn is_singleton(&self) -> bool {
+        !self.resolvable_by_rpc()
     }
 }
 
@@ -84,6 +90,11 @@ pub enum PoolSource {
     /// family (calls revert / return garbage). Kept so it is never asked
     /// again and analytics can tell "checked" from "not checked yet".
     Unresolved,
+    /// The resolver got no usable answer (no code at the address, or the
+    /// RPC kept failing for this one contract). Persisted so dead emitters
+    /// can not fill the backfill pages for ever; asked again with an
+    /// exponential backoff on `attempts`.
+    NoAnswer,
 }
 
 impl PoolSource {
@@ -92,6 +103,7 @@ impl PoolSource {
             PoolSource::Event => "event",
             PoolSource::Rpc => "rpc",
             PoolSource::Unresolved => "unresolved",
+            PoolSource::NoAnswer => "no_answer",
         }
     }
 }
@@ -106,10 +118,15 @@ impl FromStr for PoolSource {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        [PoolSource::Event, PoolSource::Rpc, PoolSource::Unresolved]
-            .into_iter()
-            .find(|source| source.as_str() == value)
-            .ok_or_else(|| format!("unknown pool source {value:?}"))
+        [
+            PoolSource::Event,
+            PoolSource::Rpc,
+            PoolSource::Unresolved,
+            PoolSource::NoAnswer,
+        ]
+        .into_iter()
+        .find(|source| source.as_str() == value)
+        .ok_or_else(|| format!("unknown pool source {value:?}"))
     }
 }
 
@@ -256,6 +273,8 @@ pub struct DexPool {
     pub log_index: u32,
     #[serde_as(as = "DisplayFromStr")]
     pub source: PoolSource,
+    /// Resolver rows: how often the pool was asked without an answer.
+    pub attempts: u32,
     /// Purge generation of the chain, stamped by the writer.
     pub epoch: u32,
     pub _version: u64,
@@ -300,17 +319,35 @@ pub struct DexSwap {
     pub amount0: I256,
     #[serde_as(as = "SerI256")]
     pub amount1: I256,
-    /// Only when the EVENT carries them (Balancer), else zero: resolved
-    /// at query time from `dex_pools`.
+    /// Only when the EVENT carries them (Balancer), else zero. A CLAIM of
+    /// the emitter, nothing more: see `verified_in` / `verified_out`.
     #[serde_as(as = "SerAddress")]
     pub token_in: Address,
     #[serde_as(as = "SerAddress")]
     pub token_out: Address,
-    /// Only for the multi asset families (Balancer, Curve), else zero.
+    /// What went into / came out of the pool, every family. Two token
+    /// families: the positive / negative side of `amount0`, `amount1`;
+    /// both zero when the signs do not describe a swap (same sign, or a
+    /// zero side).
     #[serde_as(as = "SerU256")]
     pub amount_in: U256,
     #[serde_as(as = "SerU256")]
     pub amount_out: U256,
+    /// The token PROVEN to have moved: an ERC-20 `Transfer` of exactly
+    /// `amount_in` to the emitter (`amount_out` from the emitter) earlier
+    /// in the same transaction, emitted by this token contract. Zero when
+    /// nothing proves the leg (see `dex::corroborate`). USD valuation only
+    /// ever uses these.
+    #[serde_as(as = "SerAddress")]
+    pub verified_in: Address,
+    #[serde_as(as = "SerAddress")]
+    pub verified_out: Address,
+    /// V2 / Solidly: reserves AFTER the swap, from the `Sync` the pool
+    /// emits right before its `Swap`. Zero when there is none.
+    #[serde_as(as = "SerU256")]
+    pub reserve0: U256,
+    #[serde_as(as = "SerU256")]
+    pub reserve1: U256,
     /// Curve coin indices into `dex_pools.tokens` (or
     /// `underlying_tokens` when `underlying`).
     pub coin_in: u8,

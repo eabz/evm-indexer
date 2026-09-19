@@ -6,14 +6,18 @@
 //! * the getters answer -> [`Resolution::Resolved`] (`source = 'rpc'`),
 //! * the EVM reverts / returns garbage -> [`Resolution::NotAPool`]
 //!   (`source = 'unresolved'`, the persistent negative cache),
-//! * the node could not be reached -> [`Resolution::Retry`], never cached,
+//! * the node could not be reached, or two independent providers did not
+//!   agree (`tokens::call_confirmed`) -> [`Resolution::Retry`], never cached,
 //! * empty return data -> [`Resolution::NoAnswer`]: an address without code
 //!   answers like this, and the node may simply lag behind the indexed
 //!   head, so nothing is concluded.
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 
-use crate::tokens::multicall::{CallError, EthCaller};
+use crate::tokens::{
+    call_confirmed,
+    multicall::{CallError, EthCaller},
+};
 
 use super::{
     models::{DexPool, PoolSource, Protocol},
@@ -125,7 +129,11 @@ async fn ask(
             .extend_from_slice(&U256::from(argument).to_be_bytes::<32>());
     }
 
-    match caller.call(to, Bytes::from(calldata)).await {
+    // Never a bare `eth_call`: on untrusted (discovered, public) endpoints
+    // an answer only counts once a second, independent provider gave the
+    // same one - otherwise one lying RPC could re-tokenise any pool.
+    // Without agreement the result is `Transient`: nothing is stored.
+    match call_confirmed(caller, to, Bytes::from(calldata)).await {
         Ok(data) if data.is_empty() => Answer::Empty,
         Ok(data) => match <[u8; 32]>::try_from(data.as_ref()) {
             Ok(word) => Answer::Word(word),
@@ -352,6 +360,7 @@ fn blank_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
         transaction_hash: B256::ZERO,
         log_index: 0,
         source: PoolSource::Rpc,
+        attempts: 0,
         epoch: 0,
         _version: 0,
     }
@@ -361,6 +370,16 @@ fn blank_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
 pub fn unresolved_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
     DexPool {
         source: PoolSource::Unresolved,
+        ..blank_pool(chain, candidate)
+    }
+}
+
+/// The row of a candidate that gave no usable answer: asked again after a
+/// backoff that grows with `attempts`.
+pub fn no_answer_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
+    DexPool {
+        source: PoolSource::NoAnswer,
+        attempts: candidate.attempts.saturating_add(1),
         ..blank_pool(chain, candidate)
     }
 }
@@ -552,6 +571,7 @@ mod tests {
             pool_id: pool_id_of(pool),
             address: pool,
             protocol,
+            attempts: 0,
         }
     }
 
@@ -790,5 +810,115 @@ mod tests {
         assert_eq!(row.source, PoolSource::Unresolved);
         assert_eq!((row.created_block, row.log_index), (0, 0));
         assert!(row.tokens.is_empty());
+    }
+
+    /// Two untrusted public endpoints of different providers.
+    struct TwoProviders {
+        honest: FakeNode,
+        /// Answers `token0()` with this address instead.
+        liar_token0: Option<Address>,
+    }
+
+    impl EthCaller for TwoProviders {
+        fn call(
+            &self,
+            to: Address,
+            data: Bytes,
+        ) -> futures::future::BoxFuture<'_, Result<Bytes, CallError>>
+        {
+            self.honest.call(to, data)
+        }
+
+        fn chain_id(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<u64, CallError>>
+        {
+            self.honest.chain_id()
+        }
+
+        fn source_count(&self) -> usize {
+            2
+        }
+
+        fn call_routed<'a>(
+            &'a self,
+            to: Address,
+            data: Bytes,
+            route: &'a crate::tokens::multicall::Route,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<
+                crate::tokens::multicall::Routed,
+                crate::tokens::multicall::RoutedError,
+            >,
+        > {
+            use crate::tokens::multicall::{Routed, RoutedError, Source};
+
+            Box::pin(async move {
+                // Provider 1 (the liar) answers first, provider 2 second.
+                let sources = [
+                    Source { id: 1, group: 1, trusted: false },
+                    Source { id: 2, group: 2, trusted: false },
+                ];
+                let Some(source) = sources
+                    .into_iter()
+                    .find(|source| route.admits(source))
+                else {
+                    return Err(RoutedError::no_source("nobody left"));
+                };
+
+                if source.id == 1 && data.as_ref() == TOKEN0.selector {
+                    if let Some(token) = self.liar_token0 {
+                        return Ok(Routed {
+                            data: Bytes::from(address_word(token)),
+                            source,
+                        });
+                    }
+                }
+
+                match self.honest.call(to, data).await {
+                    Ok(data) => Ok(Routed { data, source }),
+                    Err(error) => Err(RoutedError {
+                        error,
+                        source: Some(source),
+                        no_source: false,
+                    }),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn one_lying_public_rpc_can_not_re_tokenise_a_pool() {
+        let honest = FakeNode::default();
+        honest.pair(addr(1), addr(0xa), addr(0xb));
+
+        // Both providers agree: resolved.
+        let agreeing = TwoProviders { honest, liar_token0: None };
+        assert!(matches!(
+            resolve_pool(
+                &agreeing,
+                1,
+                &candidate(addr(1), Protocol::UniswapV2)
+            )
+            .await,
+            Resolution::Resolved(_)
+        ));
+
+        // One says token0 = USDC-lookalike, the other does not, and there
+        // is no third opinion: nothing is concluded, nothing is stored.
+        let lying = TwoProviders {
+            honest: agreeing.honest,
+            liar_token0: Some(addr(0xee)),
+        };
+        assert!(matches!(
+            resolve_pool(
+                &lying,
+                1,
+                &candidate(addr(1), Protocol::UniswapV2)
+            )
+            .await,
+            Resolution::Retry(_)
+        ));
     }
 }
