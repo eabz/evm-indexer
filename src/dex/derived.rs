@@ -1,14 +1,21 @@
 //! The DEX aggregates as [`DerivedTable`]s, so `purge_range` can repair
 //! their buckets after a reorg (docs/design.md §2).
 //!
+//! Nothing is deleted. A purge bumps the chain's epoch, records `(chain,
+//! epoch, from_ts)` in `reorgs` and runs every `rebuild_sql`: the surviving
+//! swaps (`FINAL` hides the tombstoned ones) of every bucket `>= from_ts`
+//! are aggregated again under the NEW epoch. The `*_v` views ignore the
+//! older epochs of those buckets (validity rule).
+//!
 //! Every `rebuild_sql` is the `SELECT` of the table's materialized view in
-//! `migrations/0011_dex_aggregates.sql` with `FINAL` and the
-//! `chain = {chain} AND timestamp >= toDateTime({from_ts})` range added. A
-//! unit test compares the texts, and the ClickHouse integration test checks
-//! that delete-bucket + rebuild reproduces what the view wrote.
+//! `migrations/0011_dex_aggregates.sql` with `FINAL`, the `chain = {chain}
+//! AND timestamp >= toDateTime({from_ts})` range and the new epoch instead
+//! of the rows' own. A unit test compares the texts, and the ClickHouse
+//! integration tests check that a repaired index equals a clean one.
 //!
 //! Placeholders: `{chain}` = chain id, `{from_ts}` = unix seconds of the
-//! first bucket to rebuild (a multiple of `bucket_seconds`).
+//! first bucket to rebuild (a multiple of `bucket_seconds`; the start of
+//! the UTC day recorded in `reorgs` always is), `{epoch}` = the new epoch.
 
 use crate::db::derived::DerivedTable;
 
@@ -32,6 +39,7 @@ macro_rules! candles {
                 ") * ",
                 $seconds,
                 ", 'UTC') AS bucket,",
+                " toUInt32({epoch}) AS epoch,",
                 " argMinState(price, (block_number, log_index)) AS open,",
                 " argMaxState(price, (block_number, log_index)) AS close,",
                 " max(price) AS high,",
@@ -42,8 +50,9 @@ macro_rules! candles {
                 " uniqState(trader) AS traders",
                 " FROM dex_swaps FINAL",
                 " WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
+                " AND is_deleted = 0",
                 " AND (sqrt_price_x96 != 0 OR (amount0 != 0 AND amount1 != 0))",
-                " GROUP BY chain, pool_id, emitter, bucket"
+                " GROUP BY chain, pool_id, emitter, bucket, epoch"
             ),
         }
     };
@@ -73,13 +82,15 @@ pub const DEX_POOL_VOLUME_1D: DerivedTable = DerivedTable {
         " leg.1 AS leg_kind,",
         " leg.2 AS leg_index,",
         " leg.3 AS leg_token,",
+        " toUInt32({epoch}) AS epoch,",
         " sum(leg.4) AS volume_in,",
         " sum(leg.5) AS volume_out,",
         " count() AS swaps,",
         " uniqState(trader) AS traders",
         " FROM dex_swaps FINAL",
         " WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
-        " GROUP BY chain, pool_id, emitter, protocol, bucket, leg_kind, leg_index, leg_token"
+        " AND is_deleted = 0",
+        " GROUP BY chain, pool_id, emitter, protocol, bucket, leg_kind, leg_index, leg_token, epoch"
     ),
 };
 
@@ -91,12 +102,14 @@ pub const DEX_PROTOCOL_STATS_1D: DerivedTable = DerivedTable {
         "INSERT INTO dex_protocol_stats_1d",
         " SELECT chain, protocol,",
         " toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS bucket,",
+        " toUInt32({epoch}) AS epoch,",
         " count() AS swaps,",
         " uniqState(trader) AS traders,",
         " uniqState(pool_id, emitter) AS pools",
         " FROM dex_swaps FINAL",
         " WHERE chain = {chain} AND timestamp >= toDateTime({from_ts})",
-        " GROUP BY chain, protocol, bucket"
+        " AND is_deleted = 0",
+        " GROUP BY chain, protocol, bucket, epoch"
     ),
 };
 
@@ -109,16 +122,21 @@ pub const DEX_DERIVED: &[DerivedTable] = &[
     DEX_PROTOCOL_STATS_1D,
 ];
 
+/// What the rebuild selects instead of the rows' own epoch.
+pub const REBUILD_EPOCH: &str = "toUInt32({epoch}) AS epoch";
+
 /// `rebuild_sql` with its placeholders filled in.
 pub fn render_rebuild(
     table: &DerivedTable,
     chain: u64,
     from_ts: u32,
+    epoch: u32,
 ) -> String {
     table
         .rebuild_sql
         .replace("{chain}", &chain.to_string())
         .replace("{from_ts}", &from_ts.to_string())
+        .replace("{epoch}", &epoch.to_string())
 }
 
 #[cfg(test)]
@@ -141,7 +159,8 @@ mod tests {
             .unwrap_or_else(|| panic!("no materialized view for {table}"))
     }
 
-    /// The rebuild statement reduced to what the view must contain.
+    /// The rebuild statement turned back into the view it must repeat:
+    /// no `FINAL`, no range, the rows' own epoch.
     fn rebuild_select(table: &DerivedTable) -> String {
         let sql = normalize(table.rebuild_sql);
         let sql = sql
@@ -149,19 +168,16 @@ mod tests {
             .expect("rebuild must insert into its own table")
             .to_owned();
 
-        let ranged = format!(" FINAL WHERE {REBUILD_RANGE}");
+        let ranged = format!(" FINAL WHERE {REBUILD_RANGE} AND ");
         assert_eq!(sql.matches(&ranged).count(), 1, "{}", table.name);
+        assert_eq!(
+            sql.matches(REBUILD_EPOCH).count(),
+            1,
+            "{}",
+            table.name
+        );
 
-        // `... AND (<view filter>) GROUP BY` or no view filter at all.
-        match sql.split_once(&format!("{ranged} AND (")) {
-            Some((head, tail)) => {
-                let (filter, group) = tail
-                    .split_once(") GROUP BY")
-                    .expect("filter must be parenthesized");
-                format!("{head} WHERE {filter} GROUP BY{group}")
-            }
-            None => sql.replace(&ranged, ""),
-        }
+        sql.replace(&ranged, " WHERE ").replace(REBUILD_EPOCH, "epoch")
     }
 
     #[test]
@@ -212,10 +228,11 @@ mod tests {
 
     #[test]
     fn placeholders_are_rendered() {
-        let sql = render_rebuild(&DEX_CANDLES_1H, 8453, 1_700_006_400);
+        let sql = render_rebuild(&DEX_CANDLES_1H, 8453, 1_700_006_400, 7);
 
         assert!(sql.contains("chain = 8453 AND"));
         assert!(sql.contains("toDateTime(1700006400)"));
+        assert!(sql.contains("toUInt32(7) AS epoch"));
         assert!(!sql.contains('{'));
     }
 }

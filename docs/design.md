@@ -191,6 +191,15 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
    the abandoned partial epoch invisible.
 
+**No read-your-writes (ClickHouse 25.12, observed on the macOS build).** Right after an
+`INSERT` returns, the next query can miss the new part for a few milliseconds when
+several writers are active (44-137 misses per 3,200 in the schema engineer's repro; it
+heals on the next try). So: (1) before purging, make sure the last flush is visible;
+(2) a tombstone `INSERT .. SELECT` can miss freshly flushed rows: re-issue
+`tombstone_sql` until `live_rows_sql` returns 0 (idempotent, lock-free), bounded, fatal
+if it never converges; (3) a rebuild never depends on seeing tombstones (it excludes the
+purged range itself). The same caution applies to any read that decides what to write.
+
 **Disk hygiene (operator note).** Tombstones and the rows they hide stay on disk until
 ClickHouse merges them away; the indexer never issues `OPTIMIZE ... FINAL CLEANUP`.
 Volume is negligible (only reorged/orphaned rows). An operator may run a cleanup during
