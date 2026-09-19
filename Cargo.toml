@@ -26,6 +26,8 @@ simple_logger = { version = "5", default-features = false, features = ["colors"]
 tokio = { version = "1", features = ["full"] }
 url = "2"
 hypersync-client-solana = "0.2"
+bs58 = "0.5"
+hypersync-solana-net-types = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
