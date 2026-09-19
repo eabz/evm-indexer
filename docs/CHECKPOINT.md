@@ -36,11 +36,15 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
 | hardening | Opus | MAIN tree (uncommitted edits possible) | launchpads wired (done, 050326b); now the pipeline hardening backlog (tirith task 64ed4968): side-table orphans, shrinking chain, bounded rebuilds, checkpoint compaction, lease fencing... | commits prefixed `hardening:` + tirith notes |
-| solana | Opus | worktree (see `git worktree list`) | Solana phase 1 (`src/svm/`, `src/source/solana.rs`, migrations 0040+), live proof | commits + tirith notes |
+| solana phase 1 | DONE, merged 442ac35 | - | live proof: 40/40 trades matched a public Solana RPC | - |
+| solana-venues | Opus | worktree | phase 2: Raydium / Orca / Meteora decoders + decode speed | commit after each venue + tirith notes |
+| solana-plan | Opus | writes only `docs/solana-research.md` section 11 | Envio rate limits (cost 1000/query, ~30 queries/window?), head following, history backfill, cost | the file itself |
 | launchpads-align | Opus | worktree | align launchpads with shared ids (`SerId32`, `tx_id String`) | commits |
 | review-d | Opus | read-only | review round 3: pipeline wiring, chain-neutral change, launchpads | findings sent to `lead` on tirith |
 
-MERGED tonight (all pushed): pipeline wiring + zero-flag proof, migrator review fixes,
+QUEUED for Solana phase 2: Solana launchpads into `launchpad_*` (after launchpads-align lands); head follower + `indexer run --chain solana` integration (after hardening releases src/pipeline; contiguity = parent_slot chain, never slot+1).
+
+MERGED tonight (all pushed): Solana phase 1, pipeline wiring + zero-flag proof, migrator review fixes,
 review round 2 + its fixes, launchpads module, chain-neutral DEX (+ shared id helpers,
 `chains` registry), chain-neutral predictions + its review fixes. Last combined gate on the
 merged state: 593 unit tests, 59/59 ClickHouse tests (run them on a FRESH throwaway
