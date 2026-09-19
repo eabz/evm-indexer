@@ -1607,6 +1607,188 @@ fn fixture_json(
     })
 }
 
+/// The launchpad shapes, and why each is worth a recording.
+const WANTED_LAUNCHPADS: &[(&str, &str)] = &[
+    (
+        "pumpfun_create",
+        "a pump.fun LAUNCH: three Borsh Strings at the front of CreateEvent, \
+         so nothing in it is at a fixed offset, and a bonding curve that \
+         must re-derive as the program's own PDA of the mint",
+    ),
+    (
+        "pumpfun_multi_buy",
+        "ONE transaction holding SEVERAL pump.fun curve trades - the bundle \
+         a sniper sends. Each must stay its own row: a decoder reading \
+         transaction level balances would report one netted trade",
+    ),
+    (
+        "pumpfun_graduation",
+        "the curve moving into PumpSwap. Its \
+         CompletePumpAmmMigrationEvent NAMES the destination pool, which is \
+         the join key that makes a token's chart continue after the curve \
+         is gone - the whole point of the module",
+    ),
+    (
+        "pumpfun_quote_curve",
+        "a pump.fun curve quoted in something other than SOL. sol_amount is \
+         0 and the real leg is in the TradeEvent tail, behind a Borsh \
+         String and a Vec - the case that cost 1.8-11.5% of curve trades",
+    ),
+    (
+        "dbc_launch",
+        "a Meteora DBC launch: EvtInitializePool names the partner CONFIG, \
+         which is how bags.fm and the other front ends are attributed \
+         without ever becoming venues",
+    ),
+    (
+        "launchlab_launch",
+        "a Raydium LaunchLab launch. PoolCreateEvent names NEITHER mint, so \
+         they come from account metas and are proved against the pool's own \
+         PDA seeds",
+    ),
+];
+
+/// Records the launchpad fixtures from live mainnet.
+///
+/// `cargo test --release svm::live_tests::record_launchpad -- --ignored
+/// --nocapture`
+#[tokio::test]
+#[ignore]
+async fn record_launchpad_fixtures() {
+    use crate::svm::{
+        launchpads::SolFamily,
+        programs::{
+            DISC_DBC_INITIALIZE_POOL, DISC_LAUNCHLAB_POOL_CREATE,
+            DISC_PUMPFUN_CREATE, DISC_PUMPFUN_MIGRATED,
+            DISC_PUMPFUN_TRADE_EVENT, EVENT_CPI_PREFIX,
+        },
+    };
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+
+    let mut found: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    let mut used: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    // A graduation is rare - a few hundred a day against millions of
+    // trades - so this sweeps several windows rather than one.
+    let mut window = 0u64;
+    while found.len() < WANTED_LAUNCHPADS.len() && window < 14 {
+        let from = head - HEAD_MARGIN - 120 - window * 900;
+        let batch = source.fetch(from, from + 120).await.expect("fetch");
+        window += 1;
+
+        for slot in &batch.batches {
+            for tx in &slot.transactions {
+                let signature = bs58::encode(tx.signature).into_string();
+                if used.contains(&signature) {
+                    continue;
+                }
+                // Every self-CPI event of a launchpad program, with the
+                // family that emitted it.
+                let events: Vec<(SolFamily, &[u8])> = tx
+                    .instructions
+                    .iter()
+                    .filter(|ix| ix.data.starts_with(&EVENT_CPI_PREFIX))
+                    .filter_map(|ix| {
+                        SolFamily::from_program(&ix.program)
+                            .map(|family| (family, ix.data.as_slice()))
+                    })
+                    .collect();
+                if events.is_empty() {
+                    continue;
+                }
+                let has = |family: SolFamily, disc: [u8; 8]| {
+                    events.iter().any(|(f, data)| {
+                        *f == family && data.get(8..16) == Some(&disc[..])
+                    })
+                };
+
+                let mut take = |name: &'static str, why: &'static str| {
+                    if found.contains_key(name)
+                        || used.contains(&signature)
+                    {
+                        return;
+                    }
+                    found.insert(name, fixture_json(name, why, slot, tx));
+                    used.insert(signature.clone());
+                };
+
+                if has(SolFamily::PumpFun, DISC_PUMPFUN_MIGRATED) {
+                    take("pumpfun_graduation", WANTED_LAUNCHPADS[2].1);
+                }
+                if has(SolFamily::PumpFun, DISC_PUMPFUN_CREATE) {
+                    take("pumpfun_create", WANTED_LAUNCHPADS[0].1);
+                }
+                if has(SolFamily::MeteoraDbc, DISC_DBC_INITIALIZE_POOL) {
+                    take("dbc_launch", WANTED_LAUNCHPADS[4].1);
+                }
+                if has(
+                    SolFamily::RaydiumLaunchlab,
+                    DISC_LAUNCHLAB_POOL_CREATE,
+                ) {
+                    take("launchlab_launch", WANTED_LAUNCHPADS[5].1);
+                }
+
+                // A bundle: more than one curve TradeEvent in one
+                // transaction.
+                let trades = events
+                    .iter()
+                    .filter(|(family, data)| {
+                        *family == SolFamily::PumpFun
+                            && data.get(8..16)
+                                == Some(&DISC_PUMPFUN_TRADE_EVENT[..])
+                    })
+                    .count();
+                if trades > 1 {
+                    take("pumpfun_multi_buy", WANTED_LAUNCHPADS[1].1);
+                }
+
+                // A curve quoted in something other than SOL: the event's
+                // own tail says so.
+                let quote_curve = events.iter().any(|(family, data)| {
+                    *family == SolFamily::PumpFun
+                        && crate::svm::events::PumpFunTrade::parse(data)
+                            .is_some_and(|event| {
+                                event.sol_amount == 0
+                                    && event.token_amount > 0
+                            })
+                });
+                if quote_curve {
+                    take("pumpfun_quote_curve", WANTED_LAUNCHPADS[3].1);
+                }
+            }
+        }
+        println!(
+            "  window {window}: have {} of {} ({:?})",
+            found.len(),
+            WANTED_LAUNCHPADS.len(),
+            found.keys().collect::<Vec<_>>()
+        );
+    }
+
+    for (name, why) in WANTED_LAUNCHPADS {
+        if !found.contains_key(name) {
+            println!("  MISSING {name}: {why}");
+        }
+    }
+
+    let out: Vec<serde_json::Value> = found.into_values().collect();
+    let path = "src/svm/fixtures/launchpads.json";
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&out).expect("serialise"),
+    )
+    .expect("write fixtures");
+    println!("\nwrote {} fixtures to {path}", out.len());
+}
+
 /// Scans live slots for the four wanted shapes and records the first of
 /// each.
 #[tokio::test]

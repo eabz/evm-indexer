@@ -27,6 +27,10 @@ pub mod venues;
 #[cfg(test)]
 mod tests;
 
+/// The launchpad decoders, on their own recorded transactions.
+#[cfg(test)]
+mod launchpad_tests;
+
 #[cfg(test)]
 mod integration_tests;
 
