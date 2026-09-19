@@ -128,6 +128,23 @@ Layers, outermost first:
       new_hash, depth, blocks_purged) — audit + metric.
    5. Evict anything cached from the purged range (pending token / pool discoveries).
 
+**Deletes must be serialized and verified (ClickHouse 25.12 loses concurrent deletes).**
+Reproduced with plain `clickhouse-client`: two clients running `DELETE` (lightweight or
+`ALTER .. DELETE`, even with `mutations_sync` / `lightweight_deletes_sync = 2`) on the
+same table at the same time both return OK, every mutation reports `is_done = 1`, yet one
+of them leaves its rows behind. Therefore `purge_range` and bucket repair:
+   - never issue two deletes in parallel, not even on different tables of one purge;
+   - hold a **database-wide purge lock** shared by every indexer process on that database
+     (same atomic `CREATE TABLE` lock-table technique as the migration runner, with
+     heartbeat and stale takeover) for the whole purge;
+   - after every delete, **verify** `count() = 0` for the predicate (`FINAL` not needed:
+     lightweight-deleted rows are already masked) and re-issue up to N times; still
+     non-zero = fatal, never continue on a half-purged range;
+   - inserts are unaffected and stay concurrent.
+   Rejected alternative, kept for the record: insert-only tombstones via
+   `ReplacingMergeTree(_version, is_deleted)`; avoids mutations entirely but forces every
+   reader and every MV to handle tombstones. Revisit if purges ever become frequent.
+
 The list of block-scoped tables is code, not convention:
 `db::BLOCK_SCOPED_TABLES` + `dex::BLOCK_SCOPED_TABLES`, children before `blocks`. A unit
 test asserts every table in the migrations that has a `block_number` column is listed.
