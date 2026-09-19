@@ -57,10 +57,16 @@ no longer see it.
 
 Totals cannot be crossed out row by row, so they work with generations:
 every row carries the chain's **epoch**, a counter that goes up by one with
-every rollback. A rollback says "for this chain, from day D on, only count
-what belongs to epoch 7 or newer", recomputes those days under epoch 7, and
-from then on new rows are stamped 7. Older numbers for those days are still
-on disk but no longer counted; days before D are untouched.
+every rollback. A rollback says "for this chain, from day D up to (but not
+including) day E, only count what belongs to epoch 7 or newer", recomputes
+exactly those days under epoch 7, and from then on new rows are stamped 7.
+Older numbers for those days are still on disk but no longer counted; days
+outside D..E are untouched.
+
+D is the day of the oldest row the rollback removed, E the day after the
+newest one - a rollback only ever invalidates the days its own rows
+contributed to. That is why healing one block eleven years back costs one
+day of recomputation and not eleven years of it.
 
 The order of a rollback:
 
@@ -72,11 +78,14 @@ The order of a rollback:
    what is really there.
 3. Cross out the transactions, logs, transfers, DEX rows ... of the range.
    Repeated until a count confirms none is left. Then work out the first
-   day that is affected.
+   and the last day that are affected.
 4. Write one line into the `reorgs` table. From this moment the affected
    days only count the new epoch, so for a moment they show too *little*
    (never too much).
-5. Recompute the totals of the affected days from what is left.
+5. Recompute the totals of the affected days from what is left - exactly
+   the days line 4 hid, no more (recomputing further would count the days
+   past them twice) and no less (a hidden day nobody recomputes reads as
+   empty for ever).
 6. Cross out the **blocks** of the range. Last, on purpose (next section).
 7. Check the **read-path copies** and repair them if needed (next section).
 8. Write the `reorgs` line again, marked *finished*.
@@ -144,7 +153,7 @@ Log lines (level WARN for a rollback, INFO for a gap heal):
 
 ```
 Chain 1: REORG detected. Stored block 19000123 has hash 0xaaaa.. but the chain now has 0xbbbb.. there. Rolling back 2 block(s) from block 19000122 (stored head 19000123).
-Chain 1: rolled back blocks [19000122, head]: 2 blocks, 431 rows, 1 checkpoints tombstoned, aggregates rebuilt from unix time 1767225600; epoch is now 4 (212ms).
+Chain 1: rolled back blocks [19000122, head]: 2 blocks, 431 rows, 1 checkpoints tombstoned, aggregates rebuilt over unix time [1767225600, 1767312000); epoch is now 4 (212ms).
 Chain 1: healed gap [18999000, 18999250) left by an interrupted write: 9120 rows tombstoned, ...
 ```
 
@@ -206,10 +215,11 @@ Raise it only when the error appears and you have checked the endpoint.
   only removes the segment that was proven wrong; the blocks above are
   checked when streaming reaches them.
 * Blocks below `--start-block` are never examined or removed.
-* After a rollback, totals are recomputed from the first affected *day* to
-  now. For a reorg at the tip that is today's numbers. For a heal deep in
-  history (a crash during a backfill of old blocks) it re-aggregates
-  everything since that day: correct, but it can take a while.
+* After a rollback, totals are recomputed for the affected *days* only -
+  from the day of the oldest removed row to the day of the newest one. For
+  a reorg at the tip that is today's numbers; for a heal deep in history
+  (a crash during a backfill of old blocks) it is the days those old
+  blocks fall on, not everything since.
 * While a rollback runs (normally well under a second) the affected days
   read too low, and between steps 3 and 6 a rolled-back block is visible
   without its transactions.

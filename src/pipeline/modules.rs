@@ -773,9 +773,12 @@ pub const LAUNCHPADS: ModuleSpec = ModuleSpec {
     // Plain `block_number` tables: the generic statement built from the
     // embedded migration DDL.
     tombstone_sql: db::tombstone_sql,
-    // Every aggregate reads a CHILD table, so its SQL needs no
-    // `{purge_from}`/`{purge_to}`; it carries `{to_ts}`, so it is sliced
-    // by month.
+    // `plain_rebuild` slices by month and renders `{purge_from}` /
+    // `{purge_to}` when the module's SQL carries them. It does not yet
+    // (patch pending with the launchpads owner, hardening round 2 item
+    // 6): until then the launchpad rebuilds depend on the tombstones of
+    // their child tables being readable, which is what every other
+    // module stopped depending on.
     rebuild_statements: plain_rebuild,
 };
 
