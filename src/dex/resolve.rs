@@ -12,7 +12,7 @@
 //!   answers like this, and the node may simply lag behind the indexed
 //!   head, so nothing is concluded.
 
-use alloy::primitives::{Address, Bytes, B256, U256};
+use alloy::primitives::{Address, Bytes, U256};
 
 use crate::tokens::{
     call_confirmed,
@@ -357,8 +357,9 @@ fn blank_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
         stable: false,
         created_block: 0,
         timestamp: 0,
-        transaction_hash: B256::ZERO,
-        log_index: 0,
+        tx_id: Bytes::new(),
+        tx_index: 0,
+        ordinal: 0,
         source: PoolSource::Rpc,
         attempts: 0,
         epoch: 0,
@@ -808,7 +809,7 @@ mod tests {
         let row = unresolved_pool(1, &candidate(addr(1), Protocol::Curve));
 
         assert_eq!(row.source, PoolSource::Unresolved);
-        assert_eq!((row.created_block, row.log_index), (0, 0));
+        assert_eq!((row.created_block, row.tx_index, row.ordinal), (0, 0, 0));
         assert!(row.tokens.is_empty());
     }
 

@@ -1174,7 +1174,7 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     forged.dex.liquidity.clear();
     forged.dex.pools.clear();
     for swap in &mut forged.dex.swaps {
-        swap.log_index += 1_000;
+        swap.ordinal += 1_000;
     }
     forged.set_version(next_version());
     let key =

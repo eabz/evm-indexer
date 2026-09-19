@@ -22,7 +22,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, B256, I256, U256};
+use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use clickhouse::Client;
 
 use crate::{
@@ -198,8 +198,19 @@ fn addr(value: &Address) -> String {
     bytes(value.as_slice())
 }
 
+/// An identity column: the address left padded to 32 bytes
+/// (docs/design.md §13).
+fn id(value: &Address) -> String {
+    bytes(crate::utils::format::id32(*value).as_slice())
+}
+
 fn word(value: &B256) -> String {
     bytes(value.as_slice())
+}
+
+/// A `tx_id` column: the raw transaction id bytes.
+fn tx(value: &Bytes) -> String {
+    bytes(value.as_ref())
 }
 
 fn int(value: &I256) -> String {
@@ -210,13 +221,13 @@ fn uint(value: &U256) -> String {
     format!("toUInt256('{value}')")
 }
 
-fn addresses(values: &[Address]) -> String {
-    let items: Vec<String> = values.iter().map(addr).collect();
+fn ids(values: &[Address]) -> String {
+    let items: Vec<String> = values.iter().map(id).collect();
     format!("[{}]", items.join(", "))
 }
 
 const SWAP_COLUMNS: &str = "chain, block_number, timestamp, \
-    transaction_hash, log_index, pool_id, emitter, protocol, sender, \
+    tx_id, tx_index, ordinal, pool_id, emitter, protocol, sender, \
     recipient, tx_from, tx_to, trader, amount0, amount1, token_in, \
     token_out, amount_in, amount_out, verified_in, verified_out, reserve0, \
     reserve1, coin_in, coin_out, underlying, \
@@ -224,29 +235,30 @@ const SWAP_COLUMNS: &str = "chain, block_number, timestamp, \
 
 fn swap_sql(swap: &DexSwap) -> String {
     format!(
-        "({}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, \
-         {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "({}, {}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, \
+         {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         swap.chain,
         swap.block_number,
         swap.timestamp,
-        word(&swap.transaction_hash),
-        swap.log_index,
+        tx(&swap.tx_id),
+        swap.tx_index,
+        swap.ordinal,
         word(&swap.pool_id),
-        addr(&swap.emitter),
+        id(&swap.emitter),
         swap.protocol,
-        addr(&swap.sender),
-        addr(&swap.recipient),
-        addr(&swap.tx_from),
-        addr(&swap.tx_to),
-        addr(&swap.trader),
+        id(&swap.sender),
+        id(&swap.recipient),
+        id(&swap.tx_from),
+        id(&swap.tx_to),
+        id(&swap.trader),
         int(&swap.amount0),
         int(&swap.amount1),
-        addr(&swap.token_in),
-        addr(&swap.token_out),
+        id(&swap.token_in),
+        id(&swap.token_out),
         uint(&swap.amount_in),
         uint(&swap.amount_out),
-        addr(&swap.verified_in),
-        addr(&swap.verified_out),
+        id(&swap.verified_in),
+        id(&swap.verified_out),
         uint(&swap.reserve0),
         uint(&swap.reserve1),
         swap.coin_in,
@@ -262,27 +274,28 @@ fn swap_sql(swap: &DexSwap) -> String {
 }
 
 const LIQUIDITY_COLUMNS: &str = "chain, block_number, timestamp, \
-    transaction_hash, log_index, pool_id, emitter, protocol, kind, sender, \
+    tx_id, tx_index, ordinal, pool_id, emitter, protocol, kind, sender, \
     owner, tx_from, tx_to, amount0, amount1, reserve0, reserve1, \
     liquidity_delta, tick_lower, tick_upper, epoch, _version";
 
 fn liquidity_sql(row: &DexLiquidity) -> String {
     format!(
         "({}, {}, {}, {}, {}, {}, {}, '{}', '{}', {}, {}, {}, {}, {}, {}, \
-         {}, {}, {}, {}, {}, {}, {})",
+         {}, {}, {}, {}, {}, {}, {}, {})",
         row.chain,
         row.block_number,
         row.timestamp,
-        word(&row.transaction_hash),
-        row.log_index,
+        tx(&row.tx_id),
+        row.tx_index,
+        row.ordinal,
         word(&row.pool_id),
-        addr(&row.emitter),
+        id(&row.emitter),
         row.protocol,
         row.kind,
-        addr(&row.sender),
-        addr(&row.owner),
-        addr(&row.tx_from),
-        addr(&row.tx_to),
+        id(&row.sender),
+        id(&row.owner),
+        id(&row.tx_from),
+        id(&row.tx_to),
         int(&row.amount0),
         int(&row.amount1),
         uint(&row.reserve0),
@@ -297,30 +310,31 @@ fn liquidity_sql(row: &DexLiquidity) -> String {
 
 const POOL_COLUMNS: &str = "chain, pool_id, emitter, factory, protocol, \
     token0, token1, tokens, underlying_tokens, fee, tick_spacing, hooks, \
-    stable, created_block, timestamp, transaction_hash, log_index, source, \
+    stable, created_block, timestamp, tx_id, tx_index, ordinal, source, \
     attempts, epoch, _version";
 
 fn pool_sql(pool: &DexPool) -> String {
     format!(
         "({}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \
-         {}, '{}', {}, {}, {})",
+         {}, {}, '{}', {}, {}, {})",
         pool.chain,
         word(&pool.pool_id),
-        addr(&pool.emitter),
-        addr(&pool.factory),
+        id(&pool.emitter),
+        id(&pool.factory),
         pool.protocol,
-        addr(&pool.token0),
-        addr(&pool.token1),
-        addresses(&pool.tokens),
-        addresses(&pool.underlying_tokens),
+        id(&pool.token0),
+        id(&pool.token1),
+        ids(&pool.tokens),
+        ids(&pool.underlying_tokens),
         pool.fee,
         pool.tick_spacing,
-        addr(&pool.hooks),
+        id(&pool.hooks),
         pool.stable,
         pool.created_block,
         pool.timestamp,
-        word(&pool.transaction_hash),
-        pool.log_index,
+        tx(&pool.tx_id),
+        pool.tx_index,
+        pool.ordinal,
         pool.source,
         pool.attempts,
         pool.epoch,
@@ -711,8 +725,9 @@ fn rpc_pool(
         stable: false,
         created_block: 0,
         timestamp: 0,
-        transaction_hash: B256::ZERO,
-        log_index: 0,
+        tx_id: Bytes::new(),
+        tx_index: 0,
+        ordinal: 0,
         source: PoolSource::Rpc,
         attempts: 0,
         epoch: 0,

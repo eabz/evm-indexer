@@ -154,6 +154,165 @@ impl<'de> DeserializeAs<'de, Option<B256>> for SerTopic {
     }
 }
 
+/// The 32 byte chain-neutral identity of an EVM address: 12 zero bytes
+/// followed by the 20 address bytes (docs/design.md section 13).
+#[inline]
+pub fn id32(address: Address) -> B256 {
+    address.into_word()
+}
+
+/// Inverse of [`id32`]. `None` when the 12 leading bytes are NOT all zero,
+/// i.e. the id is not an EVM address: a Solana pubkey, or a native 32 byte
+/// id such as a Uniswap V4 pool id or a Balancer pool id. Callers must
+/// treat `None` as "do not render this as an address", never as an error to
+/// paper over by truncating.
+#[inline]
+pub fn address_of_id32(id: B256) -> Option<Address> {
+    id.0[..12]
+        .iter()
+        .all(|byte| *byte == 0)
+        .then(|| Address::from_word(id))
+}
+
+/// `Address` <-> `FixedString(32)`: the identity encoding every analytics
+/// (`dex_*`, `launchpad_*`, `prediction_*`) identity column uses. Writing
+/// left pads with 12 zero bytes; reading REFUSES a non-zero padding instead
+/// of truncating, so a 32 byte non-EVM id can never be silently mangled
+/// into an address.
+pub struct SerId32(());
+
+impl SerializeAs<Address> for SerId32 {
+    #[inline]
+    fn serialize_as<S>(
+        value: &Address,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let bytes: &[u8; 32] = &id32(*value).0;
+        bytes.serialize(serializer)
+    }
+}
+
+impl<'de> DeserializeAs<'de, Address> for SerId32 {
+    fn deserialize_as<D>(deserializer: D) -> Result<Address, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let id = <[u8; 32]>::deserialize(deserializer).map(B256::from)?;
+        address_of_id32(id).ok_or_else(|| {
+            de::Error::custom(format!(
+                "id {id} is not an EVM address: the 12 leading bytes are \
+                 not zero"
+            ))
+        })
+    }
+}
+
+/// `Vec<Address>` <-> `Array(FixedString(32))`, element wise [`SerId32`].
+pub struct SerVecId32(());
+
+impl SerializeAs<Vec<Address>> for SerVecId32 {
+    fn serialize_as<S>(
+        value: &Vec<Address>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let raw: Vec<[u8; 32]> =
+            value.iter().map(|address| id32(*address).0).collect();
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> DeserializeAs<'de, Vec<Address>> for SerVecId32 {
+    fn deserialize_as<D>(deserializer: D) -> Result<Vec<Address>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw: Vec<[u8; 32]> = Deserialize::deserialize(deserializer)?;
+        raw.into_iter()
+            .map(|bytes| {
+                let id = B256::from(bytes);
+                address_of_id32(id).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "id {id} is not an EVM address: the 12 leading \
+                         bytes are not zero"
+                    ))
+                })
+            })
+            .collect()
+    }
+}
+
+/// The `tx_id` of an EVM transaction: the 32 raw bytes of its hash. The
+/// column is a `String` because a Solana signature is 64 bytes
+/// (docs/design.md section 13); it is never part of a sorting key.
+#[inline]
+pub fn tx_id(hash: B256) -> Bytes {
+    Bytes::copy_from_slice(hash.as_slice())
+}
+
+/// Inverse of [`tx_id`]. `None` unless the id is exactly 32 bytes, i.e. it
+/// is not an EVM transaction hash.
+#[inline]
+pub fn tx_hash_of(tx_id: &[u8]) -> Option<B256> {
+    tx_id.first_chunk::<32>().filter(|_| tx_id.len() == 32).map(B256::from)
+}
+
+/// Raw transaction id bytes <-> a `String` column: 32 bytes on EVM, 64 on
+/// Solana, never hex and never utf-8. Implemented for both `Bytes` and
+/// `Vec<u8>` so every module can pick the type that suits its rows.
+pub struct SerTxId(());
+
+impl SerializeAs<Bytes> for SerTxId {
+    #[inline]
+    fn serialize_as<S>(
+        value: &Bytes,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value.as_ref())
+    }
+}
+
+impl<'de> DeserializeAs<'de, Bytes> for SerTxId {
+    #[inline]
+    fn deserialize_as<D>(deserializer: D) -> Result<Bytes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        SerBytes::deserialize_as(deserializer)
+    }
+}
+
+impl SerializeAs<Vec<u8>> for SerTxId {
+    #[inline]
+    fn serialize_as<S>(
+        value: &Vec<u8>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+}
+
+impl<'de> DeserializeAs<'de, Vec<u8>> for SerTxId {
+    #[inline]
+    fn deserialize_as<D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        SerBytes::deserialize_as(deserializer).map(|bytes| bytes.into())
+    }
+}
+
 /// `U256` <-> `UInt256`: four little endian `u64` limbs, least significant
 /// first, i.e. 32 little endian bytes on the wire.
 pub struct SerU256(());
