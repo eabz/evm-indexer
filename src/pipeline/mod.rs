@@ -82,12 +82,7 @@ impl Progress for Database {
     }
 
     async fn block_hash(&self, number: u64) -> Result<Option<B256>> {
-        match Database::block_hash(self, number).await? {
-            Some(hash) => Ok(Some(
-                hash.parse::<B256>().context("parse stored block hash")?,
-            )),
-            None => Ok(None),
-        }
+        Database::block_hash(self, number).await
     }
 }
 
@@ -147,7 +142,6 @@ pub async fn run(config: Config) -> Result<()> {
         config.chain_id,
         config.hypersync_url.as_deref(),
         &config.hypersync_token,
-        config.traces,
     )?;
 
     // The default endpoint is derived from the chain id; only a custom url

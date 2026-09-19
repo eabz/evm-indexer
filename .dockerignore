@@ -1,0 +1,19 @@
+# Allow-list: nothing enters the build context unless it is named below.
+# This keeps `.env` (API token), `.git`, `target/`, `docs/` and local agent
+# tooling (.claude/, .tirith/, .serena/) out of the image layers and makes
+# the context a few hundred kB instead of gigabytes.
+*
+
+# What `cargo build --locked --bin indexer` needs:
+!Cargo.toml
+!Cargo.lock
+# build.rs embeds migrations/*.sql into the binary.
+!build.rs
+!migrations/
+!bin/
+!src/
+
+# ...minus what it does not need (later rules win).
+**/*.md
+**/.DS_Store
+**/*.swp

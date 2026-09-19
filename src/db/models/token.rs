@@ -5,6 +5,12 @@ use serde_with::serde_as;
 
 use crate::utils::format::SerAddress;
 
+/// Row of `tokens`. Field names are the column names.
+///
+/// No `_version` field on purpose: token metadata is written by the token
+/// worker outside of the block flushes, so `tokens._version` is assigned
+/// by the server (`DEFAULT` now, in ms) and the column is simply not part
+/// of the insert.
 #[serde_as]
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct DatabaseToken {

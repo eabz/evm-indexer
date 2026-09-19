@@ -10,24 +10,29 @@ use crate::utils::{
 };
 
 #[serde_as]
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct DatabaseWithdrawal {
+    pub chain: u64,
+    pub block_number: u64,
+    pub withdrawal_index: u64,
+    pub validator_index: u64,
     #[serde_as(as = "SerAddress")]
     pub address: Address,
     #[serde_as(as = "SerU256")]
     pub amount: U256,
-    pub block_number: u32,
-    pub chain: u64,
     pub timestamp: u32,
-    pub validator_index: u64,
-    pub withdrawal_index: u64,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
+    /// Stamped once per flush, see `RowBatch::set_version`.
+    pub _version: u64,
 }
 
 impl DatabaseWithdrawal {
     pub fn from_hypersync(
         withdrawal: &Withdrawal,
         chain: u64,
-        block_number: u32,
+        block_number: u64,
         timestamp: u32,
     ) -> Self {
         Self {
@@ -54,6 +59,8 @@ impl DatabaseWithdrawal {
                 .as_ref()
                 .map(quantity_to_u64)
                 .unwrap_or_default(),
+            epoch: 0,
+            _version: 0,
         }
     }
 }

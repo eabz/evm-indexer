@@ -3,11 +3,11 @@
 use crate::{
     db::{
         models::{
-            block::DatabaseBlock, contract::DatabaseContract,
+            block::DatabaseBlock,
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
             erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            trace::DatabaseTrace, transaction::DatabaseTransaction,
+            transaction::DatabaseTransaction,
             withdrawal::DatabaseWithdrawal,
         },
         ranges::BlockRange,
@@ -19,10 +19,10 @@ use crate::{
         ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
     },
 };
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, U256};
 use anyhow::{bail, Context, Result};
-use hypersync_client::simple_types::{Block, Log, Trace, Transaction};
-use std::collections::{HashMap, HashSet};
+use hypersync_client::simple_types::{Block, Log, Transaction};
+use std::collections::HashMap;
 
 /// Rows of one response plus the token contracts seen in its transfers.
 #[derive(Debug, Default)]
@@ -39,13 +39,12 @@ pub struct ResponseRows {
     pub blocks: Vec<Vec<Block>>,
     pub transactions: Vec<Vec<Transaction>>,
     pub logs: Vec<Vec<Log>>,
-    pub traces: Vec<Vec<Trace>>,
 }
 
-/// Per block values joined into the transaction / log / withdrawal rows.
+/// Per block values joined into the rows of the block's children.
 struct BlockContext {
     timestamp: u32,
-    base_fee_per_gas: Option<u64>,
+    base_fee_per_gas: Option<U256>,
 }
 
 /// Converts a response covering exactly the blocks of `covered`.
@@ -121,8 +120,8 @@ pub fn transform(
         })
     };
 
-    let mut contracts_seen: HashSet<Address> = HashSet::new();
-
+    // Deployed contracts are not rows: `contracts` is a view over these
+    // transactions (docs/design.md, section 9).
     for transaction in data.transactions.iter().flatten() {
         let number = transaction
             .block_number
@@ -131,73 +130,12 @@ pub fn transform(
 
         let context = context_of(number, "transaction")?;
 
-        let row = DatabaseTransaction::from_hypersync(
+        rows.transactions.push(DatabaseTransaction::from_hypersync(
             transaction,
             chain,
             context.timestamp,
             context.base_fee_per_gas,
-        )?;
-
-        if let Some(contract) = DatabaseContract::from_transaction(&row) {
-            if contracts_seen.insert(contract.contract_address) {
-                rows.contracts.push(contract);
-            }
-        }
-
-        rows.transactions.push(row);
-    }
-
-    // Transactions that failed: everything they did was rolled back,
-    // including contracts created by their inner calls.
-    let failed_transactions: HashSet<B256> = rows
-        .transactions
-        .iter()
-        .filter(|transaction| {
-            transaction.status.as_deref() == Some("failure")
-        })
-        .map(|transaction| transaction.hash)
-        .collect();
-
-    rows.traces = data
-        .traces
-        .iter()
-        .flatten()
-        .map(|trace| DatabaseTrace::from_hypersync(trace, chain))
-        .collect::<Result<_>>()?;
-
-    // Calls that reverted, per transaction: a create below one of them was
-    // rolled back even though the create trace itself reports no error.
-    let mut reverted_calls: HashMap<B256, Vec<&[u16]>> = HashMap::new();
-    for trace in &rows.traces {
-        if let (Some(hash), Some(_)) =
-            (trace.transaction_hash, &trace.error)
-        {
-            reverted_calls
-                .entry(hash)
-                .or_default()
-                .push(trace.trace_address.as_slice());
-        }
-    }
-
-    for trace in &rows.traces {
-        let Some(contract) = DatabaseContract::from_trace(trace) else {
-            continue;
-        };
-
-        let rolled_back = failed_transactions
-            .contains(&contract.transaction_hash)
-            || reverted_calls.get(&contract.transaction_hash).is_some_and(
-                |reverted| {
-                    reverted.iter().any(|ancestor| {
-                        is_proper_prefix(ancestor, &trace.trace_address)
-                    })
-                },
-            );
-
-        if !rolled_back && contracts_seen.insert(contract.contract_address)
-        {
-            rows.contracts.push(contract);
-        }
+        )?);
     }
 
     let mut tokens_seen: HashMap<Address, TokenStandard> = HashMap::new();
@@ -219,12 +157,6 @@ pub fn transform(
     }
 
     Ok(Transformed { rows, tokens_seen })
-}
-
-/// True when `ancestor` is a strict prefix of `path`, i.e. the trace at
-/// `ancestor` is a (transitive) parent of the trace at `path`.
-fn is_proper_prefix(ancestor: &[u16], path: &[u16]) -> bool {
-    ancestor.len() < path.len() && path.starts_with(ancestor)
 }
 
 /// ERC20 / ERC721 / ERC1155 transfers are decoded from the generic logs.
@@ -267,7 +199,6 @@ fn decode_transfers(
 mod tests {
     use super::*;
     use crate::db::models::log::test_support::word;
-    use alloy::primitives::U256;
     use hypersync_client::format::{
         Address as HsAddress, Data, Hash, LogArgument, Quantity,
         TransactionStatus, UInt, Withdrawal,
@@ -345,7 +276,6 @@ mod tests {
                 transfer_log(10, 0, 0x20, 3),
                 transfer_log(11, 0, 0x21, 4),
             ]],
-            traces: vec![],
         };
 
         let out =
@@ -359,12 +289,14 @@ mod tests {
         );
         assert_eq!(rows.blocks[0].transactions, 2);
         assert_eq!(rows.blocks[1].transactions, 1);
-        assert!(rows.blocks.iter().all(|b| !b.is_uncle));
 
         // Timestamp / base fee joined by block number.
         assert_eq!(rows.transactions[0].timestamp, 1_000);
         assert_eq!(rows.transactions[2].timestamp, 2_000);
-        assert_eq!(rows.transactions[0].base_fee_per_gas, Some(7));
+        assert_eq!(
+            rows.transactions[0].base_fee_per_gas,
+            Some(U256::from(7u64))
+        );
         assert_eq!(rows.logs[0].timestamp, 1_000);
         assert_eq!(rows.logs[1].timestamp, 2_000);
 
@@ -439,7 +371,9 @@ mod tests {
     }
 
     #[test]
-    fn contracts_come_from_transactions_and_create_traces() {
+    fn deployments_stay_in_the_transaction_row() {
+        // `contracts` is a view over transactions: what it needs is the
+        // created address, the sender, the status and the timestamp.
         let mut deployment = transaction(1, 0, 0xd1);
         deployment.contract_address = Some(HsAddress::from([0xc1; 20]));
 
@@ -447,166 +381,48 @@ mod tests {
         failed.contract_address = Some(HsAddress::from([0xc2; 20]));
         failed.status = Some(TransactionStatus::Failure);
 
-        let create = |address: u8, error: Option<&str>| Trace {
-            block_number: Some(1),
-            type_: Some("create".to_string()),
-            from: Some(HsAddress::from([0xfa; 20])),
-            address: Some(HsAddress::from([address; 20])),
-            transaction_hash: Some(Hash::from([0xd3; 32])),
-            error: error.map(str::to_string),
-            ..Default::default()
-        };
-
         let data = ResponseRows {
-            blocks: vec![vec![block(1, 1)]],
+            blocks: vec![vec![block(1, 1_234)]],
             transactions: vec![vec![deployment, failed]],
-            traces: vec![vec![
-                // Same contract as the deployment transaction: deduped.
-                create(0xc1, None),
-                // Deployed by a factory.
-                create(0xc3, None),
-                // Reverted creation.
-                create(0xc4, Some("Reverted")),
-                Trace {
-                    block_number: Some(1),
-                    type_: Some("call".to_string()),
-                    ..Default::default()
-                },
-            ]],
             ..Default::default()
         };
 
         let rows =
             transform(CHAIN, &data, BlockRange::new(1, 2)).unwrap().rows;
 
-        let contracts: Vec<Address> =
-            rows.contracts.iter().map(|c| c.contract_address).collect();
-
         assert_eq!(
-            contracts,
-            vec![Address::repeat_byte(0xc1), Address::repeat_byte(0xc3)]
+            rows.transactions[0].created_contract(),
+            Some(Address::repeat_byte(0xc1))
         );
-        assert_eq!(rows.contracts[0].creator, Address::repeat_byte(0x0f));
-        assert_eq!(rows.contracts[1].creator, Address::repeat_byte(0xfa));
-        assert_eq!(rows.traces.len(), 4);
+        assert_eq!(
+            rows.transactions[0].status.as_deref(),
+            Some("success")
+        );
+        assert_eq!(rows.transactions[0].from, Address::repeat_byte(0x0f));
+        assert_eq!(rows.transactions[0].timestamp, 1_234);
+        assert_eq!(
+            rows.transactions[1].status.as_deref(),
+            Some("failure")
+        );
     }
 
     #[test]
-    fn proper_prefix() {
-        assert!(is_proper_prefix(&[], &[0]));
-        assert!(is_proper_prefix(&[0], &[0, 1]));
-        assert!(is_proper_prefix(&[0], &[0, 1, 2]));
-        // A trace is not its own ancestor.
-        assert!(!is_proper_prefix(&[0, 1], &[0, 1]));
-        // Siblings / other branches / descendants.
-        assert!(!is_proper_prefix(&[1], &[0, 1]));
-        assert!(!is_proper_prefix(&[0, 1, 2], &[0, 1]));
-        assert!(!is_proper_prefix(&[], &[]));
-    }
-
-    fn create_trace(tx: u8, path: &[u64], address: u8) -> Trace {
-        Trace {
-            block_number: Some(1),
-            type_: Some("create".to_string()),
-            from: Some(HsAddress::from([0xfa; 20])),
-            address: Some(HsAddress::from([address; 20])),
-            transaction_hash: Some(Hash::from([tx; 32])),
-            trace_address: Some(path.to_vec()),
-            ..Default::default()
-        }
-    }
-
-    fn call_trace(tx: u8, path: &[u64], error: Option<&str>) -> Trace {
-        Trace {
-            block_number: Some(1),
-            type_: Some("call".to_string()),
-            transaction_hash: Some(Hash::from([tx; 32])),
-            trace_address: Some(path.to_vec()),
-            error: error.map(str::to_string),
-            ..Default::default()
-        }
-    }
-
-    fn contracts_of(data: &ResponseRows) -> Vec<Address> {
-        transform(CHAIN, data, BlockRange::new(1, 2))
-            .unwrap()
-            .rows
-            .contracts
-            .iter()
-            .map(|contract| contract.contract_address)
-            .collect()
-    }
-
-    #[test]
-    fn creations_of_a_failed_transaction_are_not_contracts() {
-        let mut failed = transaction(1, 0, 0xe1);
-        failed.status = Some(TransactionStatus::Failure);
+    fn erc721_transfer_of_token_id_zero_is_not_an_erc20_transfer() {
+        let mut log = transfer_log(10, 0, 0x21, 4);
+        log.topics[3] = Some(LogArgument::from([0u8; 32]));
 
         let data = ResponseRows {
-            blocks: vec![vec![block(1, 1)]],
-            transactions: vec![vec![failed, transaction(1, 1, 0xe2)]],
-            traces: vec![vec![
-                // The inner create "succeeded" but the transaction ran out
-                // of gas afterwards: rolled back.
-                call_trace(0xe1, &[], Some("out of gas")),
-                create_trace(0xe1, &[0], 0xc1),
-                // Same shape in a successful transaction: kept.
-                call_trace(0xe2, &[], None),
-                create_trace(0xe2, &[0], 0xc2),
-            ]],
+            blocks: vec![vec![block(10, 1)]],
+            logs: vec![vec![log]],
             ..Default::default()
         };
 
-        assert_eq!(contracts_of(&data), vec![Address::repeat_byte(0xc2)]);
-
-        // The traces themselves are all stored.
         let rows =
-            transform(CHAIN, &data, BlockRange::new(1, 2)).unwrap().rows;
-        assert_eq!(rows.traces.len(), 4);
-    }
+            transform(CHAIN, &data, BlockRange::new(10, 11)).unwrap().rows;
 
-    #[test]
-    fn creations_below_a_reverted_call_are_not_contracts() {
-        // The transaction succeeds (the caller catches the revert), but
-        // the sub call [0] reverted: everything below it is rolled back.
-        let data = ResponseRows {
-            blocks: vec![vec![block(1, 1)]],
-            transactions: vec![vec![transaction(1, 0, 0xe1)]],
-            traces: vec![vec![
-                call_trace(0xe1, &[], None),
-                call_trace(0xe1, &[0], Some("Reverted")),
-                // Direct child and deeper descendant of the reverted call.
-                create_trace(0xe1, &[0, 0], 0xc1),
-                call_trace(0xe1, &[0, 1], None),
-                create_trace(0xe1, &[0, 1, 0], 0xc2),
-                // Sibling branch that did not revert: kept.
-                call_trace(0xe1, &[1], None),
-                create_trace(0xe1, &[1, 0], 0xc3),
-                // Same path in ANOTHER transaction is unrelated: kept.
-                create_trace(0xe9, &[0, 0], 0xc4),
-            ]],
-            ..Default::default()
-        };
-
-        assert_eq!(
-            contracts_of(&data),
-            vec![Address::repeat_byte(0xc3), Address::repeat_byte(0xc4)]
-        );
-    }
-
-    #[test]
-    fn a_reverted_call_after_the_create_in_trace_order_still_counts() {
-        // Ancestors normally come first, but do not depend on the order.
-        let data = ResponseRows {
-            blocks: vec![vec![block(1, 1)]],
-            transactions: vec![vec![transaction(1, 0, 0xe1)]],
-            traces: vec![vec![
-                create_trace(0xe1, &[2, 0], 0xc1),
-                call_trace(0xe1, &[2], Some("Reverted")),
-            ]],
-            ..Default::default()
-        };
-
-        assert!(contracts_of(&data).is_empty());
+        assert_eq!(rows.logs[0].topic_count, 4);
+        assert_eq!(rows.erc721_transfers.len(), 1);
+        assert_eq!(rows.erc721_transfers[0].id, U256::ZERO);
+        assert!(rows.erc20_transfers.is_empty());
     }
 }

@@ -1,25 +1,66 @@
+pub mod derived;
 #[cfg(test)]
 mod integration_tests;
+pub mod migrate;
 pub mod models;
 pub mod ranges;
+pub mod schema;
 
+pub use schema::{
+    block_number_column, tables_with_block_number, tombstone_sql,
+    BASE_TABLES, SIDE_TABLES,
+};
+
+use alloy::primitives::B256;
 use anyhow::{anyhow, bail, Context, Result};
 use clickhouse::{Client, Row};
 use log::{info, warn};
 use models::{
-    block::DatabaseBlock, contract::DatabaseContract,
-    erc1155_transfer::DatabaseERC1155Transfer,
+    block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-    token::DatabaseToken, trace::DatabaseTrace,
-    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
+    token::DatabaseToken, transaction::DatabaseTransaction,
+    withdrawal::DatabaseWithdrawal,
 };
 use ranges::{
     assemble_missing_ranges, gaps_sql, is_dense, stats_sql, BlockRange,
     GapRow, MissingRanges, RangeStats, MAX_GAPS_PER_PASS,
 };
 use serde::Serialize;
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+/// Last `_version` handed out by [`next_version`].
+static LAST_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// `_version` for a flush: unix time in milliseconds, taken ONCE per flush
+/// and stamped on every row of it (`RowBatch::set_version`).
+///
+/// Strictly increasing inside a process even when the wall clock steps
+/// back, so a later flush of the same block always wins the
+/// `ReplacingMergeTree(_version)` dedup.
+pub fn next_version() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+
+    let mut last = LAST_VERSION.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last + 1);
+        match LAST_VERSION.compare_exchange_weak(
+            last,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(current) => last = current,
+        }
+    }
+}
 
 /// Attempts per table insert before the flush is reported as failed.
 const INSERT_ATTEMPTS: u32 = 6;
@@ -41,14 +82,26 @@ const INSERT_END_TIMEOUT: Duration = Duration::from_secs(180);
 /// Fetching the table schema for the insert (cached after the first time).
 const INSERT_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Sets `$field` on every block scoped row of a [`RowBatch`].
+macro_rules! stamp {
+    ($batch:expr, $field:ident = $value:expr) => {{
+        stamp!(@rows $batch, $field = $value;
+            blocks, logs, transactions, withdrawals,
+            erc20_transfers, erc721_transfers, erc1155_transfers);
+    }};
+    (@rows $batch:expr, $field:ident = $value:expr; $($rows:ident),*) => {$(
+        for row in &mut $batch.$rows {
+            row.$field = $value;
+        }
+    )*};
+}
+
 /// Rows produced from one or more HyperSync responses. Always holds WHOLE
 /// blocks: every row that belongs to a block in `blocks` is in here too.
 #[derive(Debug, Default)]
 pub struct RowBatch {
     pub blocks: Vec<DatabaseBlock>,
-    pub contracts: Vec<DatabaseContract>,
     pub logs: Vec<DatabaseLog>,
-    pub traces: Vec<DatabaseTrace>,
     pub transactions: Vec<DatabaseTransaction>,
     pub withdrawals: Vec<DatabaseWithdrawal>,
     pub erc20_transfers: Vec<DatabaseERC20Transfer>,
@@ -61,9 +114,7 @@ impl RowBatch {
     /// Total rows over all tables.
     pub fn rows(&self) -> usize {
         self.blocks.len()
-            + self.contracts.len()
             + self.logs.len()
-            + self.traces.len()
             + self.transactions.len()
             + self.withdrawals.len()
             + self.erc20_transfers.len()
@@ -79,9 +130,7 @@ impl RowBatch {
     /// Moves every row of `other` into `self`.
     pub fn append(&mut self, other: &mut RowBatch) {
         self.blocks.append(&mut other.blocks);
-        self.contracts.append(&mut other.contracts);
         self.logs.append(&mut other.logs);
-        self.traces.append(&mut other.traces);
         self.transactions.append(&mut other.transactions);
         self.withdrawals.append(&mut other.withdrawals);
         self.erc20_transfers.append(&mut other.erc20_transfers);
@@ -90,12 +139,35 @@ impl RowBatch {
         self.tokens.append(&mut other.tokens);
     }
 
+    /// Stamps `_version` on every block scoped row of the batch. Called
+    /// once per flush with [`next_version`]. (`tokens` rows get their
+    /// version from the server, they are not part of a block.)
+    pub fn set_version(&mut self, version: u64) {
+        stamp!(self, _version = version);
+    }
+
+    /// Stamps the chain's current purge generation on every block scoped
+    /// row of the batch (docs/design.md, section 2). Called once per flush,
+    /// like [`Self::set_version`]: the aggregates file every contribution
+    /// under the epoch of the rows it came from.
+    pub fn set_epoch(&mut self, epoch: u32) {
+        stamp!(self, epoch = epoch);
+    }
+
     /// Lowest and highest block number in the batch.
-    pub fn block_span(&self) -> Option<(u32, u32)> {
+    pub fn block_span(&self) -> Option<(u64, u64)> {
         let min = self.blocks.iter().map(|b| b.number).min()?;
         let max = self.blocks.iter().map(|b| b.number).max()?;
         Some((min, max))
     }
+}
+
+/// A single `FixedString(32)` column.
+#[serde_with::serde_as]
+#[derive(Debug, Row, serde::Deserialize)]
+struct HashRow {
+    #[serde_as(as = "crate::utils::format::SerB256")]
+    hash: B256,
 }
 
 /// Connection settings extracted from the database url.
@@ -300,19 +372,23 @@ impl Database {
         Ok(assemble_missing_ranges(range, stats, &gaps, MAX_GAPS_PER_PASS))
     }
 
-    /// Hash of an indexed canonical block (`0x` hex), if present.
-    pub async fn block_hash(&self, number: u64) -> Result<Option<String>> {
+    /// Hash of an indexed canonical block, if present. `FINAL`: the latest
+    /// version of the row is the canonical one.
+    pub async fn block_hash(&self, number: u64) -> Result<Option<B256>> {
         let query = format!(
-            "SELECT hash FROM blocks WHERE chain = {} AND number = {} \
-             AND is_uncle = false LIMIT 1",
+            "SELECT hash FROM blocks FINAL WHERE chain = {} AND number = {} \
+             LIMIT 1",
             self.chain_id, number
         );
 
-        self.db
+        let row = self
+            .db
             .query(&query)
-            .fetch_optional::<String>()
+            .fetch_optional::<HashRow>()
             .await
-            .context("query block hash")
+            .context("query block hash")?;
+
+        Ok(row.map(|row| row.hash))
     }
 
     /// Stores a batch. Every non-block table is written concurrently, then
@@ -323,9 +399,7 @@ impl Database {
     /// NO block row of this batch was written.
     pub async fn store(&self, batch: &RowBatch) -> Result<()> {
         let results = tokio::join!(
-            self.insert_rows("contracts", &batch.contracts),
             self.insert_rows("logs", &batch.logs),
-            self.insert_rows("traces", &batch.traces),
             self.insert_rows("transactions", &batch.transactions),
             self.insert_rows("withdrawals", &batch.withdrawals),
             self.insert_rows("erc20_transfers", &batch.erc20_transfers),
@@ -337,8 +411,8 @@ impl Database {
             self.insert_rows("tokens", &batch.tokens),
         );
 
-        let (r0, r1, r2, r3, r4, r5, r6, r7, r8) = results;
-        let failures: Vec<String> = [r0, r1, r2, r3, r4, r5, r6, r7, r8]
+        let (r0, r1, r2, r3, r4, r5, r6) = results;
+        let failures: Vec<String> = [r0, r1, r2, r3, r4, r5, r6]
             .into_iter()
             .filter_map(|r| r.err())
             .map(|e| format!("{e:#}"))
@@ -398,11 +472,20 @@ impl Database {
         T: Serialize,
         for<'a> T: Row<Value<'a> = T>,
     {
+        // Validation is OFF for inserts: the crate's schema validation
+        // has no mapping for (U)Int256 and panics on those columns (see
+        // `utils::format`). The rows go out as plain `RowBinary` with an
+        // explicit column list taken from the struct, so the column ORDER
+        // of the table does not matter and columns that are not part of
+        // the struct get their DEFAULT. The integration tests are the
+        // type check: they insert and read back every table.
+        let client = self.db.clone().with_validation(false);
+
         // Timeouts surface as ordinary errors, so the caller retries them
         // like any other failed insert.
         let insert = tokio::time::timeout(
             INSERT_PREPARE_TIMEOUT,
-            self.db.insert::<T>(table),
+            client.insert::<T>(table),
         )
         .await
         .map_err(|_| {
@@ -578,5 +661,37 @@ mod tests {
         assert_eq!(a.rows(), 1);
         assert!(b.is_empty());
         assert_eq!(a.block_span(), None);
+    }
+
+    #[test]
+    fn versions_are_strictly_increasing_unix_milliseconds() {
+        let first = next_version();
+        let second = next_version();
+        let third = next_version();
+
+        assert!(second > first && third > second);
+        // 2020-01-01 in ms: it is a wall clock, not a counter.
+        assert!(first > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn set_version_stamps_every_block_scoped_row() {
+        use crate::db::models::{
+            block::test_support::block_row, log::test_support::log_with,
+        };
+
+        let mut batch = RowBatch::default();
+        batch.blocks.push(block_row(5, 5, 4));
+        batch.blocks.push(block_row(6, 6, 5));
+        batch.logs.push(log_with(&[], vec![]));
+
+        batch.set_version(1_234);
+        batch.set_epoch(7);
+
+        assert!(batch.blocks.iter().all(|row| row._version == 1_234));
+        assert!(batch.logs.iter().all(|row| row._version == 1_234));
+        assert!(batch.blocks.iter().all(|row| row.epoch == 7));
+        assert!(batch.logs.iter().all(|row| row.epoch == 7));
+        assert_eq!(batch.block_span(), Some((5, 6)));
     }
 }

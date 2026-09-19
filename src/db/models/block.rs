@@ -8,56 +8,61 @@ use serde_with::serde_as;
 use crate::utils::{
     convert::{
         address_to_alloy, data_to_bytes, hash_to_b256, nonce_to_b64,
-        quantity_to_u256, quantity_to_u32, quantity_to_u64, sat_u16,
-        sat_u32,
+        quantity_to_u256, quantity_to_u32, quantity_to_u64, sat_u32,
     },
-    format::{SerAddress, SerB256, SerB64, SerBytes, SerU256, SerVecB256},
+    format::{SerAddress, SerB256, SerB64, SerBytes, SerU256},
 };
 
+/// Row of `blocks`. Field names are the column names.
 #[serde_as]
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct DatabaseBlock {
-    pub base_fee_per_gas: Option<u64>,
     pub chain: u64,
-    #[serde_as(as = "SerU256")]
-    pub difficulty: U256,
-    #[serde_as(as = "SerBytes")]
-    pub extra_data: Bytes,
-    pub gas_limit: u32,
-    pub gas_used: u32,
+    pub number: u64,
     #[serde_as(as = "SerB256")]
     pub hash: B256,
-    pub is_uncle: bool,
-    /// Kept as raw bytes (serialized as 0x-hex exactly like before) so a
-    /// chain with a non standard bloom size can never fail a conversion.
-    #[serde_as(as = "SerBytes")]
-    pub logs_bloom: Bytes,
-    #[serde_as(as = "SerAddress")]
-    pub miner: Address,
-    #[serde_as(as = "Option<SerB256>")]
-    pub mix_hash: Option<B256>,
-    #[serde_as(as = "SerB64")]
-    pub nonce: B64,
-    pub number: u32,
     #[serde_as(as = "SerB256")]
     pub parent_hash: B256,
+    pub timestamp: u32,
+    #[serde_as(as = "SerAddress")]
+    pub miner: Address,
+    /// NULL before London.
+    #[serde_as(as = "Option<SerU256>")]
+    pub base_fee_per_gas: Option<U256>,
+    #[serde_as(as = "SerU256")]
+    pub difficulty: U256,
+    /// Zero when not reported.
+    #[serde_as(as = "SerU256")]
+    pub total_difficulty: U256,
+    #[serde_as(as = "SerBytes")]
+    pub extra_data: Bytes,
+    pub gas_limit: u64,
+    pub gas_used: u64,
+    /// Zero bytes when absent.
+    #[serde_as(as = "SerB256")]
+    pub mix_hash: B256,
+    #[serde_as(as = "SerB64")]
+    pub nonce: B64,
     #[serde_as(as = "SerB256")]
     pub receipts_root: B256,
     #[serde_as(as = "SerB256")]
     pub sha3_uncles: B256,
-    pub size: u32,
+    pub size: u64,
     #[serde_as(as = "SerB256")]
     pub state_root: B256,
-    pub timestamp: u32,
-    #[serde_as(as = "Option<SerU256>")]
-    pub total_difficulty: Option<U256>,
-    pub transactions: u16,
+    pub transactions: u32,
     #[serde_as(as = "SerB256")]
     pub transactions_root: B256,
-    #[serde_as(as = "SerVecB256")]
+    #[serde_as(as = "Vec<SerB256>")]
     pub uncles: Vec<B256>,
-    #[serde_as(as = "Option<SerB256>")]
-    pub withdrawals_root: Option<B256>,
+    /// Zero bytes before Shanghai.
+    #[serde_as(as = "SerB256")]
+    pub withdrawals_root: B256,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
+    /// Stamped once per flush, see `RowBatch::set_version`.
+    pub _version: u64,
 }
 
 impl DatabaseBlock {
@@ -84,89 +89,105 @@ impl DatabaseBlock {
             h.as_ref().map(hash_to_b256).unwrap_or_default()
         };
 
+        let opt_u64 = |q: &Option<_>| {
+            q.as_ref().map(quantity_to_u64).unwrap_or_default()
+        };
+
+        let opt_u256 = |q: &Option<_>| {
+            q.as_ref().map(quantity_to_u256).unwrap_or_default()
+        };
+
         Ok(Self {
-            base_fee_per_gas: block
-                .base_fee_per_gas
-                .as_ref()
-                .map(quantity_to_u64),
             chain,
-            difficulty: block
-                .difficulty
-                .as_ref()
-                .map(quantity_to_u256)
-                .unwrap_or_default(),
-            extra_data: block
-                .extra_data
-                .as_ref()
-                .map(data_to_bytes)
-                .unwrap_or_default(),
-            gas_limit: block
-                .gas_limit
-                .as_ref()
-                .map(quantity_to_u32)
-                .unwrap_or_default(),
-            gas_used: block
-                .gas_used
-                .as_ref()
-                .map(quantity_to_u32)
-                .unwrap_or_default(),
+            number,
             hash,
-            // HyperSync does not serve uncle bodies.
-            is_uncle: false,
-            logs_bloom: block
-                .logs_bloom
+            parent_hash: opt_hash(&block.parent_hash),
+            timestamp: block
+                .timestamp
                 .as_ref()
-                .map(data_to_bytes)
+                .map(quantity_to_u32)
                 .unwrap_or_default(),
             miner: block
                 .miner
                 .as_ref()
                 .map(address_to_alloy)
                 .unwrap_or_default(),
-            mix_hash: block.mix_hash.as_ref().map(hash_to_b256),
+            base_fee_per_gas: block
+                .base_fee_per_gas
+                .as_ref()
+                .map(quantity_to_u256),
+            difficulty: opt_u256(&block.difficulty),
+            total_difficulty: opt_u256(&block.total_difficulty),
+            extra_data: block
+                .extra_data
+                .as_ref()
+                .map(data_to_bytes)
+                .unwrap_or_default(),
+            gas_limit: opt_u64(&block.gas_limit),
+            gas_used: opt_u64(&block.gas_used),
+            mix_hash: opt_hash(&block.mix_hash),
             nonce: block
                 .nonce
                 .as_ref()
                 .map(nonce_to_b64)
                 .unwrap_or_default(),
-            number: sat_u32(number),
-            parent_hash: opt_hash(&block.parent_hash),
             receipts_root: opt_hash(&block.receipts_root),
             sha3_uncles: opt_hash(&block.sha3_uncles),
-            size: block
-                .size
-                .as_ref()
-                .map(quantity_to_u32)
-                .unwrap_or_default(),
+            size: opt_u64(&block.size),
             state_root: opt_hash(&block.state_root),
-            timestamp: block
-                .timestamp
-                .as_ref()
-                .map(quantity_to_u32)
-                .unwrap_or_default(),
-            total_difficulty: block
-                .total_difficulty
-                .as_ref()
-                .map(quantity_to_u256),
-            transactions: sat_u16(transactions),
+            transactions: sat_u32(transactions),
             transactions_root: opt_hash(&block.transactions_root),
             uncles: block
                 .uncles
                 .as_ref()
                 .map(|uncles| uncles.iter().map(hash_to_b256).collect())
                 .unwrap_or_default(),
-            withdrawals_root: block
-                .withdrawals_root
-                .as_ref()
-                .map(hash_to_b256),
+            withdrawals_root: opt_hash(&block.withdrawals_root),
+            epoch: 0,
+            _version: 0,
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A block row with only the identity / chain linkage set.
+    pub fn block_row(number: u64, hash: u8, parent: u8) -> DatabaseBlock {
+        DatabaseBlock {
+            chain: 1,
+            number,
+            hash: B256::repeat_byte(hash),
+            parent_hash: B256::repeat_byte(parent),
+            timestamp: 0,
+            miner: Address::ZERO,
+            base_fee_per_gas: None,
+            difficulty: U256::ZERO,
+            total_difficulty: U256::ZERO,
+            extra_data: Bytes::new(),
+            gas_limit: 0,
+            gas_used: 0,
+            mix_hash: B256::ZERO,
+            nonce: B64::ZERO,
+            receipts_root: B256::ZERO,
+            sha3_uncles: B256::ZERO,
+            size: 0,
+            state_root: B256::ZERO,
+            transactions: 0,
+            transactions_root: B256::ZERO,
+            uncles: vec![],
+            withdrawals_root: B256::ZERO,
+            epoch: 0,
+            _version: 0,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hypersync_client::format::{Data, Hash, Quantity};
+    use hypersync_client::format::{Hash, Quantity};
 
     fn minimal() -> Block {
         Block {
@@ -182,13 +203,14 @@ mod tests {
 
         assert_eq!(row.number, 19_000_000);
         assert_eq!(row.transactions, 3);
-        assert!(!row.is_uncle);
         assert_eq!(row.base_fee_per_gas, None);
-        assert_eq!(row.total_difficulty, None);
+        assert_eq!(row.total_difficulty, U256::ZERO);
         assert_eq!(row.difficulty, U256::ZERO);
         assert_eq!(row.nonce, B64::ZERO);
+        assert_eq!(row.mix_hash, B256::ZERO);
+        assert_eq!(row.withdrawals_root, B256::ZERO);
         assert!(row.uncles.is_empty());
-        assert!(row.logs_bloom.is_empty());
+        assert_eq!(row._version, 0);
     }
 
     #[test]
@@ -202,33 +224,38 @@ mod tests {
     }
 
     #[test]
-    fn wide_values_saturate_instead_of_panicking() {
+    fn wide_values_are_kept() {
         let mut block = minimal();
         block.number = Some(u64::MAX);
         block.gas_limit = Some(Quantity::from(u64::MAX));
         block.gas_used = Some(Quantity::from(u32::MAX as u64 + 1));
-        block.size = Some(Quantity::from(vec![1u8; 20]));
-        block.timestamp = Some(Quantity::from(u64::MAX));
+        block.size = Some(Quantity::from(u32::MAX as u64 + 2));
+        // 9 bytes: more than the UInt64 the old schema saturated at.
         block.base_fee_per_gas = Some(Quantity::from(vec![1u8; 9]));
 
         let row =
             DatabaseBlock::from_hypersync(&block, 1, 100_000).unwrap();
 
-        assert_eq!(row.number, u32::MAX);
-        assert_eq!(row.gas_limit, u32::MAX);
-        assert_eq!(row.gas_used, u32::MAX);
-        assert_eq!(row.size, u32::MAX);
-        assert_eq!(row.timestamp, u32::MAX);
-        assert_eq!(row.base_fee_per_gas, Some(u64::MAX));
-        assert_eq!(row.transactions, u16::MAX);
+        assert_eq!(row.number, u64::MAX);
+        assert_eq!(row.gas_limit, u64::MAX);
+        assert_eq!(row.gas_used, u32::MAX as u64 + 1);
+        assert_eq!(row.size, u32::MAX as u64 + 2);
+        assert_eq!(
+            row.base_fee_per_gas,
+            Some(U256::from_be_slice(&[1u8; 9]))
+        );
+        assert_eq!(row.transactions, 100_000);
     }
 
     #[test]
-    fn bloom_of_any_length_is_accepted() {
+    fn values_wider_than_the_column_saturate_instead_of_panicking() {
         let mut block = minimal();
-        block.logs_bloom = Some(Data::from(vec![0xab; 3]));
+        block.size = Some(Quantity::from(vec![1u8; 20]));
+        block.timestamp = Some(Quantity::from(u64::MAX));
 
         let row = DatabaseBlock::from_hypersync(&block, 1, 0).unwrap();
-        assert_eq!(row.logs_bloom, Bytes::from(vec![0xab; 3]));
+
+        assert_eq!(row.size, u64::MAX);
+        assert_eq!(row.timestamp, u32::MAX);
     }
 }

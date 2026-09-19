@@ -54,7 +54,7 @@ impl Sink for MemoryStore {
         }
         let mut blocks = self.blocks.lock().unwrap();
         for block in &batch.blocks {
-            blocks.insert(u64::from(block.number), block.hash);
+            blocks.insert(block.number, block.hash);
         }
         self.flushes.lock().unwrap().push(batch.blocks.len());
         Ok(())

@@ -36,8 +36,91 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # Unit tests only: everything that needs a service or the network is
+      # `#[ignore]`d (see the `integration` job).
       - name: Test
         run: cargo test --locked
 
       - name: Build
         run: cargo build --release --locked
+
+  # The `#[ignore]`d tests that need a real ClickHouse (and Redis). They go
+  # through the embedded migrations, so this job is also what proves that a
+  # fresh database can be created by the binary alone.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        # Keep in step with docker-compose.yml.
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_USER: indexer
+          CLICKHOUSE_PASSWORD: indexer
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        ports:
+          - 8123:8123
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # db::integration_tests DROPs and recreates this database (its name must
+      # end in `_test`); db::migrate and dex create throwaway databases of
+      # their own on the same server.
+      TEST_DATABASE_URL: http://indexer:indexer@localhost:8123/indexer_test
+      TOKEN_CACHE_TEST_REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The filters are substring matches on the test path, any of them
+      # selects a test. Deliberately NOT selected (they need the internet or
+      # depend on network timing): tokens::*::live_* (chainid.network, public
+      # RPCs, TOKEN_TEST_RPC_URL) and unreachable_redis_never_stalls_or_fails.
+      - name: Integration tests (ClickHouse, Redis)
+        run: >-
+          cargo test --locked --lib -- --ignored
+          db::integration_tests::
+          db::migrate::integration::
+          dex::integration_tests::
+          redis_round_trip_and_restart
+
+  # The image is only published from main (docker.yml); this catches a broken
+  # Dockerfile / .dockerignore (e.g. build.rs not finding migrations/) on the
+  # pull request instead.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: evm-indexer:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker run --rm evm-indexer:ci --version
+          docker run --rm evm-indexer:ci migrate --help

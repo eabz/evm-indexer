@@ -1,12 +1,20 @@
 //! Conversions from HyperSync wire types into the alloy primitives and the
-//! (narrow) integer widths used by the ClickHouse schema.
+//! integer widths used by the ClickHouse schema.
 //!
-//! Every numeric narrowing here SATURATES. Nothing in this module panics or
-//! truncates: a value that does not fit the column becomes the column's
-//! maximum instead of wrapping around to an unrelated number.
+//! The columns are as wide as the protocol (`UInt64` block numbers, gas
+//! and nonces, `UInt256` amounts and prices), so almost nothing narrows any
+//! more. What is left:
 //!
-//! A saturated value is still WRONG data, so the first time it happens for
-//! each target width a warning is logged (once per process, not per row).
+//! - HyperSync `Quantity` is an arbitrary length big endian integer. A
+//!   value that does not fit the `UInt64` / `UInt256` column it belongs to
+//!   is not valid chain data, but it must not panic or wrap either.
+//! - Positions and counts inside a block (`transaction_index`, `log_index`,
+//!   counts...) are `UInt32` columns fed from `u64`.
+//! - `timestamp` is a `DateTime` (`u32` seconds).
+//!
+//! Those narrowings SATURATE, and the first time it happens for each
+//! target width a warning is logged (once per process, not per row): a
+//! saturated value is still wrong data.
 
 use alloy::primitives::{Address, Bytes, B256, B64, U256};
 use hypersync_client::format::{
@@ -18,13 +26,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Target widths a value can saturate at, one warning each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Width {
-    U16,
     U32,
     U64,
     U256,
 }
 
-static SATURATED_U16: AtomicBool = AtomicBool::new(false);
 static SATURATED_U32: AtomicBool = AtomicBool::new(false);
 static SATURATED_U64: AtomicBool = AtomicBool::new(false);
 static SATURATED_U256: AtomicBool = AtomicBool::new(false);
@@ -32,7 +38,6 @@ static SATURATED_U256: AtomicBool = AtomicBool::new(false);
 impl Width {
     fn flag(self) -> &'static AtomicBool {
         match self {
-            Width::U16 => &SATURATED_U16,
             Width::U32 => &SATURATED_U32,
             Width::U64 => &SATURATED_U64,
             Width::U256 => &SATURATED_U256,
@@ -41,18 +46,15 @@ impl Width {
 
     fn describe(self) -> &'static str {
         match self {
-            Width::U16 => {
-                "UInt16 column (log_index, transaction_index, \
-                 transactions, subtraces, trace_address...)"
-            }
             Width::U32 => {
-                "UInt32 column (gas, gas_limit, gas_used, size, nonce, \
-                 block number, timestamp...)"
+                "UInt32 / DateTime column (transaction_index, log_index, \
+                 counts, timestamp)"
             }
             Width::U64 => {
-                "UInt64 column (base_fee_per_gas, withdrawals...)"
+                "UInt64 column (gas, gas_limit, gas_used, size, nonce, \
+                 withdrawal indexes)"
             }
-            Width::U256 => "256 bit value",
+            Width::U256 => "UInt256 column",
         }
     }
 
@@ -69,25 +71,18 @@ fn report_saturation(width: Width, value: &dyn std::fmt::Display) {
     if !width.flag().swap(true, Ordering::Relaxed) {
         warn!(
             "Value {value} does not fit a {} and was stored as the column \
-             maximum. The stored value is WRONG; this chain needs wider \
-             columns, see docs/data-model-proposals.md (C4). This warning \
-             is logged once per process, more rows may be affected.",
+             maximum. The stored value is WRONG. This warning is logged \
+             once per process, more rows may be affected.",
             width.describe()
         );
     }
 }
 
+/// Position / count inside a block -> `UInt32` column.
 pub fn sat_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| {
         report_saturation(Width::U32, &value);
         u32::MAX
-    })
-}
-
-pub fn sat_u16(value: u64) -> u16 {
-    u16::try_from(value).unwrap_or_else(|_| {
-        report_saturation(Width::U16, &value);
-        u16::MAX
     })
 }
 
@@ -115,6 +110,7 @@ pub fn quantity_to_u64(quantity: &Quantity) -> u64 {
     })
 }
 
+/// Only for `timestamp` (`DateTime` is `u32` seconds).
 pub fn quantity_to_u32(quantity: &Quantity) -> u32 {
     let value = quantity_to_u256(quantity);
 
@@ -148,12 +144,9 @@ mod tests {
     fn narrowing_saturates_instead_of_truncating() {
         assert_eq!(sat_u32(7), 7);
         assert_eq!(sat_u32(u32::MAX as u64), u32::MAX);
+        // `(u32::MAX as u64 + 1) as u32` would be 0.
         assert_eq!(sat_u32(u32::MAX as u64 + 1), u32::MAX);
         assert_eq!(sat_u32(u64::MAX), u32::MAX);
-
-        assert_eq!(sat_u16(65_535), u16::MAX);
-        // `65_536 as u16` would be 0.
-        assert_eq!(sat_u16(65_536), u16::MAX);
     }
 
     #[test]
@@ -163,10 +156,11 @@ mod tests {
         assert_eq!(quantity_to_u32(&small), 30_000_000);
         assert_eq!(quantity_to_u256(&small), U256::from(30_000_000u64));
 
-        // Gas limit above u32::MAX (seen on some L2s / test chains).
+        // Gas limit above u32::MAX (seen on some L2s / test chains) is
+        // kept as is: the columns are UInt64.
         let big = Quantity::from(u32::MAX as u64 + 10);
-        assert_eq!(quantity_to_u32(&big), u32::MAX);
         assert_eq!(quantity_to_u64(&big), u32::MAX as u64 + 10);
+        assert_eq!(quantity_to_u64(&Quantity::from(u64::MAX)), u64::MAX);
 
         // 9 significant bytes do not fit u64.
         let huge = Quantity::from(vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -181,11 +175,8 @@ mod tests {
         // Values that fit never report anything. (The flags are process
         // wide and other tests saturate on purpose, so only the "set"
         // direction can be asserted after a saturating call.)
-        assert_eq!(sat_u16(1), 1);
+        assert_eq!(sat_u32(1), 1);
         assert_eq!(quantity_to_u64(&Quantity::from(u64::MAX)), u64::MAX);
-
-        assert_eq!(sat_u16(u64::MAX), u16::MAX);
-        assert!(Width::U16.has_saturated());
 
         assert_eq!(sat_u32(u64::MAX), u32::MAX);
         assert!(Width::U32.has_saturated());
@@ -200,8 +191,8 @@ mod tests {
         assert!(Width::U256.has_saturated());
 
         // Reporting again is a no-op (no panic, flag stays set).
-        report_saturation(Width::U16, &7);
-        assert!(Width::U16.has_saturated());
+        report_saturation(Width::U32, &7);
+        assert!(Width::U32.has_saturated());
     }
 
     #[test]

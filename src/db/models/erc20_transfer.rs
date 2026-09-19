@@ -9,28 +9,30 @@ use crate::utils::{
     format::{SerAddress, SerB256, SerU256},
 };
 
+/// Row of `erc20_transfers`. Field names are the column names.
 #[serde_as]
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct DatabaseERC20Transfer {
-    #[serde_as(as = "SerAddress")]
-    pub address: Address,
-    #[serde_as(as = "SerU256")]
-    pub amount: U256,
-    pub block_number: u32,
     pub chain: u64,
-    #[serde_as(as = "SerAddress")]
-    pub from: Address,
-    pub log_index: u16,
-    pub log_type: Option<String>,
-    pub removed: bool,
-    pub timestamp: u32,
-    #[serde_as(as = "SerAddress")]
-    pub to: Address,
-    #[serde_as(as = "SerAddress")]
-    pub token_address: Address,
+    pub block_number: u64,
+    pub log_index: u32,
+    pub transaction_index: u32,
     #[serde_as(as = "SerB256")]
     pub transaction_hash: B256,
-    pub transaction_log_index: Option<u16>,
+    pub timestamp: u32,
+    #[serde_as(as = "SerAddress")]
+    pub token_address: Address,
+    #[serde_as(as = "SerAddress")]
+    pub from: Address,
+    #[serde_as(as = "SerAddress")]
+    pub to: Address,
+    #[serde_as(as = "SerU256")]
+    pub amount: U256,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
+    /// Stamped once per flush, see `RowBatch::set_version`.
+    pub _version: u64,
 }
 
 impl DatabaseERC20Transfer {
@@ -55,19 +57,18 @@ impl DatabaseERC20Transfer {
         let amount = U256::from_be_slice(log.data.get(..32)?);
 
         Some(Self {
-            address: log.address,
-            amount,
-            block_number: log.block_number,
             chain: log.chain,
-            from: Address::from_word(topic1),
+            block_number: log.block_number,
             log_index: log.log_index,
-            log_type: log.log_type.clone(),
-            removed: log.removed,
-            timestamp: log.timestamp,
-            to: Address::from_word(topic2),
-            token_address: log.address,
+            transaction_index: log.transaction_index,
             transaction_hash: log.transaction_hash,
-            transaction_log_index: log.transaction_log_index,
+            timestamp: log.timestamp,
+            token_address: log.address,
+            from: Address::from_word(topic1),
+            to: Address::from_word(topic2),
+            amount,
+            epoch: 0,
+            _version: 0,
         })
     }
 }
@@ -93,7 +94,7 @@ mod tests {
         assert_eq!(transfer.amount, U256::from(1_000u64));
         assert_eq!(transfer.token_address, log.address);
         assert_eq!(transfer.log_index, 7);
-        assert_eq!(transfer.transaction_log_index, Some(3));
+        assert_eq!(transfer.transaction_index, 3);
     }
 
     #[test]
