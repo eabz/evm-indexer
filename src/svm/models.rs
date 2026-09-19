@@ -157,12 +157,27 @@ impl std::error::Error for OrdinalError {}
 pub struct SerSig64(());
 
 impl SerializeAs<SigBytes> for SerSig64 {
+    /// A `FixedString(64)` is 64 raw bytes with NO length prefix, which is
+    /// what a serde TUPLE produces.
+    ///
+    /// This has to be spelled out: serde implements `Serialize` for arrays
+    /// only up to 32 elements, so `[u8; 64]` silently falls through to the
+    /// SLICE impl, which is a seq and makes the clickhouse crate write a
+    /// LEB128 length byte in front. That extra byte per row desynchronises
+    /// the whole RowBinary stream, and ClickHouse reports it as a confusing
+    /// "Cannot read all data ... at row N+1" at the END of the batch.
     #[inline]
     fn serialize_as<S: serde::Serializer>(
         value: &SigBytes,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        value.serialize(serializer)
+        use serde::ser::SerializeTuple;
+
+        let mut tuple = serializer.serialize_tuple(64)?;
+        for byte in value.iter() {
+            tuple.serialize_element(byte)?;
+        }
+        tuple.end()
     }
 }
 
@@ -618,6 +633,244 @@ mod tests {
             pack_ordinal(&[ORDINAL_MAX_INDEX + 1]),
             Err(OrdinalError::IndexTooLarge(ORDINAL_MAX_INDEX + 1))
         );
+    }
+
+    /// Records the serde SHAPE a value serializes to, which is what decides
+    /// the RowBinary bytes: a tuple is written bare, a seq gets a LEB128
+    /// length in front.
+    mod shape {
+        use serde::{ser, Serialize};
+        use std::fmt;
+
+        #[derive(Debug)]
+        pub struct Error(String);
+
+        impl fmt::Display for Error {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl std::error::Error for Error {}
+        impl ser::Error for Error {
+            fn custom<T: fmt::Display>(msg: T) -> Self {
+                Error(msg.to_string())
+            }
+        }
+
+        /// `("tuple" | "seq", element count)`.
+        #[derive(Default)]
+        pub struct Recorder {
+            pub kind: &'static str,
+            pub elements: usize,
+        }
+
+        pub fn of<T: Serialize>(value: &T) -> (&'static str, usize) {
+            let mut recorder = Recorder::default();
+            value.serialize(&mut recorder).expect("record shape");
+            (recorder.kind, recorder.elements)
+        }
+
+        macro_rules! reject {
+            ($($method:ident($($ty:ty)?)),* $(,)?) => {$(
+                fn $method(self $(, _: $ty)?) -> Result<(), Error> {
+                    Err(ser::Error::custom(stringify!($method)))
+                }
+            )*};
+        }
+
+        impl ser::Serializer for &mut Recorder {
+            type Ok = ();
+            type Error = Error;
+            type SerializeSeq = Self;
+            type SerializeTuple = Self;
+            type SerializeTupleStruct = ser::Impossible<(), Error>;
+            type SerializeTupleVariant = ser::Impossible<(), Error>;
+            type SerializeMap = ser::Impossible<(), Error>;
+            type SerializeStruct = ser::Impossible<(), Error>;
+            type SerializeStructVariant = ser::Impossible<(), Error>;
+
+            reject!(
+                serialize_bool(bool),
+                serialize_i8(i8),
+                serialize_i16(i16),
+                serialize_i32(i32),
+                serialize_i64(i64),
+                serialize_u16(u16),
+                serialize_u32(u32),
+                serialize_u64(u64),
+                serialize_f32(f32),
+                serialize_f64(f64),
+                serialize_char(char),
+                serialize_str(&str),
+                serialize_bytes(&[u8]),
+                serialize_unit(),
+                serialize_none(),
+            );
+
+            fn serialize_u8(self, _: u8) -> Result<(), Error> {
+                self.elements += 1;
+                Ok(())
+            }
+
+            fn serialize_seq(
+                self,
+                len: Option<usize>,
+            ) -> Result<Self, Error> {
+                self.kind = "seq";
+                let _ = len;
+                Ok(self)
+            }
+
+            fn serialize_tuple(self, _: usize) -> Result<Self, Error> {
+                self.kind = "tuple";
+                Ok(self)
+            }
+
+            fn serialize_some<T: ?Sized + Serialize>(
+                self,
+                value: &T,
+            ) -> Result<(), Error> {
+                value.serialize(self)
+            }
+            fn serialize_unit_struct(self, _: &str) -> Result<(), Error> {
+                Err(ser::Error::custom("unit struct"))
+            }
+            fn serialize_unit_variant(
+                self,
+                _: &str,
+                _: u32,
+                _: &str,
+            ) -> Result<(), Error> {
+                Err(ser::Error::custom("unit variant"))
+            }
+            fn serialize_newtype_struct<T: ?Sized + Serialize>(
+                self,
+                _: &str,
+                value: &T,
+            ) -> Result<(), Error> {
+                value.serialize(self)
+            }
+            fn serialize_newtype_variant<T: ?Sized + Serialize>(
+                self,
+                _: &str,
+                _: u32,
+                _: &str,
+                _: &T,
+            ) -> Result<(), Error> {
+                Err(ser::Error::custom("newtype variant"))
+            }
+            fn serialize_tuple_struct(
+                self,
+                _: &str,
+                _: usize,
+            ) -> Result<ser::Impossible<(), Error>, Error> {
+                Err(ser::Error::custom("tuple struct"))
+            }
+            fn serialize_tuple_variant(
+                self,
+                _: &str,
+                _: u32,
+                _: &str,
+                _: usize,
+            ) -> Result<ser::Impossible<(), Error>, Error> {
+                Err(ser::Error::custom("tuple variant"))
+            }
+            fn serialize_map(
+                self,
+                _: Option<usize>,
+            ) -> Result<ser::Impossible<(), Error>, Error> {
+                Err(ser::Error::custom("map"))
+            }
+            fn serialize_struct(
+                self,
+                _: &str,
+                _: usize,
+            ) -> Result<ser::Impossible<(), Error>, Error> {
+                Err(ser::Error::custom("struct"))
+            }
+            fn serialize_struct_variant(
+                self,
+                _: &str,
+                _: u32,
+                _: &str,
+                _: usize,
+            ) -> Result<ser::Impossible<(), Error>, Error> {
+                Err(ser::Error::custom("struct variant"))
+            }
+        }
+
+        impl ser::SerializeSeq for &mut Recorder {
+            type Ok = ();
+            type Error = Error;
+            fn serialize_element<T: ?Sized + Serialize>(
+                &mut self,
+                value: &T,
+            ) -> Result<(), Error> {
+                value.serialize(&mut **self)
+            }
+            fn end(self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        impl ser::SerializeTuple for &mut Recorder {
+            type Ok = ();
+            type Error = Error;
+            fn serialize_element<T: ?Sized + Serialize>(
+                &mut self,
+                value: &T,
+            ) -> Result<(), Error> {
+                value.serialize(&mut **self)
+            }
+            fn end(self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+    }
+
+    /// A 64-byte signature must serialize as a TUPLE of 64 bytes.
+    ///
+    /// This is a real bug that reached a live ClickHouse: serde implements
+    /// `Serialize` for arrays only up to 32 elements, so `[u8; 64]` quietly
+    /// resolves to the SLICE impl, which is a seq, and the clickhouse crate
+    /// then writes a LEB128 length byte in front of every signature. One
+    /// stray byte per row desynchronises the RowBinary stream and ClickHouse
+    /// reports it as "Cannot read all data ... at row N+1" at the very end
+    /// of the batch, pointing nowhere near the real cause.
+    #[test]
+    fn a_signature_serializes_as_a_bare_64_byte_tuple() {
+        #[serde_as]
+        #[derive(Serialize)]
+        struct Wrapper(#[serde_as(as = "SerSig64")] SigBytes);
+
+        let (kind, elements) = shape::of(&Wrapper([7u8; 64]));
+        assert_eq!(
+            kind, "tuple",
+            "a seq makes the clickhouse crate add a length prefix, which \
+             corrupts every row"
+        );
+        assert_eq!(elements, 64);
+
+        // A 32-byte pubkey is the shape this must match.
+        let (kind, elements) = shape::of(&[0u8; 32]);
+        assert_eq!(kind, "tuple");
+        assert_eq!(elements, 32);
+    }
+
+    /// And it must come back out again.
+    #[test]
+    fn a_signature_round_trips() {
+        #[serde_as]
+        #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+        struct Wrapper(#[serde_as(as = "SerSig64")] SigBytes);
+
+        let mut signature = [0u8; 64];
+        for (index, byte) in signature.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let json = serde_json::to_string(&Wrapper(signature)).unwrap();
+        let back: Wrapper = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.0, signature);
     }
 
     #[test]

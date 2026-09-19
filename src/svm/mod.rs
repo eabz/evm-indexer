@@ -27,6 +27,10 @@ mod tests;
 #[cfg(test)]
 mod integration_tests;
 
+/// Ignored, network bound proof against mainnet and the public Solana RPC.
+#[cfg(test)]
+mod live_tests;
+
 use decode::{Diagnostics, SvmTransaction};
 use models::{SolSlot, SolToken, SolTransaction, SvmSwap};
 

@@ -370,11 +370,18 @@ fn enrich_pumpfun(
     if movement_token != event.token_amount {
         return Enrichment::Disagreed;
     }
-    // The SOL leg comes from the curve's own lamport delta, which is the
-    // trade NET of the fees paid out of the same movement. The event's
-    // sol_amount is the gross, so they differ by exactly the fees.
-    let gross = movement_sol.saturating_add(event.total_fee());
-    if movement_sol != event.sol_amount && gross != event.sol_amount {
+    // The SOL leg is the curve account's own lamport delta, and the event's
+    // `sol_amount` is the trade GROSS. They differ by whichever fees were
+    // routed through the curve's lamports in the same instruction rather
+    // than paid directly by the user - measured live, that is sometimes the
+    // protocol fee, sometimes the creator fee, sometimes both and sometimes
+    // neither, so the tolerance is the total fee rather than an exact
+    // equality on one particular routing.
+    //
+    // Anything OUTSIDE that band is a genuine contradiction and the row
+    // keeps `movement` confidence.
+    let difference = movement_sol.abs_diff(event.sol_amount);
+    if difference > event.total_fee() {
         return Enrichment::Disagreed;
     }
 
