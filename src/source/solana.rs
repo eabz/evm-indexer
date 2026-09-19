@@ -539,6 +539,25 @@ fn decode_arrow(
                     from_arrow::account_activity_from_arrow(&batch)
                         .context("decode account_activity")?
             }
+            // NOT optional, and it was missing here until the first live
+            // run through this path found it.
+            //
+            // Raydium's three programs and Orca publish their swap event as
+            // a `Program data:` / `ray_log:` LOG LINE and nowhere else, so
+            // dropping this table costs exactly those four venues their
+            // per-program decoder: every row stays at `movement`
+            // confidence, with no exact fee and no pool state. Measured
+            // live before the fix: pumpswap / pump.fun / Meteora (self-CPI
+            // events) were 99% `decoded`, while Orca and all three Raydium
+            // programs were 100% `movement` - about 20% of the streamed
+            // volume, silently degraded rather than wrong.
+            //
+            // The JSON `get()` path always had the logs; only this Arrow
+            // decoder did not, and nothing used it in production before.
+            "logs" => {
+                response.logs = from_arrow::logs_from_arrow(&batch)
+                    .context("decode logs")?
+            }
             _ => {}
         }
     }

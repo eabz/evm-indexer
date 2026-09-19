@@ -109,6 +109,14 @@ const TIP_CADENCE: Duration = Duration::from_secs(4);
 /// A pass of at most this many slots means "following the head".
 const TIP_PASS_SLOTS: u64 = 256;
 
+/// Being at most this far behind means "caught up", and only then is a
+/// cadence worth waiting out.
+///
+/// Solana produces 3.76 slots/s (docs/solana-research.md §11.2), so one
+/// [`TIP_CADENCE`] is ~15 new slots; 32 is that with room for a slow tick.
+/// Anything beyond it is real lag, and waiting only makes it worse.
+const TIP_PACE_SLOTS: u64 = 32;
+
 /// Slots asked for in one metered query while backfilling. The server
 /// truncates at its own ~5 s execution budget (30-66 slots measured); this
 /// only has to be comfortably larger than that, because the CURSOR decides.
@@ -895,18 +903,26 @@ impl<S: SlotSource> SolanaIndexer<S> {
             info!("Chain {chain}: epoch {epoch}.");
         }
 
+        // `--new-blocks-only` starts at the head and asks the checkpoints
+        // nothing: saying "the checkpoints tile [start, head)" there would
+        // be a plain lie on an empty database, which is exactly what the
+        // first live run printed.
         let mut cursor = if self.settings.new_slots_only {
+            info!(
+                "--new-blocks-only: starting at the head, slot {head}. \
+                 Nothing below it will be indexed by this process."
+            );
             head
         } else {
-            self.resume_point().await?
+            let resume = self.resume_point().await?;
+            if resume > self.settings.start_slot {
+                info!(
+                    "Checkpoints tile slots [{}, {resume}) without a hole.",
+                    self.settings.start_slot
+                );
+            }
+            resume
         };
-
-        if cursor > self.settings.start_slot {
-            info!(
-                "Checkpoints tile slots [{}, {cursor}) without a hole.",
-                self.settings.start_slot
-            );
-        }
 
         info!(
             "Solana head is slot {head}. Syncing from slot {cursor}{}.",
@@ -923,11 +939,21 @@ impl<S: SlotSource> SolanaIndexer<S> {
         loop {
             let target = target_slot(head, end_slot);
 
-            let at_tip = target.saturating_sub(cursor) <= TIP_PASS_SLOTS;
-            // At the head, let slots accumulate for one cadence before a
-            // metered query is spent on them.
-            let paced = at_tip
-                && end_slot == 0
+            let behind = target.saturating_sub(cursor);
+
+            // Wait a cadence only when we are ACTUALLY CAUGHT UP, i.e. the
+            // slots above the cursor are just the handful the chain made
+            // since the last commit. Pacing while the head is genuinely
+            // ahead adds the wait straight to the lag - measured on the
+            // first live run, where a cadence applied at any distance
+            // under 256 slots let the lag drift from 0 to 76 slots while
+            // the process was spending 4 of its 25 queries a minute.
+            //
+            // The budget governor, not this timer, is what keeps the query
+            // rate polite; this timer only exists to stop us spending a
+            // whole query on three new slots.
+            let paced = end_slot == 0
+                && behind <= TIP_PACE_SLOTS
                 && last_tip_commit
                     .is_some_and(|at| at.elapsed() < TIP_CADENCE);
 
@@ -937,10 +963,8 @@ impl<S: SlotSource> SolanaIndexer<S> {
                         failures = 0;
                         cursor = covered;
                         self.metrics.set_ready(true);
-                        if at_tip {
-                            last_tip_commit =
-                                Some(tokio::time::Instant::now());
-                        }
+                        last_tip_commit =
+                            Some(tokio::time::Instant::now());
                     }
                     Ok(PassOutcome::Restart(from)) => {
                         failures = 0;

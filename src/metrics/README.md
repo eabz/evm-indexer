@@ -70,6 +70,31 @@ first value is recorded.
 A worker that is off (`--no-dex`, `--no-predictions`, `--rpc none`) has no
 series at all.
 
+### Solana only
+
+`indexer run --chain solana` publishes five more series. They are absent
+on every other chain, rather than zero there.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `hypersync_queries_last_minute` | gauge | Metered HyperSync queries sent in the last 60 s. The free Solana budget is **30 per 60 s per endpoint** and the follower caps itself at 25, so this is the number that says how much room is left |
+| `hypersync_queries_total` | counter | Metered queries since the process started. `GET /height` is free and unmetered and is NOT counted |
+| `hypersync_ratelimit_requests_left` | gauge | What the server's own `x-ratelimit-*` headers last said: `remaining / cost`, because `remaining` counts budget units and not requests *(when known)* |
+| `solana_swaps_total` | counter | Swaps decoded and handed to the writer. `rate()` gives swaps/s |
+| `solana_skipped_slots_total` | counter | Slots inside served windows that produced no block. **Normal on Solana**; worth watching because every rows-per-day estimate assumes it stays near zero |
+
+**Read `lag_seconds`, not `lag_blocks`, when Solana shares a dashboard with
+EVM chains.** A Solana slot is 0.27 s and an Ethereum block is 12 s, so one
+`lag_blocks` panel across both families compares numbers that do not mean
+the same thing, and it would be read wrong on the first bad day. On Solana
+the loop does not publish a head timestamp, so `lag_seconds` is
+`now() - block_time` of the last committed slot: the honest end-to-end
+figure, Envio's own 10-13 s ingest lag included.
+
+There is no `solana_parent_mismatch_total`: a continuity break is not a
+counter to watch but a **fatal stop** (see the Solana section of the main
+README), so the signal is the process exiting and `ready` going to 0.
+
 Cache hit rate:
 
 ```promql

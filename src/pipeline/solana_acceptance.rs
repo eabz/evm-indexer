@@ -409,6 +409,29 @@ impl Scenario {
             .unwrap()
     }
 
+    /// `verify` once the report stops saying "consistent".
+    ///
+    /// ClickHouse gives no read-your-writes guarantee (docs/design.md §2):
+    /// a test that hand-writes a broken row and verifies in the next
+    /// breath can read the state from just before its own insert. That is
+    /// a property of the database, not of the check, so the test waits for
+    /// its own write instead of pretending the race does not exist.
+    async fn verify_inconsistent(
+        &self,
+    ) -> solana_verify::SolanaVerifyReport {
+        let mut report = self.verify().await;
+
+        for _ in 0..200 {
+            if !report.is_consistent() {
+                return report;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            report = self.verify().await;
+        }
+
+        panic!("verify still reports a consistent index:\n{report}");
+    }
+
     async fn verify(&self) -> solana_verify::SolanaVerifyReport {
         solana_verify::verify(&self.db, FIRST_SLOT, 0).await.unwrap()
     }
@@ -980,8 +1003,7 @@ async fn verify_tells_a_consistent_index_from_an_inconsistent_one() {
         .await
         .unwrap();
 
-    let report = scenario.verify().await;
-    assert!(!report.is_consistent(), "{report}");
+    let report = scenario.verify_inconsistent().await;
     assert!(!report.unasked.is_empty(), "{report}");
     assert!(
         report.to_string().contains("Result: PROBLEMS FOUND"),
@@ -1021,8 +1043,7 @@ async fn verify_catches_a_height_break_in_the_stored_slots() {
         .await
         .unwrap();
 
-    let report = scenario.verify().await;
-    assert!(!report.is_consistent(), "{report}");
+    let report = scenario.verify_inconsistent().await;
     assert!(!report.breaks.is_empty(), "{report}");
     assert!(report.breaks.iter().any(|b| b.height_broken), "{report}");
     assert!(
