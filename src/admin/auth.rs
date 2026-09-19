@@ -45,6 +45,20 @@ pub const FIRST_LOCKOUT: Duration = Duration::from_secs(30);
 /// the evening.
 pub const MAX_LOCKOUT: Duration = Duration::from_secs(15 * 60);
 
+/// Failures inside ONE window past which an address is treated as hammering
+/// rather than as someone mistyping. Only then can the lock-out grow beyond
+/// [`ATTEMPT_WINDOW`].
+pub const LOUD_FAILURES: u32 = ATTEMPTS_PER_WINDOW * 4;
+
+/// Quiet time that forgives one doubling of the lock-out, measured from the
+/// moment the last lock-out ended.
+///
+/// This is what makes the penalty DECAY. A lock-out that only ever grew,
+/// and was only ever cleared by a successful login, meant an attacker who
+/// failed five times every fifteen minutes could keep the owner out of
+/// their own panel for ever (review MAJOR 2).
+pub const DECAY_AFTER: Duration = Duration::from_secs(5 * 60);
+
 /// Sessions kept at once. The owner is one person on a handful of devices;
 /// anything beyond this is someone filling memory.
 const MAX_SESSIONS: usize = 64;
@@ -226,10 +240,15 @@ impl Sessions {
 struct Attempts {
     /// Failures inside the current window.
     failures: u32,
-    /// Total failures since the last success, for the doubling lock-out.
+    /// Failures that earned a lock-out and have not decayed yet. What makes
+    /// each lock-out longer than the last.
     consecutive: u32,
     window_started: Instant,
     locked_until: Option<Instant>,
+    /// When the most recent lock-out ENDED. The penalty decays from here,
+    /// so an attacker who comes back every fifteen minutes does not ratchet
+    /// it up for ever.
+    unlocked_at: Option<Instant>,
 }
 
 /// Per-address login throttle.
@@ -292,11 +311,28 @@ impl RateLimiter {
             consecutive: 0,
             window_started: now,
             locked_until: None,
+            unlocked_at: None,
         });
 
+        // A new window: the allowance starts again.
         if now.duration_since(state.window_started) >= ATTEMPT_WINDOW {
             state.window_started = now;
             state.failures = 0;
+        }
+
+        // And the PENALTY decays. Without this, `consecutive` only ever
+        // grew and was only ever cleared by a successful login - which is
+        // impossible while locked out, so five wrong guesses every fifteen
+        // minutes denied the owner their own panel for ever (review
+        // MAJOR 2). One step of the penalty is forgiven for every
+        // DECAY_AFTER of quiet since the last lock-out ended.
+        if let Some(unlocked_at) = state.unlocked_at {
+            let quiet = now.saturating_duration_since(unlocked_at);
+            let forgiven = u32::try_from(
+                quiet.as_secs() / DECAY_AFTER.as_secs().max(1),
+            )
+            .unwrap_or(u32::MAX);
+            state.consecutive = state.consecutive.saturating_sub(forgiven);
         }
 
         state.failures += 1;
@@ -306,14 +342,33 @@ impl RateLimiter {
             return None;
         }
 
-        // Past the allowance: lock out, doubling with every further
-        // failure, capped so an honest owner is never locked out for long.
+        // Past the allowance for THIS window: lock out, doubling with every
+        // further lock-out that has not decayed, capped.
         let over = state.consecutive.saturating_sub(ATTEMPTS_PER_WINDOW);
-        let lockout = FIRST_LOCKOUT
+        let doubled = FIRST_LOCKOUT
             .saturating_mul(2u32.saturating_pow(over.min(16)))
             .min(MAX_LOCKOUT);
 
+        // THE OWNER ALWAYS GETS BACK IN WITHIN A MINUTE, unless the address
+        // is failing loudly RIGHT NOW.
+        //
+        // A patient attacker - five wrong guesses, wait, five more - is
+        // exactly what the owner's own address looks like from behind a
+        // reverse proxy, or from any other process on a loopback-only box.
+        // Letting that ratchet the lock-out to fifteen minutes handed
+        // anyone a permanent denial of the control plane (review MAJOR 2),
+        // and it bought nothing: the allowance itself already holds the
+        // guess rate at five a minute whatever the lock-out length is.
+        //
+        // So the long cap is reserved for an address that is hammering -
+        // more than [`LOUD_FAILURES`] failures inside ONE window - which no
+        // owner mistyping a password ever does.
+        let loud = state.failures > LOUD_FAILURES;
+        let lockout =
+            if loud { doubled } else { doubled.min(ATTEMPT_WINDOW) };
+
         state.locked_until = Some(now + lockout);
+        state.unlocked_at = Some(now + lockout);
         Some(lockout)
     }
 
@@ -340,6 +395,42 @@ fn prune(attempts: &mut HashMap<IpAddr, Attempts>, now: Instant) {
         };
         attempts.remove(&oldest);
     }
+}
+
+/// Which address the login throttle counts against.
+///
+/// **`X-Forwarded-For` is a header, so by default it is a lie.** Anyone can
+/// send one, and believing it would let a single attacker spread their
+/// guesses over as many made-up addresses as they like - the throttle would
+/// stop existing. So the peer address of the TCP connection is the key, and
+/// nothing else, unless the operator has named the proxy that sits in front
+/// of the panel (`--admin-trusted-proxy <ip>`).
+///
+/// When they have, and the connection really does come from that proxy, the
+/// key is the RIGHT-MOST entry of `X-Forwarded-For` that is not the proxy
+/// itself. Right-most, because a forwarding hop APPENDS: everything to the
+/// left of it was written by someone further away and can be forged, while
+/// the right-most entry is what the trusted proxy itself observed.
+///
+/// Without this, a panel behind a proxy sees every client as one address
+/// and one attacker's lock-out falls on the owner too (review MAJOR 2).
+pub fn throttle_key(
+    peer: IpAddr,
+    forwarded: Option<&str>,
+    trusted_proxy: Option<IpAddr>,
+) -> IpAddr {
+    // Not configured, or this connection is not from the trusted proxy:
+    // the header is ignored entirely.
+    let Some(proxy) = trusted_proxy.filter(|proxy| *proxy == peer) else {
+        return peer;
+    };
+
+    forwarded
+        .unwrap_or_default()
+        .rsplit(',')
+        .filter_map(|hop| hop.trim().parse::<IpAddr>().ok())
+        .find(|hop| *hop != proxy)
+        .unwrap_or(peer)
 }
 
 /// Does this request come from the panel's own page?
@@ -483,7 +574,10 @@ mod tests {
             .expect("locked out again");
         assert_eq!(second, FIRST_LOCKOUT * 2);
 
-        // ... and it never grows past the cap, however long it goes on.
+        // ... and it grows to the cap only while the address keeps
+        // hammering INSIDE one window (see
+        // `a_patient_attacker_can_not_lock_the_owner_out_for_longer_than_a_minute`
+        // for why a slow one must not).
         let mut last = second;
         for _ in 0..30 {
             last = limiter
@@ -514,6 +608,134 @@ mod tests {
 
         // And the count starts again rather than locking out at once.
         assert_eq!(limiter.failed_at(who, much_later), None);
+    }
+
+    /// Review MAJOR 2. A patient attacker - five wrong guesses, wait, five
+    /// more - must never be able to keep the owner out for more than a
+    /// minute at a time. This is also exactly what the owner's OWN address
+    /// looks like from behind a reverse proxy.
+    #[test]
+    fn a_patient_attacker_can_not_lock_the_owner_out_for_longer_than_a_minute(
+    ) {
+        let limiter = RateLimiter::default();
+        let who = address(1);
+        let mut at = Instant::now();
+
+        for round in 0..40 {
+            for _ in 0..ATTEMPTS_PER_WINDOW {
+                let lockout = limiter.failed_at(who, at);
+                if let Some(lockout) = lockout {
+                    assert!(
+                        lockout <= ATTEMPT_WINDOW,
+                        "round {round}: locked out for {lockout:?}"
+                    );
+                }
+            }
+
+            // The attacker comes straight back the moment it lifts.
+            at += ATTEMPT_WINDOW;
+
+            // And whenever it has lifted, the owner gets in.
+            assert_eq!(
+                limiter.check_at(who, at),
+                Allowed::Yes,
+                "round {round}: the owner is still locked out"
+            );
+        }
+    }
+
+    /// The penalty is not permanent: quiet time forgives it, so a slow
+    /// attacker cannot ratchet it up over an afternoon.
+    #[test]
+    fn the_penalty_decays_with_quiet_time() {
+        let limiter = RateLimiter::default();
+        let who = address(1);
+        let mut at = Instant::now();
+
+        // Hammer hard enough to earn a real lock-out.
+        for _ in 0..(LOUD_FAILURES + 2) {
+            limiter.failed_at(who, at);
+        }
+        let hammered = limiter
+            .failed_at(who, at)
+            .expect("a loud address is locked out");
+        assert!(hammered > ATTEMPT_WINDOW, "{hammered:?}");
+
+        // Now go quiet for a long time, then fail the allowance again.
+        at += MAX_LOCKOUT + DECAY_AFTER * 20;
+        let mut after = None;
+        for _ in 0..ATTEMPTS_PER_WINDOW {
+            after = limiter.failed_at(who, at);
+        }
+
+        assert!(
+            after.is_none_or(|wait| wait <= ATTEMPT_WINDOW),
+            "the penalty did not decay: {after:?}"
+        );
+    }
+
+    /// The other half: someone actually hammering still earns the long cap.
+    #[test]
+    fn a_loud_attacker_still_earns_the_long_lock_out() {
+        let limiter = RateLimiter::default();
+        let who = address(1);
+        let now = Instant::now();
+
+        let mut longest = Duration::ZERO;
+        for _ in 0..(LOUD_FAILURES * 3) {
+            if let Some(lockout) = limiter.failed_at(who, now) {
+                longest = longest.max(lockout);
+            }
+        }
+
+        assert_eq!(longest, MAX_LOCKOUT, "a flood was not locked out");
+    }
+
+    /// `X-Forwarded-For` is a header: believing it by default would let one
+    /// attacker spread their guesses over as many invented addresses as
+    /// they like, and the throttle would stop existing.
+    #[test]
+    fn the_forwarded_address_is_ignored_unless_a_proxy_was_named() {
+        let peer = address(1);
+        let client: IpAddr = "203.0.113.9".parse().unwrap();
+
+        // Nothing configured: the header is not read at all.
+        assert_eq!(throttle_key(peer, Some("203.0.113.9"), None), peer);
+
+        // Configured, but this connection is NOT from the proxy: ignored.
+        let proxy: IpAddr = "10.0.0.7".parse().unwrap();
+        assert_eq!(
+            throttle_key(peer, Some("203.0.113.9"), Some(proxy)),
+            peer
+        );
+
+        // From the proxy: the right-most hop that is not the proxy wins,
+        // because a forwarding hop APPENDS and everything to its left can
+        // be forged by the client.
+        assert_eq!(
+            throttle_key(
+                proxy,
+                Some("198.51.100.1, 203.0.113.9"),
+                Some(proxy)
+            ),
+            client
+        );
+        assert_eq!(
+            throttle_key(
+                proxy,
+                Some("203.0.113.9, 10.0.0.7"),
+                Some(proxy)
+            ),
+            client
+        );
+
+        // Garbage, or no header at all, falls back to the peer.
+        assert_eq!(
+            throttle_key(proxy, Some("not-an-ip"), Some(proxy)),
+            proxy
+        );
+        assert_eq!(throttle_key(proxy, None, Some(proxy)), proxy);
+        assert_eq!(throttle_key(proxy, Some(""), Some(proxy)), proxy);
     }
 
     #[test]

@@ -284,6 +284,7 @@ pub fn config() -> FleetConfig {
         admin_allow_remote: false,
         admin_secure_cookie: false,
         admin_trust_forwarded_proto: false,
+        admin_trusted_proxy: None,
         chains: Vec::new(),
         max_inflight_mb: 1_024,
         solana_queries_per_minute: 25,

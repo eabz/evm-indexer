@@ -74,6 +74,9 @@ pub struct Admin {
     /// Believe `X-Forwarded-Proto: https`. Off by default: a header any
     /// client can set must not decide whether a cookie is protected.
     trust_forwarded_proto: bool,
+    /// The one address whose `X-Forwarded-For` the login throttle believes
+    /// (`--admin-trusted-proxy`). `None` = the header is ignored.
+    trusted_proxy: Option<std::net::IpAddr>,
     /// The Content-Security-Policy, with the hashes of the page's own
     /// inline script and style. Computed once at start.
     csp: String,
@@ -102,6 +105,7 @@ pub async fn start(
     let addr = config.admin_addr;
     let secure_cookie = config.admin_secure_cookie;
     let trust_forwarded_proto = config.admin_trust_forwarded_proto;
+    let trusted_proxy = config.admin_trusted_proxy;
 
     let admin = Arc::new(Admin {
         supervisor,
@@ -110,6 +114,7 @@ pub async fn start(
         limiter: RateLimiter::default(),
         secure_cookie,
         trust_forwarded_proto,
+        trusted_proxy,
         csp: page::content_security_policy(),
     });
 
@@ -363,7 +368,17 @@ async fn login(
         return secured(&admin, denied);
     }
 
-    let address = peer.ip();
+    // Behind a proxy every client shares one TCP address, so one
+    // attacker's lock-out would fall on the owner as well. The header that
+    // could tell them apart is only believed when the operator named the
+    // proxy AND the connection really came from it.
+    let address = auth::throttle_key(
+        peer.ip(),
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok()),
+        admin.trusted_proxy,
+    );
 
     // The throttle is checked BEFORE the password is even looked at, so a
     // locked-out address cannot use the comparison as an oracle.

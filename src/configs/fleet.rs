@@ -252,6 +252,9 @@ pub struct FleetConfig {
     /// Trust `X-Forwarded-Proto: https` from the proxy to decide `Secure`.
     /// Off by default: a header a client can set must not be believed.
     pub admin_trust_forwarded_proto: bool,
+    /// The ONE address whose `X-Forwarded-For` the login throttle believes.
+    /// `None` = the header is ignored, whoever sends it.
+    pub admin_trusted_proxy: Option<std::net::IpAddr>,
     /// Chains to index even when `fleet_chains` does not list them yet
     /// (`--chain`, repeatable). A brand new database needs this once.
     pub chains: Vec<u64>,
@@ -431,6 +434,7 @@ mod tests {
             admin_allow_remote: false,
             admin_secure_cookie: false,
             admin_trust_forwarded_proto: false,
+            admin_trusted_proxy: None,
             chains: Vec::new(),
             max_inflight_mb: 2_048,
             solana_queries_per_minute: 25,

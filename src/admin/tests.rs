@@ -60,6 +60,7 @@ impl Panel {
             limiter: RateLimiter::default(),
             secure_cookie: false,
             trust_forwarded_proto: false,
+            trusted_proxy: None,
             csp: page::content_security_policy(),
         };
         tweak(&mut admin);
@@ -568,6 +569,100 @@ async fn guessing_is_throttled_per_address() {
     assert_eq!(reply.status, 429, "{reply:?}");
     assert_eq!(reply.header("set-cookie"), None);
     assert!(reply.json()["retry_after_seconds"].as_u64().unwrap() > 0);
+
+    panel.stop().await;
+}
+
+/// Review MAJOR 2, over the wire: a forged `X-Forwarded-For` must not let
+/// one attacker spread their guesses over invented addresses, and with no
+/// trusted proxy configured the header is not read at all.
+#[tokio::test]
+async fn a_forged_forwarded_for_does_not_buy_more_guesses() {
+    let panel = Panel::start(&[]).await;
+
+    // Five guesses, each claiming to be a different client.
+    for i in 0..auth::ATTEMPTS_PER_WINDOW {
+        let forwarded = format!("203.0.113.{i}");
+        let reply = request(
+            panel.addr,
+            "POST",
+            "/api/login",
+            &[
+                ("Origin", &panel.origin()),
+                ("X-Forwarded-For", &forwarded),
+            ],
+            Some("{\"password\":\"guess\"}"),
+        )
+        .await;
+        assert_eq!(reply.status, 401, "{reply:?}");
+    }
+
+    // The sixth is still throttled: the header bought nothing.
+    let reply = request(
+        panel.addr,
+        "POST",
+        "/api/login",
+        &[
+            ("Origin", &panel.origin()),
+            ("X-Forwarded-For", "198.51.100.77"),
+        ],
+        Some("{\"password\":\"guess\"}"),
+    )
+    .await;
+    assert_eq!(reply.status, 429, "{reply:?}");
+
+    panel.stop().await;
+}
+
+/// ... and with the proxy named, the throttle tells two clients apart, so
+/// one attacker no longer locks the owner out.
+#[tokio::test]
+async fn behind_a_named_proxy_two_clients_are_throttled_separately() {
+    let panel = Panel::start_with(&[], |admin| {
+        // Every connection in this test comes from loopback, which is
+        // therefore "the proxy".
+        admin.trusted_proxy = Some("127.0.0.1".parse().unwrap());
+    })
+    .await;
+
+    let guess = |forwarded: &'static str| {
+        let addr = panel.addr;
+        let origin = panel.origin();
+        async move {
+            request(
+                addr,
+                "POST",
+                "/api/login",
+                &[
+                    ("Origin", origin.as_str()),
+                    ("X-Forwarded-For", forwarded),
+                ],
+                Some("{\"password\":\"guess\"}"),
+            )
+            .await
+            .status
+        }
+    };
+
+    for _ in 0..auth::ATTEMPTS_PER_WINDOW {
+        assert_eq!(guess("203.0.113.9").await, 401);
+    }
+    assert_eq!(guess("203.0.113.9").await, 429, "the attacker is locked");
+
+    // The owner, arriving through the same proxy from another address, is
+    // not caught by it.
+    let reply = request(
+        panel.addr,
+        "POST",
+        "/api/login",
+        &[
+            ("Origin", &panel.origin()),
+            ("X-Forwarded-For", "198.51.100.4"),
+        ],
+        Some(&format!("{{\"password\":\"{PASSWORD}\"}}")),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "the owner was locked out: {reply:?}");
 
     panel.stop().await;
 }

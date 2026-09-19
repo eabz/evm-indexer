@@ -195,6 +195,13 @@ pub struct FleetArgs {
 
     #[arg(
         long,
+        value_name = "IP",
+        help = "The address of the reverse proxy in front of the control panel. ONLY when a connection comes from exactly this address is `X-Forwarded-For` used to tell one sign-in attempt from another; otherwise the header is ignored entirely. Without this, every client behind a proxy shares one throttle and one attacker's lock-out falls on you too."
+    )]
+    pub admin_trusted_proxy: Option<std::net::IpAddr>,
+
+    #[arg(
+        long,
         env = "FLEET_MAX_INFLIGHT_MB",
         help = "Rough upper bound, in megabytes, on the rows the whole fleet buffers before writing. Split over the running chains, so one more chain makes every chain's write batch smaller instead of growing the process.",
         default_value_t = 2_048
@@ -741,6 +748,7 @@ impl TryFrom<FleetArgs> for FleetConfig {
             admin_allow_remote: args.admin_allow_remote,
             admin_secure_cookie: args.admin_secure_cookie,
             admin_trust_forwarded_proto: args.admin_trust_forwarded_proto,
+            admin_trusted_proxy: args.admin_trusted_proxy,
             chains: args.chains,
             max_inflight_mb: args.fleet_max_inflight_mb.max(1),
             solana_queries_per_minute: args
