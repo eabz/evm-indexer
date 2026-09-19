@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 02:35 (America/Mexico_City)
+**Last updated:** 2026-09-19 02:45 (America/Mexico_City)
 
 ## Where things are
 
@@ -35,9 +35,9 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
-| solana-venues | Opus | worktree `agent-a26920c31a5397109` | Solana phase 2: fix 1-slot-per-query cap in `src/source/solana.rs`, then Raydium / Orca / Meteora decoders + decode speed | commit after each venue + tirith notes |
+| (nobody running) | - | - | Solana venues merged 7a4487e: 8 venues, 120/120 trades matched a public RPC, ~54% of Solana DEX volume, query caps fixed (1 -> 66 slots per request). Next wave is scheduled by the lead for just after the 5-hour window resets (03:20 local) | - |
 
-MAIN TREE IS CLEAN and pushed (HEAD ca36934). Everything below is merged: pipeline wiring +
+MAIN TREE IS CLEAN and pushed (HEAD 7a4487e+). NO worktrees exist. Everything below is merged: pipeline wiring +
 zero-flag proof, migrator fixes, launchpads (+ wiring, id alignment, review fixes), chain
 neutral DEX + predictions (+ review round 2 fixes), Solana phase 1, reorg core, hardening
 round 1 (side-table orphan repair, shrinking chain, lease fencing, review round 3 blockers
@@ -50,8 +50,10 @@ NEXT TO LAUNCH (all Opus), when the 5-hour window allows:
    for the epoch moving mid-flush, root cause of the tests that fail once under load
    (`eight_chains...`, `hostile_amounts...`), pass the purged range into dex + launchpads
    rebuild SQL.
-2. Solana launchpads into `launchpad_*` (pump.fun curve, Meteora DBC, LaunchLab) - after
-   solana-venues lands (both edit `src/svm`).
+2. Solana launchpads into `launchpad_*` (pump.fun curve, Meteora DBC, LaunchLab); also the
+   pump.fun decoder disagreeing with the movement layer on 1.8-3.8% of curve trades, and a
+   curated `sol_dex_programs` registry for the prop AMMs (~32% of Solana volume: movement
+   layer decodes them, promoting a program to a venue is a false-positive decision).
 3. `indexer run --chain solana`: head follower, `sol_slots` commit marker, contiguity by
    `block_height`/parent chain, reorg handling off with a parent-hash tripwire, chain
    registration via `svm::REGISTER_CHAIN_SQL` (plan: docs/solana-research.md section 11).
