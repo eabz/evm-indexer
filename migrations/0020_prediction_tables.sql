@@ -29,9 +29,12 @@
 --     Readers print an id with the family of its chain (the chains
 --     registry): concat('0x', lower(hex(substring(id, 13)))) for 'evm',
 --     base58Encode(substring(id, 1, 32)) for 'svm'. The substring is NOT
---     optional: toString(FixedString), CAST to String and the implicit
---     conversion base58Encode() does all TRIM TRAILING ZERO BYTES, so a
---     pubkey ending in 0x00 would print as a different key (dex::api v4).
+--     optional: toString(FixedString) and CAST to String TRIM TRAILING
+--     ZERO BYTES, so a pubkey ending in 0x00 routed through either would
+--     print as a different key (dex::api v4). base58Encode(id) itself
+--     does NOT trim on 25.12.1.322 - see the header of migration 0006 for
+--     the measured values - but the substring() form is the one to copy:
+--     it states the intent and holds on every build.
 --   * transaction id = tx_id String, the RAW bytes (32 on EVM, 64 on
 --     Solana). Never a sorting key column.
 --   * position = (chain, block_number, tx_index, ordinal). block_number

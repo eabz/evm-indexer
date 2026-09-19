@@ -299,7 +299,7 @@ SELECT
   uniqMerge(a.traders) AS traders,
   uniq(a.pool_id, a.emitter) AS pools
 FROM dex_pool_volume_1h AS a
-ASOF LEFT JOIN dex_epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 LEFT JOIN (SELECT chain, pool_id, emitter, protocol, trusted FROM dex_pool_current_v) AS p ON p.chain = a.chain AND p.pool_id = a.pool_id AND p.emitter = a.emitter
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)
 GROUP BY chain, protocol, bucket;

@@ -19,9 +19,10 @@
 -- the surviving swaps of every bucket >= from_ts under the NEW epoch
 -- (rebuild_sql). Readers apply the VALIDITY RULE: a contribution with epoch e
 -- in bucket b counts iff e >= the largest epoch among the chain's reorgs with
--- from_ts <= b (0 when there is none). dex_epoch_floor_v turns reorgs into
--- that step function, every *_v view ASOF joins it and filters BEFORE it
--- merges aggregate states, so a stale epoch can not leak an open / close.
+-- from_ts <= b (0 when there is none). epoch_floor_v - the SHARED view of
+-- migration 0004, next to `reorgs` - turns reorgs into that step function,
+-- every *_v view ASOF joins it and filters BEFORE it merges aggregate
+-- states, so a stale epoch can not leak an open / close.
 -- Never read the tables below directly: only their *_v views are correct.
 --
 -- Prices are token1 per token0 in RAW units (not decimals adjusted), see
@@ -33,20 +34,16 @@
 -- Multi asset families (Balancer, Curve) have no token0 / token1 and
 -- therefore no candles. Their volume is in dex_pool_volume_1h.
 
--- The validity rule as a step function: for every (chain, from_ts) the
--- largest epoch of all reorgs of the chain starting at or before from_ts.
--- reorgs (chain, epoch, from_ts, ...) is created by migration 0004.
-CREATE VIEW IF NOT EXISTS dex_epoch_floor_v AS
-SELECT
-  chain,
-  from_ts,
-  max(step) OVER (PARTITION BY chain ORDER BY from_ts ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS epoch_floor
-FROM
-(
-  SELECT chain, toDateTime(from_ts, 'UTC') AS from_ts, max(epoch) AS step
-  FROM reorgs
-  GROUP BY chain, from_ts
-);
+-- The validity rule as a step function - for every (chain, from_ts) the
+-- largest epoch of all reorgs of the chain starting at or before from_ts -
+-- is `epoch_floor_v`, created by migration 0004 next to `reorgs` itself
+-- (docs/design.md section 1, "Aggregates"). This module used to carry a
+-- byte-for-byte equivalent copy of it, `dex_epoch_floor_v`; the copy is
+-- gone and every view below joins the shared one, exactly like the
+-- prediction and launchpad views do. 0004 runs before 0011, so the
+-- dependency order holds. The copy only differed by a
+-- `toDateTime(from_ts, 'UTC')` that was a no-op: `reorgs.from_ts` is
+-- already `DateTime('UTC')`.
 
 CREATE TABLE IF NOT EXISTS dex_candles_1m (
   chain UInt64,
@@ -273,7 +270,7 @@ SELECT
   toUInt64(sum(a.swaps)) AS swaps,
   uniqMerge(a.traders) AS traders
 FROM dex_candles_1m AS a
-ASOF LEFT JOIN dex_epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)
 GROUP BY chain, pool_id, emitter, bucket;
 
@@ -294,7 +291,7 @@ SELECT
   toUInt64(sum(a.swaps)) AS swaps,
   uniqMerge(a.traders) AS traders
 FROM dex_candles_1h AS a
-ASOF LEFT JOIN dex_epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)
 GROUP BY chain, pool_id, emitter, bucket;
 
@@ -315,7 +312,7 @@ SELECT
   toUInt64(sum(a.swaps)) AS swaps,
   uniqMerge(a.traders) AS traders
 FROM dex_candles_1d AS a
-ASOF LEFT JOIN dex_epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)
 GROUP BY chain, pool_id, emitter, bucket;
 
@@ -328,7 +325,7 @@ SELECT
   toUInt64(sum(a.swaps)) AS swaps,
   uniqMerge(a.traders) AS traders
 FROM dex_pool_volume_1h AS a
-ASOF LEFT JOIN dex_epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)
 GROUP BY chain, pool_id, emitter, protocol, bucket, token_in, token_out;
 
@@ -340,6 +337,6 @@ SELECT
   toUInt64(sum(a.swaps)) AS swaps,
   uniqMerge(a.traders) AS traders
 FROM dex_pool_volume_1h AS a
-ASOF LEFT JOIN dex_epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)
 GROUP BY chain, pool_id, emitter, protocol, day;

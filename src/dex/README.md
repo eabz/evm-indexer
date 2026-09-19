@@ -193,11 +193,19 @@ LEFT JOIN chains_v AS c ON c.chain = s.chain
 WHERE s.chain = 1
 ```
 
-`substring()` is **not** decoration. Turning a `FixedString` into a `String` -
-`toString(id)`, `CAST(id AS String)`, and the implicit conversion
-`base58Encode(id)` performs - **trims trailing zero bytes**, so
-`base58Encode(id)` silently encodes a shortened pubkey. `substring(id, 1, 32)`
-and `concat(id, '')` keep every byte.
+`substring()` is **not** decoration. Turning a `FixedString` into a `String`
+explicitly - `toString(id)` or `CAST(id AS String)` - **trims trailing zero
+bytes**, so an id routed through either loses the zeros a pubkey may end in
+(on 25.12.1.322 `length(toString(toFixedString(unhex('0102030000'), 5)))` is
+3, not 5). `substring(id, 1, 32)`, `concat(id, '')` and `hex(id)` keep every
+byte.
+
+`base58Encode(id)` does **not** trim - it takes the `FixedString` directly, and
+on 25.12.1.322 `base58Encode(toFixedString(unhex('0102030000'), 5))` is
+`7bWp9m`, the same as the `substring()` form. Keep writing the `substring()`
+form regardless: it says which bytes are meant and does not rest on a
+conversion rule a later build may change. See the header of migration `0006`
+for the measured values.
 
 **A `pool_id` is not an address**, even on EVM (a Uniswap V4 or Balancer id is a
 native 32 byte value), so `dex_pools_v.pool` prints all 32 bytes and must never
@@ -237,7 +245,7 @@ The indexer never issues DELETE / ALTER DELETE / DROP PARTITION.
 
 ```sql
 FROM dex_candles_1h AS a
-ASOF LEFT JOIN dex_epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)   -- ifNull: join_use_nulls = 1 profiles
 GROUP BY chain, pool_id, emitter, bucket
 ```
