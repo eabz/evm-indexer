@@ -52,7 +52,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use futures::future::BoxFuture;
 use hypersync_client::net_types::RollbackGuard;
-use lease::{Lease, LeaseOptions};
+use lease::{Fence, Lease, LeaseOptions};
 use log::{debug, error, info, warn};
 use modules::{DecodeState, EnabledModules};
 use std::{
@@ -130,6 +130,10 @@ type LastFlush = Arc<Mutex<Option<(u64, u64)>>>;
 struct ClickhouseSink {
     db: Database,
     discovery: Discovery,
+    /// Asked before every flush: this process must not write once it lost
+    /// the chain's lease, or once its own heartbeats stalled past the ttl
+    /// (`pipeline::lease`, "Fencing").
+    fence: Fence,
     last_flush: LastFlush,
     /// Block spans flushed with an epoch that was superseded WHILE the
     /// flush ran (a purge of another process, i.e. `indexer backfill`):
@@ -146,6 +150,10 @@ impl Sink for ClickhouseSink {
     }
 
     async fn store(&self, batch: &RowBatch) -> Result<()> {
+        // Before anything is written: is this process still the one that
+        // owns the chain? A failure here is final, like any failed flush.
+        self.fence.check()?;
+
         self.db.store(batch).await?;
 
         if let Some((from, to)) = batch.block_span() {
@@ -180,6 +188,8 @@ impl Sink for ClickhouseSink {
 /// What the reorg logic needs from the writer.
 struct WriterGate {
     writer: WriterHandle,
+    /// A purge rewrites history: it is fenced like a flush.
+    fence: Fence,
     /// Resolves once the last flush can be read back.
     visible: Box<dyn Fn() -> BoxFuture<'static, Result<()>> + Send + Sync>,
     adopt: Box<dyn Fn(u32) + Send + Sync>,
@@ -188,6 +198,9 @@ struct WriterGate {
 impl WriterControl for WriterGate {
     fn quiesce(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
+            // Step 0 of every purge: a process that lost the chain must
+            // not tombstone rows or bump the epoch either.
+            self.fence.check()?;
             self.writer.barrier().await?;
             (self.visible)().await
         })
@@ -379,6 +392,7 @@ pub async fn run_with<S: BlockSource>(
         dex: config.dex,
         predictions: config.predictions,
         launchpads: config.launchpads,
+        // MODULE: <module>: config.<module>,
     };
 
     info!(
@@ -388,10 +402,24 @@ pub async fn run_with<S: BlockSource>(
         if enabled.predictions { "on" } else { "off (--no-predictions)" },
         if enabled.launchpads { "on" } else { "off (--no-launchpads)" },
         if runtime.caller.is_some() { "on" } else { "off (--rpc none)" },
+        // MODULE: one placeholder and one arm in the line above.
     );
 
     // Checkpoints say where a previous run got to; `blocks` stays the
     // truth: the first pass verifies the whole range with the gap query.
+    //
+    // They are NOT used as the cursor, although docs/design.md section 3
+    // says "resume = max contiguous to_block". Starting the cursor at the
+    // resume point would skip the first pass's inspection of everything
+    // below it - and that inspection is the ONLY thing that finds the
+    // orphan children of a flush that died before its `blocks` insert
+    // (`ReorgGuard::begin_pass`). A checkpoint is written after `blocks`,
+    // so it cannot claim such a range; but a purge that died after
+    // tombstoning children and before its `reorgs` row can leave one
+    // below it. The gap query over `blocks` costs one indexed read per
+    // pass and answers the same question without that hole, so the
+    // checkpoints stay what they are: an index for operators and for
+    // `indexer verify`, and the log line below.
     let resume =
         verify::resume_point(&db, config.start_block).await.unwrap_or(0);
     if resume > config.start_block {
@@ -420,10 +448,13 @@ pub async fn run_with<S: BlockSource>(
     let last_flush = LastFlush::default();
     let stale = Arc::new(Mutex::new(Vec::new()));
 
+    let fence = lease.fence();
+
     let writer = Writer::spawn_with_metrics(
         ClickhouseSink {
             db: db.clone(),
             discovery: discovery.clone(),
+            fence: fence.clone(),
             last_flush: last_flush.clone(),
             stale: stale.clone(),
         },
@@ -434,6 +465,7 @@ pub async fn run_with<S: BlockSource>(
 
     let gate = WriterGate {
         writer: writer.handle(),
+        fence,
         visible: {
             let db = db.clone();
             Box::new(move || {
@@ -744,7 +776,15 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
         let gaps: Vec<(u64, u64)> =
             missing.ranges.iter().map(|r| (r.from, r.to)).collect();
 
-        let healed = self.guard.begin_pass(&gaps, range.to).await?;
+        // `covered_until`, NOT `range.to`: when the gap listing hit
+        // `MAX_GAPS_PER_PASS` it only accounts for the blocks below the
+        // last gap it returned. Telling the guard "everything up to
+        // range.to was inspected" would move its `healed_until` past gaps
+        // it never saw, and those ranges would never be orphan-checked
+        // again - their orphans stay live, the blocks are re-streamed on
+        // top, and the aggregates count both.
+        let healed =
+            self.guard.begin_pass(&gaps, missing.covered_until).await?;
         if healed > 0 {
             info!(
                 "Chain {}: healed {healed} gap range(s) left by an \

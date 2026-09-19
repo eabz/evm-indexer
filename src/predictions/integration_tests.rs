@@ -1711,6 +1711,309 @@ async fn a_non_evm_32_byte_id_round_trips_through_every_table_and_query() {
     database.drop().await;
 }
 
+/// Review round 3, item 2. The `tokens` join of the candle views used to
+/// TRUNCATE the analytics side - `toFixedString(substring(collateral_token,
+/// 13, 20), 20)` - instead of padding `tokens.address` up to 32 bytes. That
+/// maps EVERY 32 byte id onto some EVM address, so a non-EVM collateral
+/// whose last 20 bytes happen to equal a real token's address picked up
+/// that token's decimals and silently rescaled its amounts by 10^decimals.
+///
+/// The collision is planted deliberately here: `COLLIDING_COLLATERAL` is a
+/// 32 byte id with a non-zero 12 byte prefix whose last 20 bytes ARE
+/// `COLLIDING_ADDRESS`, the address of a real `tokens` row with 9 decimals.
+/// The decimals-adjusted columns must stay NULL (the honest "not known"),
+/// while the `_raw` ones keep the on-chain integer. The EVM control in the
+/// same test proves the join still works when it is supposed to.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn a_32_byte_collateral_never_borrows_a_truncated_tokens_row() {
+    let database = TestDb::create().await;
+    let traded_at = now() - 3_600;
+    let version = crate::db::next_version();
+    let token_id = U256::from(7u8).to_string();
+    let evm_token_id = U256::from(8u8).to_string();
+
+    // The last 20 bytes of the non-EVM collateral, and the collateral.
+    const COLLIDING_ADDRESS: &str =
+        "40f29e5b16d7a04c93e281fb60ac57d9138e4b2f";
+    const COLLIDING_COLLATERAL: &str = concat!(
+        "5a8c3f19d02b47e6ba71cd83",
+        "40f29e5b16d7a04c93e281fb60ac57d9138e4b2f",
+    );
+    assert_eq!(COLLIDING_COLLATERAL.len(), 64);
+    assert_eq!(&COLLIDING_COLLATERAL[24..], COLLIDING_ADDRESS);
+    // The prefix is NOT zero, so this id is not a padded EVM address.
+    assert_ne!(&COLLIDING_COLLATERAL[..24], "000000000000000000000000");
+
+    // A genuine EVM collateral on the same chain: the control.
+    const EVM_ADDRESS: &str = "1111111111111111111111111111111122223333";
+    let evm_collateral = format!("000000000000000000000000{EVM_ADDRESS}");
+
+    for sql in [
+        // The real token the forged id collides with, and the control's.
+        format!(
+            "INSERT INTO tokens (chain, address, name, symbol, decimals, type) \
+             VALUES ({SVM_CHAIN}, unhex('{COLLIDING_ADDRESS}'), 'Nine', 'NINE', 9, \
+             'ERC20'), ({SVM_CHAIN}, unhex('{EVM_ADDRESS}'), 'Six', 'SIX', 6, 'ERC20')"
+        ),
+        format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) VALUES \
+             ({SVM_CHAIN}, 'registry', unhex('{SVM_REGISTRY}'), unhex('{SVM_REGISTRY}'))"
+        ),
+        // (registry, outcome_token_id) -> collateral, for both legs.
+        format!(
+            "INSERT INTO prediction_outcome_tokens (chain, registry, \
+             outcome_token_id, market_id, outcome_index, collateral_token, \
+             first_seen_block, first_seen_timestamp, _version) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_REGISTRY}'), toUInt256('{token_id}'), \
+             unhex('{SVM_MARKET}'), 0, unhex('{COLLIDING_COLLATERAL}'), 10, \
+             {traded_at}, {version}), \
+             ({SVM_CHAIN}, unhex('{SVM_REGISTRY}'), toUInt256('{evm_token_id}'), \
+             unhex('{SVM_MARKET}'), 1, unhex('{evm_collateral}'), 10, {traded_at}, \
+             {version})"
+        ),
+        // One verified trade per leg: 240000 collateral for 400000 shares.
+        format!(
+            "INSERT INTO prediction_trades (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, protocol, exchange, registry, order_hash, maker, \
+             taker, tx_from, tx_to, outcome_token_id, side, share_amount, \
+             collateral_amount, match_type, verified, maker_outcome_token_id, \
+             maker_side, maker_collateral_amount, maker_fee_amount, maker_fee_unit, \
+             taker_fee_amount, taker_fee_unit, epoch, _version) VALUES \
+             ({SVM_CHAIN}, 11, {traded_at}, unhex('{SVM_TX}'), 4, 13, 'ctf_exchange', \
+             unhex('{SVM_EXCHANGE}'), unhex('{SVM_REGISTRY}'), unhex('{SVM_MARKET}'), \
+             unhex('{SVM_MAKER}'), unhex('{SVM_TAKER}'), unhex('{SVM_CREATOR}'), \
+             unhex('{SVM_EXCHANGE}'), toUInt256('{token_id}'), 'buy', 400000, 240000, \
+             'complementary', 1, toUInt256('{token_id}'), 'sell', 240000, 0, \
+             'collateral', 0, 'collateral', 0, {version}), \
+             ({SVM_CHAIN}, 12, {traded_at}, unhex('{SVM_TX}'), 5, 14, 'ctf_exchange', \
+             unhex('{SVM_EXCHANGE}'), unhex('{SVM_REGISTRY}'), unhex('{SVM_MARKET}'), \
+             unhex('{SVM_MAKER}'), unhex('{SVM_TAKER}'), unhex('{SVM_CREATOR}'), \
+             unhex('{SVM_EXCHANGE}'), toUInt256('{evm_token_id}'), 'buy', 400000, \
+             240000, 'complementary', 1, toUInt256('{evm_token_id}'), 'sell', 240000, \
+             0, 'collateral', 0, 'collateral', 0, {version})"
+        ),
+    ] {
+        database.execute(&sql).await;
+    }
+
+    // Truncating really would have found the colliding row: this is the
+    // lookup the views used to do, and it returns the planted 9 decimals.
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT ifNull(toString(any(decimals)), '<null>') FROM tokens FINAL \
+                 WHERE chain = {SVM_CHAIN} AND address IN (SELECT \
+                 toFixedString(substring(unhex('{COLLIDING_COLLATERAL}'), 13, 20), 20))"
+            ))
+            .await,
+        vec!["9".to_owned()],
+        "the collision is not planted correctly"
+    );
+
+    // ... and padding, which is what the views do now, finds nothing.
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM tokens FINAL WHERE chain = {SVM_CHAIN} \
+                 AND toFixedString(concat(toFixedString('', 12), address), 32) \
+                 = unhex('{COLLIDING_COLLATERAL}')"
+            ))
+            .await,
+        0
+    );
+
+    // THE ASSERTION. The non-EVM leg: raw volume is the on-chain integer
+    // and the decimals-adjusted columns are NULL. With the truncating join
+    // volume was 240000 / 10^9 = 0.00024 instead.
+    for view in [
+        "prediction_candles_1m_v",
+        "prediction_candles_1h_v",
+        "prediction_candles_1d_v",
+    ] {
+        assert_eq!(
+            database
+                .rows::<(String, String, String)>(&format!(
+                    "SELECT ifNull(toString(volume_raw), '<null>'), \
+                     ifNull(toString(volume), '<null>'), \
+                     ifNull(toString(shares), '<null>') FROM {view}(\
+                     chain = {SVM_CHAIN}, registry = '{SVM_REGISTRY}', \
+                     outcome_token_id = {token_id})"
+                ))
+                .await,
+            vec![(
+                "240000".to_owned(),
+                "<null>".to_owned(),
+                "<null>".to_owned()
+            )],
+            "{view} borrowed the decimals of a truncated tokens row"
+        );
+
+        // The control: a genuine EVM collateral on the same chain still
+        // resolves, so the join is scoped, not simply broken.
+        assert_eq!(
+            database
+                .rows::<(String, String)>(&format!(
+                    "SELECT ifNull(toString(volume_raw), '<null>'), \
+                     ifNull(toString(volume), '<null>') FROM {view}(\
+                     chain = {SVM_CHAIN}, registry = '{SVM_REGISTRY}', \
+                     outcome_token_id = {evm_token_id})"
+                ))
+                .await,
+            vec![("240000".to_owned(), "0.24".to_owned())],
+            "{view} lost a real EVM collateral"
+        );
+    }
+
+    database.drop().await;
+}
+
+/// Review round 3, item 3. An id parameter is hex without `0x` and the
+/// views pad a 40 character one, but an EMPTY string went through the
+/// same path: `unhex('')` is the empty string and `toFixedString('', 32)`
+/// is 32 ZERO BYTES, which is a real, storable value in these tables: an
+/// unknown `registry`, `market_id` or `collateral_token` is the 32 zero
+/// bytes, never a missing row. So an empty parameter, which is exactly
+/// what a UI sends when its field is unset, selected the zero bucket
+/// instead of returning nothing; a truncated 39 or 63 character id padded
+/// the same way.
+///
+/// The `holder` views were the one lucky case - the MVs that fill
+/// `prediction_ledger_by_holder` drop the zero holder on purpose, so the
+/// mint and burn legs of a split never land there - but the guard is
+/// applied uniformly rather than resting on that.
+///
+/// Every parameterized view now carries `AND length({id}) IN (40, 64)`.
+/// The positive direction - a valid id still answers - is covered by the
+/// other five tests in this file, which read these same views.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn an_empty_or_wrong_length_id_parameter_matches_nothing() {
+    let database = TestDb::create().await;
+    let traded_at = now() - 3_600;
+    let version = crate::db::next_version();
+    let token_id = U256::from(5u8).to_string();
+    let zero = "0".repeat(64);
+
+    // The premise: plant rows under the 32 zero bytes, on the holder, the
+    // market and the registry, so "matches nothing" is a filter doing
+    // work rather than an empty table.
+    for sql in [
+        format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) \
+             VALUES ({CHAIN}, 'registry', unhex('{zero}'), unhex('{zero}'))"
+        ),
+        format!(
+            "INSERT INTO prediction_outcome_tokens (chain, registry, \
+             outcome_token_id, market_id, outcome_index, collateral_token, \
+             first_seen_block, first_seen_timestamp, _version) VALUES \
+             ({CHAIN}, unhex('{zero}'), toUInt256('{token_id}'), \
+             unhex('{zero}'), 0, unhex('{zero}'), 10, {traded_at}, {version})"
+        ),
+        // A market and an exchange under the zero id, so the market list
+        // really holds a zero-id market ...
+        format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) \
+             VALUES ({CHAIN}, 'exchange', unhex('{zero}'), unhex('{zero}'))"
+        ),
+        format!(
+            "INSERT INTO prediction_markets (chain, market_id, registry, \
+             protocol, oracle, question_id, outcome_count, block_number, \
+             timestamp, tx_id, tx_index, ordinal, tx_from, source, epoch, \
+             _version) VALUES ({CHAIN}, unhex('{zero}'), unhex('{zero}'), 'ctf', \
+             unhex('{zero}'), unhex('{zero}'), 2, 10, {traded_at}, unhex('aa'), \
+             0, 1, unhex('{zero}'), 'event', 0, {version})"
+        ),
+        // ... and a verified trade on it, which feeds the candles and the
+        // trades tape under the zero registry / zero market.
+        format!(
+            "INSERT INTO prediction_trades (chain, block_number, timestamp, \
+             tx_id, tx_index, ordinal, protocol, exchange, registry, order_hash, \
+             maker, taker, tx_from, tx_to, outcome_token_id, side, share_amount, \
+             collateral_amount, match_type, verified, maker_outcome_token_id, \
+             maker_side, maker_collateral_amount, maker_fee_amount, \
+             maker_fee_unit, taker_fee_amount, taker_fee_unit, epoch, _version) \
+             VALUES ({CHAIN}, 11, {traded_at}, unhex('aa'), 1, 2, 'ctf_exchange', \
+             unhex('{zero}'), unhex('{zero}'), unhex('{zero}'), unhex('{zero}'), \
+             unhex('{zero}'), unhex('{zero}'), unhex('{zero}'), \
+             toUInt256('{token_id}'), 'buy', 400000, 240000, 'complementary', 1, \
+             toUInt256('{token_id}'), 'sell', 240000, 0, 'collateral', 0, \
+             'collateral', 0, {version})"
+        ),
+    ] {
+        database.execute(&sql).await;
+    }
+    database.refresh_markets().await;
+
+    for (table, column) in [
+        ("prediction_outcome_tokens", "registry"),
+        ("prediction_outcome_tokens_by_market", "market_id"),
+    ] {
+        assert!(
+            database
+                .count(&format!(
+                    "SELECT count() FROM {table} FINAL WHERE chain = {CHAIN} \
+                     AND {column} = toFixedString('', 32)"
+                ))
+                .await
+                > 0,
+            "{table}.{column}: the zero bucket is empty, this proves nothing"
+        );
+    }
+
+    let chain = CHAIN.to_string();
+    // Every parameterized view of 0022, with the id it scopes on.
+    let views: [(&str, &str); 8] = [
+        ("prediction_candles_1m_v", "registry"),
+        ("prediction_candles_1h_v", "registry"),
+        ("prediction_candles_1d_v", "registry"),
+        ("prediction_trades_v", "market_id"),
+        ("prediction_trades_all_v", "market_id"),
+        ("prediction_holders_v", "market_id"),
+        ("prediction_positions_v", "holder"),
+        ("prediction_activity_v", "holder"),
+    ];
+
+    // An empty field, an address one character short, a 32 byte id one
+    // short, and a stray byte. None of them may match anything.
+    for bad in ["", &"a".repeat(39), &"a".repeat(63), "00"] {
+        let parameters: [(&str, &str); 6] = [
+            ("chain", &chain),
+            ("registry", bad),
+            ("market_id", bad),
+            ("holder", bad),
+            ("outcome_token_id", &token_id),
+            ("from_block", "0"),
+        ];
+        database.set(&parameters);
+
+        for (view, id) in views {
+            let sql = match id {
+                "registry" => format!(
+                    "SELECT count() FROM {view}(chain = {{chain:UInt64}}, \
+                     registry = {{registry:String}}, \
+                     outcome_token_id = {{outcome_token_id:UInt256}})"
+                ),
+                "market_id" => format!(
+                    "SELECT count() FROM {view}(chain = {{chain:UInt64}}, \
+                     market_id = {{market_id:String}})"
+                ),
+                _ => format!(
+                    "SELECT count() FROM {view}(chain = {{chain:UInt64}}, \
+                     holder = {{holder:String}})"
+                ),
+            };
+            assert_eq!(
+                database.count(&sql).await,
+                0,
+                "{view}: id {bad:?} matched rows"
+            );
+        }
+    }
+
+    database.drop().await;
+}
+
 /// A contract nobody trusts, emitting the same events the real one does.
 const FORGER: &str = "0xF0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0";
 /// A worthless ERC-20 the forger splits one unit of.

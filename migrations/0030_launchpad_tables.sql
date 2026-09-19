@@ -2,15 +2,34 @@
 -- operator tables (docs/design.md section 11). Evidence, trust rule and
 -- the query cookbook: src/launchpads/README.md.
 --
--- CHAIN NEUTRAL IDENTITY (docs/solana-research.md section 0). Every
--- identity column here is FixedString(32): on EVM the 20 address bytes
--- left padded with 12 zero bytes, exactly like dex_pools.pool_id, so a
--- 32 byte Solana pubkey fits the same column later without rebuilding a
--- sorting key. Joins into the EVM only tables (tokens, erc20_transfers)
--- use substring(x, 13, 20), and joins into dex_pools.pool_id are direct.
+-- CHAIN NEUTRAL IDENTITY (docs/design.md section 13). Every identity
+-- column here is FixedString(32): on EVM the 20 address bytes left padded
+-- with 12 zero bytes, on Solana the 32 raw pubkey bytes, exactly like
+-- dex_pools.pool_id, so a pubkey fits the same column later without
+-- rebuilding a sorting key. Joins into dex_pools.pool_id are direct, and
+-- joins into the EVM only tables (tokens, erc20_transfers) PAD those
+-- tables' FixedString(20) address up to 32 bytes, they never truncate the
+-- 32 byte side (see dex_token_info_v in 0012 and the holder view of 0032).
+-- Readers print an id with the family of its chain (the chains registry of
+-- migration 0006, which is also where THE expression lives):
+--   concat('0x', lower(hex(substring(id, 13))))  for 'evm'
+--   base58Encode(substring(id, 1, 32))           for 'svm'
+-- The substring() is NOT optional: toString(FixedString) and CAST(id AS
+-- String) TRIM TRAILING ZERO BYTES, so anything that routes an id through
+-- them silently shortens a pubkey. substring(id, 1, 32) and concat(id, '')
+-- keep every byte, which is why hex(substring(id, 13)) is safe too. Do not
+-- rely on base58Encode(id) doing the conversion right: it keeps all 32
+-- bytes on 25.12.1.322, but the form above is correct on every build.
+-- A pool_id is NOT an address even on EVM (a Uniswap V4 / Balancer pool id
+-- is a native 32 byte value): print all 32 bytes, never the 'evm' branch.
+--
+-- tx_id is the raw transaction id as a String: 32 bytes on EVM, 64 on
+-- Solana (a signature does not fit a FixedString(32)). It is never part of
+-- a sorting key.
+--
 -- The position of a row is (chain, block_number, tx_index, ordinal)
 -- instead of (chain, block_number, log_index): ordinal IS the log index
--- on EVM. Readers format an id with concat('0x', lower(hex(substring(x, 13)))).
+-- on EVM, and the packed instruction tree path on Solana.
 --
 -- Insert-only reorg support (docs/design.md section 2): nothing is ever
 -- deleted. Every block scoped table is ReplacingMergeTree(_version,
@@ -20,8 +39,27 @@
 -- rows by itself.
 --
 -- Partitioning: the three event-stream tables by month, the launch
--- registry and every side table by chain (lookups must not fan out per
--- month). Dedup windows are added for every module by migration 0090.
+-- registry and every side table by chain. Deduplication windows are
+-- turned on by 0033, which is this module's own copy of 0090 (an applied
+-- migration never changes).
+--
+-- WHY launchpad_tokens is PARTITION BY chain and not by month, which is
+-- design section 1's default for a base table. It is a REGISTRY, read by
+-- IDENTITY and never by time: the token page, the price chart, the sniper
+-- view, the holder list and the curve -> token join every fee row needs
+-- all ask `WHERE chain = ? AND token = ?`, and its sorting key starts
+-- (chain, token, ...) for exactly that. Month partitioning would fan a
+-- single token's FINAL over every month that token was ever touched, on
+-- the module's most-read screen. The partition budget is unaffected
+-- because there is one partition per chain (the ~50 the design budgets
+-- for), not chain x months. Same table shape, same reason and same
+-- exception as dex_pools (0010) and prediction_markets / _resolutions /
+-- _questions (0020). The three event streams - trades, graduations,
+-- creator_fees - are written and purged by block range, so they keep the
+-- month partitioning the design asks for. src/launchpads/mod.rs's
+-- `migrations_follow_the_schema_rules` pins this table by name: a new
+-- block-scoped table gets month partitioning unless it is added there
+-- with a reason.
 --
 -- NOTHING HERE IS TRUSTED. Any contract can emit a TokenLaunched or a
 -- CurveBuy: read through the views of 0032, which count only emitters an
@@ -60,7 +98,7 @@ CREATE TABLE IF NOT EXISTS launchpad_tokens (
   launch_config_id UInt256,
   block_number UInt64 CODEC(Delta, ZSTD),
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
-  transaction_hash FixedString(32),
+  tx_id String,
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
   tx_from FixedString(32),
@@ -89,7 +127,7 @@ CREATE TABLE IF NOT EXISTS launchpad_trades (
   chain UInt64,
   block_number UInt64 CODEC(Delta, ZSTD),
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
-  transaction_hash FixedString(32),
+  tx_id String,
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
   family LowCardinality(String),
@@ -127,7 +165,7 @@ CREATE TABLE IF NOT EXISTS launchpad_graduations (
   chain UInt64,
   block_number UInt64 CODEC(Delta, ZSTD),
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
-  transaction_hash FixedString(32),
+  tx_id String,
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
   family LowCardinality(String),
@@ -160,7 +198,7 @@ CREATE TABLE IF NOT EXISTS launchpad_creator_fees (
   chain UInt64,
   block_number UInt64 CODEC(Delta, ZSTD),
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
-  transaction_hash FixedString(32),
+  tx_id String,
   tx_index UInt32,
   ordinal UInt64 CODEC(Delta, ZSTD),
   component UInt32,
@@ -210,7 +248,7 @@ CREATE TABLE IF NOT EXISTS launchpad_trades_by_token (
   quote_verified UInt8,
   quote_token FixedString(32),
   graduating UInt8,
-  transaction_hash FixedString(32),
+  tx_id String,
   epoch UInt32 DEFAULT 0,
   _version UInt64,
   is_deleted UInt8 DEFAULT 0
@@ -226,7 +264,7 @@ SELECT
   chain, token, block_number, tx_index, ordinal, timestamp, family,
   emitter, side, trader, caller, tx_from, token_amount, quote_amount, fee_amount,
   tax_amount, progress_wad, token_verified, quote_verified, quote_token,
-  graduating, transaction_hash, epoch, _version, is_deleted
+  graduating, tx_id, epoch, _version, is_deleted
 FROM launchpad_trades;
 
 -- Read path: what one wallet did on the curves (sniper and portfolio
@@ -248,7 +286,7 @@ CREATE TABLE IF NOT EXISTS launchpad_trades_by_trader (
   quote_verified UInt8,
   caller FixedString(32),
   tx_from FixedString(32),
-  transaction_hash FixedString(32),
+  tx_id String,
   epoch UInt32 DEFAULT 0,
   _version UInt64,
   is_deleted UInt8 DEFAULT 0
@@ -263,7 +301,7 @@ TO launchpad_trades_by_trader AS
 SELECT
   chain, trader, block_number, tx_index, ordinal, timestamp, family,
   emitter, token, side, token_amount, quote_amount, token_verified,
-  quote_verified, caller, tx_from, transaction_hash, epoch, _version,
+  quote_verified, caller, tx_from, tx_id, epoch, _version,
   is_deleted
 FROM launchpad_trades;
 
@@ -286,7 +324,7 @@ CREATE TABLE IF NOT EXISTS launchpad_launches_by_time (
   initial_supply UInt256,
   graduation_threshold UInt256,
   pool_id FixedString(32),
-  transaction_hash FixedString(32),
+  tx_id String,
   epoch UInt32 DEFAULT 0,
   _version UInt64,
   is_deleted UInt8 DEFAULT 0
@@ -301,7 +339,7 @@ TO launchpad_launches_by_time AS
 SELECT
   chain, timestamp, block_number, tx_index, ordinal, token, family,
   emitter, curve, creator, name, symbol, quote_token, initial_supply,
-  graduation_threshold, pool_id, transaction_hash, epoch, _version,
+  graduation_threshold, pool_id, tx_id, epoch, _version,
   is_deleted
 FROM launchpad_tokens;
 
@@ -321,7 +359,7 @@ CREATE TABLE IF NOT EXISTS launchpad_launches_by_creator (
   symbol String CODEC(ZSTD(3)),
   quote_token FixedString(32),
   graduation_threshold UInt256,
-  transaction_hash FixedString(32),
+  tx_id String,
   epoch UInt32 DEFAULT 0,
   _version UInt64,
   is_deleted UInt8 DEFAULT 0
@@ -336,7 +374,7 @@ TO launchpad_launches_by_creator AS
 SELECT
   chain, creator, timestamp, block_number, tx_index, ordinal, token,
   family, emitter, curve, name, symbol, quote_token,
-  graduation_threshold, transaction_hash, epoch, _version, is_deleted
+  graduation_threshold, tx_id, epoch, _version, is_deleted
 FROM launchpad_tokens;
 
 -- OPERATOR DATA, never written by the indexer, not block scoped.

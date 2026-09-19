@@ -29,14 +29,33 @@
 --      base58Encode(substring(id, 1, 32)),
 --      concat('0x', lower(hex(substring(id, 13)))))
 --
--- substring() is NOT decoration. Converting a FixedString to String -
--- toString(id), CAST(id AS String), and the implicit conversion
--- base58Encode(id) performs - TRIMS TRAILING ZERO BYTES, so base58Encode(id)
--- silently encodes a shortened pubkey: verified on ClickHouse 25.12,
--- base58Encode(toFixedString(unhex('0102030000'), 5)) = 'Ldp' (3 bytes)
--- while the correct answer, base58Encode(substring(id, 1, 5)), is '7bWp9m'.
--- substring() and concat(id, '') keep every byte. hex(substring(id, 13))
--- is safe for the same reason.
+-- substring() is NOT decoration, but the reason is narrower than it looks.
+-- What trims trailing zero bytes is turning a FixedString into a String
+-- EXPLICITLY: toString(id) and CAST(id AS String). Verified on ClickHouse
+-- 25.12.1.322,
+--   length(toString(toFixedString(unhex('0102030000'), 5)))  = 3   (trimmed)
+--   length(substring(toFixedString(unhex('0102030000'),5),1,5)) = 5 (kept)
+--   length(concat(toFixedString(unhex('0102030000'), 5), '')) = 5   (kept)
+-- so anything that routes an id through toString / CAST shortens a pubkey
+-- whose last bytes are zero, and it would print as a different key.
+--
+-- base58Encode(id) does NOT do that. It takes the FixedString directly and
+-- keeps every byte, verified on the same build:
+--   base58Encode(toFixedString(unhex('0102030000'), 5))          = '7bWp9m'
+--   base58Encode(substring(toFixedString(unhex('0102030000'),5), 1, 5))
+--                                                                = '7bWp9m'
+-- ('Ldp' is what the TRIMMED three bytes encode to - the value you get by
+-- writing base58Encode(toString(id)), not base58Encode(id). An earlier
+-- version of this header attributed 'Ldp' to base58Encode(id) itself and
+-- was wrong.) hex(id) keeps every byte for the same reason, which is why
+-- hex(substring(id, 13)) is safe.
+--
+-- The substring() form above stays MANDATORY anyway, and not as a
+-- workaround: it is what makes the intent explicit and checkable at the
+-- call site - 'all 32 bytes' on the svm branch, 'the low 20' on the evm
+-- one - and it does not depend on which conversions a future ClickHouse
+-- build decides to trim. Copy it verbatim, and never write
+-- base58Encode(id) bare on the strength of the note above.
 --
 -- A pool id is NOT an address even on EVM (a Uniswap V4 / Balancer pool id
 -- is a native 32 byte value), so dex_pools_v.pool prints all 32 bytes and

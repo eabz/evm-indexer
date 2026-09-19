@@ -64,16 +64,17 @@ pub(crate) mod sql;
 
 use std::collections::HashSet;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
+
+use crate::utils::format::tx_hash_of;
 
 pub use self::{
     decode::decode,
     derived::LAUNCHPADS_DERIVED,
     models::{
-        address_of, id_of, Family, FeeKind, FeePhase, Id,
-        LaunchpadCreatorFee, LaunchpadFrontend, LaunchpadGraduation,
-        LaunchpadToken, LaunchpadTrade, LaunchpadTrustedEmitter, PoolKind,
-        Side,
+        Family, FeeKind, FeePhase, LaunchpadCreatorFee, LaunchpadFrontend,
+        LaunchpadGraduation, LaunchpadToken, LaunchpadTrade,
+        LaunchpadTrustedEmitter, PoolKind, Side,
     },
 };
 
@@ -112,6 +113,15 @@ pub const BLOCK_SCOPED_TABLES: &[&str] = &[
 /// Tables that are NOT block scoped and never purged: operator data.
 pub const UNSCOPED_TABLES: &[&str] =
     &["launchpad_trusted_emitters", "launchpad_frontends"];
+
+/// Block scoped BASE tables that are `PARTITION BY chain` instead of the
+/// `PARTITION BY toYYYYMM(timestamp)` design §1 asks for. One entry, and
+/// the header of `0030` says why: `launchpad_tokens` is a registry read
+/// by `(chain, token)` on every token-scoped screen, never by time, so
+/// month partitioning would fan one token's `FINAL` over every month it
+/// was touched - the same exception `dex_pools` and the prediction
+/// registries make. A test pins the list.
+pub const BY_CHAIN_BASE_TABLES: &[&str] = &["launchpad_tokens"];
 
 /// The order the pipeline inserts in: a reader must never see a trade of a
 /// token whose launch row is not there yet.
@@ -206,32 +216,36 @@ impl LaunchpadRows {
         F: Fn(&B256) -> Option<TxOrigin>,
     {
         for row in &mut self.tokens {
-            if let Some(origin) = lookup(&row.transaction_hash) {
-                row.tx_from = id_of(origin.from);
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
+                row.tx_from = origin.from;
             }
         }
         for row in &mut self.trades {
-            if let Some(origin) = lookup(&row.transaction_hash) {
-                row.tx_from = id_of(origin.from);
-                row.tx_to = origin.to.map(id_of).unwrap_or_default();
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
+                row.tx_from = origin.from;
+                row.tx_to = origin.to.unwrap_or_default();
                 row.tx_value = origin.value;
             }
         }
         for row in &mut self.graduations {
-            if let Some(origin) = lookup(&row.transaction_hash) {
-                row.tx_from = id_of(origin.from);
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
+                row.tx_from = origin.from;
             }
         }
         for row in &mut self.creator_fees {
-            if let Some(origin) = lookup(&row.transaction_hash) {
-                row.tx_from = id_of(origin.from);
+            let Some(hash) = tx_hash_of(&row.tx_id) else { continue };
+            if let Some(origin) = lookup(&hash) {
+                row.tx_from = origin.from;
             }
         }
     }
 
     /// Emitters this batch showed: what an operator has to decide about
     /// (`launchpad_trusted_emitters`). Deduplicated, in first-seen order.
-    pub fn emitters(&self) -> Vec<(Id, Family)> {
+    pub fn emitters(&self) -> Vec<(Address, Family)> {
         let mut seen = HashSet::new();
 
         self.tokens
@@ -248,7 +262,7 @@ impl LaunchpadRows {
 
     /// Tokens this batch named, for the token metadata worker (the views
     /// need their decimals). EVM addresses only.
-    pub fn token_addresses(&self) -> Vec<alloy::primitives::Address> {
+    pub fn token_addresses(&self) -> Vec<Address> {
         let mut seen = HashSet::new();
 
         self.tokens
@@ -259,8 +273,7 @@ impl LaunchpadRows {
                     .iter()
                     .flat_map(|row| [row.token, row.quote_token]),
             )
-            .filter(|id| *id != B256::ZERO && seen.insert(*id))
-            .filter_map(address_of)
+            .filter(|token| !token.is_zero() && seen.insert(*token))
             .collect()
     }
 }
@@ -304,14 +317,14 @@ mod tests {
         });
 
         let trade = &rows.trades[0];
-        assert_eq!(trade.tx_from, id_of(tx.origin().from));
-        assert_eq!(trade.tx_to, id_of(tx.origin().to.unwrap()));
+        assert_eq!(trade.tx_from, tx.origin().from);
+        assert_eq!(trade.tx_to, tx.origin().to.unwrap());
         assert_eq!(trade.tx_value, tx.origin().value);
         // The launch forwarder sent the transaction; the trader is the
         // creator, and the event's `caller` is the forwarder.
         assert_eq!(trade.caller, trade.tx_to);
         assert_ne!(trade.trader, trade.caller);
-        assert_eq!(trade.trader, id_of(tx.origin().from));
+        assert_eq!(trade.trader, tx.origin().from);
     }
 
     #[test]
@@ -319,13 +332,13 @@ mod tests {
         let rows = all_rows();
 
         let emitters = rows.emitters();
-        let unique: HashSet<&(Id, Family)> = emitters.iter().collect();
+        let unique: HashSet<&(Address, Family)> =
+            emitters.iter().collect();
         assert_eq!(unique.len(), emitters.len());
         assert!(emitters.len() >= 6);
 
         let tokens = rows.token_addresses();
-        let unique: HashSet<&alloy::primitives::Address> =
-            tokens.iter().collect();
+        let unique: HashSet<&Address> = tokens.iter().collect();
         assert_eq!(unique.len(), tokens.len());
         assert!(tokens.iter().all(|token| !token.is_zero()));
     }
@@ -440,13 +453,24 @@ mod tests {
                     "{name}"
                 );
 
+                // Design §1: a block scoped BASE table is partitioned by
+                // month, a lookup / side table by chain. Every exception
+                // is named here and justified in the migration header, so
+                // a new table can not quietly pick either one.
                 let by_month =
                     body.contains("PARTITION BY toYYYYMM(timestamp)");
                 let by_chain = body.contains("PARTITION BY chain ");
                 assert!(by_month != by_chain, "{name}");
-                if SIDE_TABLES.contains(&name.as_str()) {
-                    assert!(by_chain, "{name}");
-                }
+
+                let wants_chain = SIDE_TABLES.contains(&name.as_str())
+                    || BY_CHAIN_BASE_TABLES.contains(&name.as_str());
+                assert_eq!(
+                    by_chain,
+                    wants_chain,
+                    "{name}: partitioned by {}, expected by {}",
+                    if by_chain { "chain" } else { "month" },
+                    if wants_chain { "chain" } else { "month" }
+                );
             }
 
             if aggregate {
@@ -460,7 +484,7 @@ mod tests {
         }
     }
 
-    /// Every identity column is chain neutral (docs/solana-research.md §0).
+    /// Every identity column is chain neutral (docs/design.md §13).
     #[test]
     fn identity_columns_are_32_bytes_and_positions_are_chain_neutral() {
         for (name, body) in tables() {
@@ -469,6 +493,12 @@ mod tests {
             }
             assert!(!body.contains("FixedString(20)"), "{name}");
             assert!(!body.contains(" log_index "), "{name}");
+            // The transaction id is `tx_id String` (raw bytes): a Solana
+            // signature is 64 bytes and does not fit a FixedString(32).
+            assert!(!body.contains("transaction_hash"), "{name}");
+            if body.contains(" tx_index ") {
+                assert!(body.contains(" tx_id String,"), "{name}");
+            }
             for column in
                 ["token", "emitter", "creator", "trader", "recipient"]
             {
@@ -520,6 +550,18 @@ mod tests {
         expected.sort();
 
         assert_eq!(altered, expected);
+    }
+
+    /// The month-partitioning exception is exactly one table, it is a
+    /// base table, and it is not a side table (those are by chain for
+    /// their own reason).
+    #[test]
+    fn only_the_launch_registry_escapes_month_partitioning() {
+        assert_eq!(BY_CHAIN_BASE_TABLES, ["launchpad_tokens"]);
+        for table in BY_CHAIN_BASE_TABLES {
+            assert!(BASE_TABLES.contains(table), "{table}");
+            assert!(!SIDE_TABLES.contains(table), "{table}");
+        }
     }
 
     #[test]

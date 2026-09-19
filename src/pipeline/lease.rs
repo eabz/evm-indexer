@@ -21,14 +21,46 @@
 //! * a clean shutdown writes `released = 1`, so a restart does not wait.
 //!
 //! Cost: one tiny insert and one tiny query per heartbeat.
+//!
+//! # Fencing
+//!
+//! Announcing liveness is not enough by itself. A process that is frozen
+//! (SIGSTOP, `docker pause`, a VM live-migration stun, the cgroup freezer
+//! during a node drain) or cut off from ClickHouse for longer than the ttl
+//! stops beating; another process then takes over legitimately - and the
+//! first one can still have an insert in flight, or wake up and flush.
+//!
+//! So every writer holds a [`Fence`] and asks it before each flush and
+//! before each purge ([`Fence::check`]): it refuses to write when the
+//! lease was lost, and also when this process' OWN last successful
+//! heartbeat is older than the ttl, because from that moment on it cannot
+//! know whether it still holds the chain.
+//!
+//! **Residual window, honestly.** The check is not atomic with the insert:
+//! between `check()` and the moment ClickHouse accepts the part, up to one
+//! flush can still land from a process that is being taken over. The
+//! window is bounded by the time a single flush takes, it requires the
+//! takeover to happen inside exactly that window, and the takeover itself
+//! waits one full ttl before it starts (`Lease::acquire`). Closing it
+//! completely needs a fencing token the database enforces, which
+//! ClickHouse does not offer (no conditional insert, no compare-and-set),
+//! and the design forbids a lock. What the fence removes is the LONG
+//! exposure - a frozen process that comes back minutes later and keeps
+//! writing under an epoch nobody else knows about.
 
 use crate::db::Database;
 use anyhow::{bail, Context, Result};
 use clickhouse::Row;
 use log::{info, warn};
 use serde::Deserialize;
-use std::time::Duration;
-use tokio::{sync::watch, task::JoinHandle};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tokio::{sync::watch, task::JoinHandle, time::Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseOptions {
@@ -47,7 +79,7 @@ impl Default for LeaseOptions {
 }
 
 #[derive(Debug, Clone, Row, Deserialize, PartialEq, Eq)]
-struct Other {
+pub(crate) struct Other {
     instance: String,
     host: String,
     /// Unix ms, server clock.
@@ -55,11 +87,83 @@ struct Other {
     heartbeat_ms: i64,
 }
 
+/// What a writer asks before it writes. Cheap to clone; every clone sees
+/// the same lease.
+#[derive(Clone)]
+pub struct Fence {
+    /// The lease was given up: another instance has precedence, or took
+    /// over while this one was not beating. Never goes back.
+    lost: Arc<AtomicBool>,
+    /// When this process last wrote a heartbeat successfully.
+    last_ok: Arc<Mutex<Instant>>,
+    ttl: Duration,
+    chain: u64,
+}
+
+impl Fence {
+    fn new(chain: u64, ttl: Duration) -> Self {
+        Self {
+            lost: Arc::new(AtomicBool::new(false)),
+            last_ok: Arc::new(Mutex::new(Instant::now())),
+            ttl,
+            chain,
+        }
+    }
+
+    /// A fence of a process that holds no lease at all (`indexer
+    /// backfill`, tests): always open.
+    pub fn open() -> Self {
+        Self::new(0, Duration::MAX)
+    }
+
+    fn beat_ok(&self) {
+        *self.last_ok.lock().unwrap() = Instant::now();
+    }
+
+    fn give_up(&self) {
+        self.lost.store(true, Ordering::SeqCst);
+    }
+
+    /// How long ago this process last proved it is alive.
+    pub fn stalled_for(&self) -> Duration {
+        self.last_ok.lock().unwrap().elapsed()
+    }
+
+    /// `Err` when this process must not write: it lost the lease, or its
+    /// own heartbeats have been stalled for longer than the ttl and
+    /// another process may have taken the chain over. See the module
+    /// documentation for the residual window.
+    pub fn check(&self) -> Result<()> {
+        if self.lost.load(Ordering::SeqCst) {
+            bail!(
+                "chain {}: this process lost its indexer lease; refusing \
+                 to write. Another process is indexing the chain.",
+                self.chain
+            );
+        }
+
+        let stalled = self.stalled_for();
+        if stalled > self.ttl {
+            bail!(
+                "chain {}: this process has not been able to write a \
+                 heartbeat for {stalled:?} (more than the lease ttl {:?}), \
+                 so another process may have taken the chain over. \
+                 Refusing to write until a heartbeat succeeds again.",
+                self.chain,
+                self.ttl
+            );
+        }
+
+        Ok(())
+    }
+}
+
 pub struct Lease {
     db: Database,
     instance: String,
     host: String,
     started_ms: i64,
+    fence: Fence,
     task: JoinHandle<()>,
 }
 
@@ -122,6 +226,29 @@ async fn others_alive(
         .fetch_all::<Other>()
         .await
         .context("query the live indexer instances")
+}
+
+/// Should this process stop, and why?
+///
+/// `stalled`: this process' own last successful heartbeat is older than
+/// the ttl, so it may have been taken over - then ANY live instance wins,
+/// not only an older one (a legitimate takeover starts a YOUNGER process).
+/// Otherwise only an instance with precedence - started earlier, ties
+/// broken by the instance id - makes this one stop.
+fn takeover<'a>(
+    stalled: bool,
+    others: &'a [Other],
+    started_ms: i64,
+    instance: &str,
+) -> Vec<&'a Other> {
+    others
+        .iter()
+        .filter(|other| {
+            stalled
+                || (other.started_ms, other.instance.as_str())
+                    < (started_ms, instance)
+        })
+        .collect()
 }
 
 impl Lease {
@@ -200,10 +327,13 @@ impl Lease {
             );
         }
 
+        let fence = Fence::new(db.chain_id, options.ttl);
+
         let task = {
             let db = db.clone();
             let instance = instance.clone();
             let host = host.clone();
+            let fence = fence.clone();
 
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(options.heartbeat);
@@ -212,53 +342,96 @@ impl Lease {
                 loop {
                     tick.tick().await;
 
+                    // A beat that fails leaves `last_ok` where it was: as
+                    // soon as it is older than the ttl the fence closes,
+                    // because from then on another process may have taken
+                    // the chain over.
                     if let Err(e) =
                         beat(&db, &instance, &host, started_ms, false)
                             .await
                     {
-                        warn!("Instance heartbeat failed: {e:#}");
+                        warn!(
+                            "Instance heartbeat failed ({:?} since the \
+                             last one that worked): {e:#}",
+                            fence.stalled_for()
+                        );
                         continue;
                     }
 
-                    let older =
+                    // The check has to use the state BEFORE this beat: the
+                    // takeover the fence protects against happened while
+                    // this process was not beating.
+                    let stalled = fence.stalled_for() > options.ttl;
+
+                    let others =
                         match others_alive(&db, &instance, options.ttl)
                             .await
                         {
-                            Ok(others) => others
-                                .into_iter()
-                                .filter(|other| {
-                                    (
-                                        other.started_ms,
-                                        other.instance.as_str(),
-                                    ) < (started_ms, instance.as_str())
-                                })
-                                .collect::<Vec<_>>(),
+                            Ok(others) => others,
                             Err(e) => {
                                 warn!("Instance check failed: {e:#}");
                                 continue;
                             }
                         };
 
-                    if !older.is_empty() {
-                        let _ = fatal.send(Some(format!(
-                            "another indexer process is indexing chain {} \
-                             into this database ({}) and has precedence. \
-                             Stopping this one.",
-                            db.chain_id,
-                            describe(&older)
-                        )));
+                    let wins = takeover(
+                        stalled,
+                        &others,
+                        started_ms,
+                        instance.as_str(),
+                    );
+
+                    if !wins.is_empty() {
+                        let owned: Vec<Other> =
+                            wins.into_iter().cloned().collect();
+                        fence.give_up();
+                        let _ = fatal.send(Some(if stalled {
+                            format!(
+                                "chain {}: this process could not write a \
+                                 heartbeat for longer than the lease ttl \
+                                 {:?} and another instance is alive ({}): \
+                                 it has taken the chain over. Stopping \
+                                 this one.",
+                                db.chain_id,
+                                options.ttl,
+                                describe(&owned)
+                            )
+                        } else {
+                            format!(
+                                "another indexer process is indexing \
+                                 chain {} into this database ({}) and has \
+                                 precedence. Stopping this one.",
+                                db.chain_id,
+                                describe(&owned)
+                            )
+                        }));
                         return;
                     }
+
+                    fence.beat_ok();
                 }
             })
         };
 
-        Ok(Self { db: db.clone(), instance, host, started_ms, task })
+        Ok(Self {
+            db: db.clone(),
+            instance,
+            host,
+            started_ms,
+            fence,
+            task,
+        })
+    }
+
+    /// What the writer asks before every flush and every purge.
+    pub fn fence(&self) -> Fence {
+        self.fence.clone()
     }
 
     /// Clean shutdown: the next start does not have to wait.
     pub async fn release(self) {
         self.task.abort();
+        self.fence.give_up();
         if let Err(e) = beat(
             &self.db,
             &self.instance,
@@ -278,6 +451,7 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         self.task.abort();
+        self.fence.give_up();
     }
 }
 
@@ -299,6 +473,70 @@ mod tests {
     fn strings_are_escaped() {
         assert_eq!(sql_string("plain"), "'plain'");
         assert_eq!(sql_string("o'neil\\"), "'o\\'neil\\\\'");
+    }
+
+    fn other(started_ms: i64, instance: &str) -> Other {
+        Other {
+            instance: instance.to_string(),
+            host: "h".to_string(),
+            started_ms,
+            heartbeat_ms: started_ms + 1,
+        }
+    }
+
+    #[test]
+    fn a_process_that_still_beats_only_yields_to_an_older_instance() {
+        let younger = [other(200, "b")];
+        let older = [other(50, "b")];
+
+        assert!(takeover(false, &younger, 100, "a").is_empty());
+        assert_eq!(takeover(false, &older, 100, "a").len(), 1);
+
+        // Same start instant: the instance id breaks the tie, both ways.
+        assert_eq!(takeover(false, &[other(100, "b")], 100, "c").len(), 1);
+        assert!(takeover(false, &[other(100, "c")], 100, "b").is_empty());
+    }
+
+    /// What `lease.rs` documents and nothing implemented: a process whose
+    /// own heartbeats stalled past the ttl may have been taken over, and a
+    /// legitimate takeover is always a YOUNGER process.
+    #[test]
+    fn a_process_whose_heartbeats_stalled_yields_to_any_live_instance() {
+        let younger = [other(200, "b")];
+
+        assert!(takeover(true, &younger, 100, "a").len() == 1);
+        // Nobody else alive: nothing to yield to, keep indexing.
+        assert!(takeover(true, &[], 100, "a").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_fence_closes_when_the_heartbeats_stall_and_when_it_is_lost(
+    ) {
+        let ttl = Duration::from_secs(30);
+        let fence = Fence::new(7, ttl);
+
+        fence.check().unwrap();
+
+        // Heartbeats stop: from one ttl on, this process can no longer
+        // know whether it still owns the chain.
+        tokio::time::sleep(ttl + Duration::from_secs(1)).await;
+        let error = fence.check().unwrap_err().to_string();
+        assert!(error.contains("chain 7"), "{error}");
+        assert!(error.contains("heartbeat"), "{error}");
+
+        // A heartbeat that works again reopens it ...
+        fence.beat_ok();
+        fence.check().unwrap();
+
+        // ... but a lost lease never does.
+        fence.give_up();
+        let error = fence.check().unwrap_err().to_string();
+        assert!(error.contains("lost its indexer lease"), "{error}");
+        fence.beat_ok();
+        assert!(fence.check().is_err());
+
+        // A process without a lease is never fenced.
+        Fence::open().check().unwrap();
     }
 
     #[test]

@@ -211,6 +211,30 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
      table of every module for the affected buckets, or it silently zeroes the others.
      Two indexer processes on the same chain are unsupported (refuse at startup).
 
+**Changes from the hardening round (implemented, binding):**
+   - Purge order is now: checkpoints, children, `reorgs` row (armed), rebuild, `blocks`,
+     **verify + repair side tables**, **mark the `reorgs` row completed**, caches. Side
+     tables normally follow through their MVs, but a lost view push would leave live
+     orphans for ever, so the purge checks each side table for the range and tombstones
+     it directly (`tombstone_sql_where`) until zero.
+   - `reorgs` gains `to_block`, `tombstone_version`, `completed`; two rows per purge
+     (armed, completed), deliberately not collapsed. This is what tells the debris of a
+     FINISHED purge from the leftovers of one that died: a tombstoned orphan heals only
+     when its `_version` is newer than what a completed purge of that block wrote, so a
+     restart after a rollback that shortened the chain is a no-op. Audit queries use
+     `WHERE completed = 1`. `epoch_floor_v`'s columns are unchanged.
+   - Fencing: the writer asks the lease before every flush and every purge and refuses
+     to write when the lease is lost or its own heartbeat is older than the ttl; a
+     process whose heartbeats lapsed stops for ANY other live instance.
+   - `indexer backfill` re-reads the chain's epoch before each chunk and stops loudly if
+     the live indexer purged meanwhile. `indexer verify` cross-checks aggregates against
+     base tables per complete UTC day (a doubled aggregate is INCONSISTENT).
+   - Checkpoints are an index, deliberately NOT the resume cursor: resuming from them
+     would skip the one inspection that finds orphan children below the cursor.
+   - ClickHouse 25.12 landmines: in `SELECT * REPLACE (x AS c) ... WHERE c = ..` the WHERE
+     sees the REPLACED value; and `SELECT * REPLACE` with `LIMIT` silently returns no
+     rows. Generated tombstones use positional column lists for this reason.
+
 **No read-your-writes (ClickHouse 25.12, observed on the macOS build).** Right after an
 `INSERT` returns, the next query can miss the new part for a few milliseconds when
 several writers are active (44-137 misses per 3,200 in the schema engineer's repro; it

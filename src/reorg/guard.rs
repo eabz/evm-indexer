@@ -357,7 +357,11 @@ impl ReorgGuard {
 
     /// Start of a pass: gap healing. Call with the missing
     /// ranges `[from, to)` the pass is about to stream (ascending) and the
-    /// exclusive end of the range the pass inspected.
+    /// exclusive end of the range the pass really INSPECTED - which is
+    /// `MissingRanges::covered_until`, not the end of the range it asked
+    /// about: a gap listing truncated at `MAX_GAPS_PER_PASS` only accounts
+    /// for the blocks below its last row, and everything above must stay
+    /// un-inspected so a later pass still checks it for orphans.
     ///
     /// A gap can hold children of a flush that died before its `blocks`
     /// rows were written, or of a purge that died half way. Streaming into

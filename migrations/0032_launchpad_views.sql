@@ -4,7 +4,7 @@
 -- src/launchpads/README.md section 4.
 --
 -- Two layers:
---   * six *_v views over the aggregates of 0031. Each one ASOF joins the
+--   * the *_v views over the aggregates of 0031. Each one ASOF joins the
 --     shared epoch_floor_v of 0004 and filters epoch >= ifNull(epoch_floor,
 --     0) BEFORE it merges any aggregate state (the validity rule), so a
 --     stale epoch can never leak an open / close.
@@ -13,18 +13,85 @@
 --     ...) - because a parameter is the only way to push the scope into
 --     every subquery and turn each of them into a primary key range read.
 --
--- TRUST. Anyone can emit a TokenLaunched or a CurveBuy, so the headline
--- feeds (new launches, graduations, venue stats) count only emitters an
--- operator put in launchpad_trusted_emitters. The *_all_v twin of each one
--- counts everything and exists for exploration and for deciding what to
--- trust. launchpad_trusted_curves_v is the trust set: the listed
--- singletons PLUS every per-token curve a trusted factory announced.
--- Token-scoped views are not filtered (the caller already picked the
--- token), and launchpad_token_v tells whether it is trusted.
+-- TRUST. Anyone can emit a TokenLaunched or a CurveBuy: this module
+-- decodes by event family and nothing on chain says who a venue is. So
+-- EVERY view whose numbers a screen shows counts only emitters an operator
+-- put in launchpad_trusted_emitters, and every one of them has an *_all_v
+-- twin that counts everything and exists for exploration and for deciding
+-- what to trust. launchpad_trusted_curves_v is the trust set: the listed
+-- singletons PLUS every per-token curve a trusted factory announced, which
+-- is exactly the set a forger can not enter.
 --
--- Ids are 32 bytes (docs/solana-research.md section 0). Format one with
--- concat('0x', lower(hex(substring(id, 13)))). Joins into the EVM-only
--- tokens / erc20_transfers tables use toFixedString(substring(id, 13, 20), 20).
+-- Picking a token is NOT a trust decision, and treating it as one was a
+-- real hole: the token page, the price chart, the sniper view and the
+-- holder list are scoped to a token an attacker does not control, so
+-- without the filter a forged curve naming a REAL token moves that token's
+-- trades, volume, prices, raised / curve_progress and share of supply, and
+-- a forged TokenLaunched emitted EARLIER than the real one (a token
+-- address is predictable) wins the argMin and hides the real launch. The
+-- token-scoped *_v views below therefore restrict every source - launches,
+-- trades, graduations, candles - to launchpad_trusted_curves_v, and their
+-- *_all_v twins keep the unfiltered view. A token with no trusted launch
+-- yields NO rows from the *_v views: missing numbers, never wrong ones.
+--
+-- Picking a CREATOR is not a trust decision either, and for the same
+-- reason - only there the victim is a wallet that did nothing at all. A
+-- launch names its creator in the event, so a forger can hang a launch
+-- that never graduates on any address it likes and manufacture that
+-- wallet's serial-rugger signal, and a forged fee sweep can name it as
+-- the recipient. The creator screens are scoped exactly like the token
+-- ones, in the creator page section below.
+--
+-- What is deliberately NOT filtered: the six aggregate *_v views keep one
+-- row per (key, emitter) and carry emitter through, because they are the
+-- validated layer the screen views are built from - the screens above
+-- apply the trust rule. Read them directly only for exploration.
+--
+-- PARAMETERS. Every {name:Type} is a ClickHouse BOUND parameter, sent
+-- beside the statement, never pasted into its text (src/launchpads/
+-- cookbook.rs holds the queries and a unit test enforces it). An id
+-- parameter is a String of PLAIN HEX, no 0x: 64 characters for a 32 byte
+-- id, or the 40 characters of an EVM address, which these views left pad
+-- with 12 zero bytes themselves. The padding is a constant expression
+-- ClickHouse folds before it reads a part, so the primary key range read
+-- survives it (the if / concat form is used because leftPad() is not
+-- folded - same as 0022).
+--
+-- A WRONG LENGTH MATCHES NOTHING. It used not to, and in THIS module that
+-- was the sharpest version of the bug: unhex('') is the empty string,
+-- toFixedString('', 32) is 32 zero bytes, and 32 zero bytes is a real
+-- populated bucket here - the trades whose token leg stayed unverified
+-- and whose family does not name the token (see 0030). An empty token
+-- parameter therefore returned that bucket, as if a UI with an unset
+-- field had asked for it. A truncated 39 or 63 character id pads the same
+-- way.
+--
+-- Every parameterized view below therefore carries
+--
+--   AND length({<id>:String}) IN (40, 64)
+--
+-- exactly once, in the filter that gates its output. The conjunct names
+-- no column, so ClickHouse folds it while it analyses the query: a valid
+-- length leaves the primary key range read exactly as it was (verified
+-- with EXPLAIN indexes = 1 - the key condition still names the id column
+-- and reads one granule), a wrong one makes the WHERE constant false and
+-- no part is read. An id longer than 64 characters still raises
+-- TOO_LARGE_STRING_SIZE from toFixedString, as it always did: loud, never
+-- a silent match. To look at the unverified-token bucket on purpose, read
+-- launchpad_trades_by_token directly - it is not a screen.
+--
+-- Ids are 32 bytes (docs/design.md section 13) and NOTHING here assumes
+-- the top 12 bytes are zero. Print one with the family of its chain, using
+-- THE expression documented in migration 0006, where chains_v gives the
+-- family: concat('0x', lower(hex(substring(id, 13)))) for 'evm',
+-- base58Encode(substring(id, 1, 32)) for 'svm'. The substring() is NOT
+-- decoration - toString(id) and CAST(id AS String) trim trailing zero
+-- bytes, and only substring() / concat(id, '') keep every one of them.
+-- A pool_id prints as all 32 bytes, because a Uniswap V4 / Balancer pool
+-- id is not an address. Joins into the EVM-only erc20_transfers table PAD that table's
+-- FixedString(20) address up to 32 bytes (the dex_token_info_v rule of
+-- 0012): padding lets a non-EVM id simply find no row, while truncating
+-- the 32 byte side would map every pubkey onto some address.
 --
 -- *_raw columns are the on-chain integers as Float64. Columns without the
 -- suffix are divided by 10^decimals of the asset and are NULL - never 0 -
@@ -46,7 +113,10 @@ WHERE t.is_deleted = 0
 
 -- ------------------------------------------------ aggregates, validated
 
-CREATE VIEW IF NOT EXISTS launchpad_candles_1m_v AS
+-- The candles of every (token, emitter), forged curves included: the
+-- validated aggregate layer, and the join source of the launch feed.
+-- A price chart reads launchpad_candles_1m_v below, never this.
+CREATE VIEW IF NOT EXISTS launchpad_candles_1m_all_v AS
 SELECT
   a.chain AS chain, a.token AS token, a.emitter AS emitter,
   a.bucket AS bucket,
@@ -67,7 +137,7 @@ ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)
 GROUP BY chain, token, emitter, bucket;
 
-CREATE VIEW IF NOT EXISTS launchpad_candles_1h_v AS
+CREATE VIEW IF NOT EXISTS launchpad_candles_1h_all_v AS
 SELECT
   a.chain AS chain, a.token AS token, a.emitter AS emitter,
   a.bucket AS bucket,
@@ -87,6 +157,31 @@ FROM launchpad_candles_1h AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.epoch >= ifNull(f.epoch_floor, 0)
 GROUP BY chain, token, emitter, bucket;
+
+-- THE price chart of one token: the same candles restricted to the curves
+-- an operator trusts, so a forged curve that names this token can not add
+-- a series to its chart. Parameterized because the trust set is looked up
+-- per chain. Several trusted curves for one token would each keep their
+-- own series - the emitter column says which.
+CREATE VIEW IF NOT EXISTS launchpad_candles_1m_v AS
+SELECT * FROM launchpad_candles_1m_all_v
+WHERE chain = {chain:UInt64}
+  AND length({token:String}) IN (40, 64)
+  AND token = toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32)
+  AND emitter IN (
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64});
+
+CREATE VIEW IF NOT EXISTS launchpad_candles_1h_v AS
+SELECT * FROM launchpad_candles_1h_all_v
+WHERE chain = {chain:UInt64}
+  AND length({token:String}) IN (40, 64)
+  AND token = toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32)
+  AND emitter IN (
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64});
 
 CREATE VIEW IF NOT EXISTS launchpad_venue_trades_1d_v AS
 SELECT
@@ -152,7 +247,7 @@ SELECT
   l.name AS name, l.symbol AS symbol, l.quote_token AS quote_token,
   toFloat64(l.initial_supply) AS initial_supply_raw,
   toFloat64(l.graduation_threshold) AS graduation_threshold_raw,
-  l.pool_id AS launch_pool_id, l.transaction_hash AS launch_tx,
+  l.pool_id AS launch_pool_id, l.tx_id AS launch_tx,
   l.emitter IN (
     SELECT curve FROM launchpad_trusted_curves_v
     WHERE chain = {chain:UInt64}) AS trusted,
@@ -163,7 +258,7 @@ SELECT
   ifNull(c.volume_quote_raw, 0.) AS first_minute_volume_raw,
   ifNull(c.unique_traders, 0) AS first_minute_traders
 FROM launchpad_launches_by_time AS l FINAL
-LEFT JOIN launchpad_candles_1m_v AS c
+LEFT JOIN launchpad_candles_1m_all_v AS c
   ON c.chain = l.chain AND c.token = l.token AND c.emitter = l.curve
  AND c.bucket = toDateTime(intDiv(toUInt32(l.timestamp), 60) * 60, 'UTC')
 WHERE l.chain = {chain:UInt64} AND l.is_deleted = 0
@@ -187,7 +282,16 @@ WHERE trusted = 1;
 -- what counts towards the threshold is quoteIn - fee - tax on buys, minus
 -- the net quoteOut of sells - checked digit for digit on the real curve
 -- that graduated, see README section 4).
-CREATE VIEW IF NOT EXISTS launchpad_token_v AS
+--
+-- launchpad_token_all_v counts EVERY emitter: the launch is whichever
+-- TokenLaunched came first, the trades are every curve's, and `trusted`
+-- says whether that first launch emitter is one an operator listed. It is
+-- the exploration twin and must not be put on a screen - a forger who
+-- predicts a token address can emit an earlier launch and win the argMin,
+-- and any contract can emit curve trades naming this token.
+CREATE VIEW IF NOT EXISTS launchpad_token_all_v AS
+WITH toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32) AS token_id
 SELECT
   l.launch_chain AS chain, l.launch_token AS token,
   l.first_family AS family, l.first_emitter AS emitter,
@@ -231,12 +335,13 @@ FROM
     argMin(quote_token, (block_number, tx_index, ordinal)) AS first_quote_token,
     min(block_number) AS launch_block,
     argMin(timestamp, (block_number, tx_index, ordinal)) AS launch_time,
-    argMin(transaction_hash, (block_number, tx_index, ordinal)) AS launch_tx,
+    argMin(tx_id, (block_number, tx_index, ordinal)) AS launch_tx,
     argMin(toFloat64(initial_supply), (block_number, tx_index, ordinal)) AS initial_supply_raw,
     argMin(toFloat64(graduation_threshold), (block_number, tx_index, ordinal)) AS graduation_threshold_raw
   FROM launchpad_tokens FINAL
-  WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+  WHERE chain = {chain:UInt64} AND token = token_id
     AND is_deleted = 0
+    AND length({token:String}) IN (40, 64)
   GROUP BY chain, token
 ) AS l
 CROSS JOIN
@@ -259,7 +364,7 @@ CROSS JOIN
       - sumIf(toFloat64(quote_amount), side = 'sell') AS raised_raw,
     argMax(toFloat64(progress_wad), (block_number, tx_index, ordinal)) AS last_progress_wad
   FROM launchpad_trades_by_token FINAL
-  WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+  WHERE chain = {chain:UInt64} AND token = token_id
     AND is_deleted = 0
 ) AS t
 CROSS JOIN
@@ -271,12 +376,122 @@ CROSS JOIN
     max(timestamp) AS graduation_time,
     max(block_number) AS graduation_block
   FROM launchpad_graduations FINAL
-  WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+  WHERE chain = {chain:UInt64} AND token = token_id
     AND is_deleted = 0
 ) AS g;
 
--- The trades tape of one token, newest first.
-CREATE VIEW IF NOT EXISTS launchpad_token_trades_v AS
+-- The same page, restricted to launchpad_trusted_curves_v in all three
+-- sources: the launch (so the earlier-forged-launch trick can not win the
+-- argMin), the trades (so trades / buys / unique_traders / volume /
+-- first_price / last_price / raised_raw and therefore curve_progress are
+-- the real curve's) and the graduation. A token whose launch emitter is
+-- not trusted yields no row at all, and `trusted` is then always 1.
+CREATE VIEW IF NOT EXISTS launchpad_token_v AS
+WITH toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32) AS token_id
+SELECT
+  l.launch_chain AS chain, l.launch_token AS token,
+  l.first_family AS family, l.first_emitter AS emitter,
+  l.first_curve AS curve, l.first_creator AS creator,
+  l.first_name AS name, l.first_symbol AS symbol,
+  l.first_metadata_uri AS metadata_uri,
+  l.first_quote_token AS quote_token, l.launch_block AS launch_block,
+  l.launch_time AS launch_time, l.launch_tx AS launch_tx,
+  l.initial_supply_raw AS initial_supply_raw,
+  l.graduation_threshold_raw AS graduation_threshold_raw,
+  l.first_emitter IN (
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64}) AS trusted,
+  t.trades AS trades, t.buys AS buys, t.unique_traders AS unique_traders,
+  t.volume_quote_raw AS volume_quote_raw,
+  t.volume_quote_verified_raw AS volume_quote_verified_raw,
+  t.token_volume_raw AS token_volume_raw,
+  t.first_price_raw AS first_price_raw,
+  t.last_price_raw AS last_price_raw,
+  t.last_trade_time AS last_trade_time,
+  t.raised_raw AS raised_raw,
+  multiIf(
+    l.graduation_threshold_raw > 0,
+      least(t.raised_raw / l.graduation_threshold_raw, 1.),
+    t.last_progress_wad > 0, t.last_progress_wad / 1e18,
+    NULL) AS curve_progress,
+  g.graduated AS graduated, g.last_pool_id AS pool_id,
+  g.last_pool_kind AS pool_kind, g.graduation_time AS graduation_time,
+  g.graduation_block AS graduation_block
+FROM
+(
+  SELECT
+    chain AS launch_chain, token AS launch_token,
+    argMin(family, (block_number, tx_index, ordinal)) AS first_family,
+    argMin(emitter, (block_number, tx_index, ordinal)) AS first_emitter,
+    argMin(curve, (block_number, tx_index, ordinal)) AS first_curve,
+    argMin(creator, (block_number, tx_index, ordinal)) AS first_creator,
+    argMin(name, (block_number, tx_index, ordinal)) AS first_name,
+    argMin(symbol, (block_number, tx_index, ordinal)) AS first_symbol,
+    argMin(metadata_uri, (block_number, tx_index, ordinal)) AS first_metadata_uri,
+    argMin(quote_token, (block_number, tx_index, ordinal)) AS first_quote_token,
+    min(block_number) AS launch_block,
+    argMin(timestamp, (block_number, tx_index, ordinal)) AS launch_time,
+    argMin(tx_id, (block_number, tx_index, ordinal)) AS launch_tx,
+    argMin(toFloat64(initial_supply), (block_number, tx_index, ordinal)) AS initial_supply_raw,
+    argMin(toFloat64(graduation_threshold), (block_number, tx_index, ordinal)) AS graduation_threshold_raw
+  FROM launchpad_tokens FINAL
+  WHERE chain = {chain:UInt64} AND token = token_id
+    AND is_deleted = 0
+    AND length({token:String}) IN (40, 64)
+    AND emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+  GROUP BY chain, token
+) AS l
+CROSS JOIN
+(
+  SELECT
+    toUInt64(count()) AS trades,
+    toUInt64(countIf(side = 'buy')) AS buys,
+    uniqExact(trader) AS unique_traders,
+    sum(toFloat64(quote_amount)) AS volume_quote_raw,
+    sumIf(toFloat64(quote_amount), quote_verified = 1) AS volume_quote_verified_raw,
+    sum(toFloat64(token_amount)) AS token_volume_raw,
+    argMinIf(toFloat64(quote_amount) / toFloat64(token_amount),
+             (block_number, tx_index, ordinal),
+             token_amount != 0 AND quote_amount != 0) AS first_price_raw,
+    argMaxIf(toFloat64(quote_amount) / toFloat64(token_amount),
+             (block_number, tx_index, ordinal),
+             token_amount != 0 AND quote_amount != 0) AS last_price_raw,
+    max(timestamp) AS last_trade_time,
+    sumIf(toFloat64(quote_amount) - toFloat64(fee_amount) - toFloat64(tax_amount), side = 'buy')
+      - sumIf(toFloat64(quote_amount), side = 'sell') AS raised_raw,
+    argMax(toFloat64(progress_wad), (block_number, tx_index, ordinal)) AS last_progress_wad
+  FROM launchpad_trades_by_token FINAL
+  WHERE chain = {chain:UInt64} AND token = token_id
+    AND is_deleted = 0
+    AND emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+) AS t
+CROSS JOIN
+(
+  SELECT
+    toUInt8(count() > 0) AS graduated,
+    argMax(pool_id, (block_number, tx_index, ordinal)) AS last_pool_id,
+    argMax(pool_kind, (block_number, tx_index, ordinal)) AS last_pool_kind,
+    max(timestamp) AS graduation_time,
+    max(block_number) AS graduation_block
+  FROM launchpad_graduations FINAL
+  WHERE chain = {chain:UInt64} AND token = token_id
+    AND is_deleted = 0
+    AND emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+) AS g;
+
+-- The trades tape of one token, newest first. The all_v twin is every
+-- emitter's trades, the _v one keeps the trusted curves, so a forged
+-- curve can not write lines into a real token's tape. `emitter` is
+-- carried through either way, because the tape is the one screen where
+-- seeing WHO claimed a trade is the point.
+CREATE VIEW IF NOT EXISTS launchpad_token_trades_all_v AS
 SELECT
   chain, token, timestamp, block_number, tx_index, ordinal, family,
   emitter, side, trader, caller, tx_from,
@@ -286,10 +501,21 @@ SELECT
   toFloat64(tax_amount) AS tax_amount_raw,
   if(token_amount != 0 AND quote_amount != 0,
      toFloat64(quote_amount) / toFloat64(token_amount), NULL) AS price_raw,
-  token_verified, quote_verified, quote_token, graduating, transaction_hash
+  token_verified, quote_verified, quote_token, graduating, tx_id
 FROM launchpad_trades_by_token FINAL
-WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+WHERE chain = {chain:UInt64} AND token = toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32)
   AND is_deleted = 0 AND block_number >= {from_block:UInt64}
+  AND length({token:String}) IN (40, 64)
+ORDER BY block_number DESC, tx_index DESC, ordinal DESC;
+
+CREATE VIEW IF NOT EXISTS launchpad_token_trades_v AS
+SELECT * FROM launchpad_token_trades_all_v(
+  chain = {chain:UInt64}, token = {token:String},
+  from_block = {from_block:UInt64})
+WHERE emitter IN (
+  SELECT curve FROM launchpad_trusted_curves_v
+  WHERE chain = {chain:UInt64})
 ORDER BY block_number DESC, tx_index DESC, ordinal DESC;
 
 -- Top holders of a launchpad token, from the ERC-20 transfers the TOKEN
@@ -297,42 +523,111 @@ ORDER BY block_number DESC, tx_index DESC, ordinal DESC;
 -- its launch block: the scalar subquery prunes erc20_transfers by its
 -- primary key (chain, block_number). as_of_block = the concentration at
 -- graduation, or a huge number for "now".
-CREATE VIEW IF NOT EXISTS launchpad_token_holders_v AS
+--
+-- THE 20 vs 32 byte seam of this module (the dex_token_info_v rule of
+-- migration 0012): erc20_transfers is EVM only, so its FixedString(20)
+-- token_address / from / to are PADDED up to 32 bytes here. Never
+-- substring(token, 13, 20) on the 32 byte side - that would map every
+-- Solana pubkey onto some EVM address, while padding just finds no row.
+-- token_address is not in the table's sorting key, so nothing is lost:
+-- the block_number range above is what prunes.
+--
+-- The BALANCES are the token contract's own claims (erc20_transfers), so
+-- they need no trust rule. The two things taken from launchpad_tokens do:
+-- the initial supply that share_of_initial_supply divides by, and the
+-- launch block that bounds the scan. A forged TokenLaunched naming a real
+-- token with a huge initial_supply would otherwise crush everyone's
+-- share, so the _v twin reads only rows from a trusted emitter and the
+-- all_v twin keeps every row. With no trusted launch row the denominator
+-- falls back to 1 (shares are then raw balances) and the scan starts at
+-- block 0, exactly as it does for a token this module never saw.
+CREATE VIEW IF NOT EXISTS launchpad_token_holders_all_v AS
+WITH toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32) AS token_id
 SELECT
   account,
   sum(delta) AS balance_raw,
   sum(delta) / greatest(
     (SELECT max(toFloat64(initial_supply)) FROM launchpad_tokens FINAL
-     WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+     WHERE chain = {chain:UInt64} AND token = token_id
        AND is_deleted = 0), 1.) AS share_of_initial_supply,
   countIf(delta > 0) AS received,
   countIf(delta < 0) AS sent
 FROM
 (
-  SELECT `to` AS account, toFloat64(amount) AS delta
+  SELECT toFixedString(concat(unhex('000000000000000000000000'), `to`), 32) AS account, toFloat64(amount) AS delta
   FROM erc20_transfers FINAL
   WHERE chain = {chain:UInt64}
-    AND token_address = toFixedString(substring({token:FixedString(32)}, 13, 20), 20)
+    AND toFixedString(concat(unhex('000000000000000000000000'), token_address), 32) = token_id
     AND block_number >= (
       SELECT min(block_number) FROM launchpad_tokens FINAL
-      WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+      WHERE chain = {chain:UInt64} AND token = token_id
         AND is_deleted = 0)
     AND block_number <= {as_of_block:UInt64}
     AND is_deleted = 0
   UNION ALL
-  SELECT `from` AS account, -toFloat64(amount) AS delta
+  SELECT toFixedString(concat(unhex('000000000000000000000000'), `from`), 32) AS account, -toFloat64(amount) AS delta
   FROM erc20_transfers FINAL
   WHERE chain = {chain:UInt64}
-    AND token_address = toFixedString(substring({token:FixedString(32)}, 13, 20), 20)
+    AND toFixedString(concat(unhex('000000000000000000000000'), token_address), 32) = token_id
     AND block_number >= (
       SELECT min(block_number) FROM launchpad_tokens FINAL
-      WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+      WHERE chain = {chain:UInt64} AND token = token_id
         AND is_deleted = 0)
     AND block_number <= {as_of_block:UInt64}
     AND is_deleted = 0
 )
 GROUP BY account
-HAVING balance_raw > 0
+HAVING balance_raw > 0 AND length({token:String}) IN (40, 64)
+ORDER BY balance_raw DESC;
+
+CREATE VIEW IF NOT EXISTS launchpad_token_holders_v AS
+WITH toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32) AS token_id
+SELECT
+  account,
+  sum(delta) AS balance_raw,
+  sum(delta) / greatest(
+    (SELECT max(toFloat64(initial_supply)) FROM launchpad_tokens FINAL
+     WHERE chain = {chain:UInt64} AND token = token_id
+       AND is_deleted = 0
+       AND emitter IN (
+         SELECT curve FROM launchpad_trusted_curves_v
+         WHERE chain = {chain:UInt64})), 1.) AS share_of_initial_supply,
+  countIf(delta > 0) AS received,
+  countIf(delta < 0) AS sent
+FROM
+(
+  SELECT toFixedString(concat(unhex('000000000000000000000000'), `to`), 32) AS account, toFloat64(amount) AS delta
+  FROM erc20_transfers FINAL
+  WHERE chain = {chain:UInt64}
+    AND toFixedString(concat(unhex('000000000000000000000000'), token_address), 32) = token_id
+    AND block_number >= (
+      SELECT min(block_number) FROM launchpad_tokens FINAL
+      WHERE chain = {chain:UInt64} AND token = token_id
+        AND is_deleted = 0
+        AND emitter IN (
+          SELECT curve FROM launchpad_trusted_curves_v
+          WHERE chain = {chain:UInt64}))
+    AND block_number <= {as_of_block:UInt64}
+    AND is_deleted = 0
+  UNION ALL
+  SELECT toFixedString(concat(unhex('000000000000000000000000'), `from`), 32) AS account, -toFloat64(amount) AS delta
+  FROM erc20_transfers FINAL
+  WHERE chain = {chain:UInt64}
+    AND toFixedString(concat(unhex('000000000000000000000000'), token_address), 32) = token_id
+    AND block_number >= (
+      SELECT min(block_number) FROM launchpad_tokens FINAL
+      WHERE chain = {chain:UInt64} AND token = token_id
+        AND is_deleted = 0
+        AND emitter IN (
+          SELECT curve FROM launchpad_trusted_curves_v
+          WHERE chain = {chain:UInt64}))
+    AND block_number <= {as_of_block:UInt64}
+    AND is_deleted = 0
+)
+GROUP BY account
+HAVING balance_raw > 0 AND length({token:String}) IN (40, 64)
 ORDER BY balance_raw DESC;
 
 -- ------------------------------------------------ screen: graduations
@@ -351,14 +646,14 @@ SELECT
   toFloat64(g.token_amount) AS token_amount_raw,
   toFloat64(g.quote_amount) AS quote_amount_raw,
   toFloat64(g.position_id) AS position_id,
-  g.transaction_hash AS graduation_tx,
+  g.tx_id AS graduation_tx,
   g.emitter IN (
     SELECT curve FROM launchpad_trusted_curves_v
     WHERE chain = {chain:UInt64}) AS trusted,
   ifNull(p.best_status, '') AS pool_status,
   ifNull(p.best_trusted, 0) AS pool_trusted,
   ifNull(p.best_protocol, '') AS pool_protocol,
-  ifNull(p.best_emitter, toFixedString('', 20)) AS pool_emitter
+  ifNull(p.best_emitter, toFixedString('', 32)) AS pool_emitter
 FROM launchpad_graduations AS g FINAL
 LEFT JOIN
 (
@@ -389,12 +684,37 @@ WHERE trusted = 1;
 -- One row per token a wallet launched: did it graduate, is it still
 -- trading, what did the creator take out of it. "died" = never graduated
 -- and no trade for dead_after seconds.
-CREATE VIEW IF NOT EXISTS launchpad_creator_tokens_v AS
+--
+-- THE SAME FORGERY CLASS AS THE TOKEN PAGE, and arguably a nastier one,
+-- because the victim is a WALLET that did nothing. The creator of a
+-- launch is NAMED BY THE EVENT: anyone can emit a TokenLaunched that
+-- names a stranger as `creator`, and unfiltered that launch lands on the
+-- stranger's page. It never graduates, so it raises `launches`, raises
+-- `died` and drags `graduation_rate` down - manufacturing exactly the
+-- serial-rugger signal this screen exists to report. The other three
+-- sources are open in the same way: a forged CurveBuy naming one of
+-- those tokens moves `trades` / `volume_quote_raw` / `last_trade_time`
+-- (and through it `died`), a forged Graduated flips `graduated`, and a
+-- forged fee sweep naming the wallet as `recipient` inflates
+-- `realised_creator_fees_raw`.
+--
+-- So the _v views below restrict ALL FOUR sources - launches,
+-- graduations, curve trades and creator fees - to
+-- launchpad_trusted_curves_v, exactly as launchpad_token_v does, and the
+-- _all_v twins keep the unfiltered view for deciding what to trust. A
+-- creator whose launches are all untrusted yields no token rows at all:
+-- missing numbers, never wrong ones.
+
+-- The exploration twin: every emitter counts, and `trusted` says whether
+-- the launch emitter is one an operator listed. Not for a screen.
+CREATE VIEW IF NOT EXISTS launchpad_creator_tokens_all_v AS
+WITH toFixedString(unhex(if(length({creator:String}) = 40,
+  concat('000000000000000000000000', {creator:String}), {creator:String})), 32) AS creator_id
 SELECT
   l.chain AS chain, l.creator AS creator, l.token AS token,
   l.family AS family, l.emitter AS emitter, l.curve AS curve,
   l.name AS name, l.symbol AS symbol, l.timestamp AS launch_time,
-  l.block_number AS launch_block, l.transaction_hash AS launch_tx,
+  l.block_number AS launch_block, l.tx_id AS launch_tx,
   toFloat64(l.graduation_threshold) AS graduation_threshold_raw,
   toUInt8(g.g_token != toFixedString('', 32)) AS graduated,
   g.g_pool_id AS pool_id, g.g_time AS graduation_time,
@@ -403,7 +723,10 @@ SELECT
   ifNull(t.t_last_trade_time, l.timestamp) AS last_trade_time,
   toUInt8(g.g_token = toFixedString('', 32)
     AND ifNull(t.t_last_trade_time, l.timestamp)
-        < toDateTime({as_of:UInt32}) - {dead_after:UInt32}) AS died
+        < toDateTime({as_of:UInt32}) - {dead_after:UInt32}) AS died,
+  l.emitter IN (
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64}) AS trusted
 FROM launchpad_launches_by_creator AS l FINAL
 LEFT JOIN
 (
@@ -424,20 +747,120 @@ LEFT JOIN
   WHERE chain = {chain:UInt64} AND is_deleted = 0
   GROUP BY chain, token
 ) AS t ON t.t_chain = l.chain AND t.t_token = l.token
-WHERE l.chain = {chain:UInt64} AND l.creator = {creator:FixedString(32)}
+WHERE l.chain = {chain:UInt64} AND l.creator = creator_id
   AND l.is_deleted = 0
+  AND length({creator:String}) IN (40, 64)
 ORDER BY l.timestamp DESC;
 
--- The creator header: the serial-rugger signal in one row.
-CREATE VIEW IF NOT EXISTS launchpad_creator_v AS
+-- THE screen. Same shape, every source restricted to the trusted curves,
+-- so `trusted` is always 1 here (kept so the two twins are union
+-- compatible and a UI can read either).
+CREATE VIEW IF NOT EXISTS launchpad_creator_tokens_v AS
+WITH toFixedString(unhex(if(length({creator:String}) = 40,
+  concat('000000000000000000000000', {creator:String}), {creator:String})), 32) AS creator_id
 SELECT
-  {chain:UInt64} AS chain, {creator:FixedString(32)} AS creator,
+  l.chain AS chain, l.creator AS creator, l.token AS token,
+  l.family AS family, l.emitter AS emitter, l.curve AS curve,
+  l.name AS name, l.symbol AS symbol, l.timestamp AS launch_time,
+  l.block_number AS launch_block, l.tx_id AS launch_tx,
+  toFloat64(l.graduation_threshold) AS graduation_threshold_raw,
+  toUInt8(g.g_token != toFixedString('', 32)) AS graduated,
+  g.g_pool_id AS pool_id, g.g_time AS graduation_time,
+  ifNull(t.t_trades, 0) AS trades,
+  ifNull(t.t_volume_quote_raw, 0.) AS volume_quote_raw,
+  ifNull(t.t_last_trade_time, l.timestamp) AS last_trade_time,
+  toUInt8(g.g_token = toFixedString('', 32)
+    AND ifNull(t.t_last_trade_time, l.timestamp)
+        < toDateTime({as_of:UInt32}) - {dead_after:UInt32}) AS died,
+  toUInt8(1) AS trusted
+FROM launchpad_launches_by_creator AS l FINAL
+LEFT JOIN
+(
+  SELECT chain AS g_chain, token AS g_token,
+         argMax(pool_id, block_number) AS g_pool_id,
+         max(timestamp) AS g_time
+  FROM launchpad_graduations FINAL
+  WHERE chain = {chain:UInt64} AND is_deleted = 0
+    AND emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+  GROUP BY chain, token
+) AS g ON g.g_chain = l.chain AND g.g_token = l.token
+LEFT JOIN
+(
+  SELECT chain AS t_chain, token AS t_token,
+         toUInt64(count()) AS t_trades,
+         sum(toFloat64(quote_amount)) AS t_volume_quote_raw,
+         max(timestamp) AS t_last_trade_time
+  FROM launchpad_trades_by_token FINAL
+  WHERE chain = {chain:UInt64} AND is_deleted = 0
+    AND emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+  GROUP BY chain, token
+) AS t ON t.t_chain = l.chain AND t.t_token = l.token
+WHERE l.chain = {chain:UInt64} AND l.creator = creator_id
+  AND l.is_deleted = 0
+  AND length({creator:String}) IN (40, 64)
+  AND l.emitter IN (
+    SELECT curve FROM launchpad_trusted_curves_v
+    WHERE chain = {chain:UInt64})
+ORDER BY l.timestamp DESC;
+
+-- The creator header: the serial-rugger signal in one row. The
+-- exploration twin, over every emitter.
+CREATE VIEW IF NOT EXISTS launchpad_creator_all_v AS
+WITH toFixedString(unhex(if(length({creator:String}) = 40,
+  concat('000000000000000000000000', {creator:String}), {creator:String})), 32) AS creator_id
+SELECT
+  {chain:UInt64} AS chain, creator_id AS creator,
   c.launches AS launches, c.graduated AS graduated, c.died AS died,
   if(c.launches > 0, c.graduated / c.launches, NULL) AS graduation_rate,
   c.first_launch AS first_launch, c.last_launch AS last_launch,
   c.volume_quote_raw AS volume_quote_raw,
   f.fees_raw AS realised_creator_fees_raw,
-  f.fee_events AS creator_fee_events
+  f.fee_events AS creator_fee_events,
+  c.trusted_launches AS trusted_launches
+FROM
+(
+  SELECT
+    toUInt64(count()) AS launches,
+    toUInt64(countIf(graduated = 1)) AS graduated,
+    toUInt64(countIf(died = 1)) AS died,
+    min(launch_time) AS first_launch,
+    max(launch_time) AS last_launch,
+    sum(volume_quote_raw) AS volume_quote_raw,
+    toUInt64(countIf(trusted = 1)) AS trusted_launches
+  FROM launchpad_creator_tokens_all_v(
+    chain = {chain:UInt64}, creator = {creator:String},
+    as_of = {as_of:UInt32}, dead_after = {dead_after:UInt32})
+) AS c
+CROSS JOIN
+(
+  SELECT
+    sum(toFloat64(amount)) AS fees_raw,
+    toUInt64(count()) AS fee_events
+  FROM launchpad_creator_fees FINAL
+  WHERE chain = {chain:UInt64} AND is_deleted = 0
+    AND recipient = creator_id AND kind = 'creator'
+) AS f
+WHERE length({creator:String}) IN (40, 64);
+
+-- THE screen. Every launch counted, every graduation, every trade and
+-- every fee row comes from a trusted curve, so a forger can neither add
+-- a launch to this wallet nor pay it a fee it never earned.
+CREATE VIEW IF NOT EXISTS launchpad_creator_v AS
+WITH toFixedString(unhex(if(length({creator:String}) = 40,
+  concat('000000000000000000000000', {creator:String}), {creator:String})), 32) AS creator_id
+SELECT
+  {chain:UInt64} AS chain, creator_id AS creator,
+  c.launches AS launches, c.graduated AS graduated, c.died AS died,
+  if(c.launches > 0, c.graduated / c.launches, NULL) AS graduation_rate,
+  c.first_launch AS first_launch, c.last_launch AS last_launch,
+  c.volume_quote_raw AS volume_quote_raw,
+  f.fees_raw AS realised_creator_fees_raw,
+  f.fee_events AS creator_fee_events,
+  c.launches AS trusted_launches
 FROM
 (
   SELECT
@@ -448,7 +871,7 @@ FROM
     max(launch_time) AS last_launch,
     sum(volume_quote_raw) AS volume_quote_raw
   FROM launchpad_creator_tokens_v(
-    chain = {chain:UInt64}, creator = {creator:FixedString(32)},
+    chain = {chain:UInt64}, creator = {creator:String},
     as_of = {as_of:UInt32}, dead_after = {dead_after:UInt32})
 ) AS c
 CROSS JOIN
@@ -458,8 +881,12 @@ CROSS JOIN
     toUInt64(count()) AS fee_events
   FROM launchpad_creator_fees FINAL
   WHERE chain = {chain:UInt64} AND is_deleted = 0
-    AND recipient = {creator:FixedString(32)} AND kind = 'creator'
-) AS f;
+    AND recipient = creator_id AND kind = 'creator'
+    AND emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
+) AS f
+WHERE length({creator:String}) IN (40, 64);
 
 -- -------------------------------------------------- screen: sniper view
 --
@@ -468,7 +895,15 @@ CROSS JOIN
 -- transaction or one funder. bundle_size > 1 = several buyers served by a
 -- single transaction (the real fixture has one transaction buying for 15
 -- recipients one block after the launch).
-CREATE VIEW IF NOT EXISTS launchpad_snipers_v AS
+--
+-- Every number here comes from rows anyone can emit - the buys, the launch
+-- block the window starts at, the creator a trader is compared against and
+-- the supply the share divides by - so the _v twin takes all four from
+-- launchpad_trusted_curves_v and the all_v twin takes them from everyone.
+-- Without that a forged curve mints snipers into a real token's list.
+CREATE VIEW IF NOT EXISTS launchpad_snipers_all_v AS
+WITH toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32) AS token_id
 SELECT
   b.trader AS trader,
   b.first_block - l.launch_block AS blocks_after_launch,
@@ -494,14 +929,15 @@ FROM
     SELECT
       trader, block_number, tx_index, ordinal, token_amount, quote_amount,
       tx_from,
-      count(DISTINCT trader) OVER (PARTITION BY transaction_hash) AS bundle
+      count(DISTINCT trader) OVER (PARTITION BY tx_id) AS bundle
     FROM launchpad_trades_by_token FINAL
-    WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+    WHERE chain = {chain:UInt64} AND token = token_id
       AND is_deleted = 0 AND side = 'buy'
+      AND length({token:String}) IN (40, 64)
       AND block_number <= (
         SELECT min(block_number) + {blocks:UInt64}
         FROM launchpad_tokens FINAL
-        WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+        WHERE chain = {chain:UInt64} AND token = token_id
           AND is_deleted = 0)
   )
   GROUP BY trader
@@ -513,8 +949,70 @@ CROSS JOIN
     argMin(creator, (block_number, tx_index, ordinal)) AS launch_creator,
     argMin(toFloat64(initial_supply), (block_number, tx_index, ordinal)) AS initial_supply_raw
   FROM launchpad_tokens FINAL
-  WHERE chain = {chain:UInt64} AND token = {token:FixedString(32)}
+  WHERE chain = {chain:UInt64} AND token = token_id
     AND is_deleted = 0
+) AS l
+ORDER BY token_amount_raw DESC;
+
+CREATE VIEW IF NOT EXISTS launchpad_snipers_v AS
+WITH toFixedString(unhex(if(length({token:String}) = 40,
+  concat('000000000000000000000000', {token:String}), {token:String})), 32) AS token_id
+SELECT
+  b.trader AS trader,
+  b.first_block - l.launch_block AS blocks_after_launch,
+  b.buys AS buys,
+  b.token_amount_raw AS token_amount_raw,
+  b.quote_amount_raw AS quote_amount_raw,
+  b.token_amount_raw / greatest(l.initial_supply_raw, 1.) AS share_of_initial_supply,
+  b.funder_of AS funder,
+  b.bundle_size AS bundle_size,
+  toUInt8(b.trader = l.launch_creator) AS is_creator
+FROM
+(
+  SELECT
+    trader,
+    min(block_number) AS first_block,
+    toUInt64(count()) AS buys,
+    sum(toFloat64(token_amount)) AS token_amount_raw,
+    sum(toFloat64(quote_amount)) AS quote_amount_raw,
+    argMin(tx_from, (block_number, tx_index, ordinal)) AS funder_of,
+    max(bundle) AS bundle_size
+  FROM
+  (
+    SELECT
+      trader, block_number, tx_index, ordinal, token_amount, quote_amount,
+      tx_from,
+      count(DISTINCT trader) OVER (PARTITION BY tx_id) AS bundle
+    FROM launchpad_trades_by_token FINAL
+    WHERE chain = {chain:UInt64} AND token = token_id
+      AND is_deleted = 0 AND side = 'buy'
+      AND length({token:String}) IN (40, 64)
+      AND emitter IN (
+        SELECT curve FROM launchpad_trusted_curves_v
+        WHERE chain = {chain:UInt64})
+      AND block_number <= (
+        SELECT min(block_number) + {blocks:UInt64}
+        FROM launchpad_tokens FINAL
+        WHERE chain = {chain:UInt64} AND token = token_id
+          AND is_deleted = 0
+          AND emitter IN (
+            SELECT curve FROM launchpad_trusted_curves_v
+            WHERE chain = {chain:UInt64}))
+  )
+  GROUP BY trader
+) AS b
+CROSS JOIN
+(
+  SELECT
+    min(block_number) AS launch_block,
+    argMin(creator, (block_number, tx_index, ordinal)) AS launch_creator,
+    argMin(toFloat64(initial_supply), (block_number, tx_index, ordinal)) AS initial_supply_raw
+  FROM launchpad_tokens FINAL
+  WHERE chain = {chain:UInt64} AND token = token_id
+    AND is_deleted = 0
+    AND emitter IN (
+      SELECT curve FROM launchpad_trusted_curves_v
+      WHERE chain = {chain:UInt64})
 ) AS l
 ORDER BY token_amount_raw DESC;
 

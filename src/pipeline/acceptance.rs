@@ -614,10 +614,14 @@ fn fast_workers() -> WorkerOptions {
     options
 }
 
+/// Quick heartbeats so a scenario is not slowed down by them, but a ttl
+/// that survives a saturated test machine: past the ttl the writer's fence
+/// (`pipeline::lease`) refuses to flush, which is right in production and
+/// would only be a flake here.
 fn fast_lease() -> LeaseOptions {
     LeaseOptions {
         heartbeat: Duration::from_millis(100),
-        ttl: Duration::from_millis(400),
+        ttl: Duration::from_secs(10),
     }
 }
 
@@ -1404,9 +1408,13 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
             .await,
         expected.trades.len() as u64
     );
+    // The unfiltered twin: no emitter is trusted yet at this point in the
+    // test, and launchpad_candles_1m_v counts only trusted curves.
     assert!(
         scenario
-            .count("SELECT toUInt64(count()) FROM launchpad_candles_1m_v")
+            .count(
+                "SELECT toUInt64(count()) FROM launchpad_candles_1m_all_v"
+            )
             .await
             > 0
     );
@@ -1490,6 +1498,225 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
             0,
             "{table}"
         );
+    }
+}
+
+// -------------------------------------------- aggregates vs base tables
+
+/// `indexer verify` used to report CONSISTENT for the ONE corruption the
+/// whole epoch machinery exists to prevent: a range written twice. A
+/// materialized view only ever ADDS, so the totals double while every base
+/// table still reads perfectly - wrong numbers, which are worse than
+/// missing ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn verify_catches_a_doubled_aggregate() {
+    const DAY: u32 = 86_400;
+
+    let scenario = Scenario::new("doubled").await;
+    // One block per day, so the range holds complete UTC days.
+    let chain = TestChain::with_block_time(10, DAY);
+    scenario.index_until(&chain, 10, &[]).await;
+    scenario.assert_consistent().await;
+
+    // Exactly what a restart produces: the same rows again under a new
+    // `_version`. The base tables deduplicate by key, the aggregates do
+    // not.
+    let mut batch = transform::transform_with(
+        CHAIN,
+        &chain.response(BlockRange::new(4, 6)),
+        BlockRange::new(4, 6),
+        EnabledModules::default(),
+        &mut DecodeState::default(),
+    )
+    .unwrap()
+    .rows;
+    batch.set_version(next_version());
+    batch.set_epoch(0);
+    scenario.db.store(&batch).await.unwrap();
+
+    // The base tables are untouched ...
+    assert_eq!(scenario.rows("blocks").await, 10);
+
+    // ... and verify says so.
+    let report = verify::verify(&scenario.db, 0, 0).await.unwrap();
+    assert!(!report.is_consistent(), "{report}");
+    assert!(report.gaps.is_empty(), "{report}");
+    assert!(report.orphans.is_empty(), "{report}");
+
+    let text = report.to_string();
+    assert!(text.contains("Aggregates DISAGREE"), "{text}");
+    let wrong: Vec<&str> =
+        report.aggregates.iter().map(|a| a.view).collect();
+    assert!(wrong.contains(&"daily_block_stats_v"), "{wrong:?}");
+    for report in &report.aggregates {
+        assert!(report.days_checked > 0);
+        assert!(report.view_rows > report.base_rows, "{report:?}");
+    }
+
+    // A purge of the doubled range repairs it under a new epoch, and
+    // verify agrees again.
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    purger
+        .purge_range(CHAIN, 4, Some(6), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    scenario.index_until(&chain, 10, &[]).await;
+
+    scenario.assert_consistent().await;
+}
+
+// ----------------------------------------------- the workers' queries
+
+/// Every query the background workers run, EXECUTED against ClickHouse.
+///
+/// None of them was: the unit tests assert on the SQL string, and the
+/// pipeline tests never store a prediction registry or a venue. So when
+/// the analytics tables became chain neutral (32 byte identity columns,
+/// docs/design.md section 13) and the read-back structs kept reading 20
+/// raw bytes, nothing failed - except a real indexer, which cannot even
+/// START on a chain with a stored prediction registry (`known_registries`
+/// is awaited before the writer exists).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_worker_queries_run_against_a_real_database() {
+    use crate::{
+        dex::worker::MissingPoolSource,
+        pipeline::workers::ClickhouseWorkerStore,
+        predictions::{
+            worker::{MissingVenueSource, VenueSink},
+            Protocol,
+        },
+        tokens::worker::MissingTokenSource,
+    };
+
+    let scenario = Scenario::new("workers").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let id = |address: Address| {
+        hex::encode(crate::utils::format::id32(address).0)
+    };
+    let exec = |sql: String| {
+        let db = scenario.db.clone();
+        async move {
+            db.db
+                .query(&sql)
+                .execute()
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+        }
+    };
+
+    // A registry and a venue, which no test chain of this file produces.
+    let registry = Address::repeat_byte(0x11);
+    let exchange = Address::repeat_byte(0x22);
+    let unknown = Address::repeat_byte(0x33);
+
+    exec(format!(
+        "INSERT INTO prediction_markets (chain, registry, market_id, \
+         block_number, timestamp, _version) VALUES ({CHAIN}, \
+         unhex('{}'), unhex('{}'), 1, toDateTime({BASE_TIMESTAMP}), 1)",
+        id(registry),
+        "11".repeat(32)
+    ))
+    .await;
+    exec(format!(
+        "INSERT INTO prediction_venues (chain, exchange, _version) \
+         VALUES ({CHAIN}, unhex('{}'), 1)",
+        id(exchange)
+    ))
+    .await;
+    // A trade of a venue nobody has resolved yet: the work list.
+    exec(format!(
+        "INSERT INTO prediction_trades (chain, exchange, protocol, \
+         block_number, timestamp, _version) VALUES ({CHAIN}, \
+         unhex('{}'), 'ctf_exchange', 1, now(), 1)",
+        id(unknown)
+    ))
+    .await;
+
+    let store = ClickhouseWorkerStore::new(scenario.db.clone(), true);
+
+    // 1. The token work list, both pages. `seen_tokens.address` is 20
+    //    bytes and `dex_pools_by_token.token` is 32: the union used to
+    //    widen both to String and desynchronise the row stream.
+    let all = store.missing_tokens(50).await.unwrap();
+    assert!(
+        all.iter().any(|(address, _)| *address == TOKEN0)
+            && all.iter().any(|(address, _)| *address == TOKEN1),
+        "{all:?}"
+    );
+
+    let first = store.missing_tokens_after(None, 1).await.unwrap();
+    assert_eq!(first.len(), 1);
+    let second =
+        store.missing_tokens_after(Some(first[0].0), 1).await.unwrap();
+    assert_eq!(
+        second.len(),
+        1,
+        "page 2 is empty: the cursor never matches"
+    );
+    assert_ne!(second[0].0, first[0].0);
+
+    // 2. Blank rows are verified again.
+    exec(format!(
+        "INSERT INTO tokens (chain, address, type, _version) VALUES \
+         ({CHAIN}, unhex('{}'), 'ERC20', 1)",
+        hex::encode(TOKEN0.as_slice())
+    ))
+    .await;
+    let blank = store
+        .blank_tokens(None, 50, Duration::from_millis(1))
+        .await
+        .unwrap();
+    assert_eq!(blank, vec![(TOKEN0, crate::tokens::TokenStandard::Erc20)]);
+
+    // 3. Pools that traded and have no resolved `dex_pools` row.
+    //    `dex_pools.emitter` is FixedString(32).
+    let pools = store.missing_pools(50).await.unwrap();
+    assert!(pools.iter().any(|pool| pool.address == V2_PAIR), "{pools:?}");
+
+    // 4. Venues: what is known, and what still has to be resolved.
+    //    `prediction_venues.exchange` is FixedString(32), so a 40 hex
+    //    literal in the IN list never matched.
+    let known = store.known_venues(&[exchange, unknown]).await.unwrap();
+    assert_eq!(known.into_iter().collect::<Vec<_>>(), vec![exchange]);
+
+    let venues = store.missing_venues(50).await.unwrap();
+    assert_eq!(
+        venues,
+        vec![VenueCandidateOf(unknown, Protocol::CtfExchange).into()]
+    );
+
+    // 5. The registry seed, which the binary awaits BEFORE the writer
+    //    exists: a failure here is a process that does not start.
+    let registries =
+        modules::known_registries(&scenario.db, EnabledModules::default())
+            .await
+            .unwrap();
+    assert!(registries.contains(&registry), "{registries:?}");
+}
+
+/// Sugar so the assertion above reads as a row, not as a struct literal.
+#[cfg(test)]
+struct VenueCandidateOf(Address, crate::predictions::Protocol);
+
+#[cfg(test)]
+impl From<VenueCandidateOf> for crate::predictions::VenueCandidate {
+    fn from(row: VenueCandidateOf) -> Self {
+        crate::predictions::VenueCandidate {
+            exchange: row.0,
+            protocol: row.1,
+        }
     }
 }
 

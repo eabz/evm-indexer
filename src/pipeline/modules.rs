@@ -395,7 +395,8 @@ pub async fn known_registries(
     #[serde_with::serde_as]
     #[derive(clickhouse::Row, serde::Deserialize)]
     struct RegistryRow {
-        #[serde_as(as = "crate::utils::format::SerAddress")]
+        // `prediction_*.registry` is FixedString(32) (design section 13).
+        #[serde_as(as = "crate::utils::format::SerId32")]
         registry: Address,
     }
 
@@ -517,6 +518,10 @@ pub struct ModuleSpec {
     /// Block scoped tables the indexer writes, in insert order (which is
     /// also the order a purge tombstones them in, before `blocks`).
     pub base_tables: &'static [&'static str],
+    /// The order the pipeline inserts the module's tables in. Usually the
+    /// reverse of `base_tables`, but it may hold MORE tables: a module can
+    /// write rows that are not block scoped (`prediction_outcome_tokens`).
+    pub insert_order: &'static [&'static str],
     /// Read-path tables fed by materialized views of `base_tables`. Never
     /// written directly; a purge only tombstones them directly to REPAIR a
     /// view push that was lost (`pipeline::store`).
@@ -606,6 +611,9 @@ fn dex_tombstone_sql(
 pub const DEX: ModuleSpec = ModuleSpec {
     name: "dex",
     base_tables: dex::BASE_TABLES,
+    // The DEX module writes exactly its block scoped tables, in the
+    // order they are listed there.
+    insert_order: dex::BASE_TABLES,
     side_tables: dex::SIDE_TABLES,
     derived: dex::DEX_DERIVED,
     block_column: dex::block_column,
@@ -617,6 +625,7 @@ pub const DEX: ModuleSpec = ModuleSpec {
 pub const PREDICTIONS: ModuleSpec = ModuleSpec {
     name: "predictions",
     base_tables: predictions::BASE_TABLES,
+    insert_order: predictions::INSERT_ORDER,
     side_tables: predictions::SIDE_TABLES,
     derived: predictions::PREDICTIONS_DERIVED,
     block_column: predictions::block_column,
@@ -630,6 +639,7 @@ pub const PREDICTIONS: ModuleSpec = ModuleSpec {
 pub const LAUNCHPADS: ModuleSpec = ModuleSpec {
     name: "launchpads",
     base_tables: launchpads::BASE_TABLES,
+    insert_order: launchpads::INSERT_ORDER,
     side_tables: launchpads::SIDE_TABLES,
     derived: launchpads::LAUNCHPADS_DERIVED,
     block_column: launchpads::block_column,

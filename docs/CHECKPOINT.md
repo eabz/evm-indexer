@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 01:00 (America/Mexico_City)
+**Last updated:** 2026-09-19 02:35 (America/Mexico_City)
 
 ## Where things are
 
@@ -35,20 +35,31 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
-| hardening | Opus | MAIN tree (uncommitted edits possible) | launchpads wired (done, 050326b); now the pipeline hardening backlog (tirith task 64ed4968): side-table orphans, shrinking chain, bounded rebuilds, checkpoint compaction, lease fencing... | commits prefixed `hardening:` + tirith notes |
-| solana phase 1 | DONE, merged 442ac35 | - | live proof: 40/40 trades matched a public Solana RPC | - |
-| solana-venues | Opus | worktree | phase 2: Raydium / Orca / Meteora decoders + decode speed | commit after each venue + tirith notes |
-| solana-plan | Opus | writes only `docs/solana-research.md` section 11 | Envio rate limits (cost 1000/query, ~30 queries/window?), head following, history backfill, cost | the file itself |
-| launchpads-align | Opus | worktree | align launchpads with shared ids (`SerId32`, `tx_id String`) | commits |
-| review-d | Opus | read-only | review round 3: pipeline wiring, chain-neutral change, launchpads | findings sent to `lead` on tirith |
+| solana-venues | Opus | worktree `agent-a26920c31a5397109` | Solana phase 2: fix 1-slot-per-query cap in `src/source/solana.rs`, then Raydium / Orca / Meteora decoders + decode speed | commit after each venue + tirith notes |
 
-QUEUED for Solana phase 2: Solana launchpads into `launchpad_*` (after launchpads-align lands); head follower + `indexer run --chain solana` integration (after hardening releases src/pipeline; contiguity = parent_slot chain, never slot+1).
+MAIN TREE IS CLEAN and pushed (HEAD ca36934). Everything below is merged: pipeline wiring +
+zero-flag proof, migrator fixes, launchpads (+ wiring, id alignment, review fixes), chain
+neutral DEX + predictions (+ review round 2 fixes), Solana phase 1, reorg core, hardening
+round 1 (side-table orphan repair, shrinking chain, lease fencing, review round 3 blockers
+and majors), SQL fixes. Last gates: 662 unit tests; 78/78 ClickHouse tests serial on a fresh
+server (hardening engineer), plus the lead's targeted runs at each merge.
 
-MERGED tonight (all pushed): Solana phase 1, pipeline wiring + zero-flag proof, migrator review fixes,
-review round 2 + its fixes, launchpads module, chain-neutral DEX (+ shared id helpers,
-`chains` registry), chain-neutral predictions + its review fixes. Last combined gate on the
-merged state: 593 unit tests, 59/59 ClickHouse tests (run them on a FRESH throwaway
-server: one that has accumulated dozens of test databases runs out of memory).
+NEXT TO LAUNCH (all Opus), when the 5-hour window allows:
+1. hardening round 2 (tirith task 64ed4968, still in_progress): bounded rebuild / interval
+   validity rule, checkpoint compaction, month-splitting a flush over 100 partitions, test
+   for the epoch moving mid-flush, root cause of the tests that fail once under load
+   (`eight_chains...`, `hostile_amounts...`), pass the purged range into dex + launchpads
+   rebuild SQL.
+2. Solana launchpads into `launchpad_*` (pump.fun curve, Meteora DBC, LaunchLab) - after
+   solana-venues lands (both edit `src/svm`).
+3. `indexer run --chain solana`: head follower, `sol_slots` commit marker, contiguity by
+   `block_height`/parent chain, reorg handling off with a parent-hash tripwire, chain
+   registration via `svm::REGISTER_CHAIN_SQL` (plan: docs/solana-research.md section 11).
+4. Review round 4 (hardening round, Solana, SQL fixes). 5. Layout refactor (design 12) -
+   LAST among code changes, it moves files everyone else edits. 6. Final combined gate,
+   live end-to-end run, docs final pass, research cleanup.
+OWNER DECISIONS WAITING: tirith task 115edb17 (Envio $70 month for the Solana backfill,
+history depth, hardware).
 
 Briefs for the four Opus agents: `<session scratchpad>/handoff/*.md` (original brief +
 lead follow-ups + progress notes). Agent sessions do not survive a cut, but a fresh agent
