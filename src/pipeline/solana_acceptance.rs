@@ -2288,6 +2288,112 @@ async fn a_purge_and_a_rebuild_equal_a_clean_index_with_an_unnamed_pool() {
     );
 }
 
+/// Review F, NEW-5.
+///
+/// The queue of flushes that raced another process's purge is drained by
+/// `pass()`, and `pass()` only runs when `target > cursor`. On a bounded
+/// run whose range is already tiled the cursor starts AT the resume point,
+/// so `pass()` was never entered and the queue - which startup had just
+/// filled from the database, announcing in capitals that those spans are
+/// "purged and indexed again before anything else" - was carried to the
+/// exit untouched. Nothing else ever asks for them: their rows are stored,
+/// so the tiling shows no hole, and they stay hidden from every aggregate
+/// until somebody runs an unbounded `indexer run`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_bounded_run_over_a_tiled_range_still_drains_the_stale_queue() {
+    let chain = chain(40);
+    let clean = clean_index("j_drain_clean", &chain, chain.head).await;
+    let scenario = Scenario::new("j_drain").await;
+
+    // The whole range, indexed and tiled: a second bounded run over it has
+    // nothing to stream.
+    scenario.index_until(&chain, chain.head).await.unwrap();
+    scenario.assert_consistent().await;
+
+    // Another process purged and rebuilt the third UTC day under epoch 1,
+    // and this flush of three slots raced it: identical rows, stamped with
+    // the epoch that was in force when the flush started. Nothing but the
+    // stamps distinguishes them - no hole, no orphan.
+    let tombstoned = next_version();
+    let day = BASE_TIMESTAMP + 2 * 86_400;
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+               fork_block, to_block, old_head, depth, rows_tombstoned, \
+               reason, tombstone_version, completed) \
+             VALUES ({CHAIN}, 1, {day}, {}, {}, {}, 0, 0, 0, \
+               'redecode', {tombstoned}, 1)",
+            day + 86_400,
+            chain.slot_at(24),
+            chain.slot_at(31),
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    let (from, to) = (chain.slot_at(25), chain.slot_at(27) + 1);
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO `{COMMIT_MARKER}` (chain, block_number, \
+               blockhash, parent_slot, parent_blockhash, block_height, \
+               timestamp, epoch, _version, is_deleted) \
+             SELECT chain, block_number, blockhash, parent_slot, \
+               parent_blockhash, block_height, timestamp, 0 AS epoch, \
+               {} AS `_version`, 0 AS is_deleted \
+             FROM `{COMMIT_MARKER}` FINAL WHERE chain = {CHAIN} \
+               AND block_number >= {from} AND block_number < {to}",
+            next_version()
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // No read-your-writes: the run must be able to SEE the span at
+    // startup, or the test would pass for the wrong reason.
+    for _ in 0..200 {
+        let found = scenario
+            .db
+            .stale_flush_ranges_in(COMMIT_MARKER, "block_number")
+            .await
+            .unwrap();
+        if found == vec![BlockRange::new(from, to)] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE BOUNDED RUN, over the very range that is already complete.
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    let healed: u64 = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM reorgs WHERE chain = {CHAIN} \
+             AND reason = 'gap_heal' AND fork_block = {from} \
+             AND to_block = {to} AND completed = 1"
+        ))
+        .await;
+    assert_eq!(
+        healed, 1,
+        "the bounded run exited without purging the span its own startup \
+         said it would purge before anything else"
+    );
+
+    // And it did not just purge: the slots came back under an epoch the
+    // validity rule counts, so the index equals a clean one again.
+    assert_eq!(scenario.rows(COMMIT_MARKER).await, chain.produced_slots());
+    scenario.assert_consistent().await;
+    assert_same(
+        "after a bounded run drained the stale queue",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+}
+
 /// Review F, NEW-2.
 ///
 /// `indexer verify --chain solana` compares `sum(swaps)` of
