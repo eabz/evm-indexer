@@ -1218,17 +1218,29 @@ async fn aggregates_do_not_wrap_on_hostile_amounts() {
 
     // The rebuild path obeys the same rule: hide what the views wrote
     // (epoch 0) behind a repair at epoch 1 and re-aggregate.
+    // `to_ts` is the exclusive end of the window the row hides, and the
+    // rebuild covers exactly that window: reaching past it would double
+    // count, stopping short of it would zero a bucket for ever.
+    const REPAIR_END: u32 = DAY_2 + 86_400;
     execute(
         &database,
         &format!(
-            "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, \
-               old_head, depth, rows_tombstoned, reason) \
-             VALUES ({CHAIN}, 1, {DAY_1}, 0, 0, 0, 0, 'gap_heal')"
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+               fork_block, old_head, depth, rows_tombstoned, reason) \
+             VALUES ({CHAIN}, 1, {DAY_1}, {REPAIR_END}, 0, 0, 0, 0, \
+               'gap_heal')"
         ),
     )
     .await;
     for table in CORE_DERIVED {
-        let sql = table.rebuild_sql(CHAIN, DAY_1, 1, u64::MAX, None);
+        let sql = table.rebuild_slice(
+            CHAIN,
+            DAY_1,
+            REPAIR_END,
+            1,
+            u64::MAX,
+            None,
+        );
         execute(&database, &sql).await;
     }
     check("rebuild_sql").await;
@@ -1355,21 +1367,34 @@ async fn purge(
 ) {
     let chain = database.chain_id;
 
-    // Dead rows count too: a re-run after a crash finds the same from_ts.
+    // Dead rows count too: a re-run after a crash finds the same window.
+    // Both ends: `from_ts` is the first bucket the repair covers, `to_ts`
+    // the first one past it. The validity rule hides exactly that window,
+    // so a purge deep in history does NOT touch the buckets after it.
     let mut min_timestamp = u32::MAX;
+    let mut max_timestamp = 0u32;
     for table in BASE_TABLES {
-        let found: u32 = database
+        let (found, newest): (u32, u32) = database
             .db
-            .query(&min_timestamp_sql(table, chain, from_block, to_block))
+            .query(
+                &min_timestamp_sql(table, chain, from_block, to_block)
+                    .replace(
+                        "SELECT toUInt32(min(timestamp))",
+                        "SELECT toUInt32(min(timestamp)), \
+                     toUInt32(max(timestamp))",
+                    ),
+            )
             .fetch_one()
             .await
             .unwrap();
         if found > 0 {
             min_timestamp = min_timestamp.min(found);
+            max_timestamp = max_timestamp.max(newest);
         }
     }
     assert_ne!(min_timestamp, u32::MAX, "nothing to purge");
     let from_ts = repair_start(min_timestamp);
+    let to_ts = repair_start(max_timestamp) + 86_400;
 
     let (blocks, children) = BASE_TABLES.split_last().unwrap();
     assert_eq!(*blocks, "blocks");
@@ -1381,17 +1406,18 @@ async fn purge(
     execute(
         database,
         &format!(
-            "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, \
-               old_head, depth, rows_tombstoned, reason) \
-             VALUES ({chain}, {epoch}, {from_ts}, {from_block}, 0, 0, 0, \
-               '{reason}')"
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+               fork_block, old_head, depth, rows_tombstoned, reason) \
+             VALUES ({chain}, {epoch}, {from_ts}, {to_ts}, {from_block}, \
+               0, 0, 0, '{reason}')"
         ),
     )
     .await;
 
     for table in CORE_DERIVED {
-        let sql =
-            table.rebuild_sql(chain, from_ts, epoch, from_block, to_block);
+        let sql = table.rebuild_slice(
+            chain, from_ts, to_ts, epoch, from_block, to_block,
+        );
         execute(database, &sql).await;
     }
 
@@ -1579,18 +1605,24 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
     const D1: u32 = DAY_1;
     const D2: u32 = DAY_1 + 86_400;
     const D3: u32 = DAY_1 + 2 * 86_400;
+    const D4: u32 = DAY_1 + 3 * 86_400;
+    const D5: u32 = DAY_1 + 4 * 86_400;
 
-    // (chain, contributions (day, epoch, blocks), reorgs (epoch, from_ts),
-    //  expected (day, blocks) of the view)
+    // (chain, contributions (day, epoch, blocks),
+    //  reorgs (epoch, from_ts, to_ts), expected (day, blocks) of the view)
+    //
+    // A `reorgs` row hides the older epochs of the buckets in
+    // [from_ts, to_ts) and NOTHING else: that window is what the purge
+    // rebuilt, because its rows only ever contributed to those buckets.
     type Case = (
         &'static str,
         u64,
         &'static [(u32, u32, u64)],
-        &'static [(u32, u32)],
+        &'static [(u32, u32, u32)],
         &'static [(u32, u64)],
     );
 
-    let cases: [Case; 9] = [
+    let cases: [Case; 15] = [
         (
             "no reorgs: every epoch counts",
             990_101,
@@ -1603,14 +1635,14 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
              after it ignore them",
             990_102,
             &[(D1, 0, 10), (D2, 0, 20), (D2, 1, 21), (D3, 0, 30), (D3, 1, 31)],
-            &[(1, D2)],
+            &[(1, D2, D3 + 86_400)],
             &[(D1, 10), (D2, 21), (D3, 31)],
         ),
         (
             "a repaired bucket nobody rebuilt shows nothing, not stale data",
             990_103,
             &[(D1, 0, 10), (D2, 0, 20)],
-            &[(1, D2)],
+            &[(1, D2, D3 + 86_400)],
             &[(D1, 10)],
         ),
         (
@@ -1624,7 +1656,7 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
                 (D3, 1, 31),
                 (D3, 2, 32),
             ],
-            &[(1, D2), (2, D3)],
+            &[(1, D2, D3 + 86_400), (2, D3, D3 + 86_400)],
             &[(D1, 10), (D2, 21), (D3, 32)],
         ),
         (
@@ -1639,7 +1671,7 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
                 (D3, 1, 31),
                 (D3, 2, 32),
             ],
-            &[(1, D3), (2, D2)],
+            &[(1, D3, D3 + 86_400), (2, D2, D3 + 86_400)],
             &[(D1, 10), (D2, 22), (D3, 32)],
         ),
         (
@@ -1647,7 +1679,7 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
              2 completed) is invisible",
             990_106,
             &[(D2, 0, 20), (D2, 1, 7), (D2, 2, 21), (D3, 0, 30), (D3, 2, 31)],
-            &[(1, D2), (2, D2)],
+            &[(1, D2, D3 + 86_400), (2, D2, D3 + 86_400)],
             &[(D2, 21), (D3, 31)],
         ),
         (
@@ -1655,7 +1687,7 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
              epoch 0 rows",
             990_107,
             &[(D1, 0, 10), (D1, 5, 3), (D3, 0, 30), (D3, 5, 35)],
-            &[(5, D3)],
+            &[(5, D3, D3 + 86_400)],
             &[(D1, 13), (D3, 35)],
         ),
         (
@@ -1663,7 +1695,7 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
              and add to it",
             990_108,
             &[(D2, 0, 20), (D2, 1, 21), (D2, 1, 4), (D2, 3, 5), (D3, 3, 9)],
-            &[(1, D2)],
+            &[(1, D2, D3 + 86_400)],
             &[(D2, 30), (D3, 9)],
         ),
         (
@@ -1673,6 +1705,84 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
             // Recorded for chain 990_102 above, epoch 1 from D2.
             &[],
             &[(D1, 10), (D2, 20)],
+        ),
+        // --- the bounded window (a `to_ts` that is not the end of time)
+        (
+            "a tip reorg hides the day it repaired and nothing before it",
+            990_110,
+            &[(D1, 0, 10), (D2, 0, 20), (D3, 0, 30), (D3, 1, 31)],
+            &[(1, D3, D3 + 86_400)],
+            &[(D1, 10), (D2, 20), (D3, 31)],
+        ),
+        (
+            "a deep gap heal does NOT hide the later buckets it never \
+             rebuilt: they keep their older epochs",
+            990_111,
+            &[
+                (D1, 0, 10),
+                (D1, 1, 11),
+                (D2, 0, 20),
+                (D3, 0, 30),
+                (D5, 0, 50),
+            ],
+            // Repaired the first day only.
+            &[(1, D1, D2)],
+            &[(D1, 11), (D2, 20), (D3, 30), (D5, 50)],
+        ),
+        (
+            "overlapping repairs: the older, WIDER window keeps its floor \
+             where the newer, narrower one did not reach",
+            990_112,
+            &[
+                (D1, 0, 10),
+                (D1, 1, 11),
+                (D2, 1, 21),
+                (D2, 2, 22),
+                (D3, 0, 30),
+                (D3, 1, 31),
+                (D4, 0, 40),
+            ],
+            // 1 repaired D1..D3, 2 (later, deeper in history) only D2.
+            &[(1, D1, D4), (2, D2, D3)],
+            &[(D1, 11), (D2, 22), (D3, 31), (D4, 40)],
+        ),
+        (
+            "an abandoned partial epoch inside a bounded window is \
+             invisible, and buckets past the window are untouched",
+            990_113,
+            &[
+                (D2, 0, 20),
+                // epoch 1 died half way through its rebuild
+                (D2, 1, 7),
+                (D2, 2, 21),
+                (D3, 0, 30),
+            ],
+            // The re-run computes the SAME window (timestamps survive in
+            // the tombstones), so nothing of epoch 1 can leak.
+            &[(1, D2, D3), (2, D2, D3)],
+            &[(D2, 21), (D3, 30)],
+        ),
+        (
+            "a chain of its own is not affected by any of the windows \
+             above",
+            990_114,
+            &[(D1, 0, 10), (D2, 0, 20), (D3, 0, 30), (D4, 0, 40)],
+            &[],
+            &[(D1, 10), (D2, 20), (D3, 30), (D4, 40)],
+        ),
+        (
+            "two windows that touch make one run of days, and the floor \
+             still drops to 0 after the last of them",
+            990_115,
+            &[
+                (D1, 0, 10),
+                (D1, 1, 11),
+                (D2, 0, 20),
+                (D2, 2, 22),
+                (D3, 0, 30),
+            ],
+            &[(1, D1, D2), (2, D2, D3)],
+            &[(D1, 11), (D2, 22), (D3, 30)],
         ),
     ];
 
@@ -1689,14 +1799,15 @@ async fn the_validity_rule_decides_which_epochs_a_view_counts() {
             )
             .await;
         }
-        for (epoch, from_ts) in reorgs {
+        for (epoch, from_ts, to_ts) in reorgs {
             execute(
                 &database,
                 &format!(
-                    "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, \
-                       old_head, depth, rows_tombstoned, reason) \
-                     VALUES ({chain}, {epoch}, {from_ts}, 0, 0, 0, 0, \
-                       'reorg')"
+                    "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+                       fork_block, old_head, depth, rows_tombstoned, \
+                       reason) \
+                     VALUES ({chain}, {epoch}, {from_ts}, {to_ts}, 0, 0, \
+                       0, 0, 'reorg')"
                 ),
             )
             .await;
@@ -1748,25 +1859,29 @@ async fn rebuild_sql_reproduces_what_the_views_wrote() {
         written_by_the_views.push(rows);
     }
 
-    let repair = |epoch: u32, from_ts: u32| {
+    // `to_ts` = the end of the window this repair covers, exclusive.
+    let repair = |epoch: u32, from_ts: u32, to_ts: u32| {
         let database = &database;
         async move {
             execute(
                 database,
                 &format!(
-                    "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, \
-                       old_head, depth, rows_tombstoned, reason) \
-                     VALUES ({CHAIN}, {epoch}, {}, 0, 0, 0, 0, 'gap_heal')",
+                    "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+                       fork_block, old_head, depth, rows_tombstoned, \
+                       reason) \
+                     VALUES ({CHAIN}, {epoch}, {}, {to_ts}, 0, 0, 0, 0, \
+                       'gap_heal')",
                     repair_start(from_ts)
                 ),
             )
             .await;
         }
     };
+    const BOTH_DAYS: u32 = DAY_2 + 86_400;
 
     // Epoch 1 from any timestamp inside the first day: everything the
     // views wrote (epoch 0) is hidden ...
-    repair(1, DAY_1 + 80_000).await;
+    repair(1, DAY_1 + 80_000, BOTH_DAYS).await;
     for table in CORE_DERIVED {
         assert!(
             view_rows(&database, table.name).await.is_empty(),
@@ -1779,8 +1894,14 @@ async fn rebuild_sql_reproduces_what_the_views_wrote() {
     // was purged, so no block range is excluded.)
     for (table, expected) in CORE_DERIVED.iter().zip(&written_by_the_views)
     {
-        let sql =
-            table.rebuild_sql(CHAIN, DAY_1 + 80_000, 1, u64::MAX, None);
+        let sql = table.rebuild_slice(
+            CHAIN,
+            DAY_1 + 80_000,
+            BOTH_DAYS,
+            1,
+            u64::MAX,
+            None,
+        );
         execute(&database, &sql).await;
         assert_eq!(
             &view_rows(&database, table.name).await,
@@ -1791,7 +1912,7 @@ async fn rebuild_sql_reproduces_what_the_views_wrote() {
     }
 
     // Repairing only the second day leaves the first one alone.
-    repair(2, DAY_2 + 5).await;
+    repair(2, DAY_2 + 5, BOTH_DAYS).await;
     for (table, expected) in CORE_DERIVED.iter().zip(&written_by_the_views)
     {
         assert_eq!(
@@ -1801,7 +1922,14 @@ async fn rebuild_sql_reproduces_what_the_views_wrote() {
             table.name
         );
 
-        let sql = table.rebuild_sql(CHAIN, DAY_2 + 5, 2, u64::MAX, None);
+        let sql = table.rebuild_slice(
+            CHAIN,
+            DAY_2 + 5,
+            BOTH_DAYS,
+            2,
+            u64::MAX,
+            None,
+        );
         execute(&database, &sql).await;
         assert_eq!(
             &view_rows(&database, table.name).await,

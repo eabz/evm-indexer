@@ -977,8 +977,8 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
 
         warn!(
             "Chain {}: rolled back blocks [{}, {}): {} blocks, {} rows, \
-             {} checkpoints tombstoned, aggregates rebuilt from unix time \
-             {}; epoch is now {} ({:?}). Resuming from block {}.",
+             {} checkpoints tombstoned, aggregates rebuilt over unix time \
+             [{}, {}); epoch is now {} ({:?}). Resuming from block {}.",
             self.settings.chain_id,
             rollback.fork_point,
             rollback
@@ -988,6 +988,7 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
             report.children_tombstoned,
             report.checkpoints_tombstoned,
             report.from_ts.unwrap_or_default(),
+            report.to_ts.unwrap_or_default(),
             report.epoch,
             started.elapsed(),
             rollback.fork_point,

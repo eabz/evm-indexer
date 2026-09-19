@@ -313,9 +313,14 @@ impl TestDb {
         }
 
         let day = from_ts - from_ts % 86_400;
+        // `to_ts`: the exclusive end of the window the validity rule
+        // hides. It must be the same range the rebuild below covers.
+        let to_ts = now() + 86_400;
         self.execute(&format!(
-            "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, reason) \
-             VALUES ({CHAIN}, {epoch}, {day}, {from_block}, 'reorg')"
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, \
+             fork_block, reason) \
+             VALUES ({CHAIN}, {epoch}, {day}, {to_ts}, {from_block}, \
+             'reorg')"
         ))
         .await;
 
@@ -1180,8 +1185,9 @@ async fn a_reorg_leaves_every_view_equal_to_a_clean_index() {
         .await;
     reorged
         .execute(&format!(
-            "INSERT INTO reorgs (chain, epoch, from_ts, reason) VALUES \
-             ({CHAIN}, 2, {day}, 'reorg')"
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, reason) \
+             VALUES ({CHAIN}, 2, {day}, {}, 'reorg')",
+            now() + 86_400
         ))
         .await;
     let again = everything(&reorged).await;

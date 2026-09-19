@@ -12,11 +12,14 @@
 //!  2 tombstone checkpoints       a checkpoint may under-claim, never over-claim
 //!  3 tombstone children          transactions, logs, transfers, dex rows ...
 //!    from_ts = start of day (UTC) of the earliest row in the range,
-//!              over ALL row versions and ALL block-scoped tables
+//!    to_ts   = start of the day AFTER the newest row in the range,
+//!              both over ALL row versions and ALL block-scoped tables
 //!  4 insert the `reorgs` row     arms the validity rule: readers briefly
 //!                                UNDER-count the repaired buckets;
 //!                                the writer adopts the epoch right away
-//!  5 rebuild every aggregate     from from_ts on, under the new epoch
+//!  5 rebuild every aggregate     over [from_ts, to_ts) - exactly the
+//!                                buckets the `reorgs` row hides - under
+//!                                the new epoch
 //!  6 tombstone `blocks`          LAST durable write = the commit marker
 //!  7 repair the side tables       normally a no-op: their views already
 //!                                 tombstoned them. A view push that was
@@ -45,9 +48,11 @@
 //!   children themselves, dead or alive
 //!   ([`ReorgStore::has_orphan_children`] counts tombstoned rows too), and
 //!   they stay until the range is streamed again.
-//! * `from_ts` is computed over all row versions, so a second run sees the
-//!   same (or an earlier) day even though the first run already tombstoned
-//!   the start of the range.
+//! * `from_ts` / `to_ts` are computed over all row versions, so a second
+//!   run sees the same (or a wider) window even though the first run
+//!   already tombstoned part of the range. It may never see a NARROWER
+//!   one: a bucket the validity rule hides and no repair covers would read
+//!   as empty for ever.
 //!
 //! ClickHouse gives NO read-your-writes: a query issued right after an
 //! INSERT returned can miss the new rows for a few milliseconds. So every
@@ -56,12 +61,13 @@
 //! until a count of the live rows says 0, a bounded number of times), made
 //! independent of fresh writes (the rebuild leaves the purged range out
 //! instead of relying on tombstones; the epoch is also remembered in
-//! memory), or taken twice (`from_ts`: before anything is written and again
-//! after the tombstones converged; the earlier day wins).
+//! memory), or taken twice (the `[from_ts, to_ts)` window: before anything
+//! is written and again after the tombstones converged; the wider window
+//! wins).
 
 use super::{
-    start_of_day, DiscoveryCache, PurgeReason, ReorgError, ReorgMetrics,
-    ReorgRecord, ReorgStore, WriterControl,
+    end_of_day, start_of_day, DiscoveryCache, PurgeReason, ReorgError,
+    ReorgMetrics, ReorgRecord, ReorgStore, WriterControl,
 };
 use alloy::primitives::B256;
 use log::{info, warn};
@@ -130,6 +136,9 @@ pub struct PurgeReport {
     /// `None`: the range held no row of any version, nothing was written
     /// and the epoch did not change.
     pub from_ts: Option<u32>,
+    /// Exclusive end of the repaired bucket range (start of the day after
+    /// the newest purged row), `None` together with `from_ts`.
+    pub to_ts: Option<u32>,
     pub checkpoints_tombstoned: u64,
     pub children_tombstoned: u64,
     pub blocks_tombstoned: u64,
@@ -285,7 +294,7 @@ impl Purger {
 
         let first_look = self
             .store
-            .min_timestamp(chain, from, to)
+            .timestamp_span(chain, from, to)
             .await
             .map_err(at(PurgeStep::MinTimestamp))?;
 
@@ -307,6 +316,7 @@ impl Purger {
             return Ok(PurgeReport {
                 epoch: current,
                 from_ts: None,
+                to_ts: None,
                 checkpoints_tombstoned: 0,
                 children_tombstoned: 0,
                 blocks_tombstoned: 0,
@@ -345,19 +355,32 @@ impl Purger {
             .await?;
 
         // Second look, several round trips later: a row the first one
-        // could not see yet must not move the repair to a later day.
+        // could not see yet must not move the repair to a later day, and
+        // must not leave the last day it touched out of it either. The
+        // window only ever GROWS between the two looks - a repair that
+        // covers more than the validity rule hides is merely extra work.
         let second_look = self
             .store
-            .min_timestamp(chain, from, to)
+            .timestamp_span(chain, from, to)
             .await
             .map_err(at(PurgeStep::MinTimestamp))?;
 
-        let from_ts = first_look
-            .into_iter()
-            .chain(second_look)
+        let looks = || first_look.into_iter().chain(second_look);
+
+        let from_ts = looks()
+            .map(|(min, _)| min)
             .min()
             .map(start_of_day)
             .unwrap_or_default();
+
+        // Exclusive, and always at least one whole day: the repair covers
+        // every bucket the validity rule is about to hide.
+        let to_ts = looks()
+            .map(|(_, max)| max)
+            .max()
+            .map(end_of_day)
+            .unwrap_or_default()
+            .max(from_ts.saturating_add(super::REPAIR_ALIGNMENT_SECONDS));
 
         // 4. Before the rebuild: under-count for a moment, never double
         //    count.
@@ -374,6 +397,7 @@ impl Purger {
             chain,
             epoch,
             from_ts,
+            to_ts,
             fork_block: from,
             to_block: to,
             old_head,
@@ -400,11 +424,13 @@ impl Purger {
         // stamping an epoch the validity rule already hides.
         self.writer.adopt_epoch(epoch);
 
-        // 5. Bucket repair. It leaves the purged block range out by
-        //    itself, so it neither counts the still-alive orphaned `blocks`
-        //    rows nor depends on seeing the tombstones of step 3.
+        // 5. Bucket repair of exactly the buckets the `reorgs` row hides,
+        //    `[from_ts, to_ts)` - not "from from_ts to now". It leaves the
+        //    purged block range out by itself, so it neither counts the
+        //    still-alive orphaned `blocks` rows nor depends on seeing the
+        //    tombstones of step 3.
         self.store
-            .rebuild_derived(chain, from_ts, epoch, from, to)
+            .rebuild_derived(chain, from_ts, to_ts, epoch, from, to)
             .await
             .map_err(at(PurgeStep::RebuildDerived))?;
 
@@ -463,26 +489,28 @@ impl Purger {
                 "Chain {chain}: rolled back blocks {range}: \
                  {blocks_tombstoned} blocks, {children_tombstoned} rows, \
                  {checkpoints_tombstoned} checkpoints tombstoned, \
-                 aggregates rebuilt from unix time {from_ts}; epoch is \
-                 now {epoch} ({elapsed:?})."
+                 aggregates rebuilt over unix time \
+                 [{from_ts}, {to_ts}); epoch is now {epoch} \
+                 ({elapsed:?})."
             ),
             PurgeReason::Redecode => info!(
                 "Chain {chain}: cleared {range} for re-decoding: \
                  {children_tombstoned} rows tombstoned, aggregates rebuilt \
-                 from unix time {from_ts}; epoch is now {epoch} \
-                 ({elapsed:?})."
+                 over unix time [{from_ts}, {to_ts}); epoch is now \
+                 {epoch} ({elapsed:?})."
             ),
             PurgeReason::GapHeal => info!(
                 "Chain {chain}: healed gap {range} left by an interrupted \
                  write: {children_tombstoned} rows tombstoned, aggregates \
-                 rebuilt from unix time {from_ts}; epoch is now {epoch} \
-                 ({elapsed:?})."
+                 rebuilt over unix time [{from_ts}, {to_ts}); epoch is \
+                 now {epoch} ({elapsed:?})."
             ),
         }
 
         Ok(PurgeReport {
             epoch,
             from_ts: Some(from_ts),
+            to_ts: Some(to_ts),
             checkpoints_tombstoned,
             children_tombstoned,
             blocks_tombstoned,

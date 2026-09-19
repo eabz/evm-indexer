@@ -35,7 +35,7 @@
 use crate::{
     db::{
         models::log::DatabaseLog, next_version, ranges::BlockRange,
-        Database, FlushKey, RowBatch,
+        Database, FlushKey, FlushWindow, RowBatch,
     },
     pipeline::{
         modules::{
@@ -341,9 +341,11 @@ pub async fn backfill(
             version,
         };
 
-        decoded.store(db, &key).await.with_context(|| {
-            format!("write the '{}' rows of {chunk}", spec.name)
-        })?;
+        // The backfill writes one chunk of blocks at a time, never a
+        // span of months, so it is always one part.
+        decoded.store(db, &key, FlushWindow::ALL).await.with_context(
+            || format!("write the '{}' rows of {chunk}", spec.name),
+        )?;
 
         rows_written += decoded.rows() as u64;
     }

@@ -300,6 +300,114 @@ impl DatabaseParams {
     }
 }
 
+/// How many distinct monthly partitions one INSERT of a flush may touch.
+///
+/// Base tables and aggregates are `PARTITION BY toYYYYMM(...)` and
+/// ClickHouse refuses an insert block that touches more than
+/// `max_partitions_per_insert_block` (100 by default) partitions with code
+/// 252 - in the table AND in everything its materialized views feed. A
+/// flush normally covers hours, but a pass healing gaps spread over the
+/// whole history, or a chain with a very long block time, can put blocks
+/// of hundreds of months into one. Below the limit so a view whose bucket
+/// lands in a neighbouring month still fits.
+pub const MAX_MONTHS_PER_FLUSH: usize = 90;
+
+/// A slice of a flush: the rows whose `timestamp` is in `[from, to)`.
+/// Whole months, so no monthly partition is ever written by two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushWindow {
+    pub from: u32,
+    /// Exclusive; `u32::MAX` for the last window.
+    pub to: u32,
+}
+
+impl FlushWindow {
+    /// The single window every ordinary flush uses.
+    pub const ALL: Self = Self { from: 0, to: u32::MAX };
+
+    pub fn holds(&self, timestamp: u32) -> bool {
+        timestamp >= self.from
+            && (timestamp < self.to || self.to == u32::MAX)
+    }
+}
+
+/// The windows a flush of these block timestamps has to be split into,
+/// oldest first: one, unless the flush touches more than
+/// [`MAX_MONTHS_PER_FLUSH`] distinct UTC months.
+///
+/// Splitting by month (not by block count) is what the partition key asks
+/// for, and it keeps whole blocks together: a child row carries its
+/// block's timestamp, so it always lands in the same window as its block.
+pub fn flush_windows(
+    timestamps: impl Iterator<Item = u32>,
+) -> Vec<FlushWindow> {
+    // The END of the month a timestamp falls into: a grouping key and a
+    // window boundary in one.
+    let mut ends: Vec<u32> = timestamps
+        .map(|timestamp| {
+            derived::next_month_start(timestamp).min(u64::from(u32::MAX))
+                as u32
+        })
+        .collect();
+    ends.sort_unstable();
+    ends.dedup();
+
+    if ends.len() <= MAX_MONTHS_PER_FLUSH {
+        return vec![FlushWindow::ALL];
+    }
+
+    let mut windows = Vec::new();
+    let mut from = 0;
+
+    for chunk in ends.chunks(MAX_MONTHS_PER_FLUSH) {
+        let to = *chunk.last().expect("chunks are never empty");
+        windows.push(FlushWindow { from, to });
+        from = to;
+    }
+
+    // The last window stays open ended: a row a month boundary rounded
+    // away must never fall outside every window.
+    if let Some(last) = windows.last_mut() {
+        last.to = u32::MAX;
+    }
+
+    windows
+}
+
+/// A row that belongs to a monthly partition: what [`flush_windows`]
+/// groups by and what [`select`] filters on. Implemented for every row
+/// type a flush writes (the module ones in `pipeline::modules`), so a new
+/// table can not silently skip the split - it would not compile.
+pub trait Timestamped {
+    /// Unix seconds deciding the row's partition.
+    fn timestamp(&self) -> u32;
+}
+
+macro_rules! timestamped {
+    ($($row:ty),+ $(,)?) => {$(
+        impl Timestamped for $row {
+            fn timestamp(&self) -> u32 {
+                self.timestamp
+            }
+        }
+    )+};
+}
+
+timestamped!(
+    DatabaseBlock,
+    DatabaseTransaction,
+    DatabaseLog,
+    DatabaseWithdrawal,
+    DatabaseERC20Transfer,
+    DatabaseERC721Transfer,
+    DatabaseERC1155Transfer,
+);
+
+/// The rows of `window`, borrowed.
+pub fn select<T: Timestamped>(rows: &[T], window: FlushWindow) -> Vec<&T> {
+    rows.iter().filter(|row| window.holds(row.timestamp())).collect()
+}
+
 /// Identifies one flush for the server side insert deduplication
 /// (docs/design.md, section 2, "Retried inserts must not double count"):
 /// the same rows retried carry the same token, so ClickHouse drops the
@@ -605,12 +713,61 @@ impl Database {
     /// NO block row of this batch was written (or, for a failed checkpoint
     /// insert, everything was: checkpoints are an index, `blocks` decides).
     pub async fn store(&self, batch: &RowBatch) -> Result<()> {
-        let Some(span) = batch.block_span() else {
+        if batch.block_span().is_none() {
             if batch.is_empty() {
                 return Ok(());
             }
             // Rows can not be committed without their block.
             bail!("refusing to store a batch of rows without block rows");
+        }
+
+        let windows = flush_windows(
+            batch.blocks.iter().map(|block| block.timestamp),
+        );
+
+        if windows.len() > 1 {
+            info!(
+                "Chain {}: this flush spans {} UTC months, more than one \
+                 insert may touch; storing it in {} parts, oldest first.",
+                self.chain_id,
+                windows.len() * MAX_MONTHS_PER_FLUSH,
+                windows.len()
+            );
+        }
+
+        // Oldest first, each part complete in itself (children, then
+        // `blocks`, then its checkpoints): a crash between two parts leaves
+        // the later months as ordinary gaps.
+        for window in windows {
+            self.store_window(batch, window).await?;
+        }
+
+        Ok(())
+    }
+
+    /// One part of a flush: every row whose `timestamp` falls into
+    /// `window`. With the single [`FlushWindow::ALL`] this is the whole
+    /// flush and behaves exactly as an unsplit one - the deduplication
+    /// token included, because the key's block span is computed from the
+    /// window's own blocks.
+    async fn store_window(
+        &self,
+        batch: &RowBatch,
+        window: FlushWindow,
+    ) -> Result<()> {
+        let blocks: Vec<&DatabaseBlock> = batch
+            .blocks
+            .iter()
+            .filter(|block| window.holds(block.timestamp))
+            .collect();
+
+        let Some(span) = blocks
+            .iter()
+            .map(|block| block.number)
+            .min()
+            .zip(blocks.iter().map(|block| block.number).max())
+        else {
+            return Ok(());
         };
 
         let key = FlushKey {
@@ -619,26 +776,21 @@ impl Database {
             version: batch.version(),
         };
 
+        let logs = select(&batch.logs, window);
+        let transactions = select(&batch.transactions, window);
+        let withdrawals = select(&batch.withdrawals, window);
+        let erc20 = select(&batch.erc20_transfers, window);
+        let erc721 = select(&batch.erc721_transfers, window);
+        let erc1155 = select(&batch.erc1155_transfers, window);
+
         let results = tokio::join!(
-            self.insert_flush("logs", &batch.logs, &key),
-            self.insert_flush("transactions", &batch.transactions, &key),
-            self.insert_flush("withdrawals", &batch.withdrawals, &key),
-            self.insert_flush(
-                "erc20_transfers",
-                &batch.erc20_transfers,
-                &key
-            ),
-            self.insert_flush(
-                "erc721_transfers",
-                &batch.erc721_transfers,
-                &key
-            ),
-            self.insert_flush(
-                "erc1155_transfers",
-                &batch.erc1155_transfers,
-                &key
-            ),
-            batch.modules.store(self, &key),
+            self.insert_flush_refs("logs", &logs, &key),
+            self.insert_flush_refs("transactions", &transactions, &key),
+            self.insert_flush_refs("withdrawals", &withdrawals, &key),
+            self.insert_flush_refs("erc20_transfers", &erc20, &key),
+            self.insert_flush_refs("erc721_transfers", &erc721, &key),
+            self.insert_flush_refs("erc1155_transfers", &erc1155, &key),
+            batch.modules.store(self, &key, window),
         );
 
         let (r0, r1, r2, r3, r4, r5, r6) = results;
@@ -652,10 +804,10 @@ impl Database {
             bail!("failed to store batch: {}", failures.join("; "));
         }
 
-        self.insert_flush("blocks", &batch.blocks, &key).await?;
+        self.insert_flush_refs("blocks", &blocks, &key).await?;
 
         let checkpoints: Vec<DatabaseCheckpoint> =
-            contiguous_ranges(batch.blocks.iter().map(|b| b.number))
+            contiguous_ranges(blocks.iter().map(|b| b.number))
                 .into_iter()
                 .map(|range| DatabaseCheckpoint {
                     chain: self.chain_id,
@@ -666,7 +818,10 @@ impl Database {
                 })
                 .collect();
 
-        self.insert_flush("checkpoints", &checkpoints, &key).await
+        let checkpoints: Vec<&DatabaseCheckpoint> =
+            checkpoints.iter().collect();
+
+        self.insert_flush_refs("checkpoints", &checkpoints, &key).await
     }
 
     /// Inserts rows of a flush into a block scoped `table`: synchronous,
@@ -677,6 +832,23 @@ impl Database {
         &self,
         table: &'static str,
         rows: &[T],
+        key: &FlushKey,
+    ) -> Result<()>
+    where
+        T: Serialize,
+        for<'a> T: Row<Value<'a> = T>,
+    {
+        let rows: Vec<&T> = rows.iter().collect();
+        self.insert_flush_refs(table, &rows, key).await
+    }
+
+    /// [`Self::insert_flush`] for rows selected out of a larger batch (the
+    /// parts of a flush that is split by month, `flush_windows`), without
+    /// copying them.
+    pub async fn insert_flush_refs<T>(
+        &self,
+        table: &'static str,
+        rows: &[&T],
         key: &FlushKey,
     ) -> Result<()>
     where
@@ -718,14 +890,15 @@ impl Database {
             return Ok(());
         }
 
-        self.insert_retrying(&self.small, table, rows).await
+        let rows: Vec<&T> = rows.iter().collect();
+        self.insert_retrying(&self.small, table, &rows).await
     }
 
     async fn insert_retrying<T>(
         &self,
         client: &Client,
         table: &'static str,
-        rows: &[T],
+        rows: &[&T],
     ) -> Result<()>
     where
         T: Serialize,
@@ -766,7 +939,7 @@ impl Database {
     async fn insert_once<T>(
         client: &Client,
         table: &str,
-        rows: &[T],
+        rows: &[&T],
     ) -> Result<()>
     where
         T: Serialize,
@@ -801,7 +974,7 @@ impl Database {
         );
 
         for row in rows {
-            insert.write(row).await?;
+            insert.write(*row).await?;
         }
 
         insert.end().await?;
@@ -958,6 +1131,79 @@ mod tests {
         assert_eq!(a.rows(), 2);
         assert!(b.is_empty());
         assert_eq!(a.block_span(), None);
+    }
+
+    /// 2015-08-01, 2015-09-01, ... : the first instant of `count` UTC
+    /// months in a row.
+    fn monthly(count: usize) -> Vec<u32> {
+        let mut timestamps = vec![1_438_387_200u32];
+        for _ in 1..count {
+            let last = *timestamps.last().unwrap();
+            timestamps.push(derived::next_month_start(last) as u32);
+        }
+        timestamps
+    }
+
+    #[test]
+    fn an_ordinary_flush_is_one_part() {
+        // Hours, days, even 90 months: one insert, exactly as before.
+        for count in [1, 2, 89, 90] {
+            assert_eq!(
+                flush_windows(monthly(count).into_iter()),
+                vec![FlushWindow::ALL],
+                "{count} months"
+            );
+        }
+
+        assert_eq!(
+            flush_windows(std::iter::empty()),
+            vec![FlushWindow::ALL]
+        );
+        assert!(FlushWindow::ALL.holds(0));
+        assert!(FlushWindow::ALL.holds(u32::MAX));
+    }
+
+    #[test]
+    fn a_flush_over_more_months_than_one_insert_may_touch_is_split() {
+        // 135 months (a gap heal spread over eleven years, or a chain with
+        // a very long block time): ClickHouse refuses one insert block
+        // over `max_partitions_per_insert_block` = 100 with code 252.
+        let timestamps = monthly(135);
+        let windows = flush_windows(timestamps.iter().copied());
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].from, 0);
+        assert_eq!(windows[1].to, u32::MAX);
+        // Contiguous, so no row can fall between two parts ...
+        assert_eq!(windows[0].to, windows[1].from);
+
+        // ... and every one of them lands in exactly one part, whole
+        // months at a time.
+        for timestamp in &timestamps {
+            let parts = windows
+                .iter()
+                .filter(|window| window.holds(*timestamp))
+                .count();
+            assert_eq!(parts, 1, "{timestamp}");
+        }
+
+        // The first part carries 90 months, the second the remaining 45.
+        let count = |window: &FlushWindow| {
+            timestamps.iter().filter(|t| window.holds(**t)).count()
+        };
+        assert_eq!(count(&windows[0]), MAX_MONTHS_PER_FLUSH);
+        assert_eq!(count(&windows[1]), 135 - MAX_MONTHS_PER_FLUSH);
+
+        // 10 years of hourly blocks in one flush is still 121 months.
+        let windows = flush_windows(
+            monthly(400)
+                .into_iter()
+                .flat_map(|month| [month, month + 3_600, month + 86_400]),
+        );
+        assert_eq!(windows.len(), 5);
+        for window in &windows {
+            assert!(window.from < window.to);
+        }
     }
 
     #[test]

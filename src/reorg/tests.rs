@@ -1072,13 +1072,13 @@ impl ReorgStore for ModuleStore {
         async { Ok(false) }.boxed()
     }
 
-    fn min_timestamp(
+    fn timestamp_span(
         &self,
         chain: u64,
         from: u64,
         to: Option<u64>,
-    ) -> BoxFuture<'_, anyhow::Result<Option<u32>>> {
-        self.inner.min_timestamp(chain, from, to)
+    ) -> BoxFuture<'_, anyhow::Result<Option<(u32, u32)>>> {
+        self.inner.timestamp_span(chain, from, to)
     }
 
     fn live_children(
@@ -1185,6 +1185,7 @@ impl ReorgStore for ModuleStore {
         &self,
         chain: u64,
         from_ts: u32,
+        to_ts: u32,
         epoch: u32,
         purged_from: u64,
         purged_to: Option<u64>,
@@ -1200,7 +1201,7 @@ impl ReorgStore for ModuleStore {
             };
             self.inner.rebuild_keeping(
                 chain,
-                from_ts,
+                (from_ts, to_ts),
                 epoch,
                 purged_from,
                 purged_to,
