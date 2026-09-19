@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 06:20 (America/Mexico_City)
+**Last updated:** 2026-09-19 06:50 (America/Mexico_City)
 
 ## Where things are
 
@@ -35,55 +35,58 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
-| hardening round 2 | DONE, pushed | main tree clean | bounded validity rule + rebuild, checkpoint compaction, month-split flush, epoch-mid-flush test, flaky-test root cause (dex harness tombstones once), 678 unit + 58/58 ClickHouse | - |
-| module-followups | Opus | worktree | dex/predictions harness re-read loops, launchpads rebuild excludes purged range, README signatures | commits + tirith notes |
-| solana-launchpads | DONE, merged 3bb94e9 | - | pump.fun / Meteora DBC / LaunchLab into `launchpad_*`; pump.fun agreement 100%; migration renumbered to 0043 by the lead (0042 belongs to solana-run) | - |
-| solana-run | RESUMED 05:45 to adapt (Opus) | worktree `agent-a703082e8726f3841` (4 commits + a merge of the branch) | BLOCKED on an interface drift: hardening round 2 changed `reorg::ReorgStore` (`min_timestamp` gone, `rebuild_derived` 7 params) and `src/pipeline/solana_store.rs` implements the old trait. When hardening finishes and posts its trait-change list, resume solana-run (or a fresh Opus agent in that worktree) to adapt, re-run its 13 acceptance scenarios, then merge. Live proof already done: 10 min head following, 202,105 swaps, 6.2 queries/min, 20/20 vs public RPC, restart resumes exactly. | commits in the worktree |
+| module-followups | Opus | worktree `agent-afd2d96e1d5a702bb` | dex/predictions/launchpads/svm test harness re-read loops, launchpads rebuild SQL excludes the purged range, README signatures (hand-overs from hardening round 2: `<scratchpad>/handoff/hardening2-report.md`) | commits + tirith notes |
 
-MAIN TREE IS CLEAN and pushed (HEAD 7a4487e+). NO worktrees exist. Everything below is merged: pipeline wiring +
-zero-flag proof, migrator fixes, launchpads (+ wiring, id alignment, review fixes), chain
-neutral DEX + predictions (+ review round 2 fixes), Solana phase 1, reorg core, hardening
-round 1 (side-table orphan repair, shrinking chain, lease fencing, review round 3 blockers
-and majors), SQL fixes. Last gates: 662 unit tests; 78/78 ClickHouse tests serial on a fresh
-server (hardening engineer), plus the lead's targeted runs at each merge.
-
-NEXT TO LAUNCH (all Opus), when the 5-hour window allows:
-1. hardening round 2 (tirith task 64ed4968, still in_progress): bounded rebuild / interval
-   validity rule, checkpoint compaction, month-splitting a flush over 100 partitions, test
-   for the epoch moving mid-flush, root cause of the tests that fail once under load
-   (`eight_chains...`, `hostile_amounts...`), pass the purged range into dex + launchpads
-   rebuild SQL.
-2. Solana launchpads into `launchpad_*` (pump.fun curve, Meteora DBC, LaunchLab); also the
-   pump.fun decoder disagreeing with the movement layer on 1.8-3.8% of curve trades, and a
-   curated `sol_dex_programs` registry for the prop AMMs (~32% of Solana volume: movement
-   layer decodes them, promoting a program to a venue is a false-positive decision).
-3. `indexer run --chain solana`: head follower, `sol_slots` commit marker, contiguity by
-   `block_height`/parent chain, reorg handling off with a parent-hash tripwire, chain
-   registration via `svm::REGISTER_CHAIN_SQL` (plan: docs/solana-research.md section 11).
-4. Review round 4 (hardening round, Solana, SQL fixes). 5. Layout refactor (design 12) -
-   LAST among code changes, it moves files everyone else edits. 6. Final combined gate,
-   live end-to-end run, docs final pass, research cleanup.
-OWNER DECISIONS WAITING: tirith task 115edb17 (Envio $70 month for the Solana backfill,
-history depth, hardware).
-
-Briefs for the four Opus agents: `<session scratchpad>/handoff/*.md` (original brief +
-lead follow-ups + progress notes). Agent sessions do not survive a cut, but a fresh agent
-given the handoff file plus `git status`/`git log` of the worktree can continue.
+MAIN TREE IS CLEAN and pushed (HEAD 8c23e33+). EVERYTHING BELOW IS MERGED: HyperSync ingest,
+clean binary schema, insert-only reorgs (tombstones + epochs + BOUNDED validity rule),
+migrator (+ review fixes), token worker (+ untrusted-endpoint hardening, `--rpc` default auto),
+metrics, DEX (+ forgery hardening, chain-neutral), predictions (+ review fixes, chain
+neutral), EVM launchpads (+ id alignment, review fixes), reorg core, pipeline wiring +
+zero-flag proof, hardening rounds 1 and 2, SQL fixes, Solana: phase 1, 10 venues, launchpads
+(pump.fun / Meteora DBC / LaunchLab), `sol_dex_programs` registry, and
+`indexer run --chain solana` (head follower; live 5 min: 224.8 slots/min, 141,655 swaps,
+13,918 curve trades, verify CONSISTENT). Last gates: 736 unit tests; 90 database tests
+suite by suite on a fresh ClickHouse (EVM acceptance 19/19, Solana acceptance 15/15).
+CI on PR #16 has been green on every completed run since the pipeline wiring landed.
 
 ## Still to do, in order
 
-1. DONE: pipeline wiring (zero-flag proof, 8/8 acceptance tests, review round 2 core fixes). DONE: migrator review fixes merged. DONE: review round 2 (findings routed; predictions fixes are with predictions-neutral). Open backlog: tirith tasks 'Pipeline hardening backlog' and 'Live validation'.
-2. Merge launchpads + migrator fixes (validate each in its worktree against the current
-   branch first, then a real `git merge`, then remove the worktree).
-3. Review round 2 findings -> fixes. Then review the pipeline wiring itself.
-4. Layout refactor to feature modules (design section 12).
-5. Final combined gate: all unit tests + ALL ClickHouse integration tests in parallel.
-6. Live end-to-end run on the final binary (zero flags: DEX rows + token metadata),
-   tune the HyperSync `StreamConfig`.
-7. Docs final pass (README flag table vs real CLI; single-provider RPC note).
-8. Owner decided 2026-09-18: analytics tables chain-neutral NOW (design 13) and Solana is a GO (design 14). Merge order after pipeline wiring: dex-neutral -> predictions-neutral -> launchpads -> solana phase 1, each validated in its worktree against the current branch first. Then Solana phase 2 (Raydium/Orca/Meteora decoders, launchpads on Solana, head follower + reorg variant, history backfill). Perps are deferred.
-9. END cleanup: delete research docs (`perps-`, `launchpads-`, `solana-research.md`,
-   `data-model-proposals.md`) and this file; `docs/` keeps decisions only.
+1. Merge module-followups when it reports (validate in its worktree against the branch,
+   real `git merge`, remove the worktree).
+2. Review round 4 (independent, read-only, Opus): hardening rounds 1+2 (bounded validity
+   rule, side-table repair, checkpoint compaction, month-split flush, lease fencing), the
+   whole Solana path (`src/svm/**`, `src/source/solana.rs`, `src/pipeline/solana*.rs`),
+   the SQL fixes. Route findings to fresh Opus engineers.
+3. Known open items (tirith tasks exist):
+   - Solana flush latency went from ~50 ms to 0.6-5.9 s once launchpad tables + their ten
+     MVs joined the flush; `sol_token_balances` is `PARTITION BY chain` (one partition for
+     all of Solana, merged on every insert) - prime suspect. Fix BEFORE any history backfill.
+   - `sol_token_balances` uses the POSITION as `_version`: it is excluded from tombstoning
+     and from `Database::seed_version` (a clock version can never outrank it). Confirm the
+     design is sound in review round 4.
+   - The sink's queue of flush spans that raced another process's purge is in memory only
+     (task 5e52af12): persist it or verify the days of the newest `reorgs` rows at startup.
+   - Solana history backfill driver (blocked on OWNER DECISION: Envio Starter $70 for one
+     month ~13 days vs free 48 days / ~11 weeks), nightly sample re-fetch for verify,
+     `sol_tokens.program` overwrite, DBC/LaunchLab graduations name no destination pool.
+   - Predictions: market-list cost only partly bounded (needs `market_id` denormalised onto
+     `prediction_trades`); four.meme launchpad family not built.
+4. Layout refactor to feature modules (design section 12): `src/db/models` -> `src/core`,
+   `src/utils` gone, `src/db` infrastructure only. Mechanical, no behaviour change, ONE
+   engineer, nobody else editing at the same time. Task 59f32d7e.
+5. Final combined gate: all unit tests + ALL database tests (fresh ClickHouse per suite).
+6. Live end-to-end run of the FINAL binary with zero flags on an EVM chain (DEX rows +
+   token metadata through `--rpc auto`), tune the HyperSync `StreamConfig`; and Solana
+   next to it in the same database.
+7. Docs final pass: README (Solana operator section exists from solana-run; check flag
+   table vs `src/configs`), compose example with a Solana service, CI integration filter
+   should include predictions/launchpads/svm/pipeline acceptance suites.
+8. END cleanup (owner request): delete research docs (`perps-research.md`,
+   `launchpads-research.md`, `solana-research.md`, `data-model-proposals.md`) and this file
+   after folding their DECISIONS into `docs/design.md`; `docs/` keeps decisions only.
+OWNER DECISIONS WAITING (tirith task 115edb17): Envio $70 month for the Solana backfill;
+history depth (accept 2026-01-03 start - lead recommends yes); hardware (~8 TB NVMe,
+64-128 GB RAM for year one). Perps are deferred by the owner.
 
 ## Standing instructions from the owner (2026-09-18, before going offline)
 

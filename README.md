@@ -25,6 +25,7 @@ An indexer that streams blockchain data from [Envio HyperSync](https://docs.envi
 - [Reorgs](#reorgs)
 - [DEX analytics](#dex-analytics)
 - [Prediction markets and perps](#prediction-markets-and-perps)
+- [Solana](#solana)
 - [Metrics and health checks](#metrics-and-health-checks)
 - [Performance tuning](#performance-tuning)
 - [Upgrading from 2.x](#upgrading-from-2x)
@@ -477,6 +478,86 @@ Conventions, precision, the pool resolver and the known gaps (forged events, agg
 **On by default** (`--no-launchpads` to opt out). Decoded by event family from the same logs, so it costs no extra HyperSync traffic: bonding-curve launches, buys and sells, fee sweeps and graduations into a DEX pool, plus launch attribution for venues that launch straight into a Uniswap V3 / V4 pool (their trading is already in `dex_swaps`).
 
 Nothing is trusted by default: a trade leg counts only when the asset contract reported the movement in the same transaction, and the headline views count only emitters an operator listed in `launchpad_trusted_emitters` (the module README ships the verified addresses as ready-to-run `INSERT`s; migrations seed nothing). Tables, views and the query cookbook are in [`src/launchpads/README.md`](src/launchpads/README.md).
+
+## Solana
+
+`indexer run --chain solana` indexes Solana into the same database as every EVM chain, from Envio's Solana HyperSync. It is a **separate sync loop** (`src/pipeline/solana.rs`) because three things genuinely differ; everything else — the ClickHouse insert path, the tombstone/epoch machinery, `purge_range`, the one-process-per-chain lease, the metrics — is shared.
+
+**Analytics only, and program filtered.** Solana produces ~150M non-vote transactions a day and the value sits in a couple of dozen programs, so the indexer asks for those programs and nothing else. `sol_transactions` is *the matched transactions*, not the chain's; there is no wallet history, no chain-wide transfer table and deliberately no daily chain statistics. [`src/svm/README.md`](src/svm/README.md) says what that rules out, and why.
+
+### Running it next to the EVM chains
+
+One more process against the same `DATABASE_URL`, exactly like adding any other chain:
+
+```sh
+export ENVIO_API_TOKEN=...            # the same token as the EVM chains; separate rate-limit budget
+export DATABASE_URL=http://user:pass@clickhouse:8123/indexer
+
+# follow the head from now on (what you want first)
+indexer run --chain solana --new-blocks-only --metrics-addr :9090
+
+# or from a specific slot
+indexer run --chain solana --start-block 448000000
+```
+
+`--chain` takes the name `solana` or the id `1399811149` (and `CHAIN_ID` takes either too, so a compose file needs no new variable). The indexer writes the `chains` registry row itself at startup, which is what tells a view to print a Solana identity column with `base58Encode` instead of as an EVM address.
+
+In compose, it is one more service in the `x-indexer` block:
+
+```yaml
+  indexer-solana:
+    <<: *indexer
+    container_name: evm-indexer-solana
+    environment:
+      <<: *indexer-environment
+      CHAIN_ID: solana
+      NEW_BLOCKS_ONLY: "true"
+      RPC_URL: none        # Solana needs no eth_call; decimals come with the data
+    ports:
+      - "127.0.0.1:9103:9090"
+```
+
+**`--start-block` is a SLOT**, and Envio serves Solana only from slot **391,000,000** (2026-01-03). A lower value is refused at startup rather than left to spin, because a query below the served history comes back empty *without advancing the cursor*, which a resume loop cannot tell from "caught up". Anything older exists only in the Old Faithful archive and would need a second ingest path ([`docs/solana-research.md`](docs/solana-research.md) §11.3.1).
+
+### Flags that differ
+
+| Flag | On Solana |
+|---|---|
+| `--confirmations` | **refused** unless 0. Envio serves Solana at (just behind) `finalized`, so staying further back costs freshness twice and protects against nothing |
+| `--no-dex` | **refused**: with the DEX decoder off this pipeline would store empty slot headers and nothing else |
+| `--start-block` | a slot, and at least 391,000,000 |
+| `--rpc`, `--redis` | ignored, with one log line. Token decimals arrive free on every `account_activity` row, so nothing here makes an RPC call |
+| `--max-reorg-depth` | ignored: there is no fork-point search on this chain (see below) |
+| `--no-predictions`, `--no-launchpads` | ignored: those decoders have no Solana front end yet |
+
+### Skipped slots, gaps and the tripwire
+
+**A slot with no block is normal**, not a gap: Solana simply produces no block for it. So the Solana pipeline answers "what is missing?" from the **checkpoint tiling** rather than from the rows — a checkpoint's `to_block` is the *server's* `next_slot`, not `max(slot) + 1`, and a hole in that tiling is the only thing that can mean "we never asked for these slots". Continuity between stored slots is `block_height + 1` (Solana's `block_height` counts *produced blocks*, so it is immune to skipped slots) plus the `parent_slot` / `parent_blockhash` pair.
+
+**There is no fork-point search.** On data served at finality there is no fork to find, so a continuity break is treated as what it is — something that is not supposed to happen. The indexer **stops**, loudly, with a message naming the slot, both hashes and what to check; nothing at or above the break is written. It is not repaired silently, because the repair would be indistinguishable from a wrong endpoint. The tombstone/epoch machinery stays fully in place and is used for gap heals: a flush that died between its children and its `sol_slots` insert is purged before the range is streamed again.
+
+`indexer verify --chain solana` runs the Solana checks (cursor tiling, height chain, parent chain, orphan rows, candles against `sol_dex_swaps`) and reports skipped slots as skipped rather than missing.
+
+Give it the slot you actually started from — `indexer verify --chain solana --start-block 448378313`. It defaults to 0, and after a `--new-blocks-only` run that is honest but unhelpful: everything below the start really was never asked for, so the report is one enormous hole.
+
+### Cost and rate limit
+
+The free Envio token is **30 queries per 60 seconds per endpoint** (a flat cost per query, whatever it returns), and the Solana endpoint has its own budget — adding Solana does not eat the EVM chains'. Following the head needs 5 to 15 of those, so the follower caps itself at 25 and additionally honours the `x-ratelimit-*` headers of every response. `GET /height` is free and unmetered, so discovering that nothing happened never costs a query.
+
+Loading the **history** is the expensive part and is not wired up yet: 8.5 months is ~57M slots, which is weeks of the free budget. The options, with numbers, are in [`docs/solana-research.md`](docs/solana-research.md) §11.3.
+
+### Tables
+
+`sol_slots` (the commit marker; `block_number` holds the slot), `sol_transactions`, `sol_tokens`, `sol_dex_swaps`, and the candles `sol_dex_candles_1m` / `_1h` / `_1d` — read those through their `*_v` views, which apply the reorg validity rule. Read every base table with `FINAL`.
+
+```sql
+-- hourly candles of a Solana pool, prices scaled by the mints' decimals
+SELECT bucket, open, high, low, close, swaps, traders
+FROM sol_dex_candles_1h_v
+WHERE chain = 1399811149
+  AND pool_id = base58Decode('...')
+ORDER BY bucket DESC LIMIT 48;
+```
 
 ## Metrics and health checks
 

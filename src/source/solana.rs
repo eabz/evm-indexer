@@ -28,7 +28,7 @@ use anyhow::{bail, Context, Result};
 use hypersync_client_solana::{
     config::{ClientConfig, StreamConfig},
     simple_types::SolanaResponse,
-    Client,
+    Client, RateLimitInfo,
 };
 use hypersync_solana_net_types::{
     field_selection::{
@@ -438,6 +438,40 @@ impl SolanaSource {
         Ok(to_batch(response))
     }
 
+    /// [`Self::fetch`] over Arrow, with the response's rate-limit headers.
+    ///
+    /// This is what the pipeline's head follower uses, for two reasons:
+    ///
+    /// * **Arrow is 43% of JSON for the identical query and costs the same
+    ///   1000 budget units** (measured: 19.9 MB against 46.2 MB,
+    ///   docs/solana-research.md §11.1). At 162 GB/day of head traffic
+    ///   that is not a micro-optimisation.
+    /// * **It surfaces `x-ratelimit-*`.** The budget is 30 queries per
+    ///   60 s per endpoint and `remaining` counts BUDGET UNITS, not
+    ///   requests, so the follower divides it by `cost` rather than
+    ///   hard-coding 30 - the documentation publishes neither number, and
+    ///   the runtime headers are the only source of truth.
+    ///
+    /// One request, not a stream: the follower wants to spend exactly one
+    /// metered query and be told where the server stopped.
+    pub async fn fetch_arrow(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<(SolanaBatch, RateLimitInfo)> {
+        let answer = self
+            .client
+            .get_arrow_with_rate_limit(&build_query(from, to))
+            .await
+            .with_context(|| {
+                format!("query Solana slots [{from}, {to}) as Arrow")
+            })?;
+
+        let response = decode_arrow(answer.response)?;
+
+        Ok((to_batch(response), answer.rate_limit))
+    }
+
     /// Streams `[from, to)`. Always a BOUNDED range: the client has no
     /// live-tail mode and errors at the head, so following the head is the
     /// caller's job.
@@ -504,6 +538,25 @@ fn decode_arrow(
                 response.account_activity =
                     from_arrow::account_activity_from_arrow(&batch)
                         .context("decode account_activity")?
+            }
+            // NOT optional, and it was missing here until the first live
+            // run through this path found it.
+            //
+            // Raydium's three programs and Orca publish their swap event as
+            // a `Program data:` / `ray_log:` LOG LINE and nowhere else, so
+            // dropping this table costs exactly those four venues their
+            // per-program decoder: every row stays at `movement`
+            // confidence, with no exact fee and no pool state. Measured
+            // live before the fix: pumpswap / pump.fun / Meteora (self-CPI
+            // events) were 99% `decoded`, while Orca and all three Raydium
+            // programs were 100% `movement` - about 20% of the streamed
+            // volume, silently degraded rather than wrong.
+            //
+            // The JSON `get()` path always had the logs; only this Arrow
+            // decoder did not, and nothing used it in production before.
+            "logs" => {
+                response.logs = from_arrow::logs_from_arrow(&batch)
+                    .context("decode logs")?
             }
             _ => {}
         }

@@ -206,10 +206,33 @@ pub fn decode_with(
                 if let (Some(mint), Some(decimals)) =
                     (row.mint, row.decimals)
                 {
-                    seen_mints.entry(mint).or_insert((
-                        decimals,
-                        row.token_program.unwrap_or(models::ZERO_PUBKEY),
-                    ));
+                    let seen = seen_mints
+                        .entry(mint)
+                        .or_insert((decimals, models::ZERO_PUBKEY));
+
+                    // FIRST NON-ZERO wins, not simply the first row.
+                    //
+                    // Not every `account_activity` row carries
+                    // `post_program_id` / `pre_program_id`, so "the first
+                    // row of this mint" would record the ZERO pubkey - i.e.
+                    // the System program - as the mint's token program
+                    // whenever the first row happened to be one of the
+                    // silent ones. Worse, WHICH row comes first depends on
+                    // how the slots were batched, so the same chain
+                    // indexed in two passes could store two different
+                    // programs for one mint. Found by
+                    // `solana_acceptance::a_flush_killed_before_the_commit_marker_is_healed_on_restart`:
+                    // USDC came out as the System program in a healed index
+                    // and as SPL Token in a clean one.
+                    //
+                    // A mint has exactly one token program, so taking the
+                    // first row that actually names one is both correct and
+                    // independent of the batching.
+                    if seen.1 == models::ZERO_PUBKEY {
+                        if let Some(program) = row.token_program {
+                            seen.1 = program;
+                        }
+                    }
                 }
             }
 
