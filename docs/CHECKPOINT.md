@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 09:30 (America/Mexico_City)
+**Last updated:** 2026-09-19 10:45 (America/Mexico_City)
 
 ## Where things are
 
@@ -36,7 +36,8 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
 | module-followups | DONE, merged e49d01c | - | dex flaky test 30/30 after the harness fix; launchpads rebuild excludes the purged range | - |
-| layout | Opus | worktree (see `git worktree list`) | THE layout refactor (design 12): `src/db/models` -> `src/core`, `src/utils` gone, `src/db` infrastructure only; small commits, no behaviour change. NOBODY ELSE MAY EDIT CODE until it is merged | one commit per move + tirith notes |
+| layout | DONE, merged 1271be1 | - | one code layout (feature modules); `tests/layout.rs` enforces it; 737 unit + 106 database tests green | - |
+| fix-a / fix-b / fix-d | Opus | worktrees (`git worktree list`) | review round 4 fixes: A Solana pipeline, B core pipeline, D Solana decoder. Shared rules: scratchpad `handoff/round4-common.md`. fix-c (SQL + Solana flush latency) is QUEUED: launch when the first one finishes (max 3 agents at a time) | commits per milestone + tirith notes |
 | review-e | DONE | - | review round 4: 2 BLOCKER + 11 MAJOR + 11 MINOR; full report committed as `docs/review-round-4.md` (paths are PRE-refactor, snapshot 8c23e33) | - |
 
 MAIN TREE IS CLEAN and pushed (HEAD 8c23e33+). EVERYTHING BELOW IS MERGED: HyperSync ingest,
@@ -52,6 +53,12 @@ suite by suite on a fresh ClickHouse (EVM acceptance 19/19, Solana acceptance 15
 CI on PR #16 has been green on every completed run since the pipeline wiring landed.
 
 ## Still to do, in order
+
+0. NEW OWNER REQUEST (2026-09-19): one process syncing many chains + a password protected
+   HTML control panel. Designed in `docs/design.md` section 15 (`indexer fleet`, `src/admin`).
+   Two tirith tasks exist. Build AFTER fix-b merges (both touch `src/pipeline/mod.rs`), Opus,
+   then an independent security review of the login/session surface before merging.
+   Owner said (2026-09-19): "finish everything code related"; the Envio/hardware decisions come later.
 
 1. Merge the layout refactor when it reports (validate, real `git merge`, remove worktree).
    Review round 4 findings will cite PRE-refactor paths (snapshot 8c23e33): map them.

@@ -555,3 +555,58 @@ wallet history, no chain-wide transfers, and the schema/README must say so.
   curve decoders, validated live with the owner's token; (2) Raydium / Orca / Meteora
   per-program decoders; (3) launchpads on Solana (pump.fun, Meteora DBC, LaunchLab) into
   `launchpad_*`; (4) history backfill strategy (Envio serves from 2026-01-03).
+
+## 15. One process, many chains: fleet mode and the control panel (owner request 2026-09-19)
+
+**Where the code stands.** `indexer run --chain N` is one chain per process. Nothing in the
+chain pipeline is process-global (the entry points are `pipeline::run(config)` and
+`pipeline::solana::run(config)`; leases, versions, epochs, caches and metrics are per run),
+so several chains CAN share one process; what is missing is a supervisor, a way to stop one
+chain without stopping the process, a status surface, and the panel.
+
+**`indexer fleet`** - a new subcommand, `run` stays as it is.
+- A supervisor owns one tokio task per chain; each task calls the SAME `run_with` the single
+  chain command uses, so every safety property (lease + fencing per chain, tombstones, epochs,
+  dedup tokens) is unchanged. Migrations run once at start, not per chain.
+- One chain failing never takes the others down: the supervisor restarts it with exponential
+  backoff (cap 5 min) and records the last error. A lease held by another process is a state
+  ("running elsewhere"), not an error loop.
+- Stop = the graceful path that ctrl-c takes today (flush, release the lease), per chain,
+  through a cancellation handle instead of the process signal. The panel offers NO destructive
+  action: no purge, no data removal, no schema change.
+- Desired state lives in ClickHouse, table `fleet_chains` (migration 0007:
+  `chain`, `desired` running|stopped, `settings` JSON of the per-chain `run` options,
+  `_version`; ReplacingMergeTree, PARTITION BY tuple()). The supervisor's memory is the
+  authority while it runs and the table is read once at start (no read-your-writes on
+  ClickHouse). Adding a chain needs only its id: every `run` default applies
+  (`--rpc auto`, DEX on, two-provider agreement).
+- Shared budgets: one HyperSync token serves all chains, so the supervisor owns one rate
+  budget per provider (EVM HyperSync; Solana 30 queries/min on the free tier) instead of one
+  per chain. Memory: batch sizes are per chain; the fleet caps the sum (`--fleet-max-inflight-mb`).
+- Live state per chain (in memory, fed by the pipeline through a small `StatusSink`):
+  state (starting, backfilling, following, stopped, failed, running elsewhere), stored head,
+  chain head, lag in blocks and seconds, blocks/s, last flush time and duration, reorg count
+  and deepest reorg, token/DEX worker queue depths, last error with time. Chains indexed by
+  OTHER processes show up read-only from `indexer_instances`.
+- Metrics: one `/metrics` for the whole fleet, every series labelled with `chain`.
+
+**Control panel** (`src/admin/`), served by the fleet process on `--admin-addr`
+(default `127.0.0.1:8090`; off unless a password is set).
+- One embedded HTML page (no build step, no CDN, no external request) + a small JSON API:
+  `GET /api/chains`, `POST /api/chains` (add), `POST /api/chains/{id}/start|stop|restart`,
+  `PATCH /api/chains/{id}` (settings, applied on the next start), `GET /api/chains/{id}/events`
+  (recent errors, reorgs, restarts).
+- Password: `ADMIN_PASSWORD` (env only, never a flag - flags leak into `ps`); kept as a salted
+  hash in memory, compared in constant time. Login form -> random 256-bit session token in an
+  `HttpOnly; SameSite=Strict` cookie (`Secure` when behind TLS), 12 h idle expiry, sessions in
+  memory. Login attempts are rate limited per address (5 / minute, then backoff). State-changing
+  requests must carry the session AND a same-origin `Origin`. Secrets (HyperSync token, RPC
+  URLs with keys, database password) are never sent to the browser - settings show them
+  redacted (`tokens::redact`).
+- No TLS inside the process: binds to localhost by default; for remote access put it behind a
+  reverse proxy with TLS or an SSH tunnel (README says how). Binding to a public address without
+  `--admin-allow-remote` is refused.
+- HTTP stack: `axum` (the hand-rolled metrics server stays for `run`); a security-facing
+  surface with bodies, cookies and routing is not the place for a home-made parser.
+
+Order of work: after the review round 4 core fixes merge (both touch `src/pipeline/mod.rs`).
