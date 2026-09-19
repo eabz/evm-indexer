@@ -303,7 +303,7 @@ impl Purger {
     /// lost lease or `TombstonesNotConverging` leaves it, and everything
     /// after it, for the next pass to retry. Draining the whole `Vec` into
     /// a local one and returning `Err` half way through it dropped the
-    /// rest for ever (docs/review-round-4.md, MAJOR 3).
+    /// rest for ever (review round 4, MAJOR 3).
     ///
     /// The entry is looked up again instead of being popped by index: the
     /// writer task pushes into the same queue while this runs. That is
@@ -466,7 +466,7 @@ impl Purger {
         // reads as zero until a rebuild that slices fifty years into
         // monthly INSERTs per aggregate finishes (measured: ~20,700 day
         // rows, ~678 months x ~20 aggregates). One bogus row blanked a
-        // chain's entire history (docs/review-round-4.md, MAJOR 6).
+        // chain's entire history (review round 4, MAJOR 6).
         //
         // [`ReorgStore::timestamp_span`] is asked for the smallest
         // NON-ZERO timestamp for that reason. A store that still reports
@@ -637,7 +637,7 @@ impl Purger {
     /// therefore not proof that the range is empty: it is either the
     /// truth, or a read served from just before this loop's own insert -
     /// and that is exactly the case where stopping is wrong
-    /// (docs/review-round-4.md, MAJOR 7). A zero has to be confirmed by a
+    /// (review round 4, MAJOR 7). A zero has to be confirmed by a
     /// second read, taken after the retry delay, so that the two cannot
     /// be the same lagging answer.
     async fn tombstone_until_gone(

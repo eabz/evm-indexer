@@ -4,7 +4,7 @@
 //!
 //! The prop / "dark" AMMs - HumidiFi, Tessera, Scorch, QuantumAMM, GoonFi,
 //! AlphaQ, Deriverse, SolFi V2, BisonFi and the rest - are together about
-//! **32% of Solana DEX volume** (docs/solana-research.md §1.3) and publish
+//! **32% of Solana DEX volume** (the Solana venue research §1.3) and publish
 //! no IDL and, mostly, no event. The movement layer already decodes them
 //! perfectly: it reads real SPL transfers, so the amounts, mints, price and
 //! trader of any of them are exact.

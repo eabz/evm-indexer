@@ -10,7 +10,7 @@
 //! |---|---|
 //! | `pumpswap_buy` | a plain PumpSwap buy with four fee transfers, a Token-2022 base mint and a self-CPI `BuyEvent` |
 //! | `pumpfun_sell` | a bonding curve sell whose SOL leg has NO instruction at all: the curve just decrements its own lamports |
-//! | `two_opposite_swaps` | docs/solana-research.md section 2.2: ONE transaction, TWO PumpSwap swaps on the SAME pool in OPPOSITE directions. Reading transaction level balances reports ~0.03 SOL instead of two ~6.2 SOL trades |
+//! | `two_opposite_swaps` | the Solana venue research section 2.2: ONE transaction, TWO PumpSwap swaps on the SAME pool in OPPOSITE directions. Reading transaction level balances reports ~0.03 SOL instead of two ~6.2 SOL trades |
 //! | `jupiter_three_hop` | a Jupiter v6 route over BisonFi -> Meteora DLMM -> Raydium CPMM: must become three swaps, each attributed to its own venue and all three carrying the router as attribution |
 //! | `bisonfi_quote_update` | a direct prop-AMM call with 379 compute units and zero token movement. Must decode to NOTHING |
 
@@ -53,7 +53,7 @@ const PHASE2: &str = include_str!("fixtures/phase2.json");
 /// | `launchlab_launch` | a Raydium LaunchLab launch. `PoolCreateEvent` names NEITHER mint, so they come from account metas and are proved against the pool's PDA seeds |
 const LAUNCHPADS: &str = include_str!("fixtures/launchpads.json");
 
-/// The two transactions the ADDENDUM of docs/review-round-4.md names, in the
+/// The two transactions the ADDENDUM of review round 4 names, in the
 /// same shape again. Recorded by SLOT and SIGNATURE (see
 /// `svm::live_tests::record_round4_fixtures`) rather than by scanning for a
 /// shape, so the findings are reproduced from the very bytes the reviewer

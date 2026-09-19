@@ -3291,7 +3291,7 @@ async fn a_non_evm_id_survives_every_table_and_view() {
         .await;
     assert_eq!(printed.len(), 1, "{printed:?}");
     // base58 of the WHOLE 32 bytes: decoding gives every byte back. The
-    // shape solana-research sketched, base58Encode(id), would not.
+    // shape the Solana research sketched, base58Encode(id), would not.
     assert_eq!(
         database
             .lines(&format!(

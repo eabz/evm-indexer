@@ -626,7 +626,7 @@ The headline views count only the registry and exchange addresses an operator ha
 
 Tables, views and the query cookbook: [`src/predictions/README.md`](src/predictions/README.md).
 
-**Perpetual futures are deferred**, deliberately: only about 4% of perp volume is readable from EVM event logs on chains HyperSync serves, and there is almost no "one ABI, many forks" effect to exploit. The reasoning and the candidate venue list are in [`docs/design.md`](docs/design.md), section 17.
+**Perpetual futures are deferred**, deliberately: only about 4% of perp volume is readable from EVM event logs on chains HyperSync serves, and there is almost no "one ABI, many forks" effect to exploit. The reasoning and the candidate venue list are in [`docs/design.md`](docs/design.md), section 17.2.
 
 ## Token launchpads
 
@@ -654,7 +654,7 @@ indexer run --chain solana --start-block 448000000
 
 `CHAIN_ID` accepts the name too, so a compose file needs no new variable. The indexer writes the `chains` registry row itself at startup, which is what tells a view to print a Solana identity with `base58Encode` instead of as an EVM address.
 
-**`--start-block` is a SLOT**, and Envio serves Solana only from slot **391,000,000** (2026-01-03). A lower value is refused at startup rather than left to spin, because a query below the served history comes back empty *without advancing the cursor*, which a resume loop cannot tell from "caught up". Anything older exists only in the Old Faithful archive and would need a second ingest path.
+**`--start-block` is a SLOT**, and Envio serves Solana only from slot **391,000,000** (2026-01-03). A lower value is refused at startup rather than left to spin, because a query below the served history comes back empty *without advancing the cursor*, which a resume loop cannot tell from "caught up". Anything older exists only in the Old Faithful archive and would need a second ingest path (`docs/design.md`, section 14.3).
 
 ### Flags that differ on Solana
 
@@ -681,7 +681,7 @@ indexer run --chain solana --start-block 448000000
 
 The free Envio token is **30 queries per 60 seconds per endpoint** (a flat cost per query, whatever it returns), and the Solana endpoint has its own budget — adding Solana does not eat the EVM chains'. Following the head needs 5 to 15 of those, so the follower caps itself at 25 (`--solana-queries-per-minute`) and additionally honours the `x-ratelimit-*` headers of every response. `GET /height` is free and unmetered, so discovering that nothing happened never costs a query.
 
-Loading the **history** is the expensive part and is not wired up: 8.5 months is ~57M slots, which is weeks of the free budget. The options and their costs are recorded in [`docs/design.md`](docs/design.md), section 17.
+Loading the **history** is the expensive part and is not wired up: 8.5 months is ~57M slots, which is weeks of the free budget. The options and their costs are recorded in [`docs/design.md`](docs/design.md), section 14.3.
 
 ### Tables
 

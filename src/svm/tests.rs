@@ -132,7 +132,7 @@ fn a_bonding_curve_sell_recovers_its_sol_leg_from_lamports() {
 
 /// THE reason this decoder works per instruction subtree.
 ///
-/// docs/solana-research.md section 2.2: one transaction, two PumpSwap swaps
+/// the Solana venue research section 2.2: one transaction, two PumpSwap swaps
 /// on the SAME pool in OPPOSITE directions, signed by two different signers.
 /// About 6.2 SOL moves each way and the transaction's NET vault delta is
 /// about 0.03 SOL. Anything that reads transaction-level balances reports
@@ -836,7 +836,7 @@ fn venue_event_lengths_match_the_chain() {
 
 // --- review round 4 ------------------------------------------------------
 //
-// Everything below pins a finding of the ADDENDUM of docs/review-round-4.md.
+// Everything below pins a finding of the ADDENDUM of review round 4.
 // Where the report names a real transaction, that transaction is the
 // fixture (`fixtures/round4.json`); where it names a shape no recording of
 // which could be found, the transaction is BUILT here and the test says so.

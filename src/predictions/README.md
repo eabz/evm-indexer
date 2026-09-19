@@ -254,7 +254,7 @@ Storage follows docs/design.md §1-§2: binary `FixedString` / `UInt256`,
 aggregates keyed by `epoch` with the shared `epoch_floor_v` validity rule.
 
 **These tables are CHAIN NEUTRAL** (docs/design.md §13,
-`docs/solana-research.md` §0): a prediction venue on a non-EVM chain is fed
+`the Solana venue research` §0): a prediction venue on a non-EVM chain is fed
 into the same `prediction_*` tables later, so nothing here is EVM shaped.
 
 | | Rule |

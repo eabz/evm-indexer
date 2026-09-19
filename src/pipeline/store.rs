@@ -485,7 +485,7 @@ impl ReorgStore for ClickhouseReorgStore {
             // it here let it settle core orphans it never repaired: the
             // heal was skipped, the tombstoned core rows stayed in the
             // aggregates, and the range was counted again when it was
-            // streamed a second time (docs/review-round-4.md, MAJOR 5).
+            // streamed a second time (review round 4, MAJOR 5).
             //
             // Only the purges whose block range can cover a row of
             // [from, to) are read, newest tombstones first: a chain with
@@ -576,7 +576,7 @@ impl ReorgStore for ClickhouseReorgStore {
             // `minIf(timestamp > 0)`: a timestamp of 0 is a MISSING block
             // time, not a block time of 1970, and taking it as the start
             // of the repair window hides every aggregate bucket of the
-            // chain (docs/review-round-4.md, MAJOR 6). It reads 0 when
+            // chain (review round 4, MAJOR 6). It reads 0 when
             // the table has no row with a real timestamp in the range,
             // which is why the row count and the zero count come too.
             const COUNTED: &str = "SELECT toUInt64(count()), \

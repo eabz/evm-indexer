@@ -19,7 +19,7 @@
 -- contract holding the positions (a forged registry never collides with
 -- the real one), outcome_token_id = the ERC-1155 id of one outcome.
 --
--- CHAIN NEUTRAL (docs/design.md section 13, docs/solana-research.md
+-- CHAIN NEUTRAL (docs/design.md section 13, the Solana venue research
 -- section 0). Prediction markets on a non-EVM chain feed the SAME tables,
 -- so nothing here is EVM shaped:
 --   * every identity column (registry, exchange, emitter, maker, taker,

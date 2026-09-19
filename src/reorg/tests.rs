@@ -1040,7 +1040,7 @@ async fn a_module_purge_repairs_only_its_own_side_tables() {
 /// The queue of flush spans that raced another process's purge is the
 /// ONLY record that those blocks have to be indexed again - their rows
 /// are stored, so no gap query reports them. A purge that fails must
-/// therefore leave the queue alone (docs/review-round-4.md, MAJOR 3).
+/// therefore leave the queue alone (review round 4, MAJOR 3).
 ///
 /// This is the drain BOTH pipelines use (`pipeline::mod` for EVM,
 /// `pipeline::solana` for Solana), so the rule is proven once here rather
@@ -1099,7 +1099,7 @@ async fn a_failed_purge_keeps_every_queued_flush_span() {
 /// ONE stale read ended it with rows still alive: the purge reported
 /// success, the aggregates of those days kept counting the rows it was
 /// supposed to remove, and nothing ever looked again
-/// (docs/review-round-4.md, MAJOR 7). A zero is now only proof when a
+/// (review round 4, MAJOR 7). A zero is now only proof when a
 /// second, independent read confirms it - the model's own rule for a
 /// lagging read ("never two in a row, it heals on the next try").
 #[tokio::test]
@@ -1646,7 +1646,7 @@ async fn tombstoned_orphans_still_mark_an_unfinished_heal() {
 /// repair window to "every day since 1970": `epoch_floor_v` would then
 /// raise the floor on ~20,700 days at once and every aggregate of the
 /// chain would read as zero until a rebuild that slices fifty years into
-/// monthly INSERTs per aggregate finished (docs/review-round-4.md,
+/// monthly INSERTs per aggregate finished (review round 4,
 /// MAJOR 6). The store leaves the 0 out of the window; a store that still
 /// reports it is clamped here, to the last day of the range.
 #[tokio::test]

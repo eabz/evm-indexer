@@ -220,7 +220,7 @@ than as a wrong number. That is the right way round.
 All three were found in live data, and all three are fixed here.
 
 **1. "Both legs share one counterparty" does not identify the pool.**
-docs/solana-research.md §3.1 proposes that rule, but a swap is *locally
+the Solana venue research §3.1 proposes that rule, but a swap is *locally
 symmetric*: the taker also receives one mint and sends the other, so the rule
 returns two candidates whenever the taker uses one owner for both legs. On
 the recorded Jupiter route the router's proxy is a counterparty of all three
@@ -340,7 +340,7 @@ added on either side breaks a test instead of being discovered later.
 ## Venues, and adding one
 
 Streamed today, with their 30-day volume share
-(docs/solana-research.md §1.1) — **~54% of Solana DEX volume**:
+(the Solana venue research §1.1) — **~54% of Solana DEX volume**:
 
 | Venue | Share | Event | Live agreement with the movement layer |
 |---|---|---|---|
@@ -414,9 +414,9 @@ rather than on a published format — which is exactly what the column is for.
 
 ```sql
 INSERT INTO sol_dex_programs (program_id, name, kind, confidence, source) VALUES
-  (toFixedString(base58Decode('BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi'), 32), 'bisonfi',   'prop_amm', 90, 'docs/solana-research.md appendix B; decodes in the Jupiter fixture test'),
-  (toFixedString(base58Decode('9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp'), 32), 'humidifi',  'prop_amm', 80, 'docs/solana-research.md section 2; obfuscated data, 2 SPL transfers a swap'),
-  (toFixedString(base58Decode('TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH'), 32), 'tessera_v', 'prop_amm', 80, 'docs/solana-research.md section 2; free-text S-00 log only');
+  (toFixedString(base58Decode('BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi'), 32), 'bisonfi',   'prop_amm', 90, 'the Solana venue research appendix B; decodes in the Jupiter fixture test'),
+  (toFixedString(base58Decode('9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp'), 32), 'humidifi',  'prop_amm', 80, 'the Solana venue research section 2; obfuscated data, 2 SPL transfers a swap'),
+  (toFixedString(base58Decode('TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH'), 32), 'tessera_v', 'prop_amm', 80, 'the Solana venue research section 2; free-text S-00 log only');
 ```
 
 Routers. **Attribution only**: 40% of Solana DEX volume is routed, so
@@ -425,8 +425,8 @@ the chain.
 
 ```sql
 INSERT INTO sol_dex_programs (program_id, name, kind, confidence, source) VALUES
-  (toFixedString(base58Decode('JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'), 32), 'jupiter_v6', 'router', 100, 'docs/solana-research.md section 1.2'),
-  (toFixedString(base58Decode('FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9'), 32), 'axiom',      'router',  90, 'docs/launchpads-research.md section 2.1');
+  (toFixedString(base58Decode('JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'), 32), 'jupiter_v6', 'router', 100, 'the Solana venue research section 1.2'),
+  (toFixedString(base58Decode('FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9'), 32), 'axiom',      'router',  90, 'the launchpad venue research section 2.1');
 ```
 
 A row sets the `protocol` NAME a swap of that program is stored under. It
@@ -509,7 +509,7 @@ pools and curves only, and a unit test pins it.
 
 bags.fm, StonkFun, BONK.fun / LetsBonk, Jupiter Studio and the rest are not
 programs. They are **configurations** of one of these three
-(docs/launchpads-research.md §4.2), and the only thing on chain that names
+(the launchpad venue research §4.2), and the only thing on chain that names
 one is the config account's fee claimer.
 
 * A DBC launch names its `config`, a LaunchLab launch its `platform_config`
@@ -598,6 +598,6 @@ and its tests are untouched.
   not a field of any event, so `graduation_threshold` is 0 for that family.
   LaunchLab states its own; DBC's is in the config.
 * **Nothing is wired to the pipeline yet** — same as the rest of this
-  module (docs/solana-research.md §11.5). `svm::decode` produces the rows;
+  module (the Solana venue research §11.5). `svm::decode` produces the rows;
   `svm::SHARED_BASE_TABLES` and `launchpads::INSERT_ORDER` say how to write
   them.
