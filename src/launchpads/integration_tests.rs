@@ -250,16 +250,16 @@ async fn store_the_destination_pool(db: &TestDb) {
     db.execute(&format!(
         "INSERT INTO dex_pools (chain, pool_id, emitter, factory, protocol, \
          token0, token1, tokens, underlying_tokens, fee, tick_spacing, hooks, \
-         stable, created_block, timestamp, transaction_hash, log_index, \
+         stable, created_block, timestamp, tx_id, tx_index, ordinal, \
          source, _version) VALUES ({CHAIN}, unhex('{GRADUATION_POOL}'), \
-         unhex('8366a39cc670b4001a1121b8f6a443a643e40951'), \
-         unhex('8366a39cc670b4001a1121b8f6a443a643e40951'), 'uniswap_v4', \
-         unhex('0000000000000000000000000000000000000000'), \
-         unhex('{TOKEN_20}'), [], [], 0, 200, \
-         unhex('e5e702641ea86f4ae6cc3cdaed2b886f976be044'), false, \
+         unhex('0000000000000000000000008366a39cc670b4001a1121b8f6a443a643e40951'), \
+         unhex('0000000000000000000000008366a39cc670b4001a1121b8f6a443a643e40951'), 'uniswap_v4', \
+         unhex('0000000000000000000000000000000000000000000000000000000000000000'), \
+         unhex('000000000000000000000000{TOKEN_20}'), [], [], 0, 200, \
+         unhex('000000000000000000000000e5e702641ea86f4ae6cc3cdaed2b886f976be044'), false, \
          {GRADUATION_BLOCK}, toDateTime(1789780288), \
          unhex('0000000000000000000000000000000000000000000000000000000000000001'), \
-         18, 'event', 1)",
+         0, 18, 'event', 1)",
         TOKEN_20 = &TOKEN[2..],
     ))
     .await;
@@ -267,7 +267,7 @@ async fn store_the_destination_pool(db: &TestDb) {
     // emitter is a trusted one.
     db.execute(&format!(
         "INSERT INTO dex_trusted_emitters (chain, emitter, protocol) VALUES \
-         ({CHAIN}, unhex('8366a39cc670b4001a1121b8f6a443a643e40951'), \
+         ({CHAIN}, unhex('0000000000000000000000008366a39cc670b4001a1121b8f6a443a643e40951'), \
          'uniswap_v4')"
     ))
     .await;

@@ -805,8 +805,10 @@ async fn zero_flags_index_dex_and_resolve_tokens() {
         scenario
             .count(&format!(
                 "SELECT toUInt64(count()) FROM dex_swaps FINAL WHERE \
-                 tx_from = unhex('{}') AND tx_to = unhex('{}')",
+                 tx_from = unhex('{}{}') AND tx_to = unhex('{}{}')",
+                "00".repeat(12),
                 "d0".repeat(20),
+                "00".repeat(12),
                 "c0".repeat(20)
             ))
             .await,
@@ -816,7 +818,8 @@ async fn zero_flags_index_dex_and_resolve_tokens() {
         scenario
             .count(&format!(
                 "SELECT toUInt64(count()) FROM dex_liquidity FINAL WHERE \
-                 tx_from = unhex('{}')",
+                 tx_from = unhex('{}{}')",
+                "00".repeat(12),
                 "d0".repeat(20)
             ))
             .await,
