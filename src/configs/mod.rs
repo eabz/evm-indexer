@@ -353,7 +353,7 @@ pub struct BackfillArgs {
     #[arg(
         long,
         visible_alias = "start-block",
-        help = "First block to re-decode. Below the chain's coverage floor this LOWERS the floor, once the range is complete and verified.",
+        help = "First block to re-decode. Below the chain's coverage floor this lowers the floor too, but only after a check that every block in between really is stored and gap-free.",
         default_value_t = 0
     )]
     pub from_block: u64,

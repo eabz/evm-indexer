@@ -808,6 +808,15 @@ carry the detail.
   an optional `from_block` (migration 0023) for an operator who has verified one. A
   constant table of addresses would also have contradicted the module's own rule, which
   is that it ships no address list at all and the operator says what it believes.
+- **Lowering the floor is a CHECK, not a claim, and it moves over blocks that
+  are already stored.** `indexer backfill --start-block N` lowers the floor only
+  after `verify` confirms that every block from `N` to the old floor is stored and
+  gap-free; otherwise the floor stays and the command says how many are missing.
+  Note what that means in practice: a backfill re-decodes logs this database
+  already has, it does not fetch new ones, so this is the path for a deployment
+  that indexed deeper before the floor existed. Streaming a range BELOW the floor
+  that nobody has ever asked for is not implemented by any command yet, and is the
+  one piece of section 16 that is not here.
 - **The pass reads TRUSTED addresses only, which includes the questions.** A market's
   title comes from a NegRisk or UMA adapter, so an operator who wants titles back has to
   have those adapters in `prediction_trusted`. This is the module's existing trust model,

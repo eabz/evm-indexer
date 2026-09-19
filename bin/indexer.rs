@@ -113,6 +113,71 @@ async fn run_fleet(config: FleetConfig) -> Result<()> {
     fleet::run(config).await
 }
 
+/// Lowers the coverage floor to `from_block`, but only when everything
+/// between there and the old floor is actually stored and gap-free
+/// (docs/design.md section 16).
+///
+/// This is the ONLY way the floor moves earlier, and it is deliberately
+/// a check rather than a claim: the floor is what this database promises,
+/// so it may only follow the data, never lead it. A range that is not
+/// complete leaves the floor exactly where it was and says why.
+///
+/// Note what this does NOT do: it does not fetch anything. `indexer
+/// backfill` re-decodes logs this database already has, so the floor moves
+/// down only over blocks that are already stored - which is the case an
+/// operator actually hits, having indexed deeper with an older version or
+/// with an explicit `--start-block` before the floor was ever written.
+async fn lower_the_floor_if_earned(
+    db: &Database,
+    from_block: u64,
+) -> Result<()> {
+    use evm_indexer::coverage::store;
+
+    let Some(floor) = store::stored(db).await? else { return Ok(()) };
+    if from_block >= floor.block {
+        return Ok(());
+    }
+
+    let report =
+        pipeline::verify::verify(db, from_block, floor.block).await?;
+
+    if !report.gaps.is_empty() {
+        let missing: u64 = report.gaps.iter().map(|gap| gap.len()).sum();
+        println!(
+            "The coverage floor stays at block {} ({}). Blocks \
+             [{from_block}, {}) are not all stored - {missing} are \
+             missing - and the floor is a promise, so it only ever follows \
+             the data. `indexer verify --start-block {from_block} \
+             --end-block {}` lists the holes.",
+            floor.block,
+            floor.date(),
+            floor.block,
+            floor.block
+        );
+        return Ok(());
+    }
+
+    let timestamp = pipeline::verify::block_timestamp(db, from_block)
+        .await
+        .unwrap_or(0);
+
+    store::lower_to(
+        db,
+        // No lease: this writes one row of `chain_coverage`, which the
+        // engine resolves in favour of the LOWEST block whatever else is
+        // writing (see the migration header).
+        &evm_indexer::pipeline::lease::Fence::open(),
+        store::Floor {
+            block: from_block,
+            timestamp,
+            reason: store::Reason::Backfill,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// `indexer backfill --module predictions --registry-only`.
 ///
 /// Reads the blocks below this chain's coverage floor, filtered to the
@@ -259,6 +324,11 @@ async fn run_backfill(config: BackfillConfig) -> Result<()> {
         config.chunk_blocks,
     )
     .await?;
+
+    // A backfill that reached below the coverage floor may have made the
+    // promise bigger - but only if the older range really is complete
+    // (docs/design.md section 16). Checked, never assumed.
+    lower_the_floor_if_earned(&db, config.from_block).await?;
 
     match report.rewritten {
         None => println!(

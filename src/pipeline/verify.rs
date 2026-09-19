@@ -620,16 +620,28 @@ async fn coverage_line(db: &Database) -> Option<String> {
 /// The UTC day one stored block was mined on. A point lookup on the
 /// primary key, so it costs nothing next to the rest of a verification.
 async fn block_date(db: &Database, number: u64) -> Option<String> {
+    Some(coverage::date::format(i64::from(
+        block_timestamp(db, number).await?,
+    )))
+}
+
+/// The timestamp of one stored block, or `None` when it is not stored or
+/// carries no block time (a 0 is a MISSING time, never 1970).
+pub async fn block_timestamp(db: &Database, number: u64) -> Option<u32> {
     let sql = format!(
         "SELECT toUInt32(timestamp) FROM blocks FINAL \
          WHERE chain = {} AND number = {number}",
         db.chain_id
     );
 
-    let timestamp = db.db.query(&sql).fetch_all::<u32>().await.ok()?;
-    let timestamp = timestamp.into_iter().next().filter(|ts| *ts > 0)?;
-
-    Some(coverage::date::format(i64::from(timestamp)))
+    db.db
+        .query(&sql)
+        .fetch_all::<u32>()
+        .await
+        .ok()?
+        .into_iter()
+        .next()
+        .filter(|timestamp| *timestamp > 0)
 }
 
 /// `[first, last)`: the UTC days the verified range covers COMPLETELY.

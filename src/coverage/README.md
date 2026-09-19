@@ -69,8 +69,11 @@ chain is indexed. After that it is a **fact about the data**, not a setting:
 * Moving it **later** is refused everywhere. Data is never dropped, so a
   higher floor would be a claim the stored rows contradict.
 * Moving it **earlier** is `indexer backfill --start-block N` (or
-  `--start-date D`), which lowers the floor once the older range is
-  complete.
+  `--start-date D`). It lowers the floor only after `verify` says every
+  block from `N` to the old floor is stored and gap-free; otherwise the
+  floor stays and the command says how many are missing. Note that a
+  backfill re-decodes stored logs rather than fetching new ones, so this
+  moves the floor over blocks this database already has.
 
 Two independent mechanisms enforce "never later", because one of them would
 not be enough. The code reads the stored floor before it writes, which is
