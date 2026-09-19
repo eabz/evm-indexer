@@ -215,72 +215,28 @@ fn is_word(byte: u8) -> bool {
 /// - `'strings'` with `\'` and `''` escapes,
 /// - `` `quoted` `` and `"quoted"` identifiers (same escapes),
 /// - `-- line comments` (also `#!` and `# `),
-/// - `/* block comments */` (not nested, like ClickHouse),
+/// - `/* block /* comments */ */` (nested, like ClickHouse),
 /// - `$tag$ heredoc strings $tag$`.
 ///
 /// Statements are returned trimmed, without the `;` and without leading
 /// comments; pieces holding only whitespace / comments are dropped.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, SplitError> {
-    // Every delimiter is ASCII, so byte offsets found here are always
-    // UTF-8 boundaries.
-    let bytes = sql.as_bytes();
-    let line_of = |at: usize| {
-        bytes[..at].iter().filter(|&&b| b == b'\n').count() + 1
-    };
-
     let mut statements = Vec::new();
     // Offset of the first code byte of the statement being scanned.
     let mut start: Option<usize> = None;
-    let mut i = 0;
 
-    while i < bytes.len() {
-        let byte = bytes[i];
-        let next = bytes.get(i + 1).copied();
-
-        match byte {
-            b';' => {
+    for (piece, range) in lex(sql)? {
+        match piece {
+            Piece::Separator => {
                 if let Some(from) = start.take() {
-                    statements.push(sql[from..i].trim_end().to_string());
+                    let statement = &sql[from..range.start];
+                    statements.push(statement.trim_end().to_string());
                 }
-                i += 1;
             }
-            b'\'' | b'"' | b'`' => {
-                start.get_or_insert(i);
-                i = skip_quoted(bytes, i).ok_or_else(|| SplitError {
-                    what: match byte {
-                        b'\'' => "string literal",
-                        _ => "quoted identifier",
-                    },
-                    line: line_of(i),
-                })?;
+            Piece::Code | Piece::Quoted => {
+                start.get_or_insert(range.start);
             }
-            b'-' if next == Some(b'-') => i = skip_line(bytes, i),
-            b'#' if matches!(next, Some(b' ' | b'!')) => {
-                i = skip_line(bytes, i)
-            }
-            b'/' if next == Some(b'*') => {
-                i = find(bytes, i + 2, b"*/").ok_or_else(|| {
-                    SplitError { what: "block comment", line: line_of(i) }
-                })?;
-            }
-            b'$' if i == 0
-                || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'$') =>
-            {
-                start.get_or_insert(i);
-                i = match heredoc_tag(bytes, i) {
-                    Some(tag) => find(bytes, i + tag.len(), tag)
-                        .ok_or_else(|| SplitError {
-                            what: "heredoc string",
-                            line: line_of(i),
-                        })?,
-                    None => i + 1,
-                };
-            }
-            _ if byte.is_ascii_whitespace() => i += 1,
-            _ => {
-                start.get_or_insert(i);
-                i += 1;
-            }
+            Piece::Comment | Piece::Space => {}
         }
     }
 
@@ -289,6 +245,121 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, SplitError> {
     }
 
     Ok(statements)
+}
+
+/// What a stretch of a SQL script is, for [`lex`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Piece {
+    /// Keywords, names, numbers, operators.
+    Code,
+    /// String literal, quoted identifier or heredoc, quotes included.
+    Quoted,
+    Comment,
+    /// A `;` outside of everything else.
+    Separator,
+    Space,
+}
+
+/// Cuts a script into [`Piece`]s covering it entirely. Every delimiter is
+/// ASCII, so the ranges always fall on UTF-8 boundaries.
+fn lex(
+    sql: &str,
+) -> Result<Vec<(Piece, std::ops::Range<usize>)>, SplitError> {
+    let bytes = sql.as_bytes();
+    let unterminated = |what: &'static str, at: usize| SplitError {
+        what,
+        line: bytes[..at].iter().filter(|&&b| b == b'\n').count() + 1,
+    };
+
+    let mut pieces: Vec<(Piece, std::ops::Range<usize>)> = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        let next = bytes.get(i + 1).copied();
+
+        let (piece, end) = match byte {
+            b';' => (Piece::Separator, i + 1),
+            b'\'' | b'"' | b'`' => {
+                let what = match byte {
+                    b'\'' => "string literal",
+                    _ => "quoted identifier",
+                };
+                let end = skip_quoted(bytes, i)
+                    .ok_or_else(|| unterminated(what, i))?;
+                (Piece::Quoted, end)
+            }
+            b'-' if next == Some(b'-') => {
+                (Piece::Comment, skip_line(bytes, i))
+            }
+            b'#' if matches!(next, Some(b' ' | b'!')) => {
+                (Piece::Comment, skip_line(bytes, i))
+            }
+            b'/' if next == Some(b'*') => {
+                let end = skip_block_comment(bytes, i)
+                    .ok_or_else(|| unterminated("block comment", i))?;
+                (Piece::Comment, end)
+            }
+            b'$' if i == 0
+                || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'$') =>
+            {
+                match heredoc_tag(bytes, i) {
+                    Some(tag) => {
+                        let end = find(bytes, i + tag.len(), tag)
+                            .ok_or_else(|| {
+                                unterminated("heredoc string", i)
+                            })?;
+                        (Piece::Quoted, end)
+                    }
+                    None => (Piece::Code, i + 1),
+                }
+            }
+            _ if byte.is_ascii_whitespace() => (Piece::Space, i + 1),
+            _ => (Piece::Code, i + 1),
+        };
+
+        match pieces.last_mut() {
+            // Runs of code / space are one piece.
+            Some((last, range))
+                if *last == piece
+                    && matches!(piece, Piece::Code | Piece::Space) =>
+            {
+                range.end = end;
+            }
+            _ => pieces.push((piece, i..end)),
+        }
+
+        i = end;
+    }
+
+    Ok(pieces)
+}
+
+/// `at` is on `/*`; returns the offset after the matching `*/`. Block
+/// comments NEST in ClickHouse (verified on 25.12: `SELECT /* a /* b */ c
+/// */ 1` is valid, `SELECT /* a /* b */ 1` is "comment is not closed").
+fn skip_block_comment(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut i = at;
+
+    while i + 1 < bytes.len() {
+        match (bytes[i], bytes[i + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                i += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    None
 }
 
 /// `at` is on the opening quote; returns the offset after the closing one.
@@ -339,6 +410,156 @@ fn heredoc_tag(bytes: &[u8], at: usize) -> Option<&[u8]> {
 fn escape_placeholders(statement: &str) -> String {
     statement.replace('?', "??")
 }
+
+// ---- idempotency lint ------------------------------------------------------
+
+/// A statement reduced to what the lint looks at: comments removed, every
+/// quoted section replaced by `_`, upper case, single spaces.
+pub fn skeleton(statement: &str) -> Result<String, SplitError> {
+    let mut code = String::new();
+
+    for (piece, range) in lex(statement)? {
+        match piece {
+            Piece::Code => code.push_str(&statement[range]),
+            Piece::Quoted => code.push_str(" _ "),
+            Piece::Comment | Piece::Space | Piece::Separator => {
+                code.push(' ')
+            }
+        }
+    }
+
+    // Parentheses and commas are word boundaries for the lint.
+    let code = code.replace(['(', ')', ','], " ").to_ascii_uppercase();
+
+    Ok(code.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// `ALTER TABLE` clauses that need `IF NOT EXISTS` right after them.
+const ALTER_NEEDS_IF_NOT_EXISTS: [&str; 5] = [
+    "ADD COLUMN",
+    "ADD INDEX",
+    "ADD PROJECTION",
+    "ADD CONSTRAINT",
+    "ADD STATISTICS",
+];
+
+/// `ALTER TABLE` clauses that need `IF EXISTS` right after them.
+const ALTER_NEEDS_IF_EXISTS: [&str; 8] = [
+    "DROP COLUMN",
+    "DROP INDEX",
+    "DROP PROJECTION",
+    "DROP CONSTRAINT",
+    "DROP STATISTICS",
+    "CLEAR COLUMN",
+    "CLEAR INDEX",
+    "RENAME COLUMN",
+];
+
+/// `ALTER TABLE` clauses that are never safe to replay blindly.
+const ALTER_NOT_IDEMPOTENT: [&str; 7] = [
+    "UPDATE",
+    "ATTACH PARTITION",
+    "ATTACH PART",
+    "DETACH PARTITION",
+    "DETACH PART",
+    "MOVE PARTITION",
+    "REPLACE PARTITION",
+];
+
+/// Why replaying `statement` could fail or change the outcome, `None`
+/// when it is idempotent. The runner's failure model (re-run after a
+/// partial failure, several processes racing) REQUIRES idempotent
+/// statements; a unit test holds every embedded migration to it.
+///
+/// Accepted: `CREATE ... IF NOT EXISTS` / `CREATE OR REPLACE`, `DROP` /
+/// `TRUNCATE ... IF EXISTS`, `ALTER TABLE` with `ADD ... IF NOT EXISTS`,
+/// `DROP|CLEAR|RENAME COLUMN ... IF EXISTS`, and every `MODIFY ...`
+/// (`MODIFY SETTING`, `MODIFY COLUMN`, `MODIFY TTL`, ...), `RESET
+/// SETTING`, `COMMENT COLUMN`, `MATERIALIZE ...`, `DELETE WHERE`; plus
+/// statements without lasting effect on the schema (`SELECT`, `SYSTEM`,
+/// `OPTIMIZE`, `GRANT`, `REVOKE`, lightweight `DELETE`).
+///
+/// Refused: plain `INSERT` (seed rows are duplicated by a replay),
+/// `RENAME` / `EXCHANGE`, `ATTACH` / `DETACH`, `ALTER ... UPDATE`,
+/// partition moves, and anything the lint does not know.
+pub fn idempotency_violation(statement: &str) -> Option<String> {
+    let code = match skeleton(statement) {
+        Ok(code) => code,
+        Err(e) => return Some(e.to_string()),
+    };
+    let padded = format!(" {code} ");
+    let first = code.split(' ').next().unwrap_or_default();
+
+    // Every `clause` occurrence must be followed by `guard`.
+    let unguarded = |clause: &str, guard: &str| {
+        padded.match_indices(&format!(" {clause} ")).any(|(at, found)| {
+            !padded[at + found.len()..].starts_with(&format!("{guard} "))
+        })
+    };
+
+    match first {
+        "CREATE" => {
+            let guarded = code.starts_with("CREATE OR REPLACE ")
+                || padded.contains(" IF NOT EXISTS ");
+            (!guarded).then(|| {
+                "CREATE without IF NOT EXISTS (or OR REPLACE)".to_string()
+            })
+        }
+        "DROP" | "TRUNCATE" => (!padded.contains(" IF EXISTS "))
+            .then(|| format!("{first} without IF EXISTS")),
+        "ALTER" => {
+            for clause in ALTER_NEEDS_IF_NOT_EXISTS {
+                if unguarded(clause, "IF NOT EXISTS") {
+                    return Some(format!(
+                        "ALTER ... {clause} without IF NOT EXISTS"
+                    ));
+                }
+            }
+            for clause in ALTER_NEEDS_IF_EXISTS {
+                if unguarded(clause, "IF EXISTS") {
+                    return Some(format!(
+                        "ALTER ... {clause} without IF EXISTS"
+                    ));
+                }
+            }
+            ALTER_NOT_IDEMPOTENT
+                .iter()
+                .find(|clause| padded.contains(&format!(" {clause} ")))
+                .map(|clause| {
+                    format!("ALTER ... {clause} is not idempotent")
+                })
+        }
+        "SELECT" | "WITH" | "SYSTEM" | "OPTIMIZE" | "GRANT" | "REVOKE"
+        | "DELETE" => None,
+        "INSERT" => Some(
+            "INSERT is duplicated by a replay; seed data does not belong \
+             in a migration"
+                .to_string(),
+        ),
+        "RENAME" | "EXCHANGE" | "ATTACH" | "DETACH" => {
+            Some(format!("{first} is not idempotent"))
+        }
+        other => Some(format!(
+            "'{other}' statements are not known to be idempotent"
+        )),
+    }
+}
+
+/// A reviewed exception to [`idempotency_violation`] for one embedded
+/// statement. Adding one is a code review decision: say in `reason` why
+/// replaying the statement (after a partial failure, or by two racing
+/// processes) is harmless.
+#[derive(Debug, Clone, Copy)]
+pub struct IdempotencyException {
+    /// `0004_reorgs_checkpoints`.
+    pub migration: &'static str,
+    /// Start of the statement's [`skeleton`].
+    pub skeleton_starts_with: &'static str,
+    pub reason: &'static str,
+}
+
+/// See [`IdempotencyException`]. Entries that match nothing fail the tests.
+pub const IDEMPOTENCY_EXCEPTIONS: &[IdempotencyException] = &[];
 
 // ---- plan ------------------------------------------------------------------
 
@@ -1166,12 +1387,27 @@ mod tests {
     }
 
     #[test]
-    fn block_comments_do_not_nest() {
-        // Like ClickHouse: the first `*/` closes the comment.
+    fn block_comments_nest() {
+        // Like ClickHouse 25.12: `SELECT /* a /* b */ c */ 1` returns 1 and
+        // `SELECT /* a /* b */ 1` is "Multiline comment is not closed".
         assert_eq!(
-            split("/* a /* b */ SELECT 1; SELECT 2"),
+            split("SELECT /* a; /* b; */ c; */ 1; SELECT 2"),
+            ["SELECT /* a; /* b; */ c; */ 1", "SELECT 2"]
+        );
+        assert_eq!(
+            split("/* x /* y /* z */ ; */ ; */ SELECT 1; SELECT 2"),
             ["SELECT 1", "SELECT 2"]
         );
+        assert_eq!(
+            split_statements("/* a /* b */ SELECT 1; SELECT 2"),
+            Err(SplitError { what: "block comment", line: 1 })
+        );
+        assert_eq!(
+            split_statements("SELECT 1;\n/* a /* b */ c"),
+            Err(SplitError { what: "block comment", line: 2 })
+        );
+        // A quote inside a nested comment stays inert.
+        assert_eq!(split("/* a /* ' */ ' */ SELECT 1;"), ["SELECT 1"]);
     }
 
     #[test]
@@ -1299,6 +1535,157 @@ FROM transactions;
             escape_placeholders("SELECT a ? 'x?' : 'y'"),
             "SELECT a ?? 'x??' : 'y'"
         );
+    }
+
+    // ---- idempotency lint ----
+
+    #[test]
+    fn skeleton_drops_comments_and_quoted_text() {
+        assert_eq!(
+            skeleton(
+                "create table /* c */ if not exists `my table` (\n  a \
+                 String DEFAULT 'INSERT; x' -- DROP\n)"
+            )
+            .unwrap(),
+            "CREATE TABLE IF NOT EXISTS _ A STRING DEFAULT _"
+        );
+        assert!(skeleton("SELECT 'oops").is_err());
+    }
+
+    #[test]
+    fn lint_accepts_idempotent_statements() {
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS t (a UInt8) ENGINE = Memory",
+            "create table if not exists t (a UInt8) ENGINE = Memory",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t AS SELECT 1",
+            "CREATE VIEW IF NOT EXISTS v AS SELECT 1",
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "CREATE OR REPLACE FUNCTION f AS (x) -> x",
+            "CREATE DICTIONARY IF NOT EXISTS d (a UInt8) PRIMARY KEY a",
+            "CREATE DATABASE IF NOT EXISTS x",
+            "DROP TABLE IF EXISTS t",
+            "DROP VIEW IF EXISTS v SYNC",
+            "TRUNCATE TABLE IF EXISTS t",
+            // The pipeline's 0090_dedup_windows.
+            "ALTER TABLE blocks MODIFY SETTING \
+             non_replicated_deduplication_window = 10000",
+            "ALTER TABLE t RESET SETTING non_replicated_deduplication_window",
+            "ALTER TABLE t MODIFY COLUMN a UInt64 CODEC(ZSTD(3))",
+            "ALTER TABLE t MODIFY TTL ts + INTERVAL 1 DAY",
+            "ALTER TABLE t MODIFY COMMENT 'x'",
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS b UInt8, \
+             ADD COLUMN IF NOT EXISTS c UInt8 AFTER b",
+            "ALTER TABLE t ADD INDEX IF NOT EXISTS i a TYPE minmax",
+            "ALTER TABLE t DROP COLUMN IF EXISTS b",
+            "ALTER TABLE t RENAME COLUMN IF EXISTS b TO c",
+            "ALTER TABLE t MATERIALIZE INDEX i",
+            "ALTER TABLE t DELETE WHERE a = 1",
+            "ALTER TABLE t COMMENT COLUMN IF EXISTS a 'ADD COLUMN x'",
+            "SELECT 1",
+            "SYSTEM RELOAD DICTIONARIES",
+            "OPTIMIZE TABLE t FINAL",
+            "GRANT SELECT ON t TO reader",
+            "DELETE FROM t WHERE a = 1",
+            // Scary words inside comments / strings / identifiers.
+            "CREATE TABLE IF NOT EXISTS t (\n  a UInt8 COMMENT 'INSERT \
+             INTO x', -- DROP TABLE y\n  `RENAME` UInt8\n) ENGINE = Memory",
+        ] {
+            assert_eq!(idempotency_violation(statement), None, "{statement}");
+        }
+    }
+
+    #[test]
+    fn lint_refuses_non_idempotent_statements() {
+        for (statement, why) in [
+            ("CREATE TABLE t (a UInt8) ENGINE = Memory", "IF NOT EXISTS"),
+            ("CREATE VIEW v AS SELECT 1", "IF NOT EXISTS"),
+            ("CREATE MATERIALIZED VIEW mv TO t AS SELECT 1", "IF NOT EXISTS"),
+            // The guard must be code, not a comment or a string.
+            (
+                "CREATE TABLE /* IF NOT EXISTS */ t (a UInt8) ENGINE = Memory",
+                "IF NOT EXISTS",
+            ),
+            ("DROP TABLE t", "IF EXISTS"),
+            ("TRUNCATE TABLE t", "IF EXISTS"),
+            ("INSERT INTO t VALUES (1)", "INSERT"),
+            ("insert into t select 1", "INSERT"),
+            ("ALTER TABLE t ADD COLUMN b UInt8", "ADD COLUMN"),
+            (
+                "ALTER TABLE t ADD COLUMN IF NOT EXISTS b UInt8, \
+                 ADD COLUMN c UInt8",
+                "ADD COLUMN",
+            ),
+            ("ALTER TABLE t ADD INDEX i a TYPE minmax", "ADD INDEX"),
+            ("ALTER TABLE t DROP COLUMN b", "DROP COLUMN"),
+            ("ALTER TABLE t RENAME COLUMN b TO c", "RENAME COLUMN"),
+            ("ALTER TABLE t UPDATE a = a + 1 WHERE 1", "UPDATE"),
+            ("ALTER TABLE t ATTACH PARTITION 1 FROM u", "ATTACH PARTITION"),
+            ("RENAME TABLE a TO b", "RENAME"),
+            ("EXCHANGE TABLES a AND b", "EXCHANGE"),
+            ("DETACH TABLE a", "DETACH"),
+            ("USE other", "USE"),
+            ("SELECT 'oops", "unterminated"),
+        ] {
+            let violation = idempotency_violation(statement)
+                .unwrap_or_else(|| panic!("accepted: {statement}"));
+            assert!(violation.contains(why), "{statement}: {violation}");
+        }
+    }
+
+    /// Correctness of the runner (re-run after a partial failure, racing
+    /// processes, lock takeover) rests on this.
+    #[test]
+    fn embedded_migrations_are_idempotent() {
+        let mut used = vec![false; IDEMPOTENCY_EXCEPTIONS.len()];
+        let mut violations = Vec::new();
+
+        for migration in embedded().unwrap() {
+            let statements = split_statements(&migration.sql).unwrap();
+
+            for (index, statement) in statements.iter().enumerate() {
+                let Some(violation) = idempotency_violation(statement)
+                else {
+                    continue;
+                };
+
+                let code = skeleton(statement).unwrap();
+                let exception =
+                    IDEMPOTENCY_EXCEPTIONS.iter().position(|e| {
+                        e.migration == migration.label()
+                            && code.starts_with(e.skeleton_starts_with)
+                    });
+
+                match exception {
+                    Some(at) => used[at] = true,
+                    None => violations.push(format!(
+                        "{} statement {}: {violation}: {}",
+                        migration.label(),
+                        index + 1,
+                        excerpt(statement)
+                    )),
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "non-idempotent statements in embedded migrations (fix them, \
+             or add a reviewed IDEMPOTENCY_EXCEPTIONS entry):\n{}",
+            violations.join("\n")
+        );
+
+        for (exception, used) in IDEMPOTENCY_EXCEPTIONS.iter().zip(used) {
+            assert!(
+                used,
+                "stale idempotency exception (matches nothing): \
+                 {exception:?}"
+            );
+            assert!(
+                exception.reason.len() >= 20
+                    && !exception.skeleton_starts_with.is_empty(),
+                "exception without a real reason / pattern: {exception:?}"
+            );
+        }
     }
 
     // ---- file names (shared with build.rs) ----
