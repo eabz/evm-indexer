@@ -570,12 +570,18 @@ pub fn plain_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
     )
 }
 
-/// DEX: one statement per month, bounded by `to_ts`. Its SQL has no
-/// purge-range exclusion: it relies on the tombstones of `dex_swaps`
-/// (which the purge verifies with `live_children` before it rebuilds).
+/// DEX: one statement per month, bounded by `to_ts`, with the purged block
+/// range left out by the statement itself (like core and predictions): a
+/// rebuild must never depend on the tombstones of `dex_swaps` being
+/// readable already (docs/design.md §2, "No read-your-writes").
 fn dex_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
     dex::derived::rebuild_statements(
-        table, r.chain, r.from_ts, r.to_ts, r.epoch,
+        table,
+        r.chain,
+        r.from_ts,
+        r.to_ts,
+        r.epoch,
+        (r.purged_from, r.purged_to),
     )
 }
 

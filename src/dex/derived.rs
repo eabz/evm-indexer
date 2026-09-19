@@ -15,7 +15,15 @@
 //!
 //! Placeholders: `{chain}`, `{from_ts}` (unix seconds, a multiple of
 //! `bucket_seconds`; the start of the UTC day recorded in `reorgs` always
-//! is), `{to_ts}` (exclusive) and `{epoch}` (the new epoch).
+//! is), `{to_ts}` (exclusive), `{epoch}` (the new epoch) and the purged
+//! block range `{purge_from}` / `{purge_to}`.
+//!
+//! **A rebuild never depends on seeing the tombstones** (docs/design.md §2,
+//! "No read-your-writes"): ClickHouse can still hide a part that was
+//! written a moment ago, so the statement leaves the purged block range out
+//! by itself instead of trusting `FINAL` to have caught up. The canonical
+//! rows of that range add themselves through the materialized view when
+//! they are streamed again.
 //!
 //! **Run a rebuild through [`rebuild_statements`]**, never as one statement:
 //! the aggregates are partitioned by month, and one INSERT that spans more
@@ -24,10 +32,13 @@
 
 use crate::db::derived::DerivedTable;
 
-/// Range predicate the rebuild adds to the view's `SELECT`.
+/// Range predicate the rebuild adds to the view's `SELECT`: the bucket
+/// range it repairs, minus the block range the purge is removing (the
+/// tombstones of which it must not depend on seeing).
 pub const REBUILD_RANGE: &str = "chain = {chain} \
      AND timestamp >= toDateTime({from_ts}) \
-     AND timestamp < toDateTime({to_ts})";
+     AND timestamp < toDateTime({to_ts}) \
+     AND NOT (block_number >= {purge_from} AND block_number < {purge_to})";
 
 /// What the rebuild selects instead of the rows' own epoch.
 pub const REBUILD_EPOCH: &str = "toUInt32({epoch}) AS epoch";
@@ -68,6 +79,7 @@ macro_rules! candles {
                 " uniqState(trader) AS traders",
                 " FROM dex_swaps FINAL",
                 " WHERE chain = {chain} AND timestamp >= toDateTime({from_ts}) AND timestamp < toDateTime({to_ts})",
+                " AND NOT (block_number >= {purge_from} AND block_number < {purge_to})",
                 " AND is_deleted = 0 AND protocol NOT IN ('balancer_v2', 'curve')",
                 " GROUP BY chain, pool_id, emitter, bucket, epoch"
             ),
@@ -96,6 +108,7 @@ pub const DEX_POOL_VOLUME_1H: DerivedTable = DerivedTable {
         " uniqState(trader) AS traders",
         " FROM dex_swaps FINAL",
         " WHERE chain = {chain} AND timestamp >= toDateTime({from_ts}) AND timestamp < toDateTime({to_ts})",
+        " AND NOT (block_number >= {purge_from} AND block_number < {purge_to})",
         " AND is_deleted = 0",
         " GROUP BY chain, pool_id, emitter, protocol, bucket, token_in, token_out, epoch"
     ),
@@ -108,12 +121,17 @@ pub const DEX_DERIVED: &[DerivedTable] =
 /// `rebuild_sql` with its placeholders filled in, for `[from_ts, to_ts)`.
 /// Keep the range within one month (ClickHouse refuses an insert block of
 /// more than 100 partitions): use [`rebuild_statements`].
+///
+/// `purged` is the block range the purge this repair belongs to is
+/// removing, `None` as its end meaning open ended. The statement excludes
+/// it instead of relying on the tombstones being readable already.
 pub fn render_rebuild(
     table: &DerivedTable,
     chain: u64,
     from_ts: u32,
     to_ts: u32,
     epoch: u32,
+    purged: (u64, Option<u64>),
 ) -> String {
     table
         .rebuild_sql
@@ -121,6 +139,8 @@ pub fn render_rebuild(
         .replace("{from_ts}", &from_ts.to_string())
         .replace("{to_ts}", &to_ts.to_string())
         .replace("{epoch}", &epoch.to_string())
+        .replace("{purge_from}", &purged.0.to_string())
+        .replace("{purge_to}", &purged.1.unwrap_or(u64::MAX).to_string())
 }
 
 /// Unix seconds of the first instant of the UTC month after the one
@@ -169,13 +189,15 @@ pub fn rebuild_statements(
     from_ts: u32,
     to_ts: u32,
     epoch: u32,
+    purged: (u64, Option<u64>),
 ) -> Vec<String> {
     let mut statements = Vec::new();
     let mut start = from_ts - from_ts % table.bucket_seconds.max(1);
 
     while start < to_ts {
         let end = next_month_start(start).min(u64::from(to_ts)) as u32;
-        statements.push(render_rebuild(table, chain, start, end, epoch));
+        statements
+            .push(render_rebuild(table, chain, start, end, epoch, purged));
         start = end;
     }
 
@@ -278,13 +300,50 @@ mod tests {
             1_700_006_400,
             1_700_010_000,
             7,
+            (100, Some(120)),
         );
 
         assert!(sql.contains("chain = 8453 AND"));
         assert!(sql.contains("timestamp >= toDateTime(1700006400)"));
         assert!(sql.contains("timestamp < toDateTime(1700010000)"));
         assert!(sql.contains("toUInt32(7) AS epoch"));
+        assert!(sql
+            .contains("NOT (block_number >= 100 AND block_number < 120)"));
         assert!(!sql.contains('{'));
+
+        // Open ended (a rollback at the tip).
+        let sql =
+            render_rebuild(&DEX_CANDLES_1H, 1, 0, 60, 1, (100, None));
+        assert!(sql.contains(&format!(
+            "NOT (block_number >= 100 AND block_number < {})",
+            u64::MAX
+        )));
+    }
+
+    /// Every DEX aggregate reads `dex_swaps`, so every one of them can and
+    /// must leave the purged block range out by itself: a rebuild runs
+    /// before the tombstones are guaranteed to be readable (docs/design.md
+    /// §2, "No read-your-writes").
+    #[test]
+    fn every_rebuild_excludes_the_purged_block_range() {
+        for table in DEX_DERIVED {
+            let sql = normalize(table.rebuild_sql);
+            assert_eq!(
+                sql.matches(
+                    "NOT (block_number >= {purge_from} AND block_number \
+                     < {purge_to})"
+                )
+                .count(),
+                1,
+                "{}",
+                table.name
+            );
+            assert!(
+                sql.contains(" FROM dex_swaps FINAL "),
+                "{}",
+                table.name
+            );
+        }
     }
 
     #[test]
@@ -308,6 +367,7 @@ mod tests {
             1_356_998_400,
             1_700_006_400,
             3,
+            (0, None),
         );
 
         assert_eq!(statements.len(), 131);
@@ -336,10 +396,18 @@ mod tests {
             1_700_006_401,
             1_700_010_000,
             1,
+            (0, None),
         );
         assert_eq!(one.len(), 1);
         assert!(one[0].contains("toDateTime(1700006400)"));
-        assert!(rebuild_statements(&DEX_CANDLES_1D, 1, 86_400, 86_400, 1)
-            .is_empty());
+        assert!(rebuild_statements(
+            &DEX_CANDLES_1D,
+            1,
+            86_400,
+            86_400,
+            1,
+            (0, None)
+        )
+        .is_empty());
     }
 }
