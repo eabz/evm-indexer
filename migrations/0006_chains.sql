@@ -54,8 +54,8 @@
 -- workaround: it is what makes the intent explicit and checkable at the
 -- call site - 'all 32 bytes' on the svm branch, 'the low 20' on the evm
 -- one - and it does not depend on which conversions a future ClickHouse
--- build decides to trim. Copy it verbatim; never write base58Encode(id)
--- bare on the strength of the note above.
+-- build decides to trim. Copy it verbatim, and never write
+-- base58Encode(id) bare on the strength of the note above.
 --
 -- A pool id is NOT an address even on EVM (a Uniswap V4 / Balancer pool id
 -- is a native 32 byte value), so dex_pools_v.pool prints all 32 bytes and

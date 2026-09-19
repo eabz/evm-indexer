@@ -38,8 +38,8 @@
 -- largest epoch of all reorgs of the chain starting at or before from_ts -
 -- is `epoch_floor_v`, created by migration 0004 next to `reorgs` itself
 -- (docs/design.md section 1, "Aggregates"). This module used to carry a
--- byte-for-byte equivalent copy of it, `dex_epoch_floor_v`; the copy is
--- gone and every view below joins the shared one, exactly like the
+-- byte-for-byte equivalent copy of it called `dex_epoch_floor_v`. The
+-- copy is gone and every view below joins the shared one, like the
 -- prediction and launchpad views do. 0004 runs before 0011, so the
 -- dependency order holds. The copy only differed by a
 -- `toDateTime(from_ts, 'UTC')` that was a no-op: `reorgs.from_ts` is

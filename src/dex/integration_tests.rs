@@ -36,7 +36,7 @@ use crate::{
             pool_id_of, DexLiquidity, DexPool, DexSwap, PoolSource,
             Protocol,
         },
-        sql::{statements, CHAINS_SQL, MIGRATIONS},
+        sql::{reorg_prerequisites, statements, CHAINS_SQL, MIGRATIONS},
         tombstone_sql, DexRows, BASE_TABLES, DEX_DERIVED, SIDE_TABLES,
     },
 };
@@ -56,12 +56,6 @@ const NULL: f64 = -1.0;
 /// `tokenIn` of the Balancer fixture swap.
 const BALANCER_TOKEN_IN: &str =
     "0x0f2d719407fdbeff09d87557abb7232601fd9f29";
-
-/// Minimal copy of the table migration 0004 creates.
-const REORGS_DDL: &str = "CREATE TABLE IF NOT EXISTS reorgs (\
-    chain UInt64, epoch UInt32, from_ts DateTime, \
-    detected_at DateTime DEFAULT now()) \
-    ENGINE = MergeTree ORDER BY (chain, epoch)";
 
 const DAI: &str = "0x6b175474e89094c44da98b954eedeac495271d0f";
 
@@ -107,7 +101,11 @@ impl TestDb {
         let database = Self { admin, client, name };
 
         database.execute(TOKENS_DDL).await;
-        database.execute(REORGS_DDL).await;
+        // `reorgs` and the SHARED epoch_floor_v the aggregate views join
+        // (migration 0004, which the migrator applies long before 0011).
+        for statement in reorg_prerequisites() {
+            database.execute(&statement).await;
+        }
         for statement in statements(CHAINS_SQL) {
             database.execute(&statement).await;
         }

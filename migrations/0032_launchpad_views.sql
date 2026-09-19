@@ -40,7 +40,7 @@
 -- that never graduates on any address it likes and manufacture that
 -- wallet's serial-rugger signal, and a forged fee sweep can name it as
 -- the recipient. The creator screens are scoped exactly like the token
--- ones; see the creator page section below.
+-- ones, in the creator page section below.
 --
 -- What is deliberately NOT filtered: the six aggregate *_v views keep one
 -- row per (key, emitter) and carry emitter through, because they are the

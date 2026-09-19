@@ -1116,9 +1116,8 @@ async fn a_forged_launch_moves_no_creator_page_number() {
     };
     let honest_launches =
         db.text(&header("launchpad_creator_v", "launches")).await;
-    let honest_rate = db
-        .text(&header("launchpad_creator_v", "graduation_rate"))
-        .await;
+    let honest_rate =
+        db.text(&header("launchpad_creator_v", "graduation_rate")).await;
     let honest_fees = db
         .text(&header("launchpad_creator_v", "realised_creator_fees_raw"))
         .await;
@@ -1220,17 +1219,16 @@ async fn a_forged_launch_moves_no_creator_page_number() {
         honest_launches
     );
     assert_eq!(
-        db.text(&header("launchpad_creator_v", "graduation_rate"))
-            .await,
+        db.text(&header("launchpad_creator_v", "graduation_rate")).await,
         honest_rate
     );
+    assert_eq!(db.text(&header("launchpad_creator_v", "died")).await, "0");
     assert_eq!(
-        db.text(&header("launchpad_creator_v", "died")).await,
-        "0"
-    );
-    assert_eq!(
-        db.text(&header("launchpad_creator_v", "realised_creator_fees_raw"))
-            .await,
+        db.text(&header(
+            "launchpad_creator_v",
+            "realised_creator_fees_raw"
+        ))
+        .await,
         honest_fees,
         "a forged fee sweep reached the creator's realised fees"
     );
@@ -1392,15 +1390,18 @@ async fn an_empty_or_wrong_length_id_parameter_matches_nothing() {
     // A real id still answers: the guard must not have broken the screens.
     db.set(&cookbook_parameters(&token, &creator));
     for sql in token_views.iter().chain(&creator_views) {
-        assert!(db.count(sql).await > 0, "a valid id returned nothing: {sql}");
+        assert!(
+            db.count(sql).await > 0,
+            "a valid id returned nothing: {sql}"
+        );
     }
 
     // ... and every wrong length answers with nothing at all.
     for bad in [
-        "",                  // the empty field of a UI
-        &token[..39],        // one character short of an address
-        &token[..63],        // one short of a 32 byte id
-        "00",                // a stray byte
+        "",           // the empty field of a UI
+        &token[..39], // one character short of an address
+        &token[..63], // one short of a 32 byte id
+        "00",         // a stray byte
     ] {
         db.set(&cookbook_parameters(bad, bad));
         for sql in token_views.iter().chain(&creator_views) {
