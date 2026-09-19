@@ -1492,12 +1492,22 @@ async fn an_empty_or_wrong_length_id_parameter_matches_nothing() {
         );
     }
 
-    // ... and every wrong length answers with nothing at all.
+    // ... and every wrong length answers with nothing at all - as does a
+    // right-length id that is not hex. `unhex` does not raise on one: it
+    // turns every non-hex character into the nibble 0xE or 0xF, so the
+    // old guard let a malformed id through to a bucket of 0xEF bytes
+    // (review round 4, MINOR 23).
+    let not_hex_40 = "zz".repeat(20);
+    let not_hex_64 = "gg".repeat(32);
+    let mixed_64 = format!("{}zz", &token[..62]);
     for bad in [
         "",           // the empty field of a UI
         &token[..39], // one character short of an address
         &token[..63], // one short of a 32 byte id
         "00",         // a stray byte
+        &not_hex_40,  // 40 characters, none of them hex
+        &not_hex_64,  // 64 characters, none of them hex
+        &mixed_64,    // a real id with two characters fat-fingered
     ] {
         db.set(&cookbook_parameters(bad, bad));
         for sql in token_views.iter().chain(&creator_views) {
