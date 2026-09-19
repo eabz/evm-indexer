@@ -646,29 +646,36 @@ fn cpi_event_of<'a>(
 /// Does the venue's own pair of amounts match the movement layer's?
 ///
 /// The movement layer measured real SPL transfers, so it is the ground
-/// truth; the event is the venue's claim about the same trade. They can
-/// legitimately differ by the fees that left the subtree - which the
-/// movement layer books separately in `fee_amount` - and by a Token-2022
-/// transfer fee, which the pool-side transfer does not show. So the input
-/// leg must match EXACTLY (nothing is skimmed before the pool receives it on
-/// any of these venues) and the output leg is allowed to be short by at most
-/// the event's own declared fees.
+/// truth; the event is the venue's claim about the same trade. The two
+/// measure slightly different things, and the difference is a Token-2022
+/// **transfer fee** - on BOTH legs.
 ///
-/// Anything outside that band is a real contradiction: the row keeps
-/// `movement` confidence and the disagreement is counted.
+/// This was found by measurement, not by reading: Raydium CPMM's agreement
+/// rate sat at 52.8% live, and in every disagreeing case the gap was
+/// **exactly** `input_transfer_fee`, to the unit. The movement layer reads
+/// the `transferChecked` instruction, which is what the taker SENT; the
+/// event reports what the pool actually CREDITED, which on a mint with a
+/// transfer fee is less. Neither is wrong. The output leg has the mirror
+/// image of the same problem, which phase 1 already found and models as
+/// `amount_out_gross` (what the pool sent) against `amount_out` (what the
+/// taker received).
+///
+/// So each leg is allowed to differ by at most the transfer fee the event
+/// itself declares for that leg. Anything outside that band is a real
+/// contradiction: the row keeps `movement` confidence and the disagreement
+/// is counted.
 fn amounts_agree(
     swap: &MovementSwap,
     event_in: u64,
+    in_transfer_fee: u64,
     event_out: u64,
-    tolerance: u64,
+    out_transfer_fee: u64,
 ) -> bool {
     if event_in == 0 || event_out == 0 {
         return false;
     }
-    if swap.amount_in != event_in {
-        return false;
-    }
-    swap.amount_out_gross.abs_diff(event_out) <= tolerance
+    swap.amount_in.abs_diff(event_in) <= in_transfer_fee
+        && swap.amount_out_gross.abs_diff(event_out) <= out_transfer_fee
 }
 
 /// Writes reserves onto `reserve0` / `reserve1` in the row's token order.
@@ -708,7 +715,10 @@ pub fn enrich_raydium_v4(
     // The ray_log carries no fee field, so the output leg must match to the
     // byte: Raydium v4 takes its fee out of the input before the swap maths
     // and the out_amount is what the vault actually sent.
-    if !amounts_agree(swap, event.amount_in, event.amount_out, 0) {
+    // Raydium v4 predates Token-2022 and its pools are classic SPL, so
+    // there is no transfer fee on either leg and both must match to the
+    // byte.
+    if !amounts_agree(swap, event.amount_in, 0, event.amount_out, 0) {
         return Enrichment::Disagreed;
     }
 
@@ -773,6 +783,7 @@ pub fn enrich_raydium_cpmm(
     if !amounts_agree(
         swap,
         event.input_amount,
+        event.input_transfer_fee,
         event.output_amount,
         event.output_transfer_fee,
     ) {
@@ -818,12 +829,18 @@ pub fn enrich_raydium_clmm(
     };
 
     let (amount_in, amount_out) = event.legs();
-    let transfer_fee_out = if event.zero_for_one {
-        event.transfer_fee_1
+    let (transfer_fee_in, transfer_fee_out) = if event.zero_for_one {
+        (event.transfer_fee_0, event.transfer_fee_1)
     } else {
-        event.transfer_fee_0
+        (event.transfer_fee_1, event.transfer_fee_0)
     };
-    if !amounts_agree(swap, amount_in, amount_out, transfer_fee_out) {
+    if !amounts_agree(
+        swap,
+        amount_in,
+        transfer_fee_in,
+        amount_out,
+        transfer_fee_out,
+    ) {
         return Enrichment::Disagreed;
     }
 
@@ -861,6 +878,7 @@ pub fn enrich_orca(
     if !amounts_agree(
         swap,
         event.input_amount,
+        event.input_transfer_fee,
         event.output_amount,
         event.output_transfer_fee,
     ) {
@@ -945,9 +963,13 @@ pub fn enrich_meteora_damm2(
         return Enrichment::None;
     };
 
+    // This venue is the one that states the Token-2022 gap itself: the
+    // "included" figures are the transfers as sent, which is exactly what
+    // the movement layer measures, so no tolerance is needed on either leg.
     if !amounts_agree(
         swap,
         event.included_transfer_fee_amount_in,
+        0,
         event.included_transfer_fee_amount_out,
         0,
     ) {

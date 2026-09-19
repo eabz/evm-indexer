@@ -230,6 +230,105 @@ async fn live_response_caps_decide_slots_per_query() {
     );
 }
 
+/// Why a venue's event contradicted the movement layer, in its own numbers.
+///
+/// A disagreement rate is a symptom; this prints the diagnosis. It re-reads
+/// the event of every swap that stayed `movement` and puts the venue's
+/// figures next to the ones the SPL transfers prove, which is how the
+/// Raydium CPMM creator-fee case was found.
+#[tokio::test]
+#[ignore]
+async fn live_explain_disagreements() {
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+    let venue_filter = std::env::var("EXPLAIN_VENUE")
+        .unwrap_or_else(|_| "raydium_cpmm".to_owned());
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+    let from = head - HEAD_MARGIN - 60;
+    let batch = source.fetch(from, from + 60).await.expect("fetch");
+    let rows = svm::decode(SOLANA_CHAIN, &batch.batches);
+
+    // (slot, tx_index) -> the transaction, so a row can be taken back to
+    // the bytes it came from.
+    let mut by_key = BTreeMap::new();
+    for slot in &batch.batches {
+        for tx in &slot.transactions {
+            by_key.insert((slot.slot, tx.tx_index), tx);
+        }
+    }
+
+    println!("\n=== {venue_filter}: rows the event did not confirm ===");
+    let mut shown = 0;
+    for swap in &rows.swaps {
+        if swap.protocol != venue_filter || swap.confidence == "decoded" {
+            continue;
+        }
+        let Some(tx) = by_key.get(&(swap.block_number, swap.tx_index))
+        else {
+            continue;
+        };
+        let path = crate::svm::models::unpack_ordinal(swap.ordinal);
+        let Some(instruction) =
+            tx.instructions.iter().find(|ix| ix.path == path)
+        else {
+            continue;
+        };
+
+        let event = tx
+            .logs
+            .iter()
+            .filter(|log| {
+                log.is_data && log.path == path && log.program == instruction.program
+            })
+            .find_map(|log| {
+                let bytes = log.event_bytes()?;
+                crate::svm::venues::RaydiumCpmmSwap::parse(&bytes)
+            });
+
+        println!(
+            "\n  {} ordinal {:?}",
+            bs58::encode(&swap.tx_id).into_string(),
+            path
+        );
+        println!(
+            "    movement : in {:>20}  out(gross) {:>20}",
+            swap.amount_in, swap.amount_out_gross
+        );
+        match event {
+            Some(event) => println!(
+                "    event    : in {:>20}  out         {:>20}\n    \
+                 fees     : trade {} creator {} in_xfer {} out_xfer {}\n    \
+                 delta    : in {} out {}",
+                event.input_amount,
+                event.output_amount,
+                event.trade_fee,
+                event.creator_fee,
+                event.input_transfer_fee,
+                event.output_transfer_fee,
+                i128::from(event.input_amount)
+                    - swap.amount_in.to_string().parse::<i128>().unwrap(),
+                i128::from(event.output_amount)
+                    - swap
+                        .amount_out_gross
+                        .to_string()
+                        .parse::<i128>()
+                        .unwrap(),
+            ),
+            None => println!("    event    : NOT FOUND or wrong length"),
+        }
+
+        shown += 1;
+        if shown >= 12 {
+            break;
+        }
+    }
+    println!("\n  {shown} shown");
+}
+
 /// (i) What the stream contains and how much of it the decoders cover.
 #[tokio::test]
 #[ignore]
