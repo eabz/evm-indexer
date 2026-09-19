@@ -2,6 +2,11 @@
 -- and pools are joined at QUERY time, so rows get better as the background
 -- resolvers fill tokens / dex_pools.
 --
+-- Reorg safety comes from what they read, nothing here knows about epochs or
+-- tombstones: base tables only with FINAL (hides tombstones), pools only
+-- through dex_pool_current_v (FINAL + first creation event wins), aggregates
+-- only through their *_v views (validity rule of docs/design.md §2).
+--
 -- Rules shared by every view:
 --   unknown stays NULL - unknown pool tokens, unknown decimals and
 --     unpriceable amounts are NULL, never 0,
@@ -55,7 +60,7 @@ SELECT
   p.created_block AS created_block,
   p.timestamp AS created_at,
   p.source AS source
-FROM (SELECT * FROM dex_pools FINAL WHERE source != 'unresolved') AS p
+FROM dex_pool_current_v AS p
 LEFT JOIN dex_token_info_v AS t0 ON t0.chain = p.chain AND t0.token = p.token0
 LEFT JOIN dex_token_info_v AS t1 ON t1.chain = p.chain AND t1.token = p.token1;
 
@@ -115,8 +120,7 @@ FROM
   LEFT JOIN
   (
     SELECT chain, pool_id, emitter, token0, token1, tokens, underlying_tokens, 1 AS found
-    FROM dex_pools FINAL
-    WHERE source != 'unresolved'
+    FROM dex_pool_current_v
   ) AS p ON p.chain = s.chain AND p.pool_id = s.pool_id AND p.emitter = s.emitter
 ) AS r
 LEFT JOIN dex_token_info_v AS ti ON ti.chain = r.chain AND ti.token = r.r_token_in
@@ -261,8 +265,7 @@ FROM
   LEFT JOIN
   (
     SELECT chain, pool_id, emitter, token0, token1, tokens, underlying_tokens, 1 AS found
-    FROM dex_pools FINAL
-    WHERE source != 'unresolved'
+    FROM dex_pool_current_v
   ) AS p ON p.chain = l.chain AND p.pool_id = l.pool_id AND p.emitter = l.emitter
 ) AS r
 LEFT JOIN dex_token_info_v AS t ON t.chain = r.chain AND t.token = r.token
@@ -279,7 +282,7 @@ CREATE VIEW IF NOT EXISTS dex_pool_volume_usd_1d_v AS
 SELECT
   v.chain AS chain, v.pool_id AS pool_id, v.emitter AS emitter, v.protocol AS protocol, v.bucket AS bucket,
   v.volume_usd AS volume_usd,
-  v.swaps AS swaps,
+  u.swaps AS swaps,
   u.traders AS traders
 FROM
 (
@@ -294,16 +297,11 @@ FROM
       any(leg_kind) = 'side', in_usd,
       greatest(in_usd, out_usd)
     ), 0) AS volume_usd,
-    toUInt64(sum(swaps) / 2) AS swaps
+    toUInt64(sum(swaps) / 2) AS leg_swaps
   FROM dex_pool_token_volume_1d_v
   GROUP BY chain, pool_id, emitter, protocol, bucket
 ) AS v
-INNER JOIN
-(
-  SELECT chain, pool_id, emitter, protocol, bucket, uniqMerge(traders) AS traders
-  FROM dex_pool_volume_1d
-  GROUP BY chain, pool_id, emitter, protocol, bucket
-) AS u ON u.chain = v.chain AND u.pool_id = v.pool_id AND u.emitter = v.emitter AND u.protocol = v.protocol AND u.bucket = v.bucket;
+INNER JOIN dex_pool_stats_1d_v AS u ON u.chain = v.chain AND u.pool_id = v.pool_id AND u.emitter = v.emitter AND u.protocol = v.protocol AND u.bucket = v.bucket;
 
 CREATE VIEW IF NOT EXISTS dex_protocol_volume_usd_1d_v AS
 SELECT

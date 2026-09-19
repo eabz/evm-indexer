@@ -28,9 +28,18 @@
 //! * Decoding never needs RPC. Pool tokens come from creation events; pools
 //!   first seen mid-history are resolved in the background by
 //!   [`PoolWorker`] and joined at query time.
-//! * `dex_pools._version` is NOT the flush timestamp, see
-//!   [`pool_event_version`]: the first creation event wins, RPC rows lose
-//!   against any event row.
+//! * `dex_pools` holds one row per creation EVENT (positional key, like
+//!   every block scoped table) plus at most one row of the RPC resolver.
+//!   Readers go through the `dex_pool_current_v` view: event rows before
+//!   resolver rows, then the earliest position - the first creation event
+//!   wins, a forged later `PairCreated` can not replace a pool's tokens.
+//! * Nothing is ever deleted (docs/design.md §2): a purge INSERTs
+//!   tombstones into [`BASE_TABLES`] ([`tombstone_sql`]), the side tables
+//!   follow through their materialized views, the aggregates are keyed by
+//!   `epoch` and read through `*_v` views that apply the validity rule.
+//! * `tx_from` / `tx_to` are filled on swaps AND liquidity rows by
+//!   [`DexRows::attach_transactions`]. `dex_liquidity.tx_from` is who
+//!   seeded / pulled liquidity; the event `sender` is usually a router.
 //!
 //! # Populating `quote_tokens`
 //!
@@ -74,8 +83,8 @@ pub use self::{
     decode::decode,
     derived::DEX_DERIVED,
     models::{
-        pool_address_of, pool_event_version, pool_id_of, DexLiquidity,
-        DexPool, DexSwap, LiquidityKind, PoolSource, Protocol,
+        pool_address_of, pool_id_of, DexLiquidity, DexPool, DexSwap,
+        LiquidityKind, PoolSource, Protocol,
     },
     worker::{
         MissingPoolSource, PoolSink, PoolWorker, PoolWorkerOptions,
@@ -83,27 +92,25 @@ pub use self::{
     },
 };
 
-/// Every DEX table that is purged by block range, children and side tables
-/// first, in the order `purge_range` must delete them. All of them have a
-/// `block_number` column EXCEPT [`POOLS_TABLE`], whose block column is
-/// [`POOLS_TABLE_BLOCK_COLUMN`].
-pub const BLOCK_SCOPED_TABLES: &[&str] = &[
-    "dex_swaps_by_pool",
-    "dex_swaps_by_trader",
-    "dex_pools_by_token",
-    "dex_liquidity",
-    "dex_swaps",
-    POOLS_TABLE,
-];
+/// Block scoped tables the indexer writes, in INSERT order. `purge_range`
+/// tombstones exactly these (before `blocks`), see [`tombstone_sql`]. All
+/// of them have a `block_number` column EXCEPT [`POOLS_TABLE`], whose block
+/// column is [`POOLS_TABLE_BLOCK_COLUMN`] ([`block_column`]).
+pub const BASE_TABLES: &[&str] =
+    &["dex_swaps", "dex_liquidity", POOLS_TABLE];
+
+/// Read-path tables fed by materialized views of [`BASE_TABLES`]. Never
+/// written nor tombstoned directly: the views pass `_version`,
+/// `is_deleted` and `epoch` through, so they follow their base table.
+pub const SIDE_TABLES: &[&str] =
+    &["dex_swaps_by_pool", "dex_swaps_by_trader", "dex_pools_by_token"];
 
 pub const POOLS_TABLE: &str = "dex_pools";
 
 /// `dex_pools` is block scoped through the block of its creation event.
-/// Rows written by the RPC resolver have `created_block = 0` and are never
-/// purged (pool metadata does not depend on the fork).
 pub const POOLS_TABLE_BLOCK_COLUMN: &str = "created_block";
 
-/// The block column of a table of [`BLOCK_SCOPED_TABLES`].
+/// The block column of a table of [`BASE_TABLES`] / [`SIDE_TABLES`].
 pub fn block_column(table: &str) -> &'static str {
     if table == POOLS_TABLE {
         POOLS_TABLE_BLOCK_COLUMN
@@ -112,16 +119,51 @@ pub fn block_column(table: &str) -> &'static str {
     }
 }
 
-/// Insertion order (the mirror image of [`BLOCK_SCOPED_TABLES`]): side
-/// tables are fed by materialized views, so only these three are written.
-pub const INSERT_ORDER: &[&str] =
-    &["dex_swaps", "dex_liquidity", POOLS_TABLE];
+/// Extra predicate a purge of `table` must carry. Rows of the RPC resolver
+/// (`created_block = 0`) are chain STATE, not part of a block: a gap heal
+/// starting at block 0 must not tombstone them. (If one is tombstoned
+/// anyway the backfill resolves the pool again and the newer row wins.)
+pub fn purge_filter(table: &str) -> Option<&'static str> {
+    (table == POOLS_TABLE).then_some("source = 'event'")
+}
+
+/// The tombstone INSERT of `purge_range` for one of [`BASE_TABLES`]: every
+/// live row of `chain` in `[from_block, to_block)` again, with `version`
+/// and `is_deleted = 1`. `FINAL` then hides the rows here and - through
+/// the materialized views - in the side tables. Idempotent, and safe to run
+/// concurrently for different chains (it is only an INSERT).
+pub fn tombstone_sql(
+    table: &str,
+    chain: u64,
+    from_block: u64,
+    to_block: Option<u64>,
+    version: u64,
+) -> String {
+    let column = block_column(table);
+    let mut sql = format!(
+        "INSERT INTO {table} SELECT * REPLACE ({version} AS _version, \
+         1 AS is_deleted) FROM {table} FINAL WHERE chain = {chain} \
+         AND {column} >= {from_block}"
+    );
+
+    if let Some(to_block) = to_block {
+        sql.push_str(&format!(" AND {column} < {to_block}"));
+    }
+    if let Some(filter) = purge_filter(table) {
+        sql.push_str(&format!(" AND {filter}"));
+    }
+
+    sql
+}
 
 /// Pool ids of `dex_swaps` / `dex_liquidity` without a `dex_pools` row, for
 /// the [`MissingPoolSource`] of the pipeline. Placeholders: `{chain}`,
 /// `{limit}`. Columns: `pool_id FixedString(32)`, `emitter
 /// FixedString(20)`, `protocol String`. Families described by events only
-/// (V4, Balancer) are excluded: RPC can not resolve them.
+/// (V4, Balancer) are excluded: RPC can not resolve them. `dex_pools` is
+/// read with `FINAL` (a tombstoned pool IS missing); the swap side is not,
+/// on purpose: it is the big side, and resolving the pool of a reorged-out
+/// swap is harmless.
 pub const MISSING_POOLS_SQL: &str = "\
 SELECT pool_id, emitter, any(family) AS protocol FROM (\
 SELECT pool_id, emitter, toString(protocol) AS family \
@@ -131,7 +173,7 @@ SELECT pool_id, emitter, toString(protocol) AS family \
 FROM dex_liquidity WHERE chain = {chain}) \
 WHERE family NOT IN ('uniswap_v4', 'balancer_v2') \
 AND (pool_id, emitter) NOT IN (\
-SELECT pool_id, emitter FROM dex_pools WHERE chain = {chain}) \
+SELECT pool_id, emitter FROM dex_pools FINAL WHERE chain = {chain}) \
 GROUP BY pool_id, emitter \
 LIMIT {limit}";
 
@@ -177,14 +219,30 @@ impl DexRows {
         self.liquidity.append(&mut other.liquidity);
     }
 
-    /// Stamps the flush version on swaps and liquidity. Pool rows keep
-    /// their own version on purpose, see [`pool_event_version`].
+    /// Stamps the flush version on every row.
     pub fn set_version(&mut self, version: u64) {
+        for pool in &mut self.pools {
+            pool._version = version;
+        }
         for swap in &mut self.swaps {
             swap._version = version;
         }
         for row in &mut self.liquidity {
             row._version = version;
+        }
+    }
+
+    /// Stamps the chain's purge generation on every row (docs/design.md
+    /// §2): the aggregates are keyed by it.
+    pub fn set_epoch(&mut self, epoch: u32) {
+        for pool in &mut self.pools {
+            pool.epoch = epoch;
+        }
+        for swap in &mut self.swaps {
+            swap.epoch = epoch;
+        }
+        for row in &mut self.liquidity {
+            row.epoch = epoch;
         }
     }
 
@@ -311,6 +369,7 @@ mod tests {
             liquidity: U256::ZERO,
             tick: 0,
             fee: 0,
+            epoch: 0,
             _version: 0,
         }
     }
@@ -320,8 +379,63 @@ mod tests {
         let mut rows = DexRows::default();
         rows.swaps
             .push(swap(Address::repeat_byte(7), Protocol::UniswapV2));
+        rows.pools = decode(
+            1,
+            &[crate::dex::fixtures::v2_pair_created_for(
+                Address::repeat_byte(7),
+            )],
+        )
+        .pools;
+        rows.liquidity =
+            decode(1, &[crate::dex::fixtures::V2_SYNC.log()]).liquidity;
+
         rows.set_version(42);
-        assert_eq!(rows.swaps[0]._version, 42);
+        rows.set_epoch(3);
+
+        assert_eq!((rows.swaps[0]._version, rows.swaps[0].epoch), (42, 3));
+        assert_eq!((rows.pools[0]._version, rows.pools[0].epoch), (42, 3));
+        assert_eq!(
+            (rows.liquidity[0]._version, rows.liquidity[0].epoch),
+            (42, 3)
+        );
+    }
+
+    #[test]
+    fn transactions_are_attached_to_liquidity_rows_too() {
+        let mut rows = decode(1, &[crate::dex::fixtures::V2_MINT.log()]);
+        let provider = Address::repeat_byte(0x55);
+        let router = rows.liquidity[0].sender;
+
+        rows.attach_transactions(|_| {
+            Some(TxOrigin { from: provider, to: Some(router) })
+        });
+
+        assert_eq!(rows.liquidity[0].tx_from, provider);
+        assert_eq!(rows.liquidity[0].tx_to, router);
+        assert_ne!(rows.liquidity[0].sender, provider);
+    }
+
+    #[test]
+    fn tombstones_are_plain_inserts() {
+        assert_eq!(
+            tombstone_sql("dex_swaps", 10, 500, None, 99),
+            "INSERT INTO dex_swaps SELECT * REPLACE (99 AS _version, \
+             1 AS is_deleted) FROM dex_swaps FINAL WHERE chain = 10 \
+             AND block_number >= 500"
+        );
+
+        let pools = tombstone_sql(POOLS_TABLE, 10, 0, Some(7), 99);
+        assert!(pools.ends_with(
+            "AND created_block >= 0 AND created_block < 7 \
+             AND source = 'event'"
+        ));
+
+        for table in BASE_TABLES {
+            let sql = tombstone_sql(table, 1, 1, None, 1).to_uppercase();
+            assert!(sql.starts_with("INSERT INTO "));
+            assert!(!sql.replace("IS_DELETED", "").contains("DELETE"));
+            assert!(!sql.contains("ALTER") && !sql.contains("DROP"));
+        }
     }
 
     #[test]
@@ -409,8 +523,9 @@ mod tests {
             .collect();
         expected.sort();
 
-        let mut listed: Vec<String> = BLOCK_SCOPED_TABLES
+        let mut listed: Vec<String> = BASE_TABLES
             .iter()
+            .chain(SIDE_TABLES)
             .map(|name| name.to_string())
             .collect();
         listed.sort();
@@ -418,17 +533,32 @@ mod tests {
         assert_eq!(listed, expected);
 
         for (name, body) in tables() {
-            if BLOCK_SCOPED_TABLES.contains(&name.as_str()) {
+            if listed.contains(&name) {
                 let column = format!(" {} UInt64", block_column(&name));
                 assert!(body.contains(&column), "{name}");
             }
         }
+    }
 
-        // Base tables are purged after their side tables.
-        assert_eq!(BLOCK_SCOPED_TABLES.last(), Some(&POOLS_TABLE));
-        for table in INSERT_ORDER {
-            assert!(BLOCK_SCOPED_TABLES.contains(table));
-        }
+    /// Every materialized view as (name, target, select).
+    fn materialized_views() -> Vec<(String, String, String)> {
+        MIGRATIONS
+            .iter()
+            .flat_map(|(_, sql)| statements(sql))
+            .map(|statement| normalize(&statement))
+            .filter_map(|statement| {
+                let rest = statement.strip_prefix(
+                    "CREATE MATERIALIZED VIEW IF NOT EXISTS ",
+                )?;
+                let (name, rest) = rest.split_once(" TO ")?;
+                let (target, select) = rest.split_once(" AS ")?;
+                Some((
+                    name.to_owned(),
+                    target.to_owned(),
+                    select.to_owned(),
+                ))
+            })
+            .collect()
     }
 
     #[test]
@@ -457,34 +587,106 @@ mod tests {
                 // The database comes from the connection URL.
                 assert!(!statement.contains("indexer."), "{name}");
                 assert!(!statement.contains("PROJECTION"), "{name}");
+                // Section 9 of the design: neither exists any more.
+                assert!(!statement.contains("traces"), "{name}");
+                assert!(!statement.contains("contracts"), "{name}");
             }
         }
 
         for (name, body) in tables() {
-            let replacing = body.contains("ReplacingMergeTree(_version)");
+            let block_scoped = BASE_TABLES.contains(&name.as_str())
+                || SIDE_TABLES.contains(&name.as_str());
             let aggregating = body.contains("AggregatingMergeTree");
-            assert!(replacing != aggregating, "{name}");
 
-            if replacing {
-                assert!(body.contains(" _version UInt64"), "{name}");
-            }
-
-            if body.contains(" block_number UInt64")
-                && name != "dex_pools_by_token"
-            {
+            if block_scoped {
                 assert!(
                     body.contains(
-                        "PARTITION BY (chain, toYYYYMM(timestamp))"
+                        "ReplacingMergeTree(_version, is_deleted)"
                     ),
                     "{name}"
                 );
+                for column in [
+                    " _version UInt64",
+                    " is_deleted UInt8 DEFAULT 0",
+                    " epoch UInt32 DEFAULT 0",
+                ] {
+                    assert!(body.contains(column), "{name}: {column}");
+                }
+            } else if aggregating {
+                // Epoch is the LAST key column of every aggregate.
+                assert!(body.contains(" epoch UInt32,"), "{name}");
+                assert!(body.trim_end().ends_with(", epoch)"), "{name}");
+                assert!(
+                    body.contains("PARTITION BY toYYYYMM(bucket)"),
+                    "{name}"
+                );
+            } else {
+                assert_eq!(name, "quote_tokens");
             }
+
+            // 50+ chains in one database: months only for the base
+            // tables, chain only for lookups - never both.
+            assert!(!body.contains("PARTITION BY (chain"), "{name}");
+            if ["dex_swaps", "dex_liquidity"].contains(&name.as_str()) {
+                assert!(
+                    body.contains("PARTITION BY toYYYYMM(timestamp)"),
+                    "{name}"
+                );
+            } else if block_scoped {
+                assert!(body.contains("PARTITION BY chain"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn side_tables_follow_tombstones_and_aggregates_skip_them() {
+        let views = materialized_views();
+        assert_eq!(views.len(), 8);
+
+        for (name, target, select) in views {
+            if SIDE_TABLES.contains(&target.as_str()) {
+                for column in ["epoch", "_version", "is_deleted"] {
+                    assert!(
+                        select.contains(&format!(" {column}")),
+                        "{name}: {column}"
+                    );
+                }
+                assert!(!select.contains("is_deleted = 0"), "{name}");
+            } else {
+                assert!(select.contains("WHERE is_deleted = 0"), "{name}");
+                assert!(select.trim_end().ends_with(", epoch"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_ever_deleted() {
+        for (name, sql) in MIGRATIONS {
+            for statement in statements(sql) {
+                let upper = normalize(&statement).to_uppercase();
+                for verb in
+                    ["DELETE FROM", "ALTER TABLE", "DROP ", "TRUNCATE"]
+                {
+                    assert!(!upper.contains(verb), "{name}: {verb}");
+                }
+            }
+        }
+
+        for table in DEX_DERIVED {
+            let upper = table.rebuild_sql.to_uppercase();
+            assert!(upper.starts_with("INSERT INTO "), "{}", table.name);
+            assert!(
+                !upper.replace("IS_DELETED", "").contains("DELETE"),
+                "{}",
+                table.name
+            );
         }
     }
 
     #[test]
     fn missing_pools_sql_has_its_placeholders() {
         assert_eq!(MISSING_POOLS_SQL.matches("{chain}").count(), 3);
+        assert!(MISSING_POOLS_SQL.contains("FROM dex_pools FINAL"));
         assert_eq!(MISSING_POOLS_SQL.matches("{limit}").count(), 1);
     }
 }

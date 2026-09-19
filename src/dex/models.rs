@@ -199,30 +199,16 @@ pub fn pool_address_of(pool_id: B256) -> Option<Address> {
         .then(|| Address::from_word(pool_id))
 }
 
-/// `dex_pools._version` of rows written by the RPC resolver: below every
-/// event version, so a creation event always wins whatever the insertion
-/// order.
-pub const POOL_VERSION_RPC: u64 = 1;
-/// `dex_pools._version` of [`PoolSource::Unresolved`] rows: loses against
-/// everything.
-pub const POOL_VERSION_UNRESOLVED: u64 = 0;
-
-/// `dex_pools._version` of a row decoded from a creation event.
+/// `dex_pools`: one row per CREATION EVENT of a pool, plus at most one row
+/// written by the RPC resolver (`created_block = 0`, `log_index = 0`).
 ///
-/// NOT the flush timestamp: it DEcreases with the position of the event
-/// so the FIRST creation event of a `(chain, pool_id, emitter)` wins. A
-/// contract emitting a forged `PairCreated` for an existing pool can
-/// therefore not overwrite its tokens. Re-inserting the same block yields
-/// the same version (idempotent).
-pub fn pool_event_version(block_number: u64, log_index: u32) -> u64 {
-    const LOG_BITS: u32 = 24;
-    let log_index = u64::from(log_index).min((1 << LOG_BITS) - 1);
-    let block_number = block_number.min((1 << (63 - LOG_BITS)) - 1);
-
-    u64::MAX - ((block_number << LOG_BITS) | log_index)
-}
-
-/// `dex_pools`: one row per pool, keyed by `(chain, pool_id, emitter)`.
+/// The table is positional like every block scoped table - key `(chain,
+/// pool_id, emitter, created_block, log_index)` - so versions, tombstones
+/// and re-inserts work exactly as everywhere else (docs/design.md §2).
+/// Several live rows of one pool can exist (a forged `PairCreated` costs
+/// one transaction); readers pick THE row through the `dex_pool_current_v`
+/// view: event rows before resolver rows, then the earliest position. The
+/// first creation event wins.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct DexPool {
@@ -270,8 +256,8 @@ pub struct DexPool {
     pub log_index: u32,
     #[serde_as(as = "DisplayFromStr")]
     pub source: PoolSource,
-    /// See [`pool_event_version`]: set by the producer, the writer must
-    /// NOT stamp it with the flush time.
+    /// Purge generation of the chain, stamped by the writer.
+    pub epoch: u32,
     pub _version: u64,
 }
 
@@ -338,6 +324,9 @@ pub struct DexSwap {
     pub tick: i32,
     /// Fee charged by this swap when the event reports it (V4), else 0.
     pub fee: u32,
+    /// Purge generation of the chain, stamped by the writer. The
+    /// aggregates are keyed by it (docs/design.md §2).
+    pub epoch: u32,
     pub _version: u64,
 }
 
@@ -365,6 +354,9 @@ pub struct DexLiquidity {
     /// zero otherwise.
     #[serde_as(as = "SerAddress")]
     pub owner: Address,
+    /// `from` of the transaction: WHO provided / removed the liquidity.
+    /// `sender` is usually a router and must not be used for attribution.
+    /// Zero until [`super::DexRows::attach_transactions`] ran.
     #[serde_as(as = "SerAddress")]
     pub tx_from: Address,
     #[serde_as(as = "SerAddress")]
@@ -384,6 +376,7 @@ pub struct DexLiquidity {
     pub liquidity_delta: I256,
     pub tick_lower: i32,
     pub tick_upper: i32,
+    pub epoch: u32,
     pub _version: u64,
 }
 
@@ -414,21 +407,6 @@ mod tests {
         let address = Address::repeat_byte(0xab);
         assert_eq!(pool_address_of(pool_id_of(address)), Some(address));
         assert_eq!(pool_address_of(B256::repeat_byte(1)), None);
-    }
-
-    #[test]
-    fn first_creation_event_wins() {
-        let first = pool_event_version(100, 5);
-        let forged_later = pool_event_version(100, 6);
-        let much_later = pool_event_version(20_000_000, 0);
-
-        assert!(first > forged_later);
-        assert!(forged_later > much_later);
-        assert!(much_later > POOL_VERSION_RPC);
-        const { assert!(POOL_VERSION_RPC > POOL_VERSION_UNRESOLVED) };
-        // Out of range positions saturate instead of wrapping around.
-        assert!(pool_event_version(u64::MAX, u32::MAX) > POOL_VERSION_RPC);
-        assert_eq!(pool_event_version(7, 1), pool_event_version(7, 1));
     }
 
     #[test]

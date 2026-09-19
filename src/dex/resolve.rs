@@ -16,10 +16,7 @@ use alloy::primitives::{Address, Bytes, B256, U256};
 use crate::tokens::multicall::{CallError, EthCaller};
 
 use super::{
-    models::{
-        DexPool, PoolSource, Protocol, POOL_VERSION_RPC,
-        POOL_VERSION_UNRESOLVED,
-    },
+    models::{DexPool, PoolSource, Protocol},
     PoolCandidate,
 };
 
@@ -355,7 +352,8 @@ fn blank_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
         transaction_hash: B256::ZERO,
         log_index: 0,
         source: PoolSource::Rpc,
-        _version: POOL_VERSION_RPC,
+        epoch: 0,
+        _version: 0,
     }
 }
 
@@ -363,7 +361,6 @@ fn blank_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
 pub fn unresolved_pool(chain: u64, candidate: &PoolCandidate) -> DexPool {
     DexPool {
         source: PoolSource::Unresolved,
-        _version: POOL_VERSION_UNRESOLVED,
         ..blank_pool(chain, candidate)
     }
 }
@@ -598,7 +595,6 @@ mod tests {
         assert_eq!((pool.token0, pool.token1), (addr(0xa), addr(0xb)));
         assert_eq!(pool.factory, addr(0xf));
         assert_eq!(pool.source, PoolSource::Rpc);
-        assert_eq!(pool._version, POOL_VERSION_RPC);
         assert_eq!(pool.created_block, 0);
     }
 
@@ -792,7 +788,7 @@ mod tests {
         let row = unresolved_pool(1, &candidate(addr(1), Protocol::Curve));
 
         assert_eq!(row.source, PoolSource::Unresolved);
-        assert_eq!(row._version, POOL_VERSION_UNRESOLVED);
+        assert_eq!((row.created_block, row.log_index), (0, 0));
         assert!(row.tokens.is_empty());
     }
 }

@@ -14,8 +14,8 @@ use crate::db::models::log::DatabaseLog;
 use super::{
     events::{self, EventDef},
     models::{
-        pool_event_version, pool_id_of, DexLiquidity, DexPool, DexSwap,
-        LiquidityKind, PoolSource, Protocol,
+        pool_id_of, DexLiquidity, DexPool, DexSwap, LiquidityKind,
+        PoolSource, Protocol,
     },
     DexRows,
 };
@@ -322,7 +322,8 @@ impl Event<'_> {
             transaction_hash: self.log.transaction_hash,
             log_index,
             source: PoolSource::Event,
-            _version: pool_event_version(block_number, log_index),
+            epoch: 0,
+            _version: 0,
         }
     }
 
@@ -375,6 +376,7 @@ impl Event<'_> {
             liquidity: U256::ZERO,
             tick: 0,
             fee: 0,
+            epoch: 0,
             _version: 0,
         }
     }
@@ -406,6 +408,7 @@ impl Event<'_> {
             liquidity_delta: I256::ZERO,
             tick_lower: 0,
             tick_upper: 0,
+            epoch: 0,
             _version: 0,
         }
     }
@@ -740,9 +743,8 @@ fn decode_event(event: &Event<'_>, kind: Kind) -> Option<Decoded> {
 
 /// Decodes every DEX event of `logs` (any order, any mix of contracts).
 ///
-/// Rows come out in input order with `_version = 0` on swaps / liquidity
-/// (stamp them with [`DexRows::set_version`]); pool rows carry their own
-/// version, see [`pool_event_version`].
+/// Rows come out in input order with `_version = 0` and `epoch = 0`: stamp
+/// them with [`DexRows::set_version`] and [`DexRows::set_epoch`].
 pub fn decode(chain: u64, logs: &[DatabaseLog]) -> DexRows {
     let mut rows = DexRows::default();
     // Balancer pools registered in this batch, by (pool id, vault).
