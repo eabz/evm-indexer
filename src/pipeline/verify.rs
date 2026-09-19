@@ -611,6 +611,7 @@ async fn coverage_line(db: &Database) -> Option<String> {
 
     Some(coverage::store::sentence(
         &coverage,
+        coverage::store::unit_of(db.chain_id),
         covered_to_date.as_deref(),
         stored_head,
     ))

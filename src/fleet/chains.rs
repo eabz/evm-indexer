@@ -218,7 +218,12 @@ pub async fn coverage(db: &Database) -> Result<BTreeMap<u64, String>> {
             };
             (
                 chain,
-                crate::coverage::store::sentence(&coverage, None, None),
+                crate::coverage::store::sentence(
+                    &coverage,
+                    crate::coverage::store::unit_of(chain),
+                    None,
+                    None,
+                ),
             )
         })
         .collect())

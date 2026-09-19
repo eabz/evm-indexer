@@ -256,20 +256,32 @@ async fn write(db: &Database, fence: &Fence, floor: Floor) -> Result<()> {
     })
 }
 
+/// What a position on this chain is CALLED. The column is `block_number`
+/// everywhere (design section 13), but on Solana it holds a slot, and a
+/// sentence for a person has to say the word the person uses.
+pub fn unit_of(chain: u64) -> &'static str {
+    if chain == crate::pipeline::solana::SOLANA_CHAIN_ID {
+        "slot"
+    } else {
+        "block"
+    }
+}
+
 /// The sentence every surface prints: `indexer verify`, the fleet's status
 /// line and the control panel all say the same thing in the same words.
 ///
 /// `covered_to_block` is exclusive, so the last covered block is one below
 /// it, and `covered_to_date` is that block's day when the caller could
-/// afford to look it up.
+/// afford to look it up. `unit` is [`unit_of`] for the chain.
 pub fn sentence(
     coverage: &Coverage,
+    unit: &str,
     covered_to_date: Option<&str>,
     stored_head: Option<u64>,
 ) -> String {
     if coverage.is_empty() {
         return format!(
-            "Coverage: nothing stored yet. The floor is {} (block {}), \
+            "Coverage: nothing stored yet. The floor is {} ({unit} {}), \
              from {}.",
             coverage.floor.date(),
             coverage.floor.block,
@@ -279,12 +291,12 @@ pub fn sentence(
 
     let last = coverage.covered_to_block.saturating_sub(1);
     let to = match covered_to_date {
-        Some(date) => format!("{date} (block {last})"),
-        None => format!("block {last}"),
+        Some(date) => format!("{date} ({unit} {last})"),
+        None => format!("{unit} {last}"),
     };
 
     let mut line = format!(
-        "Coverage: gap-free from {} (block {}) to {}.",
+        "Coverage: gap-free from {} ({unit} {}) to {}.",
         coverage.floor.date(),
         coverage.floor.block,
         to
@@ -433,7 +445,8 @@ mod tests {
             covered_to_block: 1_000,
         };
 
-        let line = sentence(&coverage, Some("2024-06-15"), Some(999));
+        let line =
+            sentence(&coverage, "block", Some("2024-06-15"), Some(999));
         assert_eq!(
             line,
             "Coverage: gap-free from 2024-03-01 (block 500) to 2024-06-15 \
@@ -441,7 +454,8 @@ mod tests {
         );
 
         // A stored head above the gap-free part is the interesting case.
-        let line = sentence(&coverage, Some("2024-06-15"), Some(5_000));
+        let line =
+            sentence(&coverage, "block", Some("2024-06-15"), Some(5_000));
         assert!(line.contains("up to 5000"), "{line}");
         assert!(line.contains("hole"), "{line}");
 
@@ -450,9 +464,23 @@ mod tests {
             floor: floor(500, "2024-03-01"),
             covered_to_block: 500,
         };
-        let line = sentence(&empty, None, None);
+        let line = sentence(&empty, "block", None, None);
         assert!(line.contains("nothing stored yet"), "{line}");
         assert!(line.contains("block 500"), "{line}");
+
+        // On Solana the same sentence says "slot", because that is the
+        // word the person reading it uses.
+        let line = sentence(&coverage, "slot", None, Some(999));
+        assert!(line.contains("slot 500"), "{line}");
+        assert!(line.contains("slot 999"), "{line}");
+        assert!(!line.contains("block"), "{line}");
+    }
+
+    #[test]
+    fn only_solana_counts_in_slots() {
+        assert_eq!(unit_of(1), "block");
+        assert_eq!(unit_of(8453), "block");
+        assert_eq!(unit_of(1_399_811_149), "slot");
     }
 
     #[test]

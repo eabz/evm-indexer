@@ -190,7 +190,10 @@ async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
             println!(
                 "{}",
                 evm_indexer::coverage::store::sentence(
-                    &coverage, None, None
+                    &coverage,
+                    evm_indexer::coverage::store::unit_of(config.chain_id),
+                    None,
+                    None,
                 )
             );
         }
