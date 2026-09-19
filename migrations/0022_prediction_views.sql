@@ -30,6 +30,21 @@
 -- if / concat form below). Anything other than 40 or 64 hex characters is
 -- a caller error: it can only fail to match.
 --
+-- THE 20 vs 32 BYTE SEAM (the dex_token_info_v rule of migration 0012).
+-- Identity columns here - collateral_token among them - are the chain
+-- neutral FixedString(32) of docs/design.md section 13, while the core
+-- `tokens` table is EVM only and keys on a FixedString(20) address. Where
+-- the two meet, PAD `tokens.address` up to 32 bytes:
+--
+--   toFixedString(concat(toFixedString('', 12), tk.address), 32)
+--
+-- NEVER truncate the 32 byte side with substring(collateral_token, 13, 20).
+-- Truncating maps EVERY 32 byte id onto some EVM address - a Solana pubkey
+-- whose last 20 bytes happen to equal a real token's address would pick up
+-- that token's decimals and silently rescale its amounts by 10^decimals.
+-- Padding just finds no row, which is the honest answer: the amount stays
+-- raw and the decimals-adjusted column stays NULL.
+--
 -- Amounts: *_raw columns are the on chain integers as Float64, the others
 -- are divided by 10^decimals of the collateral token (shares of a CTF
 -- position use the unit of their collateral). They are NULL while the
@@ -42,8 +57,9 @@ toFixedString(unhex(if(length({registry:String}) = 40,
   concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
 (
   SELECT any(toNullable(decimals)) FROM tokens FINAL
-  WHERE chain = {chain:UInt64} AND address IN (
-    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+  WHERE chain = {chain:UInt64}
+    AND toFixedString(concat(toFixedString('', 12), address), 32) IN (
+    SELECT collateral_token
     FROM prediction_outcome_tokens FINAL
     WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
@@ -71,8 +87,9 @@ toFixedString(unhex(if(length({registry:String}) = 40,
   concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
 (
   SELECT any(toNullable(decimals)) FROM tokens FINAL
-  WHERE chain = {chain:UInt64} AND address IN (
-    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+  WHERE chain = {chain:UInt64}
+    AND toFixedString(concat(toFixedString('', 12), address), 32) IN (
+    SELECT collateral_token
     FROM prediction_outcome_tokens FINAL
     WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
@@ -100,8 +117,9 @@ toFixedString(unhex(if(length({registry:String}) = 40,
   concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
 (
   SELECT any(toNullable(decimals)) FROM tokens FINAL
-  WHERE chain = {chain:UInt64} AND address IN (
-    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+  WHERE chain = {chain:UInt64}
+    AND toFixedString(concat(toFixedString('', 12), address), 32) IN (
+    SELECT collateral_token
     FROM prediction_outcome_tokens FINAL
     WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
@@ -300,8 +318,8 @@ collaterals AS (
     toFixedString(concat(toFixedString('', 12), tk.address), 32) AS address,
     tk.symbol AS symbol, tk.decimals AS decimals, toUInt8(1) AS known
   FROM tokens AS tk FINAL
-  WHERE (tk.chain, tk.address) IN (
-    SELECT chain, toFixedString(substring(collateral_token, 13, 20), 20)
+  WHERE (tk.chain, toFixedString(concat(toFixedString('', 12), tk.address), 32)) IN (
+    SELECT chain, collateral_token
     FROM primary_collateral)
 ),
 enriched AS (
@@ -777,8 +795,8 @@ decimals AS (
     tk.decimals AS decimals, toUInt8(1) AS known
   FROM tokens AS tk FINAL
   WHERE tk.chain = {chain:UInt64} AND (
-    tk.address IN (SELECT toFixedString(substring(collateral_token, 13, 20), 20) FROM venues)
-    OR tk.address IN (SELECT toFixedString(substring(collateral_token, 13, 20), 20) FROM funding))
+    toFixedString(concat(toFixedString('', 12), tk.address), 32) IN (SELECT collateral_token FROM venues)
+    OR toFixedString(concat(toFixedString('', 12), tk.address), 32) IN (SELECT collateral_token FROM funding))
 ),
 labelled AS (
   SELECT address FROM prediction_venue_labels FINAL WHERE chain = {chain:UInt64}

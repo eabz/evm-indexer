@@ -1711,6 +1711,163 @@ async fn a_non_evm_32_byte_id_round_trips_through_every_table_and_query() {
     database.drop().await;
 }
 
+/// Review round 3, item 2. The `tokens` join of the candle views used to
+/// TRUNCATE the analytics side - `toFixedString(substring(collateral_token,
+/// 13, 20), 20)` - instead of padding `tokens.address` up to 32 bytes. That
+/// maps EVERY 32 byte id onto some EVM address, so a non-EVM collateral
+/// whose last 20 bytes happen to equal a real token's address picked up
+/// that token's decimals and silently rescaled its amounts by 10^decimals.
+///
+/// The collision is planted deliberately here: `COLLIDING_COLLATERAL` is a
+/// 32 byte id with a non-zero 12 byte prefix whose last 20 bytes ARE
+/// `COLLIDING_ADDRESS`, the address of a real `tokens` row with 9 decimals.
+/// The decimals-adjusted columns must stay NULL (the honest "not known"),
+/// while the `_raw` ones keep the on-chain integer. The EVM control in the
+/// same test proves the join still works when it is supposed to.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn a_32_byte_collateral_never_borrows_a_truncated_tokens_row() {
+    let database = TestDb::create().await;
+    let traded_at = now() - 3_600;
+    let version = crate::db::next_version();
+    let token_id = U256::from(7u8).to_string();
+    let evm_token_id = U256::from(8u8).to_string();
+
+    // The last 20 bytes of the non-EVM collateral, and the collateral.
+    const COLLIDING_ADDRESS: &str =
+        "40f29e5b16d7a04c93e281fb60ac57d9138e4b2f";
+    const COLLIDING_COLLATERAL: &str = concat!(
+        "5a8c3f19d02b47e6ba71cd83",
+        "40f29e5b16d7a04c93e281fb60ac57d9138e4b2f",
+    );
+    assert_eq!(COLLIDING_COLLATERAL.len(), 64);
+    assert_eq!(&COLLIDING_COLLATERAL[24..], COLLIDING_ADDRESS);
+    // The prefix is NOT zero, so this id is not a padded EVM address.
+    assert_ne!(&COLLIDING_COLLATERAL[..24], "000000000000000000000000");
+
+    // A genuine EVM collateral on the same chain: the control.
+    const EVM_ADDRESS: &str = "1111111111111111111111111111111122223333";
+    let evm_collateral = format!("000000000000000000000000{EVM_ADDRESS}");
+
+    for sql in [
+        // The real token the forged id collides with, and the control's.
+        format!(
+            "INSERT INTO tokens (chain, address, name, symbol, decimals, type) \
+             VALUES ({SVM_CHAIN}, unhex('{COLLIDING_ADDRESS}'), 'Nine', 'NINE', 9, \
+             'ERC20'), ({SVM_CHAIN}, unhex('{EVM_ADDRESS}'), 'Six', 'SIX', 6, 'ERC20')"
+        ),
+        format!(
+            "INSERT INTO prediction_trusted (chain, kind, address, registry) VALUES \
+             ({SVM_CHAIN}, 'registry', unhex('{SVM_REGISTRY}'), unhex('{SVM_REGISTRY}'))"
+        ),
+        // (registry, outcome_token_id) -> collateral, for both legs.
+        format!(
+            "INSERT INTO prediction_outcome_tokens (chain, registry, \
+             outcome_token_id, market_id, outcome_index, collateral_token, \
+             first_seen_block, first_seen_timestamp, _version) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_REGISTRY}'), toUInt256('{token_id}'), \
+             unhex('{SVM_MARKET}'), 0, unhex('{COLLIDING_COLLATERAL}'), 10, \
+             {traded_at}, {version}), \
+             ({SVM_CHAIN}, unhex('{SVM_REGISTRY}'), toUInt256('{evm_token_id}'), \
+             unhex('{SVM_MARKET}'), 1, unhex('{evm_collateral}'), 10, {traded_at}, \
+             {version})"
+        ),
+        // One verified trade per leg: 240000 collateral for 400000 shares.
+        format!(
+            "INSERT INTO prediction_trades (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, protocol, exchange, registry, order_hash, maker, \
+             taker, tx_from, tx_to, outcome_token_id, side, share_amount, \
+             collateral_amount, match_type, verified, maker_outcome_token_id, \
+             maker_side, maker_collateral_amount, maker_fee_amount, maker_fee_unit, \
+             taker_fee_amount, taker_fee_unit, epoch, _version) VALUES \
+             ({SVM_CHAIN}, 11, {traded_at}, unhex('{SVM_TX}'), 4, 13, 'ctf_exchange', \
+             unhex('{SVM_EXCHANGE}'), unhex('{SVM_REGISTRY}'), unhex('{SVM_MARKET}'), \
+             unhex('{SVM_MAKER}'), unhex('{SVM_TAKER}'), unhex('{SVM_CREATOR}'), \
+             unhex('{SVM_EXCHANGE}'), toUInt256('{token_id}'), 'buy', 400000, 240000, \
+             'complementary', 1, toUInt256('{token_id}'), 'sell', 240000, 0, \
+             'collateral', 0, 'collateral', 0, {version}), \
+             ({SVM_CHAIN}, 12, {traded_at}, unhex('{SVM_TX}'), 5, 14, 'ctf_exchange', \
+             unhex('{SVM_EXCHANGE}'), unhex('{SVM_REGISTRY}'), unhex('{SVM_MARKET}'), \
+             unhex('{SVM_MAKER}'), unhex('{SVM_TAKER}'), unhex('{SVM_CREATOR}'), \
+             unhex('{SVM_EXCHANGE}'), toUInt256('{evm_token_id}'), 'buy', 400000, \
+             240000, 'complementary', 1, toUInt256('{evm_token_id}'), 'sell', 240000, \
+             0, 'collateral', 0, 'collateral', 0, {version})"
+        ),
+    ] {
+        database.execute(&sql).await;
+    }
+
+    // Truncating really would have found the colliding row: this is the
+    // lookup the views used to do, and it returns the planted 9 decimals.
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT ifNull(toString(any(decimals)), '<null>') FROM tokens FINAL \
+                 WHERE chain = {SVM_CHAIN} AND address IN (SELECT \
+                 toFixedString(substring(unhex('{COLLIDING_COLLATERAL}'), 13, 20), 20))"
+            ))
+            .await,
+        vec!["9".to_owned()],
+        "the collision is not planted correctly"
+    );
+
+    // ... and padding, which is what the views do now, finds nothing.
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM tokens FINAL WHERE chain = {SVM_CHAIN} \
+                 AND toFixedString(concat(toFixedString('', 12), address), 32) \
+                 = unhex('{COLLIDING_COLLATERAL}')"
+            ))
+            .await,
+        0
+    );
+
+    // THE ASSERTION. The non-EVM leg: raw volume is the on-chain integer
+    // and the decimals-adjusted columns are NULL. With the truncating join
+    // volume was 240000 / 10^9 = 0.00024 instead.
+    for view in [
+        "prediction_candles_1m_v",
+        "prediction_candles_1h_v",
+        "prediction_candles_1d_v",
+    ] {
+        assert_eq!(
+            database
+                .rows::<(String, String, String)>(&format!(
+                    "SELECT ifNull(toString(volume_raw), '<null>'), \
+                     ifNull(toString(volume), '<null>'), \
+                     ifNull(toString(shares), '<null>') FROM {view}(\
+                     chain = {SVM_CHAIN}, registry = '{SVM_REGISTRY}', \
+                     outcome_token_id = {token_id})"
+                ))
+                .await,
+            vec![(
+                "240000".to_owned(),
+                "<null>".to_owned(),
+                "<null>".to_owned()
+            )],
+            "{view} borrowed the decimals of a truncated tokens row"
+        );
+
+        // The control: a genuine EVM collateral on the same chain still
+        // resolves, so the join is scoped, not simply broken.
+        assert_eq!(
+            database
+                .rows::<(String, String)>(&format!(
+                    "SELECT ifNull(toString(volume_raw), '<null>'), \
+                     ifNull(toString(volume), '<null>') FROM {view}(\
+                     chain = {SVM_CHAIN}, registry = '{SVM_REGISTRY}', \
+                     outcome_token_id = {evm_token_id})"
+                ))
+                .await,
+            vec![("240000".to_owned(), "0.24".to_owned())],
+            "{view} lost a real EVM collateral"
+        );
+    }
+
+    database.drop().await;
+}
+
 /// A contract nobody trusts, emitting the same events the real one does.
 const FORGER: &str = "0xF0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0";
 /// A worthless ERC-20 the forger splits one unit of.
