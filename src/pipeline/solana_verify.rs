@@ -562,8 +562,11 @@ async fn complete_days(
         return Ok(None);
     }
 
-    let first =
-        if first_day_complete { low - low % DAY } else { low - low % DAY + DAY };
+    let first = if first_day_complete {
+        low - low % DAY
+    } else {
+        low - low % DAY + DAY
+    };
     let last = high - high % DAY;
 
     Ok((first < last).then_some((first, last)))

@@ -648,7 +648,7 @@ In compose, it is one more service in the `x-indexer` block:
 
 `indexer verify --chain solana` runs the Solana checks (cursor tiling, height chain, parent chain, orphan rows, candles against `sol_dex_swaps`) and reports skipped slots as skipped rather than missing.
 
-Give it the slot you actually started from — `indexer verify --chain solana --start-block 448378313`. It defaults to 0, and after a `--new-blocks-only` run that is honest but unhelpful: everything below the start really was never asked for, so the report is one enormous hole.
+It starts at the chain's [coverage floor](#what-this-indexer-covers-the-coverage-floor), the same on every chain: below the floor nothing was ever asked for, so counting it as missing would print one enormous hole about a healthy database. `--start-block` still means exactly what it says, including below the floor, and the report then names the floor so the hole reads as a choice.
 
 ### Cost and rate limit
 

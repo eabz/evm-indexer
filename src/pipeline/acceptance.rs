@@ -2930,12 +2930,8 @@ async fn new_blocks_only_indexes_the_block_its_floor_promises() {
          'nothing stored yet' for ever: {coverage:?}"
     );
 
-    let line = store::sentence(
-        &coverage,
-        store::unit_of(CHAIN),
-        None,
-        Some(59),
-    );
+    let line =
+        store::sentence(&coverage, store::unit_of(CHAIN), None, Some(59));
     assert!(line.contains("gap-free from"), "{line}");
     assert!(!line.contains("nothing stored yet"), "{line}");
 

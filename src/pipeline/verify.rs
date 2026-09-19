@@ -453,14 +453,10 @@ pub async fn block_at_date(
         date.midnight()
     );
 
-    let (found, lowest) = db
-        .db
-        .query(&sql)
-        .fetch_one::<(u64, u64)>()
-        .await
-        .with_context(|| {
-            format!("find the first stored block of {date} or later")
-        })?;
+    let (found, lowest) =
+        db.db.query(&sql).fetch_one::<(u64, u64)>().await.with_context(
+            || format!("find the first stored block of {date} or later"),
+        )?;
 
     Ok((found > 0).then_some(lowest))
 }
@@ -813,8 +809,11 @@ async fn complete_days(
 
     // `low` is the first stored block's timestamp. Its day is comparable
     // when nothing is stored below it inside this range.
-    let first =
-        if first_day_complete { low - low % DAY } else { low - low % DAY + DAY };
+    let first = if first_day_complete {
+        low - low % DAY
+    } else {
+        low - low % DAY + DAY
+    };
     let last = high - high % DAY;
 
     Ok((first < last).then_some((first, last)))
@@ -979,7 +978,10 @@ mod tests {
 
         assert!(!below.is_consistent());
         let text = below.to_string();
-        assert!(text.contains("BELOW this chain's coverage floor"), "{text}");
+        assert!(
+            text.contains("BELOW this chain's coverage floor"),
+            "{text}"
+        );
         assert!(text.contains("block 500"), "{text}");
         assert!(text.contains("[0, 500)"), "{text}");
 

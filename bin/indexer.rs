@@ -139,7 +139,8 @@ async fn lower_the_floor_if_earned(
     }
 
     let report =
-        pipeline::verify::verify(db, Some(from_block), floor.block).await?;
+        pipeline::verify::verify(db, Some(from_block), floor.block)
+            .await?;
 
     if !report.gaps.is_empty() {
         let missing: u64 = report.gaps.iter().map(|gap| gap.len()).sum();

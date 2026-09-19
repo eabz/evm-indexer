@@ -519,8 +519,13 @@ pub async fn run_with<S: BlockSource>(
     // pass and answers the same question without that hole, so the
     // checkpoints stay what they are: an index for operators and for
     // `indexer verify`, and the log line below.
-    let resume =
-        verify::resume_point(&db, config.start_block).await.unwrap_or(0);
+    // On a query error: "the checkpoints cover nothing above the floor",
+    // which silences the line below. `unwrap_or(0)` said "nothing above
+    // block zero" and happened to mean the same only because the line is
+    // guarded - a coincidence, now that the floor is rarely zero.
+    let resume = verify::resume_point(&db, config.start_block)
+        .await
+        .unwrap_or(config.start_block);
     if resume > config.start_block {
         info!(
             "Checkpoints cover blocks [{}, {resume}) without a hole.",

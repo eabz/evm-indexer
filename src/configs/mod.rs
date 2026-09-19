@@ -1750,7 +1750,8 @@ mod tests {
     /// so: `verify` then starts at the chain's coverage floor, which only
     /// the database knows (docs/design.md section 16).
     #[test]
-    fn verify_takes_a_start_block_or_a_start_date_and_neither_by_default() {
+    fn verify_takes_a_start_block_or_a_start_date_and_neither_by_default()
+    {
         let error = parse_command(
             &[("DATABASE_URL", DATABASE)],
             &[
