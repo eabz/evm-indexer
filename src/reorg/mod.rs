@@ -251,6 +251,34 @@ pub trait ReorgStore: Send + Sync {
         to: Option<u64>,
     ) -> BoxFuture<'_, anyhow::Result<u64>>;
 
+    /// LIVE rows (`FINAL`) of the READ-PATH SIDE TABLES of the scope in
+    /// the range, after the base tables were tombstoned: what a lost
+    /// materialized-view push left behind.
+    ///
+    /// A side row is written only by the view of its base row, so once the
+    /// base row is dead nothing ever rewrites the side row: without this
+    /// check an orphan there is permanent (a `tx_lookup` entry pointing at
+    /// a block that was rolled back, a `dex_swaps_by_pool` row of a swap
+    /// that never happened).
+    fn live_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+    ) -> BoxFuture<'_, anyhow::Result<u64>>;
+
+    /// Tombstones those rows DIRECTLY, with the same statement shape the
+    /// base tables use. Only ever a REPAIR: in the normal case the views
+    /// already did it and this writes nothing. Returns the rows
+    /// tombstoned.
+    fn tombstone_side_rows(
+        &self,
+        chain: u64,
+        from: u64,
+        to: Option<u64>,
+        version: u64,
+    ) -> BoxFuture<'_, anyhow::Result<u64>>;
+
     /// LIVE checkpoints overlapping the range.
     fn live_checkpoints(
         &self,

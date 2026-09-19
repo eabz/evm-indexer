@@ -78,7 +78,8 @@ The order of a rollback:
    (never too much).
 5. Recompute the totals of the affected days from what is left.
 6. Cross out the **blocks** of the range. Last, on purpose (next section).
-7. Forget cached token / pool discoveries from the range, update metrics.
+7. Check the **read-path copies** and repair them if needed (next section).
+8. Forget cached token / pool discoveries from the range, update metrics.
 
 Then streaming resumes at the fork point.
 
@@ -106,6 +107,16 @@ same totals. Nothing has to be remembered between runs to get there:
   are already crossed out still count as evidence: they are the only trace
   of a heal that died half way.
 * A checkpoint never claims a block that is not stored, at any moment.
+* **Read-path copies.** Some tables are copies of others, kept for a
+  different lookup (a transaction by hash, the swaps of one pool). The
+  database maintains them itself: crossing out the original normally
+  crosses out the copy for free. *Normally*: if the original lands and the
+  copy is not written (the process dies between the two, the database
+  drops the follow-up write), the original is gone and the copy stays -
+  and nothing in the system ever writes that copy again, so it would be
+  wrong for ever. So step 7 counts what is still alive in every copy of
+  the range and, if anything is, crosses it out directly. It writes
+  nothing in the normal case.
 
 This is tested by stopping the rollback at every single step (not done at
 all, and done half way), restarting or retrying, and comparing the result

@@ -1471,6 +1471,127 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
     }
 }
 
+// ------------------------------------------------------ side tables
+
+/// Tombstones reach the read-path side tables only through their
+/// materialized views. If a base insert lands and the push into one of its
+/// views does not (a failure between the parts, a process killed mid
+/// insert), the base row is dead and the mirror row stays alive FOR EVER:
+/// nothing ever rewrites a side row except the view of its base row.
+///
+/// The state is reproduced here exactly - live side rows for blocks whose
+/// base rows are all tombstoned - and the purge has to repair it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
+    /// Every read-path side table the core and the modules declare.
+    fn side_tables() -> Vec<&'static str> {
+        let mut tables: Vec<&'static str> = db::SIDE_TABLES.to_vec();
+        for spec in ALL_MODULES {
+            tables.extend_from_slice(spec.side_tables);
+        }
+        tables
+    }
+
+    let scenario = Scenario::new("sides").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+
+    // A normal purge of blocks [9, head]: the views tombstone the mirrors.
+    let report = purger
+        .purge_range(CHAIN, 9, None, PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert!(report.blocks_tombstoned > 0);
+    assert_eq!(report.side_rows_tombstoned, 0, "the views did their job");
+
+    let live_side = |table: &'static str| {
+        let db = scenario.db.clone();
+        async move {
+            db.db
+                .query(&format!(
+                    "SELECT toUInt64(count()) FROM `{table}` FINAL WHERE \
+                     chain = {CHAIN} AND block_number >= 9"
+                ))
+                .fetch_one::<u64>()
+                .await
+                .unwrap_or_else(|e| panic!("{table}: {e}"))
+        }
+    };
+
+    for table in side_tables() {
+        assert_eq!(live_side(table).await, 0, "{table}");
+    }
+
+    // Now the failure: the tombstone reached the base tables and NOT the
+    // views. The pre-tombstone versions are still on disk, so putting them
+    // back with a newer `_version` reproduces that state exactly.
+    let version = next_version();
+    let mut injected = 0;
+    for table in side_tables() {
+        scenario
+            .db
+            .db
+            .query(&format!(
+                "INSERT INTO `{table}` SELECT * REPLACE \
+                 (toUInt64({version}) AS _version, toUInt8(0) AS \
+                 is_deleted) FROM `{table}` WHERE chain = {CHAIN} AND \
+                 block_number >= 9 AND is_deleted = 0"
+            ))
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{table}: {e}"));
+        injected += live_side(table).await;
+    }
+
+    assert!(injected > 0, "nothing was resurrected");
+    // No base row explains a single one of them.
+    for table in db::BASE_TABLES.iter().filter(|t| **t != "blocks") {
+        assert_eq!(
+            scenario
+                .count(&format!(
+                    "SELECT toUInt64(count()) FROM `{table}` FINAL WHERE \
+                     chain = {CHAIN} AND block_number >= 9"
+                ))
+                .await,
+            0,
+            "{table}"
+        );
+    }
+
+    // The purge verifies the side tables and repairs them directly.
+    let report = purger
+        .purge_range(CHAIN, 9, None, PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert_eq!(report.side_rows_tombstoned, injected);
+
+    for table in side_tables() {
+        assert_eq!(live_side(table).await, 0, "{table} still has orphans");
+    }
+
+    // And the chain is still indexable to something a reader can not tell
+    // from a clean index.
+    scenario.index_until(&chain, 12, &[]).await;
+    let clean = clean_index("sides_clean", &chain).await;
+    assert_same(
+        "after the side table repair",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+    scenario.assert_consistent().await;
+}
+
 // ------------------------------------------------------------ deep purge
 
 /// A purge deep in history repairs more than 100 monthly partitions of

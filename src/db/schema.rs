@@ -103,13 +103,43 @@ pub fn tombstone_sql(
     to_block: Option<u64>,
     version: u64,
 ) -> Result<String> {
+    let block_column = block_number_column(table);
+
+    if !has_column(table, block_column) {
+        bail!("table '{table}' has no '{block_column}' column");
+    }
+
+    let upper = to_block
+        .map(|to| format!(" AND `{block_column}` < {to}"))
+        .unwrap_or_default();
+
+    tombstone_sql_where(
+        table,
+        &format!(
+            "chain = {chain} AND `{block_column}` >= {from_block}{upper}"
+        ),
+        version,
+    )
+}
+
+/// [`tombstone_sql`] over an arbitrary `predicate` (already rendered,
+/// without the `WHERE`). The rows a purge has to remove from a side table
+/// are addressed by the side table's OWN block column plus the extra filter
+/// of the base table it is fed from, which is not what the default
+/// predicate builds - see `pipeline::store`.
+///
+/// Works for any table of the migrations with `chain`, `_version` and
+/// `is_deleted`; the predicate is the caller's responsibility.
+pub fn tombstone_sql_where(
+    table: &str,
+    predicate: &str,
+    version: u64,
+) -> Result<String> {
     let columns = table_columns().get(table).with_context(|| {
         format!("no table '{table}' in the migrations")
     })?;
 
-    let block_column = block_number_column(table);
-
-    for required in ["chain", block_column, "_version", "is_deleted"] {
+    for required in ["chain", "_version", "is_deleted"] {
         if !columns.iter().any(|column| column == required) {
             bail!("table '{table}' has no '{required}' column");
         }
@@ -129,16 +159,86 @@ pub fn tombstone_sql(
         })
         .collect();
 
-    let upper = to_block
-        .map(|to| format!(" AND `{block_column}` < {to}"))
-        .unwrap_or_default();
-
     Ok(format!(
         "INSERT INTO `{table}` ({}) SELECT {} FROM `{table}` FINAL \
-         WHERE chain = {chain} AND `{block_column}` >= {from_block}{upper}",
+         WHERE {predicate}",
         quoted.join(", "),
         values.join(", "),
     ))
+}
+
+/// Does `table` of the embedded migrations have `column`?
+pub fn has_column(table: &str, column: &str) -> bool {
+    table_columns()
+        .get(table)
+        .is_some_and(|columns| columns.iter().any(|name| name == column))
+}
+
+/// `(target, source)` of every INCREMENTAL materialized view in `sql`
+/// (`CREATE MATERIALIZED VIEW .. TO <target> AS SELECT .. FROM <source>`).
+/// Refreshable views recompute their target instead of being fed by an
+/// insert, so they are left out.
+///
+/// This is how the purge learns which side tables a base table feeds: the
+/// migrations are the single source of truth, exactly like the column
+/// lists above.
+pub fn view_sources(sql: &str) -> Vec<(String, String)> {
+    let unquote = |name: &str| name.trim_matches('`').to_string();
+
+    split_sql_statements(sql)
+        .into_iter()
+        .map(|statement| {
+            statement.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
+        .filter(|statement| {
+            statement.starts_with("CREATE MATERIALIZED VIEW")
+                && !statement.contains(" REFRESH ")
+        })
+        .filter_map(|statement| {
+            let (_, rest) = statement.split_once(" TO ")?;
+            let target = unquote(rest.split(' ').next()?);
+
+            // The first `FROM` that names a TABLE. Several views select
+            // from a subquery (`FROM ( SELECT *, arrayJoin(..) FROM t )`),
+            // so `FROM (` is skipped and the search continues inside.
+            let source = statement
+                .match_indices(" FROM ")
+                .filter_map(|(at, marker)| {
+                    let word = statement[at + marker.len()..]
+                        .split_whitespace()
+                        .next()?;
+                    (word != "(").then(|| unquote(word))
+                })
+                .next()?;
+
+            (!target.is_empty() && !source.is_empty())
+                .then_some((target, source))
+        })
+        .collect()
+}
+
+/// [`view_sources`] over every embedded migration, as `source -> targets`
+/// (a base table can feed several side tables; a side table has exactly
+/// one source).
+pub fn view_targets() -> &'static HashMap<String, Vec<String>> {
+    static TARGETS: OnceLock<HashMap<String, Vec<String>>> =
+        OnceLock::new();
+
+    TARGETS.get_or_init(|| {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+
+        let migrations = super::migrate::embedded().unwrap_or_default();
+        for migration in &migrations {
+            for (target, source) in view_sources(&migration.sql) {
+                let targets = map.entry(source).or_default();
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+
+        map
+    })
 }
 
 /// Number of LIVE rows of `[from_block, to_block)` in `table`. A purge

@@ -517,6 +517,10 @@ pub struct ModuleSpec {
     /// Block scoped tables the indexer writes, in insert order (which is
     /// also the order a purge tombstones them in, before `blocks`).
     pub base_tables: &'static [&'static str],
+    /// Read-path tables fed by materialized views of `base_tables`. Never
+    /// written directly; a purge only tombstones them directly to REPAIR a
+    /// view push that was lost (`pipeline::store`).
+    pub side_tables: &'static [&'static str],
     pub derived: &'static [DerivedTable],
     /// Column holding the block number of a base table.
     pub block_column: fn(&str) -> &'static str,
@@ -587,6 +591,7 @@ fn dex_tombstone_sql(
 pub const DEX: ModuleSpec = ModuleSpec {
     name: "dex",
     base_tables: dex::BASE_TABLES,
+    side_tables: dex::SIDE_TABLES,
     derived: dex::DEX_DERIVED,
     block_column: dex::block_column,
     purge_filter: dex::purge_filter,
@@ -597,6 +602,7 @@ pub const DEX: ModuleSpec = ModuleSpec {
 pub const PREDICTIONS: ModuleSpec = ModuleSpec {
     name: "predictions",
     base_tables: predictions::BASE_TABLES,
+    side_tables: predictions::SIDE_TABLES,
     derived: predictions::PREDICTIONS_DERIVED,
     block_column: predictions::block_column,
     purge_filter: no_filter,
@@ -610,6 +616,7 @@ pub const PREDICTIONS: ModuleSpec = ModuleSpec {
 pub const LAUNCHPADS: ModuleSpec = ModuleSpec {
     name: "launchpads",
     base_tables: launchpads::BASE_TABLES,
+    side_tables: launchpads::SIDE_TABLES,
     derived: launchpads::LAUNCHPADS_DERIVED,
     block_column: launchpads::block_column,
     purge_filter: no_filter,
