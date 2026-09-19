@@ -1042,11 +1042,11 @@ mod tests {
 
     // ------------------------------------------- incomplete slot headers
 
+    type TestBlock = hypersync_client_solana::simple_types::Block;
+
     /// A block header with every field the tripwire compares.
-    fn complete_block(
-        slot: u64,
-    ) -> hypersync_client_solana::simple_types::Block {
-        hypersync_client_solana::simple_types::Block {
+    fn complete_block(slot: u64) -> TestBlock {
+        TestBlock {
             slot: Some(slot),
             blockhash: Some(hypersync_solana_net_types::Hash([1u8; 32])),
             parent_slot: Some(slot - 1),
@@ -1055,13 +1055,10 @@ mod tests {
             )),
             block_height: Some(900_000),
             block_time: Some(1_767_225_600),
-            ..Default::default()
         }
     }
 
-    fn response_of(
-        block: hypersync_client_solana::simple_types::Block,
-    ) -> SolanaResponse {
+    fn response_of(block: TestBlock) -> SolanaResponse {
         SolanaResponse {
             next_slot: 500,
             blocks: vec![block],
@@ -1095,10 +1092,9 @@ mod tests {
     /// - then re-aggregates - every day of the chain since 1970.
     #[test]
     fn a_slot_header_missing_a_field_is_a_retryable_error_not_a_zero() {
-        let cases: Vec<(
-            &str,
-            Box<dyn Fn(&mut hypersync_client_solana::simple_types::Block)>,
-        )> = vec![
+        type DropField = Box<dyn Fn(&mut TestBlock)>;
+
+        let cases: Vec<(&str, DropField)> = vec![
             ("blockhash", Box::new(|b| b.blockhash = None)),
             ("parent_slot", Box::new(|b| b.parent_slot = None)),
             ("parent_blockhash", Box::new(|b| b.parent_blockhash = None)),

@@ -622,7 +622,7 @@ impl WriterControl for SvmWriterGate {
 /// an operator makes over time (`src/svm/registry.rs`), and an unlisted
 /// program simply keeps its built-in venue name. What would be an error is
 /// a read that fails for another reason, so this does not swallow one.
-async fn load_program_names(
+pub(crate) async fn load_program_names(
     db: &Database,
 ) -> Result<svm::registry::ProgramNames> {
     let rows: Vec<svm::registry::SolDexProgram> = db
@@ -645,7 +645,10 @@ async fn load_program_names(
 /// invisible. The purge then tombstones the checkpoints it can see, the
 /// invisible one survives, the tiling shows no hole where the slots were
 /// removed, and those slots are never streamed again.
-async fn wait_until_visible(db: Database, last: LastFlush) -> Result<()> {
+pub(crate) async fn wait_until_visible(
+    db: Database,
+    last: LastFlush,
+) -> Result<()> {
     let Some(mark) = *last.lock().unwrap() else {
         return Ok(());
     };
