@@ -20,7 +20,10 @@
 //!   statements and derived tables of [`ModuleSpec`].
 
 use crate::{
-    db::{self, derived::DerivedTable, Database, FlushKey, RowBatch},
+    db::{
+        self, derived::DerivedTable, select, Database, FlushKey,
+        FlushWindow, RowBatch, Timestamped,
+    },
     dex::{self, DexRows},
     launchpads::{self, LaunchpadRows},
     predictions::{self, PredictionRows, RegistrySet},
@@ -202,26 +205,47 @@ impl ModuleRows {
         ]
     }
 
-    /// Stores the rows of every module, each module's tables in its own
-    /// insert order. Called by `Database::store` next to the core
-    /// children, i.e. BEFORE `blocks`. The rows go out through the structs'
-    /// own column lists, so a module adding a column changes nothing here.
+    /// Stores the rows of every module that fall into `window`, each
+    /// module's tables in its own insert order. Called by
+    /// `Database::store` next to the core children, i.e. BEFORE `blocks`.
+    /// The rows go out through the structs' own column lists, so a module
+    /// adding a column changes nothing here.
+    ///
+    /// `window` is the part of the flush being written
+    /// (`FlushWindow::ALL` unless the flush spans more monthly partitions
+    /// than one insert may touch); every module row carries its block's
+    /// `timestamp`, so it lands in the same part as its block.
     pub async fn store(
         &self,
         db: &Database,
         key: &FlushKey,
+        window: FlushWindow,
     ) -> Result<()> {
         for table in dex::BASE_TABLES.iter().copied() {
             match table {
                 "dex_swaps" => {
-                    db.insert_flush(table, &self.dex.swaps, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&self.dex.swaps, window),
+                        key,
+                    )
+                    .await?
                 }
                 "dex_liquidity" => {
-                    db.insert_flush(table, &self.dex.liquidity, key)
-                        .await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&self.dex.liquidity, window),
+                        key,
+                    )
+                    .await?
                 }
                 "dex_pools" => {
-                    db.insert_flush(table, &self.dex.pools, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&self.dex.pools, window),
+                        key,
+                    )
+                    .await?
                 }
                 // A new table in the module: fail loudly instead of
                 // silently never writing it (unit tested below).
@@ -233,25 +257,60 @@ impl ModuleRows {
         for table in predictions::INSERT_ORDER.iter().copied() {
             match table {
                 "prediction_outcome_tokens" => {
-                    db.insert_flush(table, &p.outcome_tokens, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&p.outcome_tokens, window),
+                        key,
+                    )
+                    .await?
                 }
                 "prediction_markets" => {
-                    db.insert_flush(table, &p.markets, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&p.markets, window),
+                        key,
+                    )
+                    .await?
                 }
                 "prediction_questions" => {
-                    db.insert_flush(table, &p.questions, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&p.questions, window),
+                        key,
+                    )
+                    .await?
                 }
                 "prediction_resolutions" => {
-                    db.insert_flush(table, &p.resolutions, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&p.resolutions, window),
+                        key,
+                    )
+                    .await?
                 }
                 "prediction_position_events" => {
-                    db.insert_flush(table, &p.position_events, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&p.position_events, window),
+                        key,
+                    )
+                    .await?
                 }
                 "prediction_transfers" => {
-                    db.insert_flush(table, &p.transfers, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&p.transfers, window),
+                        key,
+                    )
+                    .await?
                 }
                 "prediction_trades" => {
-                    db.insert_flush(table, &p.trades, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&p.trades, window),
+                        key,
+                    )
+                    .await?
                 }
                 other => {
                     bail!("no insert path for predictions table '{other}'")
@@ -263,16 +322,36 @@ impl ModuleRows {
         for table in launchpads::INSERT_ORDER.iter().copied() {
             match table {
                 "launchpad_tokens" => {
-                    db.insert_flush(table, &l.tokens, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&l.tokens, window),
+                        key,
+                    )
+                    .await?
                 }
                 "launchpad_trades" => {
-                    db.insert_flush(table, &l.trades, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&l.trades, window),
+                        key,
+                    )
+                    .await?
                 }
                 "launchpad_graduations" => {
-                    db.insert_flush(table, &l.graduations, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&l.graduations, window),
+                        key,
+                    )
+                    .await?
                 }
                 "launchpad_creator_fees" => {
-                    db.insert_flush(table, &l.creator_fees, key).await?
+                    db.insert_flush_refs(
+                        table,
+                        &select(&l.creator_fees, window),
+                        key,
+                    )
+                    .await?
                 }
                 other => {
                     bail!("no insert path for launchpads table '{other}'")
@@ -283,6 +362,47 @@ impl ModuleRows {
         // MODULE: the same loop over <module>::INSERT_ORDER
 
         Ok(())
+    }
+}
+
+/// Every module row a flush writes belongs to a monthly partition, and a
+/// flush over more than 90 months has to be split (`db::flush_windows`).
+/// Every one of these carries its block's `timestamp`, so a module row
+/// always lands in the same part as its block. A new table without an
+/// implementation here does not compile - which is the point.
+macro_rules! module_timestamps {
+    ($($row:ty),+ $(,)?) => {$(
+        impl Timestamped for $row {
+            fn timestamp(&self) -> u32 {
+                self.timestamp
+            }
+        }
+    )+};
+}
+
+module_timestamps!(
+    dex::DexSwap,
+    dex::DexLiquidity,
+    dex::DexPool,
+    predictions::PredictionMarket,
+    predictions::PredictionQuestion,
+    predictions::PredictionResolution,
+    predictions::PredictionPositionEvent,
+    predictions::PredictionTransfer,
+    predictions::PredictionTrade,
+    launchpads::LaunchpadToken,
+    launchpads::LaunchpadTrade,
+    launchpads::LaunchpadGraduation,
+    launchpads::LaunchpadCreatorFee,
+);
+
+/// Not block scoped (`PARTITION BY chain`, an outcome id is a
+/// mathematical fact no reorg changes), but it still travels in a flush:
+/// filed by the sighting that revealed it, so it is written exactly once
+/// even when the flush is split.
+impl Timestamped for predictions::PredictionOutcomeToken {
+    fn timestamp(&self) -> u32 {
+        self.first_seen_timestamp
     }
 }
 
@@ -570,12 +690,18 @@ pub fn plain_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
     )
 }
 
-/// DEX: one statement per month, bounded by `to_ts`. Its SQL has no
-/// purge-range exclusion: it relies on the tombstones of `dex_swaps`
-/// (which the purge verifies with `live_children` before it rebuilds).
+/// DEX: one statement per month, bounded by `to_ts`, with the purged block
+/// range left out by the statement itself (like core and predictions): a
+/// rebuild must never depend on the tombstones of `dex_swaps` being
+/// readable already (docs/design.md §2, "No read-your-writes").
 fn dex_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
     dex::derived::rebuild_statements(
-        table, r.chain, r.from_ts, r.to_ts, r.epoch,
+        table,
+        r.chain,
+        r.from_ts,
+        r.to_ts,
+        r.epoch,
+        (r.purged_from, r.purged_to),
     )
 }
 
@@ -647,9 +773,12 @@ pub const LAUNCHPADS: ModuleSpec = ModuleSpec {
     // Plain `block_number` tables: the generic statement built from the
     // embedded migration DDL.
     tombstone_sql: db::tombstone_sql,
-    // Every aggregate reads a CHILD table, so its SQL needs no
-    // `{purge_from}`/`{purge_to}`; it carries `{to_ts}`, so it is sliced
-    // by month.
+    // `plain_rebuild` slices by month and renders `{purge_from}` /
+    // `{purge_to}` when the module's SQL carries them. It does not yet
+    // (patch pending with the launchpads owner, hardening round 2 item
+    // 6): until then the launchpad rebuilds depend on the tombstones of
+    // their child tables being readable, which is what every other
+    // module stopped depending on.
     rebuild_statements: plain_rebuild,
 };
 
@@ -843,6 +972,40 @@ mod tests {
             "a launchpads table was added: add its arm to \
              ModuleRows::store and ModuleRows::counts"
         );
+    }
+
+    /// A repair covers EXACTLY the bucket window its `reorgs` row hides,
+    /// `[from_ts, to_ts)`. An aggregate whose `rebuild_sql` has no
+    /// `{to_ts}` can not be bounded: it would file new-epoch contributions
+    /// into buckets past `to_ts`, whose floor was not raised, and they
+    /// would be counted ON TOP of the old ones. (It also could not be
+    /// sliced by month, which ClickHouse needs past 100 partitions.)
+    #[test]
+    fn every_aggregate_of_every_module_can_be_bounded() {
+        let mut checked = 0;
+
+        for table in db::derived::CORE_DERIVED {
+            assert!(
+                table.rebuild_sql.contains("{to_ts}"),
+                "{}",
+                table.name
+            );
+            checked += 1;
+        }
+
+        for spec in ALL_MODULES {
+            for table in spec.derived {
+                assert!(
+                    table.rebuild_sql.contains("{to_ts}"),
+                    "{}: {}",
+                    spec.name,
+                    table.name
+                );
+                checked += 1;
+            }
+        }
+
+        assert!(checked >= 10, "{checked} aggregates found");
     }
 
     #[test]

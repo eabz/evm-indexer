@@ -151,6 +151,9 @@ struct ReorgRow {
     chain: u64,
     epoch: u32,
     from_ts: u32,
+    /// Exclusive end of the repaired bucket range: `epoch_floor_v` only
+    /// raises the floor inside `[from_ts, to_ts)`.
+    to_ts: u32,
     fork_block: u64,
     to_block: u64,
     old_head: u64,
@@ -529,22 +532,25 @@ impl ReorgStore for ClickhouseReorgStore {
         })
     }
 
-    fn min_timestamp(
+    fn timestamp_span(
         &self,
         chain: u64,
         from: u64,
         to: Option<u64>,
-    ) -> BoxFuture<'_, Result<Option<u32>>> {
+    ) -> BoxFuture<'_, Result<Option<(u32, u32)>>> {
         Box::pin(async move {
-            let mut lowest: Option<u32> = None;
+            let mut span: Option<(u32, u32)> = None;
+
+            const COUNTED: &str =
+                "SELECT toUInt64(count()), toUInt32(min(timestamp)), \
+                 toUInt32(max(timestamp))";
 
             let mut queries: Vec<String> = self
                 .children()
                 .iter()
                 .map(|child| {
                     format!(
-                        "SELECT toUInt64(count()), toUInt32(min(timestamp)) \
-                         FROM `{}` WHERE {}",
+                        "{COUNTED} FROM `{}` WHERE {}",
                         child.table,
                         child.predicate(chain, from, to)
                     )
@@ -557,13 +563,13 @@ impl ReorgStore for ClickhouseReorgStore {
                 queries.push(
                     min_timestamp_sql("blocks", chain, from, to).replace(
                         "SELECT toUInt32(min(timestamp))",
-                        "SELECT toUInt64(count()), toUInt32(min(timestamp))",
+                        COUNTED,
                     ),
                 );
             }
 
             for sql in queries {
-                let (rows, min): (u64, u32) = self
+                let (rows, min, max): (u64, u32, u32) = self
                     .db
                     .db
                     .query(&sql)
@@ -572,11 +578,14 @@ impl ReorgStore for ClickhouseReorgStore {
                     .with_context(|| format!("query failed: {sql}"))?;
 
                 if rows > 0 {
-                    lowest = Some(lowest.map_or(min, |low| low.min(min)));
+                    span = Some(match span {
+                        Some((low, high)) => (low.min(min), high.max(max)),
+                        None => (min, max),
+                    });
                 }
             }
 
-            Ok(lowest)
+            Ok(span)
         })
     }
 
@@ -700,6 +709,7 @@ impl ReorgStore for ClickhouseReorgStore {
                 chain: record.chain,
                 epoch: record.epoch,
                 from_ts: record.from_ts,
+                to_ts: record.to_ts,
                 fork_block: record.fork_block,
                 to_block: record.to_block.unwrap_or(u64::MAX),
                 old_head: record.old_head,
@@ -720,24 +730,16 @@ impl ReorgStore for ClickhouseReorgStore {
         &self,
         chain: u64,
         from_ts: u32,
+        to_ts: u32,
         epoch: u32,
         purged_from: u64,
         purged_to: Option<u64>,
     ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            // Exclusive end of the rebuild: the newest row there is.
-            // No FINAL: an upper bound is all that is needed.
-            let newest: u32 = self
-                .db
-                .db
-                .query(&format!(
-                    "SELECT toUInt32(max(timestamp)) FROM blocks \
-                     WHERE chain = {chain}"
-                ))
-                .fetch_one()
-                .await
-                .context("query the newest block timestamp")?;
-            let to_ts = newest.max(from_ts).saturating_add(1);
+            // `[from_ts, to_ts)` is what the `reorgs` row of this purge
+            // hides and therefore exactly what has to be rebuilt - not
+            // "from from_ts to the head". Both come from the purge, which
+            // read them over ALL row versions of the purged range.
 
             // EVERY aggregate of the chain: the epoch and the validity rule
             // are per chain, so the new `reorgs` row hides every older

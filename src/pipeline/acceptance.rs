@@ -846,6 +846,49 @@ fn assert_same(
     }
 }
 
+/// How long a snapshot comparison keeps re-reading before it fails.
+const SETTLE: Duration = Duration::from_secs(10);
+
+/// [`assert_same`] for two scenarios that were just indexed, re-reading
+/// BOTH until they agree.
+///
+/// ClickHouse gives no read-your-writes (docs/design.md, section 2): a
+/// query issued right after an insert was acknowledged can miss the new
+/// part for a few milliseconds - on a saturated machine for a lot longer.
+/// Both snapshots here are taken right after a final flush, so either of
+/// them can be short of its last blocks, and the comparison then fails
+/// for a reason that has nothing to do with what the test is about. (Seen
+/// on 25.12: 533 vs 528 `erc20_transfers` rows, the missing five all in
+/// the last block - of the CLEAN side.) Production re-reads in the same
+/// situation (`wait_until_visible`), and so does this.
+async fn assert_same_eventually(
+    what: &str,
+    actual: &Scenario,
+    clean: &Scenario,
+) {
+    let started = std::time::Instant::now();
+
+    loop {
+        let (actual, clean) =
+            (actual.snapshot().await, clean.snapshot().await);
+
+        let agree = clean
+            .iter()
+            .all(|(name, expected)| actual.get(name) == Some(expected));
+
+        if agree {
+            return;
+        }
+
+        if started.elapsed() > SETTLE {
+            assert_same(what, &actual, &clean);
+            unreachable!("assert_same must have failed");
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// A clean index of `chain` as it is now, in its own database.
 async fn clean_index(name: &str, chain: &TestChain) -> Scenario {
     let clean = Scenario::new(name).await;
@@ -1047,7 +1090,11 @@ async fn a_flush_killed_before_blocks_is_healed_on_restart() {
     db.insert_flush("erc20_transfers", &batch.erc20_transfers, &key)
         .await
         .unwrap();
-    batch.modules.store(db, &key).await.unwrap();
+    batch
+        .modules
+        .store(db, &key, crate::db::FlushWindow::ALL)
+        .await
+        .unwrap();
 
     // The orphans are there, and they already inflated the aggregates.
     let report = verify::verify(db, 0, 0).await.unwrap();
@@ -1059,11 +1106,7 @@ async fn a_flush_killed_before_blocks_is_healed_on_restart() {
     scenario.index_until(&chain, 12, &[]).await;
 
     let clean = clean_index("c_crash_clean", &chain).await;
-    assert_same(
-        "after the gap heal",
-        &scenario.snapshot().await,
-        &clean.snapshot().await,
-    );
+    assert_same_eventually("after the gap heal", &scenario, &clean).await;
 
     let reasons: Vec<String> = db
         .db
@@ -1157,8 +1200,8 @@ async fn a_reorg_of_depth_3_ends_up_equal_to_a_clean_index() {
     scenario.index_until(&chain, 14, &[]).await;
 
     let clean = clean_index("e_reorg_clean", &chain).await;
+    assert_same_eventually("after the rollback", &scenario, &clean).await;
     let actual = scenario.snapshot().await;
-    assert_same("after the rollback", &actual, &clean.snapshot().await);
 
     // Fewer swaps than before: orphan keys died, aggregates went DOWN.
     assert_eq!(actual["dex_swaps"].len(), 16);
@@ -1302,7 +1345,10 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     forged.set_version(next_version());
     let key =
         FlushKey { chain: CHAIN, span: (6, 6), version: next_version() };
-    forged.store(&fixed.db, &key).await.unwrap();
+    forged
+        .store(&fixed.db, &key, crate::db::FlushWindow::ALL)
+        .await
+        .unwrap();
     assert_eq!(fixed.rows("dex_swaps").await, 17);
 
     let report =
@@ -1333,11 +1379,12 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     chain.extend(2, 0, busy_block);
     fixed.index_until(&chain, 14, &[]).await;
     let clean = clean_index("f_backfill_clean_longer", &chain).await;
-    assert_same(
+    assert_same_eventually(
         "after indexing on top of a backfill",
-        &fixed.snapshot().await,
-        &clean.snapshot().await,
-    );
+        &fixed,
+        &clean,
+    )
+    .await;
 }
 
 // ------------------------------------------------------------ (g)
@@ -1804,11 +1851,12 @@ async fn debris_of_a_finished_purge_is_not_healed_again() {
     chain.extend(4, 0, busy_block);
     scenario.index_until(&chain, 16, &[]).await;
     let clean = clean_index("shorter_clean", &chain).await;
-    assert_same(
+    assert_same_eventually(
         "after the chain outgrew the old head",
-        &scenario.snapshot().await,
-        &clean.snapshot().await,
-    );
+        &scenario,
+        &clean,
+    )
+    .await;
     scenario.assert_consistent().await;
 }
 
@@ -1928,11 +1976,12 @@ async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
     // from a clean index.
     scenario.index_until(&chain, 12, &[]).await;
     let clean = clean_index("sides_clean", &chain).await;
-    assert_same(
+    assert_same_eventually(
         "after the side table repair",
-        &scenario.snapshot().await,
-        &clean.snapshot().await,
-    );
+        &scenario,
+        &clean,
+    )
+    .await;
     scenario.assert_consistent().await;
 }
 
@@ -1947,17 +1996,18 @@ async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
 async fn a_purge_eleven_years_deep_can_finish() {
     const MONTH: u32 = 30 * 86_400;
 
-    // Small flushes: ONE insert may not span more than 100 monthly
-    // partitions either (not a concern on a real chain, where a flush of
-    // 100k rows covers hours or days, never eight years).
+    // Small flushes, so this test says something about the REPAIR only;
+    // a flush spanning more months than one insert may touch is its own
+    // test (`a_flush_over_a_hundred_monthly_partitions_is_split`).
     const SMALL_FLUSHES: [&str; 2] = ["--flush-rows", "300"];
 
     let scenario = Scenario::new("deep").await;
     let chain = TestChain::with_block_time(135, MONTH);
     scenario.index_until(&chain, 135, &SMALL_FLUSHES).await;
 
-    // Block 3 (11 years before the head) has to go: every aggregate is
-    // rebuilt from its day on, 132 months.
+    // Block 3 (11 years before the head) has to go. Its rows only ever
+    // contributed to ITS day, so that is the whole window the purge hides
+    // and rebuilds - not the 132 months from that day to the head.
     let purger = Purger::new(
         Arc::new(ClickhouseReorgStore::new(
             scenario.db.clone(),
@@ -1976,17 +2026,335 @@ async fn a_purge_eleven_years_deep_can_finish() {
     assert_eq!(report.blocks_tombstoned, 1);
     assert_eq!(report.epoch, 1);
 
+    // The repair is BOUNDED: one day wide, and that is exactly what the
+    // `reorgs` row hides.
+    let (from_ts, to_ts) =
+        (report.from_ts.unwrap(), report.to_ts.unwrap());
+    assert_eq!(to_ts - from_ts, 86_400, "{from_ts}..{to_ts}");
+    let recorded: Vec<(u32, u32)> = scenario
+        .db
+        .db
+        .query(&format!(
+            "SELECT toUInt32(from_ts), toUInt32(to_ts) FROM reorgs \
+             WHERE chain = {CHAIN} AND completed = 1"
+        ))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(recorded, vec![(from_ts, to_ts)]);
+
+    // And the work is bounded with it: NOTHING outside that day was
+    // re-filed under the new epoch. Unbounded, all 132 months would carry
+    // epoch 1 rows - and every bucket in them would have been hidden
+    // until the rebuild had refilled it. (Inside the window there is
+    // nothing left to re-file either: block 3 was the only block of its
+    // day and the rebuild leaves the purged range out.)
+    let repaired = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM daily_block_stats \
+             WHERE chain = {CHAIN} AND epoch = 1 AND \
+             (day < {from_ts} OR day >= {to_ts})"
+        ))
+        .await;
+    assert_eq!(repaired, 0, "{repaired} buckets outside the window");
+
+    // The 11 years of buckets AFTER the purged day keep their epoch 0
+    // contributions: nothing rebuilt them, so hiding them would zero
+    // them for ever.
+    let later = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM daily_block_stats_v \
+             WHERE chain = {CHAIN} AND day >= {to_ts}"
+        ))
+        .await;
+    assert!(later > 100, "{later} later daily buckets survived the purge");
+
     // The hole is streamed again and everything equals a clean index.
     scenario.index_until(&chain, 135, &SMALL_FLUSHES).await;
 
     let clean = Scenario::new("deep_clean").await;
     clean.index_until(&chain, 135, &SMALL_FLUSHES).await;
-    assert_same(
-        "after a deep purge",
-        &scenario.snapshot().await,
-        &clean.snapshot().await,
-    );
+    assert_same_eventually("after a deep purge", &scenario, &clean).await;
     scenario.assert_consistent().await;
+}
+
+/// Every base table and every aggregate is `PARTITION BY toYYYYMM(...)`,
+/// and ClickHouse refuses ONE insert block that touches more than
+/// `max_partitions_per_insert_block` (100) partitions with code 252 - in
+/// the table and in everything its materialized views feed. A flush
+/// normally covers hours, but a pass healing gaps spread over the whole
+/// history, or a chain with a very long block time, puts hundreds of
+/// months into one. It has to be split by month, oldest part first, with
+/// `blocks` still last inside each part and its own checkpoints after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_flush_over_a_hundred_monthly_partitions_is_split() {
+    const MONTH: u32 = 30 * 86_400;
+    const BLOCKS: u64 = 135;
+
+    // One block per month and no row limit: all 135 blocks - 135 monthly
+    // partitions in `blocks`, `transactions`, `logs`, the transfer tables
+    // and every daily aggregate behind them - are buffered into a single
+    // flush.
+    let scenario = Scenario::new("months").await;
+    let chain = TestChain::with_block_time(BLOCKS, MONTH);
+    scenario
+        .index_until(&chain, BLOCKS, &["--flush-rows", "1000000"])
+        .await;
+
+    // Nothing was lost or duplicated by the split: the same chain indexed
+    // in small flushes (no split anywhere) reads exactly the same.
+    let clean = Scenario::new("months_clean").await;
+    clean.index_until(&chain, BLOCKS, &["--flush-rows", "300"]).await;
+
+    assert_same_eventually("a flush split by month", &scenario, &clean)
+        .await;
+    scenario.assert_consistent().await;
+
+    // The checkpoints of the parts still cover the whole flush without a
+    // hole, so the resume point is the head.
+    let resume = scenario
+        .count(&format!(
+            "SELECT toUInt64(max(to_block)) FROM checkpoints FINAL \
+             WHERE chain = {CHAIN}"
+        ))
+        .await;
+    assert_eq!(resume, BLOCKS);
+
+    let stored = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM blocks FINAL WHERE chain = \
+             {CHAIN}"
+        ))
+        .await;
+    assert_eq!(stored, BLOCKS);
+}
+
+/// The untested path: ANOTHER process (`indexer backfill --module dex`)
+/// moves the chain's epoch while this one is in the middle of a flush.
+///
+/// The flush was stamped with the epoch this process read before it
+/// started sending rows. By the time they land, the backfill's `reorgs`
+/// row has raised the epoch floor of their day, so their contributions to
+/// every aggregate are HIDDEN - the rows are there, the numbers are not.
+/// `ClickhouseSink::store` re-reads the epoch after every flush for
+/// exactly this, and hands the span to the sync loop, which purges it and
+/// streams it again under the new epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_flush_racing_another_processs_purge_is_indexed_again() {
+    let scenario = Scenario::new("epoch_race").await;
+    let chain = TestChain::new(12);
+
+    // Blocks 0..8 are indexed normally; 8..12 are the flush that races.
+    scenario.index_until(&chain, 8, &[]).await;
+    assert_eq!(scenario.db.current_epoch().await.unwrap(), 0);
+
+    let workers = Workers::spawn(
+        &scenario.db,
+        None,
+        None,
+        EnabledModules::default(),
+        Metrics::disabled(),
+        fast_workers(),
+    )
+    .unwrap();
+
+    let stale: Arc<Mutex<Vec<BlockRange>>> = Arc::default();
+    let sink = ClickhouseSink {
+        db: scenario.db.clone(),
+        discovery: workers.discovery(),
+        fence: Fence::open(),
+        last_flush: LastFlush::default(),
+        stale: stale.clone(),
+    };
+
+    let racing = BlockRange::new(8, 12);
+    let mut batch = transform::transform_with(
+        CHAIN,
+        &chain.response(racing),
+        racing,
+        EnabledModules::default(),
+        &mut DecodeState::default(),
+    )
+    .unwrap()
+    .rows;
+
+    batch.set_version(next_version());
+    // What the writer does: read the epoch, then send the rows.
+    batch.set_epoch(sink.epoch().await.unwrap());
+    assert_eq!(batch.epoch(), 0);
+
+    // ... and while they are on their way, the REAL `indexer backfill
+    // --module dex` runs in another process, finds a forged swap in a
+    // block below, purges its range and bumps the chain to epoch 1.
+    let mut forged = transform::transform_with(
+        CHAIN,
+        &chain.response(BlockRange::new(3, 4)),
+        BlockRange::new(3, 4),
+        EnabledModules::default(),
+        &mut DecodeState::default(),
+    )
+    .unwrap()
+    .rows
+    .modules;
+    forged.dex.liquidity.clear();
+    forged.dex.pools.clear();
+    for swap in &mut forged.dex.swaps {
+        swap.ordinal += 1_000;
+    }
+    forged.set_version(next_version());
+    forged
+        .store(
+            &scenario.db,
+            &FlushKey {
+                chain: CHAIN,
+                span: (3, 3),
+                version: next_version(),
+            },
+            crate::db::FlushWindow::ALL,
+        )
+        .await
+        .unwrap();
+
+    let report =
+        backfill::backfill(&scenario.db, "dex", 0, 8, 5).await.unwrap();
+    assert_eq!(report.epoch, 1);
+
+    sink.store(&batch).await.unwrap();
+    workers.shutdown().await;
+
+    // The sink noticed and handed the whole span to the sync loop.
+    assert_eq!(*stale.lock().unwrap(), vec![racing]);
+
+    // It is not being careful for nothing: the rows are stored, but their
+    // contributions are behind the new floor, so the day under-counts.
+    let clean = clean_index("epoch_race_clean", &chain).await;
+    let hidden = scenario.snapshot().await;
+    let expected = clean.snapshot().await;
+    assert_ne!(
+        hidden["daily_block_stats_v"], expected["daily_block_stats_v"],
+        "the racing flush would have been invisible"
+    );
+
+    // What the sync loop does with the span on its next pass
+    // (`purge_stale_flushes`, then the ordinary gap streaming).
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    purger
+        .purge_range(
+            CHAIN,
+            racing.from,
+            Some(racing.to),
+            PurgeReason::GapHeal,
+        )
+        .await
+        .unwrap();
+
+    scenario.index_until(&chain, 12, &[]).await;
+
+    assert_same_eventually(
+        "after a flush raced a backfill",
+        &scenario,
+        &clean,
+    )
+    .await;
+    scenario.assert_consistent().await;
+}
+
+/// `checkpoints` gains one row per flush and nothing ever removes them, so
+/// a chain that has been following the head for a year holds millions of
+/// rows that all say the same thing. Compaction collapses the contiguous
+/// runs into one covering row each - insert only, like everything else -
+/// and the answer (the resume point, and which blocks are claimed) must
+/// come out identical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn checkpoints_are_compacted_without_changing_what_they_claim() {
+    // The fake chain serves four blocks per response and `--flush-rows 1`
+    // flushes each of them, so this run writes 300 checkpoint rows.
+    const BLOCKS: u64 = 1_200;
+
+    let scenario = Scenario::new("compact").await;
+    let chain = TestChain::new(BLOCKS);
+    scenario.index_until(&chain, BLOCKS, &["--flush-rows", "1"]).await;
+
+    let live = || async {
+        scenario
+            .count(&format!(
+                "SELECT toUInt64(count()) FROM checkpoints FINAL \
+                 WHERE chain = {CHAIN}"
+            ))
+            .await
+    };
+    let on_disk = || async {
+        scenario
+            .count(&format!(
+                "SELECT toUInt64(count()) FROM checkpoints \
+                 WHERE chain = {CHAIN}"
+            ))
+            .await
+    };
+
+    // The sync loop compacted them as it went: every one of those 300
+    // rows was written (nothing is ever deleted), one is alive, and it
+    // claims exactly what all of them together claimed.
+    let written = on_disk().await;
+    assert!(written > 300, "{written} checkpoint rows written");
+    assert_eq!(live().await, 1);
+    assert_eq!(
+        verify::resume_point(&scenario.db, 0).await.unwrap(),
+        BLOCKS
+    );
+
+    // Another pass finds nothing left to do (a compaction that died after
+    // its insert must not make the next one rewrite everything).
+    assert_eq!(scenario.db.compact_checkpoints().await.unwrap(), 0);
+    assert_eq!(on_disk().await, written);
+
+    // A purge splits the covering row again, and the hole survives the
+    // next compaction: the resume point stops at the fork.
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(crate::pipeline::backfill::EpochOnly::new(
+            scenario.db.clone(),
+        )),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    purger
+        .purge_range(CHAIN, 100, Some(110), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+
+    assert_eq!(verify::resume_point(&scenario.db, 0).await.unwrap(), 100);
+
+    // Below the threshold now (two rows), so compaction leaves it alone;
+    // the claim is unchanged either way.
+    scenario.db.compact_checkpoints().await.unwrap();
+    assert_eq!(verify::resume_point(&scenario.db, 0).await.unwrap(), 100);
+
+    let claimed: Vec<(u64, u64)> = scenario
+        .db
+        .db
+        .query(&format!(
+            "SELECT from_block, to_block FROM checkpoints FINAL \
+             WHERE chain = {CHAIN} ORDER BY from_block"
+        ))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(claimed, vec![(0, 100), (110, BLOCKS)]);
 }
 
 // ------------------------------------------------------------ the views

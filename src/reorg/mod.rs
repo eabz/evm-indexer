@@ -165,6 +165,12 @@ pub struct ReorgRecord {
     /// Start of day (UTC, unix seconds) of the earliest purged row: from
     /// this bucket on, only contributions of `epoch` or newer count.
     pub from_ts: u32,
+    /// Exclusive end of that bucket range: the start of the day AFTER the
+    /// NEWEST purged row. The purge only invalidated the buckets its own
+    /// rows contributed to, so this is what it repairs and all the
+    /// validity rule may hide; later buckets keep counting whatever epoch
+    /// they hold. Always `> from_ts` and a start of day.
+    pub to_ts: u32,
     /// First purged block.
     pub fork_block: u64,
     /// Exclusive end of the purged range, `None` = open ended.
@@ -245,15 +251,23 @@ pub trait ReorgStore: Send + Sync {
         to: Option<u64>,
     ) -> BoxFuture<'_, anyhow::Result<bool>>;
 
-    /// Smallest `timestamp` in the range over EVERY block-scoped table,
-    /// `blocks` included, over ALL row versions (no `FINAL`, tombstoned
-    /// rows included). `None` when the range holds no row at all.
-    fn min_timestamp(
+    /// Smallest and largest `timestamp` in the range over EVERY
+    /// block-scoped table, `blocks` included, over ALL row versions (no
+    /// `FINAL`, tombstoned rows included). `None` when the range holds no
+    /// row at all.
+    ///
+    /// Both ends matter: the smallest decides the first bucket the repair
+    /// covers, the largest the last one. Both are read without `FINAL` so
+    /// a purge that crashed half way computes the SAME window when it is
+    /// run again - a tombstone keeps its row's timestamp, so the window
+    /// can not shrink between attempts and no bucket is left hidden but
+    /// never rebuilt.
+    fn timestamp_span(
         &self,
         chain: u64,
         from: u64,
         to: Option<u64>,
-    ) -> BoxFuture<'_, anyhow::Result<Option<u32>>>;
+    ) -> BoxFuture<'_, anyhow::Result<Option<(u32, u32)>>>;
 
     /// LIVE rows (`FINAL`) of every block-scoped table EXCEPT `blocks` in
     /// the range: what [`tombstone_children`](Self::tombstone_children)
@@ -345,7 +359,11 @@ pub trait ReorgStore: Send + Sync {
     ) -> BoxFuture<'a, anyhow::Result<()>>;
 
     /// Bucket repair: runs the rebuild of EVERY `DerivedTable` (core, DEX,
-    /// predictions) for the chain from `from_ts` on, filed under `epoch`.
+    /// predictions) for the chain over the buckets of `[from_ts, to_ts)`,
+    /// filed under `epoch`. That window is exactly what the `reorgs` row
+    /// hides, so the two must never disagree: a bucket the validity rule
+    /// hides but the repair does not cover reads as empty for ever.
+    ///
     /// Every rebuild must leave out the purged block range by itself: its
     /// `blocks` rows are still alive at this point, and the tombstones of
     /// its children may not be readable yet.
@@ -353,6 +371,7 @@ pub trait ReorgStore: Send + Sync {
         &self,
         chain: u64,
         from_ts: u32,
+        to_ts: u32,
         epoch: u32,
         purged_from: u64,
         purged_to: Option<u64>,
@@ -560,4 +579,11 @@ impl std::error::Error for ReorgError {
 /// Start of day (UTC) of `timestamp`: the alignment of `reorgs.from_ts`.
 pub fn start_of_day(timestamp: u32) -> u32 {
     timestamp - timestamp % REPAIR_ALIGNMENT_SECONDS
+}
+
+/// Start of the day AFTER the one `timestamp` falls into: the alignment of
+/// `reorgs.to_ts`, which is exclusive. Saturates at `u32::MAX` so a
+/// timestamp in the last representable day still yields an end above it.
+pub fn end_of_day(timestamp: u32) -> u32 {
+    start_of_day(timestamp).saturating_add(REPAIR_ALIGNMENT_SECONDS)
 }

@@ -10,15 +10,23 @@
 //! ```text
 //! epoch   = the chain's highest epoch + 1
 //! from_ts = start of day (UTC) of the earliest purged row
-//! 1. INSERT INTO reorgs (chain, epoch, from_ts, ...)
-//! 2. table.rebuild_sql(chain, from_ts, epoch)   -- for every DerivedTable
+//! to_ts   = start of the day AFTER the latest purged row
+//! 1. INSERT INTO reorgs (chain, epoch, from_ts, to_ts, ...)
+//! 2. table.rebuild_statements(chain, from_ts, to_ts, epoch, ...)
+//!                                               -- for every DerivedTable
 //! ```
 //!
 //! The `*_v` views (`0004`, through `epoch_floor_v`) then apply the
-//! validity rule: a contribution with epoch
-//! `e` in bucket `b` counts iff `e >= max(r.epoch)` over the `reorgs` rows
-//! of the chain with `r.from_ts <= b`. Blocks streamed afterwards carry the
-//! new epoch and flow through the views as usual.
+//! validity rule: a contribution with epoch `e` in bucket `b` counts iff
+//! `e >= max(r.epoch)` over the `reorgs` rows of the chain with
+//! `r.from_ts <= b AND b < r.to_ts` (0 when none covers `b`). Blocks
+//! streamed afterwards carry the new epoch and flow through the views as
+//! usual.
+//!
+//! The window is what makes the repair BOUNDED: a purge only invalidates
+//! the buckets its own rows contributed to, so it hides and rebuilds
+//! `[from_ts, to_ts)` and nothing else. A gap heal deep in history used to
+//! re-aggregate the chain from that day to the head, on every pass.
 //!
 //! `from_ts` must be a start of day for EVERY table, whatever its bucket
 //! width: the validity rule hides a whole bucket, so a rebuild has to cover
@@ -64,9 +72,17 @@ impl DerivedTable {
         timestamp - timestamp % self.bucket_seconds.max(1)
     }
 
-    /// `rebuild_sql` for `chain`: re-aggregates every live row from the
-    /// day of `from_ts` on, filed under `epoch`. `from_ts` is aligned down
-    /// with [`repair_start`], the same value `reorgs.from_ts` holds.
+    /// `rebuild_sql` for `chain` over the buckets of `[from_ts, to_ts)`,
+    /// as ONE statement. `from_ts` is aligned down with [`repair_start`],
+    /// the same value `reorgs.from_ts` holds; `to_ts` is exclusive and is
+    /// what `reorgs.to_ts` holds.
+    ///
+    /// **The upper bound is not an optimization.** The `reorgs` row raises
+    /// the epoch floor of exactly `[from_ts, to_ts)`. A rebuild that
+    /// reaches PAST `to_ts` files new-epoch contributions into buckets
+    /// whose floor was not raised, where they are counted ON TOP of the
+    /// old ones - a silent doubling. A rebuild that stops SHORT of `to_ts`
+    /// leaves hidden buckets nobody refilled - a silent zero.
     ///
     /// `purged_from..purged_to` (open ended when `None`) is the block range
     /// of the purge this repair belongs to, which the rebuild must NOT
@@ -84,10 +100,11 @@ impl DerivedTable {
     /// So every `rebuild_sql` excludes the range itself, with the
     /// `{purge_from}` / `{purge_to}` placeholders. (A `rebuild_sql` without
     /// them is rendered unchanged.)
-    pub fn rebuild_sql(
+    pub fn rebuild_slice(
         &self,
         chain: u64,
         from_ts: u32,
+        to_ts: u32,
         epoch: u32,
         purged_from: u64,
         purged_to: Option<u64>,
@@ -95,7 +112,7 @@ impl DerivedTable {
         self.render_slice(
             chain,
             repair_start(from_ts),
-            u32::MAX,
+            to_ts,
             epoch,
             purged_from,
             purged_to,
@@ -109,10 +126,12 @@ impl DerivedTable {
     /// deep in history (a gap heal while backfilling old blocks) fail at
     /// this step on every restart, for ever.
     ///
-    /// `to_ts` is exclusive: the timestamp of the newest stored block + 1
-    /// (NOT `u32::MAX`: one statement is issued per month). A `rebuild_sql`
-    /// without a `{to_ts}` placeholder can not be sliced and is rendered as
-    /// the single statement [`Self::rebuild_sql`] gives.
+    /// `to_ts` is exclusive and is `reorgs.to_ts`: the start of the day
+    /// after the newest row the purge removed (NEVER `u32::MAX` - see
+    /// [`Self::rebuild_slice`] on why both bounds are load bearing).
+    /// A `rebuild_sql` without a `{to_ts}` placeholder can not be bounded
+    /// or sliced at all; `every_aggregate_can_be_bounded_and_sliced`
+    /// asserts no declared aggregate is like that.
     pub fn rebuild_statements(
         &self,
         chain: u64,
@@ -123,9 +142,10 @@ impl DerivedTable {
         purged_to: Option<u64>,
     ) -> Vec<String> {
         if !self.rebuild_sql.contains("{to_ts}") {
-            return vec![self.rebuild_sql(
+            return vec![self.rebuild_slice(
                 chain,
                 from_ts,
+                to_ts,
                 epoch,
                 purged_from,
                 purged_to,
@@ -420,7 +440,14 @@ mod tests {
         assert_eq!(repair_start(86_400 + 7_201), 86_400);
         assert_eq!(repair_start(86_399), 0);
         assert_eq!(
-            table.rebuild_sql(137, 86_400 + 7_201, 4, 10, Some(20)),
+            table.rebuild_slice(
+                137,
+                86_400 + 7_201,
+                u32::MAX,
+                4,
+                10,
+                Some(20)
+            ),
             "INSERT INTO t SELECT 4 FROM b FINAL WHERE chain = 137 AND \
              timestamp >= 86400"
         );
@@ -430,11 +457,11 @@ mod tests {
             ..table
         };
         assert_eq!(
-            blocks.rebuild_sql(1, 0, 1, 10, Some(20)),
+            blocks.rebuild_slice(1, 0, u32::MAX, 1, 10, Some(20)),
             "number >= 10 AND number < 20"
         );
         assert_eq!(
-            blocks.rebuild_sql(1, 0, 1, 10, None),
+            blocks.rebuild_slice(1, 0, u32::MAX, 1, 10, None),
             format!("number >= 10 AND number < {}", u64::MAX)
         );
     }
@@ -468,7 +495,7 @@ mod tests {
             let sql = normalize(table.rebuild_sql);
 
             // No placeholder left behind, none unknown.
-            let rendered = table.rebuild_sql(1, 0, 3, 5, None);
+            let rendered = table.rebuild_slice(1, 0, u32::MAX, 3, 5, None);
             assert!(!rendered.contains('{'), "{rendered}");
             assert_eq!(
                 sql.matches("{chain}").count(),

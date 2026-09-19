@@ -1931,16 +1931,27 @@ async fn purge(
             .await;
     }
 
+    // `to_ts`: the exclusive end of the window this repair covers. It
+    // must match the range the rebuild below writes - the validity rule
+    // hides exactly [from_ts, to_ts).
     database
         .execute(&format!(
-            "INSERT INTO reorgs (chain, epoch, from_ts) VALUES \
-             ({chain}, {new_epoch}, toDateTime({from_ts}))"
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts) VALUES \
+             ({chain}, {new_epoch}, toDateTime({from_ts}), \
+              toDateTime({REBUILD_TO}))"
         ))
         .await;
 
     for table in DEX_DERIVED {
         for statement in rebuild_statements(
-            table, chain, from_ts, REBUILD_TO, new_epoch,
+            table,
+            chain,
+            from_ts,
+            REBUILD_TO,
+            new_epoch,
+            // This helper emulates a purge that tombstoned nothing: the
+            // statement must count every live row of the range.
+            (u64::MAX, None),
         ) {
             database.execute(&statement).await;
         }
@@ -2347,7 +2358,14 @@ async fn a_rebuild_deeper_than_100_months_is_chunked() {
 
     // One INSERT over everything is refused by ClickHouse...
     let table = &DEX_DERIVED[2];
-    let whole = render_rebuild(table, CHAIN, first, REBUILD_TO, 1);
+    let whole = render_rebuild(
+        table,
+        CHAIN,
+        first,
+        REBUILD_TO,
+        1,
+        (u64::MAX, None),
+    );
     let refused = database.client.query(&whole).execute().await;
     assert!(
         format!("{refused:?}").contains("TOO_MANY_PARTS")
