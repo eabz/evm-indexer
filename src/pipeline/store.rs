@@ -152,6 +152,7 @@ struct ReorgRow {
     epoch: u32,
     from_ts: u32,
     fork_block: u64,
+    to_block: u64,
     old_head: u64,
     #[serde_as(as = "SerB256")]
     old_hash: B256,
@@ -160,6 +161,10 @@ struct ReorgRow {
     depth: u64,
     rows_tombstoned: u64,
     reason: String,
+    tombstone_version: u64,
+    /// 0 = the purge armed the validity rule, 1 = it finished. Two rows
+    /// per purge, never collapsed (see migration 0004).
+    completed: u8,
 }
 
 /// A checkpoint row with its tombstone flag (the flush path never writes
@@ -456,27 +461,67 @@ impl ReorgStore for ClickhouseReorgStore {
                 .map(|to| format!(" AND number < {to}"))
                 .unwrap_or_default();
 
+            // The purges of this chain that FINISHED, as (first block,
+            // exclusive last block, the `_version` they stamped on their
+            // tombstones). `reorgs` holds a handful of rows per chain.
+            let done = format!(
+                "(SELECT groupArray((fork_block, to_block, \
+                 tombstone_version)) FROM reorgs WHERE chain = {chain} \
+                 AND completed = 1) AS done"
+            );
+
+            // Highest tombstone version a completed purge of this block
+            // wrote, 0 when there is none. A tombstone at or below it is
+            // that purge's debris; a NEWER one was written by a purge that
+            // died half way, and its rows are still counted by the
+            // aggregates.
+            let settled = |column: &str| {
+                format!(
+                    "arrayMax(arrayConcat([toUInt64(0)], arrayMap(r -> \
+                     r.3, arrayFilter(r -> r.1 <= `{column}` AND r.2 > \
+                     `{column}`, done))))"
+                )
+            };
+
+            let no_live_block = format!(
+                "NOT IN (SELECT number FROM blocks FINAL \
+                 WHERE chain = {chain} AND number >= {from}{upper})"
+            );
+
             for child in self.children() {
-                // No FINAL on the child: tombstoned rows are the only
-                // trace of a heal that died half way. FINAL on `blocks`:
-                // a tombstoned block is not there.
-                let sql = format!(
-                    "SELECT toUInt64(count()) FROM (\
-                     SELECT `{column}` AS n FROM `{table}` WHERE {predicate} \
-                     AND `{column}` NOT IN (\
-                     SELECT number FROM blocks FINAL WHERE chain = {chain} \
-                     AND number >= {from}{upper}) LIMIT 1)",
-                    column = child.block_column(),
-                    table = child.table,
-                    predicate = child.predicate(chain, from, to),
+                let column = child.block_column();
+                let table = child.table;
+                let predicate = child.predicate(chain, from, to);
+
+                // (1) No FINAL: a tombstone is the only trace a gap-heal
+                //     purge that died half way leaves behind. One a
+                //     COMPLETED purge wrote is settled.
+                let unsettled = format!(
+                    "WITH {done} SELECT toUInt64(count()) FROM (\
+                     SELECT `{column}` AS n FROM `{table}` \
+                     WHERE {predicate} AND `{column}` {no_live_block} \
+                     AND is_deleted = 1 AND `_version` > {} LIMIT 1)",
+                    settled(column)
                 );
 
-                if self.count(&sql).await? > 0 {
-                    debug!(
-                        "Orphan rows in '{}' for blocks [{from}, {to:?}).",
-                        child.table
-                    );
-                    return Ok(true);
+                // (2) A LIVE row always counts, wherever it is: it is a
+                //     flush that died before its `blocks` insert, and its
+                //     contributions are in the aggregates.
+                let alive = format!(
+                    "SELECT toUInt64(count()) FROM (\
+                     SELECT `{column}` AS n FROM `{table}` FINAL \
+                     WHERE {predicate} AND `{column}` {no_live_block} \
+                     LIMIT 1)"
+                );
+
+                for sql in [unsettled, alive] {
+                    if self.count(&sql).await? > 0 {
+                        debug!(
+                            "Orphan rows in '{table}' for blocks \
+                             [{from}, {to:?})."
+                        );
+                        return Ok(true);
+                    }
                 }
             }
 
@@ -656,12 +701,15 @@ impl ReorgStore for ClickhouseReorgStore {
                 epoch: record.epoch,
                 from_ts: record.from_ts,
                 fork_block: record.fork_block,
+                to_block: record.to_block.unwrap_or(u64::MAX),
                 old_head: record.old_head,
                 old_hash: record.old_hash,
                 new_hash: record.new_hash,
                 depth: record.depth,
                 rows_tombstoned: record.rows_tombstoned,
                 reason: record.reason.to_string(),
+                tombstone_version: record.version,
+                completed: u8::from(record.completed),
             };
 
             self.db.insert_rows("reorgs", std::slice::from_ref(&row)).await

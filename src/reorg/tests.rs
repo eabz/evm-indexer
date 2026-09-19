@@ -397,6 +397,9 @@ async fn purge_steps_run_in_the_documented_order() {
             // nothing when the materialized views did their job.
             PurgeStep::TombstoneSideTables,
             PurgeStep::Verify,
+            // Everything is durable: the `reorgs` row is written again,
+            // completed. Its absence is what marks a purge that died.
+            PurgeStep::InsertReorg,
         ]
     );
     // The writer was quiesced before the search AND before the purge.
@@ -783,6 +786,72 @@ async fn a_guard_purge_that_reads_nothing_is_not_reported_as_done() {
     ));
     assert!(!error.is_fatal());
     assert!(node.data().reorgs.is_empty());
+}
+
+// ------------------------------------------------- the chain got shorter
+
+/// A rollback whose new fork is SHORTER than what was stored leaves
+/// tombstoned children above the new head, at block numbers the chain does
+/// not have any more. Nothing will ever stream them again, so they stay -
+/// and they look exactly like the debris of a gap heal that died half way.
+///
+/// The first pass after every start therefore purged that tail again:
+/// a new epoch and a rebuild of every aggregate from the day of those rows
+/// to now, on EVERY restart, until the chain outgrew the old head.
+#[tokio::test]
+async fn a_restart_after_a_rollback_that_shortened_the_chain_does_nothing()
+{
+    let mut node = indexed(60, NodeOptions::new(CHAIN)).await;
+
+    // Blocks 50..59 are replaced by five different ones: the chain is
+    // five blocks SHORTER than what is stored.
+    node.chain.reorg(10, 5);
+    let head = node.chain.block(54).unwrap().header;
+    node.guard
+        .repair(&super::Rollback {
+            fork_point: 50,
+            purge_to: None,
+            depth: 10,
+            mismatch_height: 59,
+            old_head: 59,
+            old_hash: B256::ZERO,
+            new_hash: head.hash,
+        })
+        .await
+        .unwrap();
+
+    node.restart();
+    node.settle(false).await.unwrap();
+    assert_clean(&node, "after the rollback");
+
+    // Blocks 55..59 hold tombstoned children and no block at all.
+    let data = node.data();
+    assert_eq!(data.live_blocks().keys().max(), Some(&54));
+    assert!(data.children.iter().any(|table| table
+        .keys()
+        .any(|(number, _)| (55..60).contains(number))));
+
+    let purges = data.reorgs.len();
+    let epoch = node.writer.epoch();
+
+    for restart in 1..=3 {
+        node.restart();
+        node.settle(false).await.unwrap();
+
+        assert_eq!(
+            node.data().reorgs.len(),
+            purges,
+            "restart {restart} purged the tail again"
+        );
+        assert_eq!(node.writer.epoch(), epoch, "restart {restart}");
+        assert_clean(&node, "after a restart");
+    }
+
+    // And when the chain finally outgrows the old head, those blocks are
+    // indexed like any other.
+    node.chain.extend(10);
+    node.settle(false).await.unwrap();
+    assert_clean(&node, "after the chain outgrew the old head");
 }
 
 // --------------------------------------------------- side table orphans

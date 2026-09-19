@@ -20,6 +20,7 @@ use crate::{
     db::{self, migrate, next_version, DatabaseParams, FlushKey},
     dex, launchpads,
     pipeline::{backfill, modules::ALL_MODULES, verify},
+    reorg::ReorgStore,
     tokens::{
         discovery::{
             build_caller_with, CallerOptions, ChainRegistry, Connector,
@@ -235,6 +236,15 @@ fn busy_block(number: u64) -> Vec<TestTx> {
 /// the genesis block.
 const LAUNCHPAD_FIXTURES: &[&launchpads::fixtures::RawTx] =
     launchpads::fixtures::ALL;
+
+/// `bytes` as a 32 byte id: 12 zero bytes, then the value (the chain
+/// neutral identity convention of docs/design.md section 13).
+fn left_padded_32(bytes: &[u8]) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    let start = 32 - bytes.len().min(32);
+    id[start..].copy_from_slice(&bytes[bytes.len() - (32 - start)..]);
+    id
+}
 
 /// `LAUNCHPAD_FIXTURES[number - 1]` as a block of this test chain.
 fn launchpad_block(number: u64) -> Vec<TestTx> {
@@ -1053,7 +1063,7 @@ async fn a_flush_killed_before_blocks_is_healed_on_restart() {
 
     let reasons: Vec<String> = db
         .db
-        .query("SELECT toString(reason) FROM reorgs")
+        .query("SELECT toString(reason) FROM reorgs WHERE completed = 1")
         .fetch_all()
         .await
         .unwrap();
@@ -1153,7 +1163,8 @@ async fn a_reorg_of_depth_3_ends_up_equal_to_a_clean_index() {
         .db
         .db
         .query(
-            "SELECT toString(reason), fork_block, depth, epoch FROM reorgs",
+            "SELECT toString(reason), fork_block, depth, epoch FROM \
+             reorgs WHERE completed = 1",
         )
         .fetch_all()
         .await
@@ -1205,7 +1216,11 @@ async fn a_reorg_deeper_than_max_reorg_depth_is_a_clear_fatal_error() {
     // Nothing was purged, nothing was written.
     assert_same("after the refusal", &scenario.snapshot().await, &before);
     assert_eq!(
-        scenario.count("SELECT toUInt64(count()) FROM reorgs").await,
+        scenario
+            .count(
+                "SELECT toUInt64(count()) FROM reorgs WHERE completed = 1"
+            )
+            .await,
         0
     );
 }
@@ -1230,7 +1245,11 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
         &expected,
     );
     assert_eq!(
-        clean.count("SELECT toUInt64(count()) FROM reorgs").await,
+        clean
+            .count(
+                "SELECT toUInt64(count()) FROM reorgs WHERE completed = 1"
+            )
+            .await,
         0
     );
     assert_eq!(
@@ -1295,7 +1314,7 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     let reasons: Vec<String> = fixed
         .db
         .db
-        .query("SELECT toString(reason) FROM reorgs")
+        .query("SELECT toString(reason) FROM reorgs WHERE completed = 1")
         .fetch_all()
         .await
         .unwrap();
@@ -1427,7 +1446,10 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
         .map(|(emitter, family)| {
             format!(
                 "({CHAIN}, unhex('{}'), '{}', '', 1)",
-                hex::encode(emitter.0),
+                // The column is FixedString(32) and an EVM address is 12
+                // zero bytes + the 20 address bytes: hex-encoding the
+                // address alone would RIGHT pad it.
+                hex::encode(left_padded_32(emitter.as_slice())),
                 family.as_str()
             )
         })
@@ -1469,6 +1491,98 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
             "{table}"
         );
     }
+}
+
+// ------------------------------------------------ the chain got shorter
+
+/// A rollback whose new fork is SHORTER than what was stored leaves
+/// tombstoned rows above the new head, at block numbers the chain does not
+/// have any more. Nothing will ever stream them again, and they look
+/// exactly like the debris of a gap heal that died half way - so the first
+/// pass after EVERY start purged that tail once more (a new epoch and a
+/// rebuild of every aggregate from that day to now), until the chain
+/// outgrew the old head.
+///
+/// A completed purge now records the `_version` it stamped on its
+/// tombstones, which is what tells its debris from an unfinished heal's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn debris_of_a_finished_purge_is_not_healed_again() {
+    let scenario = Scenario::new("shorter").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let store =
+        ClickhouseReorgStore::new(scenario.db.clone(), Scope::Chain);
+    let purger = Purger::new(
+        Arc::new(store.clone()),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+
+    // Blocks [9, head] are rolled back and the chain does not have them
+    // any more: the tail keeps their tombstoned rows for ever.
+    let report = purger
+        .purge_range(CHAIN, 9, None, PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert!(report.children_tombstoned > 0);
+
+    let completed: u64 = scenario
+        .count("SELECT toUInt64(count()) FROM reorgs WHERE completed = 1")
+        .await;
+    assert_eq!(completed, 1);
+
+    // Nothing left to heal: a restart is a no-op.
+    assert!(
+        !store.has_orphan_children(CHAIN, 9, None).await.unwrap(),
+        "the debris of a finished purge must not look like an \
+         unfinished one"
+    );
+
+    // A tombstone NEWER than what any completed purge wrote is the trace
+    // of a purge that died half way, and must still be found.
+    let version = next_version();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            // The filter has to run in a SUBQUERY: in a
+            // `SELECT * REPLACE (x AS c) FROM t WHERE c = ..` the WHERE
+            // sees the REPLACED value of `c`, not the stored one
+            // (measured on ClickHouse 25.12).
+            "INSERT INTO logs SELECT * REPLACE (toUInt64({version}) AS \
+             _version, toUInt8(1) AS is_deleted) FROM (SELECT * FROM logs \
+             WHERE chain = {CHAIN} AND block_number >= 9 AND \
+             is_deleted = 0)"
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    assert!(
+        store.has_orphan_children(CHAIN, 9, None).await.unwrap(),
+        "a tombstone no completed purge wrote must be healed"
+    );
+
+    // And healing it makes the tail quiet again.
+    purger
+        .purge_range(CHAIN, 9, None, PurgeReason::GapHeal)
+        .await
+        .unwrap();
+    assert!(!store.has_orphan_children(CHAIN, 9, None).await.unwrap());
+
+    // The chain grows past the old head again: business as usual.
+    chain.extend(4, 0, busy_block);
+    scenario.index_until(&chain, 16, &[]).await;
+    let clean = clean_index("shorter_clean", &chain).await;
+    assert_same(
+        "after the chain outgrew the old head",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+    scenario.assert_consistent().await;
 }
 
 // ------------------------------------------------------ side tables
@@ -1543,10 +1657,13 @@ async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
             .db
             .db
             .query(&format!(
+                // The filter runs in a SUBQUERY: in a
+                // `SELECT * REPLACE (x AS c) FROM t WHERE c = ..` the
+                // WHERE sees the REPLACED value of `c` (ClickHouse 25.12).
                 "INSERT INTO `{table}` SELECT * REPLACE \
                  (toUInt64({version}) AS _version, toUInt8(0) AS \
-                 is_deleted) FROM `{table}` WHERE chain = {CHAIN} AND \
-                 block_number >= 9 AND is_deleted = 0"
+                 is_deleted) FROM (SELECT * FROM `{table}` WHERE chain = \
+                 {CHAIN} AND block_number >= 9 AND is_deleted = 0)"
             ))
             .execute()
             .await

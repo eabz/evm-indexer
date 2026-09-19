@@ -1081,12 +1081,49 @@ impl ReorgStore for FakeStore {
             Self::enter(&mut state, chain, PurgeStep::FindOrphans)?;
             let view = state.view(chain);
             let blocks = view.live_blocks();
+
+            // Highest `_version` a COMPLETED purge of this block
+            // stamped on its tombstones (0 when there is none). A
+            // tombstone at or below it is that purge's debris - nothing
+            // left to do, and re-purging it would bump the epoch and
+            // rebuild every aggregate on every single restart for as long
+            // as the chain stays shorter. A NEWER tombstone was written by
+            // a purge that died half way, whose rows the aggregates still
+            // count.
+            let settled_version = |number: u64| {
+                view.reorgs
+                    .iter()
+                    .filter(|r| {
+                        r.completed
+                            && r.fork_block <= number
+                            && r.to_block.is_none_or(|to| number < to)
+                    })
+                    .map(|r| r.version)
+                    .max()
+                    .unwrap_or(0)
+            };
+
             Ok(view.children.iter().any(|table| {
                 table.iter().any(|((number, _), versions)| {
-                    in_range(*number, from, to)
-                        && !blocks.contains_key(number)
-                        && (!self.orphans_live_only
-                            || !live(versions).is_empty())
+                    if !in_range(*number, from, to)
+                        || blocks.contains_key(number)
+                    {
+                        return false;
+                    }
+                    // A LIVE row always counts (a flush that died before
+                    // its `blocks` insert), wherever it is.
+                    if !live(versions).is_empty() {
+                        return true;
+                    }
+                    if self.orphans_live_only {
+                        return false;
+                    }
+                    let newest = versions
+                        .iter()
+                        .map(|r| r.version)
+                        .max()
+                        .unwrap_or(0);
+                    newest > settled_version(*number)
                 })
             }))
         }
@@ -1379,7 +1416,22 @@ impl ReorgStore for FakeStore {
             let chain = record.chain;
             // Partial: the row lands but the acknowledgement is lost.
             let partial = Self::enter(&mut state, chain, step)?;
-            state.write(chain).reorgs.push(record.clone());
+            // Two physical rows per purge (armed, then completed). The
+            // model keeps ONE entry per purge and flips the flag, which
+            // is what a reader that groups them sees - and, unlike
+            // replacing by `(chain, epoch)`, it never loses the row of a
+            // DIFFERENT purge that reused an epoch (which happens when
+            // the previous `reorgs` row was not readable yet).
+            let reorgs = &mut state.write(chain).reorgs;
+            let same = |r: &&mut ReorgRecord| {
+                r.epoch == record.epoch
+                    && r.fork_block == record.fork_block
+                    && r.from_ts == record.from_ts
+            };
+            match reorgs.iter_mut().find(same) {
+                Some(existing) => *existing = record.clone(),
+                None => reorgs.push(record.clone()),
+            }
             if partial {
                 return Err(injected(step));
             }

@@ -574,6 +574,21 @@ fn dex_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
     )
 }
 
+/// Predictions: one statement per month, bounded by `to_ts`. Its own
+/// renderer (the module aligns `from_ts` to each table's bucket) and, like
+/// the DEX one, no purge-range exclusion: every aggregate reads a child
+/// table, which the purge tombstones before it rebuilds.
+fn predictions_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
+    predictions::derived::rebuild_statements(
+        table,
+        r.chain,
+        r.from_ts,
+        r.to_ts,
+        r.epoch,
+        (r.purged_from, r.purged_to),
+    )
+}
+
 fn no_filter(_table: &str) -> Option<&'static str> {
     None
 }
@@ -609,8 +624,7 @@ pub const PREDICTIONS: ModuleSpec = ModuleSpec {
     // Plain `block_number` tables: the generic statement built from the
     // embedded migration DDL.
     tombstone_sql: db::tombstone_sql,
-    // Sliced by month as soon as its SQL carries `{to_ts}`.
-    rebuild_statements: plain_rebuild,
+    rebuild_statements: predictions_rebuild,
 };
 
 pub const LAUNCHPADS: ModuleSpec = ModuleSpec {
