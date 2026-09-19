@@ -9,7 +9,7 @@
 //!   value that does not fit the `UInt64` / `UInt256` column it belongs to
 //!   is not valid chain data, but it must not panic or wrap either.
 //! - Positions and counts inside a block (`transaction_index`, `log_index`,
-//!   trace positions, `subtraces`...) are `UInt32` columns fed from `u64`.
+//!   counts...) are `UInt32` columns fed from `u64`.
 //! - `timestamp` is a `DateTime` (`u32` seconds).
 //!
 //! Those narrowings SATURATE, and the first time it happens for each
@@ -48,7 +48,7 @@ impl Width {
         match self {
             Width::U32 => {
                 "UInt32 / DateTime column (transaction_index, log_index, \
-                 trace positions, counts, timestamp)"
+                 counts, timestamp)"
             }
             Width::U64 => {
                 "UInt64 column (gas, gas_limit, gas_used, size, nonce, \

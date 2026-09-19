@@ -496,10 +496,7 @@ mod tests {
     use super::*;
     use crate::dex::{
         decode, events,
-        models::{
-            pool_event_version, pool_id_of, LiquidityKind, PoolSource,
-            Protocol,
-        },
+        models::{pool_id_of, LiquidityKind, PoolSource, Protocol},
         DexRows,
     };
 
@@ -527,7 +524,7 @@ mod tests {
         assert_eq!(pool.created_block, 0x18cd705);
         assert_eq!(pool.log_index, 0x3a4);
         assert_eq!(pool.source, PoolSource::Event);
-        assert_eq!(pool._version, pool_event_version(0x18cd705, 0x3a4));
+        assert_eq!((pool._version, pool.epoch), (0, 0));
         assert_eq!(pool.timestamp, 1_700_000_000);
     }
 
@@ -744,10 +741,11 @@ mod tests {
         );
         assert_eq!(pool.log_index, 0x20);
 
-        // Alone, the tokens still produce a (later, losing) row.
+        // Alone, the tokens still produce a row, at a later position:
+        // it loses against the `PoolRegistered` one (first event wins).
         let alone = one(&BALANCER_TOKENS_REGISTERED).pools.remove(0);
         assert_eq!(alone.tokens.len(), 2);
-        assert!(alone._version < pool._version);
+        assert!(alone.log_index > pool.log_index);
     }
 
     #[test]

@@ -44,41 +44,85 @@ forks emit) the row says `uniswap_v2`; `dex_pools.protocol` tells them apart
   (V4, Balancer). `emitter` is the contract that emitted the event and is part
   of a pool's identity: `dex_pools` is keyed `(chain, pool_id, emitter)`, so a
   forked PoolManager / Vault can not overwrite the original's pools.
-* `trader` = `tx_from` when the pipeline attached transactions
-  (`DexRows::attach_transactions`), else the event's recipient, else its sender.
-  `tx_to` is the contract the user called: router / aggregator attribution
-  without a registry.
-* **`dex_pools._version` is not the flush timestamp.** Event rows carry a version
-  that DEcreases with `(created_block, log_index)`: the FIRST creation event
-  wins, so a contract forging `PairCreated` for an existing pair can not replace
-  its tokens. RPC rows carry `1`, negative (`unresolved`) rows `0`: a creation
-  event always beats them, whatever the insertion order. Writers must not
-  overwrite it (`DexRows::set_version` skips pools).
+* **`tx_from` / `tx_to` are the sender and the target of the TRANSACTION**, filled
+  on swaps AND liquidity rows by `DexRows::attach_transactions` from the
+  transactions of the same batch. `dex_liquidity.tx_from` is who seeded (or
+  pulled) a pool's liquidity - the event `sender` is usually a router, never use
+  it for attribution. `dex_swaps.trader` = `tx_from` when attached, else the
+  event's recipient, else its sender. `tx_to` is the contract the user called:
+  router / aggregator attribution without a registry.
+* **`dex_pools` holds one row per creation EVENT** (positional key `(chain,
+  pool_id, emitter, created_block, log_index)`, like every block scoped table)
+  plus at most one row of the RPC resolver (`created_block = 0`). Several live
+  rows of one pool can exist - a forged `PairCreated` costs one transaction - so
+  **read pools through `dex_pool_current_v`**: event rows before resolver rows,
+  then the earliest position. The first creation event wins; versions are the
+  plain flush versions, there is nothing special for a writer to respect.
 * Hashes / addresses are raw bytes (`FixedString`): format with
   `concat('0x', lower(hex(x)))`, compare with `unhex('...')`. Query base tables
   with `FINAL`.
 
+## Reorgs: insert-only (docs/design.md §2)
+
+The indexer never issues DELETE / ALTER DELETE / DROP PARTITION (ClickHouse
+loses one of two concurrent DELETEs, and 50+ indexers share the database).
+
+* **Base tables** (`dex::BASE_TABLES`: `dex_swaps`, `dex_liquidity`, `dex_pools`)
+  are `ReplacingMergeTree(_version, is_deleted)`. `purge_range` INSERTs
+  tombstones with `dex::tombstone_sql(table, chain, from, to, version)`;
+  `FINAL` hides the rows. A re-streamed row at the same position carries a
+  newer version and is alive again; positions the canonical block does not
+  have stay dead.
+* **Side tables** (`dex::SIDE_TABLES`) are never touched: their materialized
+  views pass `_version`, `is_deleted` and `epoch` through, a tombstone on the
+  base table tombstones them.
+* **`dex_pools`** is purged by `created_block`, event rows only
+  (`dex::purge_filter`). Resolver rows describe chain STATE, not a block: no
+  purge touches them, and when a pool's creation event is reorged out the pool
+  falls back to its resolver row if there is one (if one is ever tombstoned the
+  backfill resolves the pool again and the newer row wins).
+* **Aggregates** carry `epoch` (the chain's purge generation, stamped on every
+  row by `DexRows::set_epoch` / `PoolWorker::set_epoch`) as the last key
+  column, their views only aggregate live rows. A purge records `(chain, epoch,
+  from_ts)` in `reorgs` and runs every `DEX_DERIVED` `rebuild_sql` under the
+  new epoch. The `*_v` views apply the validity rule - epoch `e` counts in
+  bucket `b` iff `e >=` the largest epoch among the chain's reorgs with
+  `from_ts <= b` - BEFORE merging states:
+
+```sql
+-- dex_epoch_floor_v: reorgs as a step function (running max over from_ts)
+FROM dex_candles_1h AS a
+ASOF LEFT JOIN dex_epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+WHERE a.epoch >= f.epoch_floor          -- no reorg at or before b: floor 0
+GROUP BY chain, pool_id, emitter, bucket
+```
+
+Never read an aggregate table directly, only its `*_v` view.
+
 ## Tables (`0010_dex_tables.sql`)
+
+Base tables are partitioned by month only (chain is the first key column); side
+tables and `dex_pools` by chain. Always read with `FINAL`.
 
 | table | key | purged by |
 |---|---|---|
-| `dex_pools` | `(chain, pool_id, emitter)` | `created_block` (0 for RPC rows: never purged) |
-| `dex_swaps` | `(chain, block_number, log_index)` | `block_number` |
-| `dex_liquidity` | `(chain, block_number, log_index)` | `block_number` |
-| `dex_swaps_by_pool` (MV) | `(chain, pool_id, block_number, log_index)` | `block_number` |
-| `dex_swaps_by_trader` (MV) | `(chain, trader, block_number, log_index)` | `block_number` |
-| `dex_pools_by_token` (MV) | `(chain, token, pool_id, emitter)` | `block_number` (= the pool's `created_block`) |
+| `dex_pools` | `(chain, pool_id, emitter, created_block, log_index)` | tombstones on `created_block`, event rows only |
+| `dex_swaps` | `(chain, block_number, log_index)` | tombstones on `block_number` |
+| `dex_liquidity` | `(chain, block_number, log_index)` | tombstones on `block_number` |
+| `dex_swaps_by_pool` (MV) | `(chain, pool_id, block_number, log_index)` | follows `dex_swaps` |
+| `dex_swaps_by_trader` (MV) | `(chain, trader, block_number, log_index)` | follows `dex_swaps` |
+| `dex_pools_by_token` (MV) | `(chain, token, pool_id, emitter, block_number, log_index)` | follows `dex_pools` |
+| `dex_pool_current_v` (view) | THE row of every pool | - |
 | `quote_tokens` | `(chain, token)` | user data, never purged |
-
-`dex::BLOCK_SCOPED_TABLES` lists them in deletion order;
-`dex::block_column(table)` gives the column (`created_block` for `dex_pools`).
 
 ## Aggregates (`0011_dex_aggregates.sql`)
 
-`AggregatingMergeTree` + materialized view + finalizing `*_v` view, each declared
-in `dex::DEX_DERIVED` with a `rebuild_sql` that repeats the view's `SELECT`
-(placeholders `{chain}`, `{from_ts}` = unix seconds of the first bucket). Buckets
-are computed from the unix time, always UTC.
+`AggregatingMergeTree` (key ends in `epoch`, partitioned by month) + materialized
+view + finalizing `*_v` view, each declared in `dex::DEX_DERIVED` with a
+`rebuild_sql` that repeats the view's `SELECT` (placeholders `{chain}`,
+`{from_ts}` = unix seconds of the first bucket, `{epoch}` = the new epoch;
+`dex::derived::render_rebuild`). Buckets are computed from the unix time, always
+UTC. `dex_pool_stats_1d_v` finalizes swaps / traders per pool and day.
 
 | table | bucket | content |
 |---|---|---|
@@ -116,7 +160,7 @@ resolvers fill `tokens` / `dex_pools`. Unknown stays `NULL`, never 0.
 | `dex_token_volume_usd_1d_v` | daily USD volume of ANY token (swap level: filter chain + time) |
 | `dex_top_pools_v` | pools by USD volume of the trailing 30 days |
 
-These views join `tokens FINAL` and `dex_pools FINAL` whole: always filter by
+These views join `tokens FINAL` and `dex_pool_current_v` whole: always filter by
 `chain` (and a time range for the swap level ones).
 
 ### USD
@@ -165,7 +209,9 @@ pools are described by their events and are never called.
 
 * **Forged events.** Anyone can deploy a contract that emits swap shaped events
   with absurd amounts, or a "factory" that announces a pool BEFORE the real one
-  exists. First-event-wins and `emitter` keyed pools close the cheap attacks;
+  exists. First-event-wins and `emitter` keyed pools close the cheap attacks
+  (one remains: if a reorg drops the real creation and re-creates it AFTER a
+  forged one, the forgery is the first event);
   analytics that need more should restrict to factories they trust
   (`dex_pools.factory`) or cross check against `erc20_transfers`.
 * **Aggregator attribution** is only `tx_to`. Multi hop routes are separate

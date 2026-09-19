@@ -6,9 +6,11 @@
 //!   cargo test dex::integration -- --ignored
 //! ```
 //!
-//! Every test creates (and drops) its OWN database on that server, applies
-//! a minimal `tokens` table plus the DEX migrations to it, and never
-//! touches the database named in the url.
+//! Every test creates (and drops) its OWN databases on that server, applies
+//! minimal `tokens` and `reorgs` tables (owned by the core migrations) plus
+//! the DEX migrations to them, and never touches the database named in the
+//! url. No test issues a DELETE: reorgs are tombstones + epochs
+//! (docs/design.md §2), exactly as `purge_range` does them.
 //!
 //! Rows go through [`decode`] and are inserted with `INSERT ... VALUES`
 //! (`unhex` / `toInt256`): the binary row serializers of the design are
@@ -24,18 +26,18 @@ use alloy::primitives::{Address, B256, I256, U256};
 use clickhouse::Client;
 
 use crate::{
-    db::{models::log::DatabaseLog, DatabaseParams},
+    db::{models::log::DatabaseLog, next_version, DatabaseParams},
     dex::{
-        block_column, decode,
+        decode,
         derived::render_rebuild,
         events,
         fixtures::{self, address, hash, RawLog},
         models::{
             pool_id_of, DexLiquidity, DexPool, DexSwap, PoolSource,
-            Protocol, POOL_VERSION_RPC,
+            Protocol,
         },
         sql::{statements, MIGRATIONS},
-        DexRows, BLOCK_SCOPED_TABLES, DEX_DERIVED,
+        tombstone_sql, DexRows, BASE_TABLES, DEX_DERIVED, SIDE_TABLES,
     },
 };
 
@@ -55,6 +57,12 @@ const NULL: f64 = -1.0;
 const BALANCER_TOKEN_IN: &str =
     "0x0f2d719407fdbeff09d87557abb7232601fd9f29";
 
+/// Minimal copy of the table migration 0004 creates.
+const REORGS_DDL: &str = "CREATE TABLE IF NOT EXISTS reorgs (\
+    chain UInt64, epoch UInt32, from_ts DateTime, \
+    detected_at DateTime DEFAULT now()) \
+    ENGINE = MergeTree ORDER BY (chain, epoch)";
+
 const DAI: &str = "0x6b175474e89094c44da98b954eedeac495271d0f";
 
 struct TestDb {
@@ -73,7 +81,13 @@ impl TestDb {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let name = format!("dex_it_{}_{nanos}", std::process::id());
+        // Tests run in parallel and the clock is coarse: number them too.
+        static SEQUENCE: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let sequence =
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name =
+            format!("dex_it_{}_{nanos}_{sequence}", std::process::id());
 
         let admin = Client::default()
             .with_url(&params.endpoint)
@@ -90,6 +104,7 @@ impl TestDb {
         let database = Self { admin, client, name };
 
         database.execute(TOKENS_DDL).await;
+        database.execute(REORGS_DDL).await;
         for (file, sql) in MIGRATIONS {
             for statement in statements(sql) {
                 database
@@ -120,16 +135,13 @@ impl TestDb {
             .unwrap_or_else(|error| panic!("{error}\n{sql}"))
     }
 
-    /// Every row of `source` as text, sorted.
-    async fn snapshot(&self, source: &str) -> Vec<String> {
+    /// A single String column.
+    async fn lines(&self, sql: &str) -> Vec<String> {
         self.client
-            .query(&format!(
-                "SELECT hex(toString(tuple(*))) AS line FROM {source} \
-                 ORDER BY line"
-            ))
+            .query(&sql.replace('?', "??"))
             .fetch_all::<String>()
             .await
-            .unwrap()
+            .unwrap_or_else(|error| panic!("{error}\n{sql}"))
     }
 
     async fn insert(&self, rows: &DexRows) {
@@ -204,12 +216,12 @@ const SWAP_COLUMNS: &str = "chain, block_number, timestamp, \
     transaction_hash, log_index, pool_id, emitter, protocol, sender, \
     recipient, tx_from, tx_to, trader, amount0, amount1, token_in, \
     token_out, amount_in, amount_out, coin_in, coin_out, underlying, \
-    sqrt_price_x96, liquidity, tick, fee, _version";
+    sqrt_price_x96, liquidity, tick, fee, epoch, _version";
 
 fn swap_sql(swap: &DexSwap) -> String {
     format!(
         "({}, {}, {}, {}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, \
-         {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+         {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         swap.chain,
         swap.block_number,
         swap.timestamp,
@@ -236,6 +248,7 @@ fn swap_sql(swap: &DexSwap) -> String {
         uint(&swap.liquidity),
         swap.tick,
         swap.fee,
+        swap.epoch,
         swap._version,
     )
 }
@@ -243,12 +256,12 @@ fn swap_sql(swap: &DexSwap) -> String {
 const LIQUIDITY_COLUMNS: &str = "chain, block_number, timestamp, \
     transaction_hash, log_index, pool_id, emitter, protocol, kind, sender, \
     owner, tx_from, tx_to, amount0, amount1, reserve0, reserve1, \
-    liquidity_delta, tick_lower, tick_upper, _version";
+    liquidity_delta, tick_lower, tick_upper, epoch, _version";
 
 fn liquidity_sql(row: &DexLiquidity) -> String {
     format!(
         "({}, {}, {}, {}, {}, {}, {}, '{}', '{}', {}, {}, {}, {}, {}, {}, \
-         {}, {}, {}, {}, {}, {})",
+         {}, {}, {}, {}, {}, {}, {})",
         row.chain,
         row.block_number,
         row.timestamp,
@@ -269,6 +282,7 @@ fn liquidity_sql(row: &DexLiquidity) -> String {
         int(&row.liquidity_delta),
         row.tick_lower,
         row.tick_upper,
+        row.epoch,
         row._version,
     )
 }
@@ -276,12 +290,12 @@ fn liquidity_sql(row: &DexLiquidity) -> String {
 const POOL_COLUMNS: &str = "chain, pool_id, emitter, factory, protocol, \
     token0, token1, tokens, underlying_tokens, fee, tick_spacing, hooks, \
     stable, created_block, timestamp, transaction_hash, log_index, source, \
-    _version";
+    epoch, _version";
 
 fn pool_sql(pool: &DexPool) -> String {
     format!(
         "({}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \
-         {}, '{}', {})",
+         {}, '{}', {}, {})",
         pool.chain,
         word(&pool.pool_id),
         addr(&pool.emitter),
@@ -300,6 +314,7 @@ fn pool_sql(pool: &DexPool) -> String {
         word(&pool.transaction_hash),
         pool.log_index,
         pool.source,
+        pool.epoch,
         pool._version,
     )
 }
@@ -462,10 +477,12 @@ fn swaps() -> Vec<DatabaseLog> {
     ]
 }
 
-async fn seed(database: &TestDb) {
+/// Tokens, quote tokens and pools of `chain`: what both a reorged and a
+/// clean index know before the first swap.
+async fn seed_reference(database: &TestDb, chain: u64) {
     let token = |hex: &str, symbol: &str, decimals: u8| {
         format!(
-            "({CHAIN}, {}, '{symbol}', '{symbol}', {decimals}, 'ERC20', 1)",
+            "({chain}, {}, '{symbol}', '{symbol}', {decimals}, 'ERC20', 1)",
             addr(&address(hex))
         )
     };
@@ -483,9 +500,9 @@ async fn seed(database: &TestDb) {
 
     database
         .execute(&format!(
-            "INSERT INTO quote_tokens (chain, token, kind) VALUES \
-             ({CHAIN}, {}, 'stable'), ({CHAIN}, {}, 'stable'), \
-             ({CHAIN}, {}, 'native'), ({CHAIN}, {}, 'stable')",
+            "INSERT INTO quote_tokens (chain, token, kind, _version) VALUES \
+             ({chain}, {}, 'stable', 1), ({chain}, {}, 'stable', 1), \
+             ({chain}, {}, 'native', 1), ({chain}, {}, 'stable', 1)",
             addr(&address(fixtures::USDC)),
             addr(&address(fixtures::USDT)),
             addr(&address(fixtures::WETH)),
@@ -495,7 +512,7 @@ async fn seed(database: &TestDb) {
         ))
         .await;
 
-    let mut created = decode(CHAIN, &pools());
+    let mut created = decode(chain, &pools());
     assert_eq!(created.pools.len(), 4);
 
     // Curve has no creation event: the row the RPC resolver would write.
@@ -515,22 +532,35 @@ async fn seed(database: &TestDb) {
         created_block: 0,
         timestamp: 0,
         source: PoolSource::Rpc,
-        _version: POOL_VERSION_RPC,
         ..created.pools[0].clone()
     });
 
+    created.set_version(next_version());
     database.insert(&created).await;
+}
+
+/// Decodes and inserts `logs` the way the pipeline flushes them.
+async fn insert_logs(
+    database: &TestDb,
+    chain: u64,
+    logs: &[DatabaseLog],
+    epoch: u32,
+) {
+    let mut rows = decode(chain, logs);
+    assert_eq!(rows.rows(), logs.len());
+    rows.set_version(next_version());
+    rows.set_epoch(epoch);
+    database.insert(&rows).await;
+}
+
+async fn seed(database: &TestDb) {
+    seed_reference(database, CHAIN).await;
 
     // Two inserts: the aggregate states of the views must merge.
     let logs = swaps();
     let (first, second) = logs.split_at(4);
-
-    for part in [first, second] {
-        let mut rows = decode(CHAIN, part);
-        assert_eq!(rows.swaps.len(), part.len());
-        rows.set_version(1_000);
-        database.insert(&rows).await;
-    }
+    insert_logs(database, CHAIN, first, 0).await;
+    insert_logs(database, CHAIN, second, 0).await;
 }
 
 fn close(actual: f64, expected: f64) -> bool {
@@ -902,208 +932,221 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
     database.drop().await;
 }
 
-#[tokio::test]
-#[ignore = "needs TEST_DATABASE_URL"]
-async fn the_first_creation_event_wins_and_rpc_rows_lose() {
-    let database = TestDb::create().await;
+// ------------------------------------------------ reorgs without DELETE
 
-    let pair = address(fixtures::V2_USDC_WETH);
-    let real = decode(CHAIN, &pools()).pools.remove(0);
+/// What `purge_range` does to the DEX tables, in its order (docs/design.md
+/// §2): tombstone the base tables from `fork_block` on, record the reorg,
+/// repair every aggregate under the new epoch. Only INSERTs.
+async fn purge(
+    database: &TestDb,
+    chain: u64,
+    fork_block: u64,
+    new_epoch: u32,
+    from_ts: u32,
+) {
+    let version = next_version();
 
-    // A forged PairCreated for the same pair, 10 blocks later.
-    let forged = DexPool {
-        token0: Address::repeat_byte(0x66),
-        tokens: vec![Address::repeat_byte(0x66), real.token1],
-        created_block: real.created_block + 10,
-        _version: crate::dex::pool_event_version(
-            real.created_block + 10,
-            0,
-        ),
-        ..real.clone()
-    };
-    let rpc = DexPool {
-        token0: Address::repeat_byte(0x77),
-        source: PoolSource::Rpc,
-        created_block: 0,
-        _version: POOL_VERSION_RPC,
-        ..real.clone()
-    };
-
-    // Worst insertion order: the real row first.
-    for pool in [real.clone(), forged, rpc] {
+    for table in BASE_TABLES {
         database
-            .insert(&DexRows { pools: vec![pool], ..DexRows::default() })
+            .execute(&tombstone_sql(
+                table, chain, fork_block, None, version,
+            ))
             .await;
     }
 
-    let stored = database
-        .client
-        .query(&format!(
-            "SELECT lower(hex(token0)), source FROM dex_pools FINAL \
-             WHERE chain = {CHAIN} AND pool_id = {}",
-            word(&pool_id_of(pair))
+    database
+        .execute(&format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts) VALUES \
+             ({chain}, {new_epoch}, toDateTime({from_ts}))"
         ))
-        .fetch_all::<(String, String)>()
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(
-        stored,
-        vec![(fixtures::USDC[2..].to_string(), "event".to_string())]
-    );
+    for table in DEX_DERIVED {
+        database
+            .execute(&render_rebuild(table, chain, from_ts, new_epoch))
+            .await;
+    }
+}
 
-    database.drop().await;
+/// Everything a reader can see of `chain`, as sorted text per source:
+/// base and side tables through FINAL (without the bookkeeping columns),
+/// every aggregate and analyst view as is.
+async fn visible_state(
+    database: &TestDb,
+    chain: u64,
+) -> Vec<(String, Vec<String>)> {
+    let mut state = Vec::new();
+
+    for table in BASE_TABLES.iter().chain(SIDE_TABLES) {
+        let rows = database
+            .lines(&format!(
+                "SELECT hex(toString(tuple(* EXCEPT (_version, epoch, \
+                 is_deleted)))) AS line FROM {table} FINAL \
+                 WHERE chain = {chain} ORDER BY line"
+            ))
+            .await;
+        state.push((table.to_string(), rows));
+    }
+
+    for view in READER_VIEWS {
+        let rows = database
+            .lines(&format!(
+                "SELECT hex(toString(tuple(*))) AS line FROM {view} \
+                 WHERE chain = {chain} ORDER BY line"
+            ))
+            .await;
+        state.push((view.to_string(), rows));
+    }
+
+    state
+}
+
+fn assert_same_state(
+    actual: &[(String, Vec<String>)],
+    expected: &[(String, Vec<String>)],
+    what: &str,
+) {
+    assert_eq!(actual.len(), expected.len());
+
+    for ((name, rows), (_, clean)) in actual.iter().zip(expected) {
+        assert_eq!(
+            rows.len(),
+            clean.len(),
+            "{what}: {name} has another number of rows"
+        );
+        assert!(
+            rows == clean,
+            "{what}: {name} differs from a clean index"
+        );
+    }
+}
+
+/// Views a consumer reads (everything except the trailing-30-days one,
+/// which depends on now()).
+const READER_VIEWS: &[&str] = &[
+    "dex_pool_current_v",
+    "dex_pools_v",
+    "dex_swaps_v",
+    "dex_swaps_usd_v",
+    "dex_candles_1m_v",
+    "dex_candles_1h_v",
+    "dex_candles_1d_v",
+    "dex_pool_prices_1m_v",
+    "dex_pool_prices_1h_v",
+    "dex_pool_prices_1d_v",
+    "dex_pool_volume_1d_v",
+    "dex_pool_stats_1d_v",
+    "dex_protocol_stats_1d_v",
+    "dex_native_price_1h_v",
+    "dex_native_price_1d_v",
+    "dex_pool_token_volume_1d_v",
+    "dex_pool_volume_usd_1d_v",
+    "dex_protocol_volume_usd_1d_v",
+    "dex_token_volume_1d_v",
+    "dex_token_volume_usd_1d_v",
+];
+
+/// A pool announced in block `block` (a creation inside a reorged range).
+fn late_pair(pair: u8, block: u32, log_index: u16) -> DatabaseLog {
+    constructed(
+        Address::repeat_byte(0xf2),
+        &[
+            events::V2_PAIR_CREATED.topic0,
+            Address::repeat_byte(0x0a).into_word(),
+            Address::repeat_byte(0x0b).into_word(),
+        ],
+        [Address::repeat_byte(pair).into_word().to_vec(), number(2)]
+            .concat(),
+        block,
+        log_index,
+        DAY + 70,
+    )
+}
+
+/// The canonical blocks 101 and 102 after the reorg: FEWER swaps than the
+/// orphaned ones (keys 101/1.. of the old fork stay dead), other amounts on
+/// the key that is reused (101/0), a liquidity event and a pool creation.
+fn canonical_tail() -> Vec<DatabaseLog> {
+    let pair = address(fixtures::V2_USDC_WETH);
+
+    vec![
+        v2_swap(
+            pair,
+            TRADER_X,
+            [3_000_000, 0, 0, 1_100_000_000_000_000],
+            101,
+            0,
+            DAY + 70,
+        ),
+        fixtures::V3_SWAP.placed(101, 1, DAY + 70),
+        fixtures::V2_SYNC.placed(101, 2, DAY + 70),
+        late_pair(0x97, 101, 3),
+        v2_swap(
+            pair,
+            TRADER_X,
+            [0, 500_000_000_000_000, 1_200_000, 0],
+            102,
+            0,
+            DAY + 3_700,
+        ),
+    ]
 }
 
 #[tokio::test]
 #[ignore = "needs TEST_DATABASE_URL"]
-async fn purge_and_bucket_repair_reproduce_the_views() {
+async fn a_reorg_leaves_exactly_a_clean_index() {
+    // The index that lived through the reorg...
     let database = TestDb::create().await;
     seed(&database).await;
-
-    // Liquidity rows so every block scoped table has something to purge.
-    let mut liquidity = decode(
+    insert_logs(
+        &database,
         CHAIN,
         &[
-            fixtures::V2_SYNC.at(DAY + 10),
-            fixtures::V3_MINT.at(DAY + 3_700),
+            fixtures::V2_MINT.placed(101, 8, DAY + 70),
+            fixtures::V3_MINT.placed(102, 1, DAY + 3_700),
+            // Created on the fork that loses.
+            late_pair(0x98, 101, 9),
         ],
-    );
-    liquidity.liquidity[0].block_number = 100;
-    liquidity.liquidity[1].block_number = 102;
-    database.insert(&liquidity).await;
+        0,
+    )
+    .await;
 
-    // A pool created inside the range that will be purged.
-    let late = decode(
-        CHAIN,
-        &[constructed(
-            Address::repeat_byte(0xf2),
-            &[
-                events::V2_PAIR_CREATED.topic0,
-                Address::repeat_byte(0x0a).into_word(),
-                Address::repeat_byte(0x0b).into_word(),
-            ],
-            [Address::repeat_byte(0x98).into_word().to_vec(), number(2)]
-                .concat(),
-            101,
-            9,
-            DAY + 70,
-        )],
-    );
-    assert_eq!(late.pools.len(), 1);
-    database.insert(&late).await;
+    let before = visible_state(&database, CHAIN).await;
 
-    // ---- 1. delete bucket + rebuild == what the views wrote.
-    for table in DEX_DERIVED {
-        let view = format!("{}_v", table.name);
-        let before = database.snapshot(&view).await;
-        assert!(!before.is_empty(), "{view}");
+    purge(&database, CHAIN, 101, 1, DAY).await;
 
-        database
-            .execute(&format!(
-                "DELETE FROM {} WHERE chain = {CHAIN} AND {} >= \
-                 toDateTime({DAY}) SETTINGS lightweight_deletes_sync = 2",
-                table.name, table.bucket_column
-            ))
-            .await;
-        assert!(database.snapshot(&view).await.is_empty(), "{view}");
-
-        database.execute(&render_rebuild(table, CHAIN, DAY)).await;
-        assert_eq!(database.snapshot(&view).await, before, "{view}");
-    }
-
-    // ---- 2. reorg at block 101: lightweight delete on every table.
-    for table in BLOCK_SCOPED_TABLES {
-        let column = block_column(table);
-        let total = database
-            .count(&format!(
-                "SELECT count() FROM {table} WHERE chain = {CHAIN}"
-            ))
-            .await;
-        let doomed = database
-            .count(&format!(
-                "SELECT count() FROM {table} WHERE chain = {CHAIN} \
-                 AND {column} >= 101"
-            ))
-            .await;
-        assert!(total > doomed && doomed > 0, "{table}: {doomed}/{total}");
-
-        database
-            .execute(&format!(
-                "DELETE FROM {table} WHERE chain = {CHAIN} AND {column} >= \
-                 101 SETTINGS lightweight_deletes_sync = 2"
-            ))
-            .await;
-
+    // Between purge and re-stream: only block 100 (swaps A and B) is left,
+    // in the base tables, the side tables and the aggregates alike.
+    for table in ["dex_swaps", "dex_swaps_by_pool", "dex_swaps_by_trader"]
+    {
         assert_eq!(
             database
                 .count(&format!(
-                    "SELECT count() FROM {table} WHERE chain = {CHAIN}"
+                    "SELECT count() FROM {table} FINAL WHERE chain = {CHAIN}"
                 ))
                 .await,
-            total - doomed,
-            "{table}"
-        );
-        assert_eq!(
-            database
-                .count(&format!(
-                    "SELECT count() FROM {table} WHERE chain = {CHAIN} \
-                     AND {column} >= 101"
-                ))
-                .await,
-            0,
+            2,
             "{table}"
         );
     }
-
-    // Swaps A and B (block 100) survive, pools (block 90 / rpc) too.
     assert_eq!(
         database
             .count(&format!(
-                "SELECT count() FROM dex_swaps FINAL WHERE chain = {CHAIN}"
+                "SELECT count() FROM dex_liquidity FINAL \
+                 WHERE chain = {CHAIN}"
+            ))
+            .await,
+        0
+    );
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT toUInt64(sum(swaps)) FROM dex_candles_1d_v \
+                 WHERE chain = {CHAIN}"
             ))
             .await,
         2
     );
-    assert_eq!(
-        database
-            .count(&format!(
-                "SELECT count() FROM dex_pools FINAL WHERE chain = {CHAIN}"
-            ))
-            .await,
-        5
-    );
-
-    // ---- 3. bucket repair from the bucket of the first purged block.
-    for table in DEX_DERIVED {
-        let from = (DAY + 70) - (DAY + 70) % table.bucket_seconds;
-
-        database
-            .execute(&format!(
-                "DELETE FROM {} WHERE chain = {CHAIN} AND {} >= \
-                 toDateTime({from}) SETTINGS lightweight_deletes_sync = 2",
-                table.name, table.bucket_column
-            ))
-            .await;
-        database.execute(&render_rebuild(table, CHAIN, from)).await;
-    }
-
-    let hour = database
-        .client
-        .query(&format!(
-            "SELECT toUInt32(bucket), high, low, close, volume0, swaps \
-             FROM dex_candles_1h_v WHERE chain = {CHAIN}"
-        ))
-        .fetch_all::<(u32, f64, f64, f64, f64, u64)>()
-        .await
-        .unwrap();
-
-    // Only the V2 pair is left, with swaps A and B.
-    assert_eq!(hour.len(), 1);
-    assert_eq!(hour[0].0, DAY);
-    assert_eq!((hour[0].2, hour[0].3), (3.8e8, 3.8e8));
-    assert_eq!((hour[0].4, hour[0].5), (7_624_963.0, 2));
-
     assert_eq!(
         database
             .count(&format!(
@@ -1113,26 +1156,436 @@ async fn purge_and_bucket_repair_reproduce_the_views() {
             .await,
         2
     );
+    // Nothing was deleted: the 9 orphans are tombstones, FINAL hides them.
+    assert!(
+        database
+            .count(&format!(
+                "SELECT countIf(is_deleted = 1) FROM dex_swaps \
+                 WHERE chain = {CHAIN}"
+            ))
+            .await
+            >= 9
+    );
 
-    // ---- 4. re-streaming the purged blocks restores everything.
-    let logs = swaps();
-    let mut again = decode(CHAIN, &logs[2..]);
-    again.set_version(2_000);
-    database.insert(&again).await;
+    insert_logs(&database, CHAIN, &canonical_tail(), 1).await;
 
+    // ... and the index that only ever saw the canonical chain.
+    let clean = TestDb::create().await;
+    seed_reference(&clean, CHAIN).await;
+    let mut canonical = swaps()[..2].to_vec();
+    canonical.extend(canonical_tail());
+    insert_logs(&clean, CHAIN, &canonical, 0).await;
+
+    let after = visible_state(&database, CHAIN).await;
+    let expected = visible_state(&clean, CHAIN).await;
+
+    assert_same_state(&after, &expected, "after the reorg");
+    assert!(before != after);
+
+    // Spot checks by hand: 101/0 carries the NEW amounts, the day candle
+    // of the V2 pair is A, B, the new C and the new D.
     let pair = word(&pool_id_of(address(fixtures::V2_USDC_WETH)));
     let day = database
         .client
         .query(&format!(
-            "SELECT close, volume0, swaps, traders FROM dex_candles_1d_v \
+            "SELECT volume0, volume1, swaps FROM dex_candles_1d_v \
              WHERE chain = {CHAIN} AND pool_id = {pair}"
         ))
-        .fetch_one::<(f64, f64, u64, u64)>()
+        .fetch_one::<(f64, f64, u64)>()
         .await
         .unwrap();
-    assert_eq!(day, (4.5e8, 10_624_963.0, 4, 2));
+    assert_eq!(
+        day,
+        (
+            2_624_963.0 + 5e6 + 3e6 + 1_200_000.0,
+            1e15 + 1.9e15 + 1.1e15 + 5e14,
+            4
+        )
+    );
+
+    // A second reorg on top, deeper than the first (fork 100), then the
+    // same canonical chain again: still a clean index.
+    purge(&database, CHAIN, 100, 2, DAY).await;
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_swaps FINAL WHERE chain = {CHAIN}"
+            ))
+            .await,
+        0
+    );
+    insert_logs(&database, CHAIN, &canonical, 2).await;
+    let again = visible_state(&database, CHAIN).await;
+    assert_same_state(&again, &expected, "after the second reorg");
+
+    clean.drop().await;
+    database.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_validity_rule_keeps_old_buckets_and_later_additions() {
+    let database = TestDb::create().await;
+    seed_reference(&database, CHAIN).await;
+
+    let pair = address(fixtures::V2_USDC_WETH);
+    let yesterday = DAY - 86_400;
+    let swap = |block: u32, timestamp: u32, usdc: u128| {
+        v2_swap(
+            pair,
+            TRADER_X,
+            [usdc, 0, 0, usdc * 1_000],
+            block,
+            0,
+            timestamp,
+        )
+    };
+
+    // Epoch 0: one swap yesterday, one today.
+    insert_logs(
+        &database,
+        CHAIN,
+        &[
+            swap(50, yesterday + 5, 1_000_000),
+            swap(100, DAY + 5, 2_000_000),
+        ],
+        0,
+    )
+    .await;
+
+    // Reorg of today's block only: from_ts = start of today.
+    purge(&database, CHAIN, 100, 1, DAY).await;
+    insert_logs(&database, CHAIN, &[swap(100, DAY + 5, 4_000_000)], 1)
+        .await;
+
+    // A later gap heal writes an OLD block of yesterday under epoch 1:
+    // it must ADD to yesterday's epoch 0 contribution, not replace it.
+    insert_logs(
+        &database,
+        CHAIN,
+        &[swap(60, yesterday + 9, 8_000_000)],
+        1,
+    )
+    .await;
+
+    let days = database
+        .client
+        .query(&format!(
+            "SELECT toUInt32(bucket), volume0, swaps FROM dex_candles_1d_v \
+             WHERE chain = {CHAIN} ORDER BY bucket"
+        ))
+        .fetch_all::<(u32, f64, u64)>()
+        .await
+        .unwrap();
+
+    assert_eq!(days, vec![(yesterday, 9e6, 2), (DAY, 4e6, 1)]);
+
+    // Open / close come from valid epochs only: today's stale epoch 0 swap
+    // had another price and an earlier position.
+    insert_logs(
+        &database,
+        CHAIN,
+        &[v2_swap(pair, TRADER_X, [1_000_000, 0, 0, 7], 99, 0, DAY + 1)],
+        0,
+    )
+    .await;
+    let open = database
+        .client
+        .query(&format!(
+            "SELECT open, close, swaps FROM dex_candles_1d_v \
+             WHERE chain = {CHAIN} AND bucket = toDateTime({DAY}, 'UTC')"
+        ))
+        .fetch_one::<(f64, f64, u64)>()
+        .await
+        .unwrap();
+    assert_eq!(open, (1_000.0, 1_000.0, 1));
+
+    // Another chain is not affected by this chain's reorgs.
+    seed_reference(&database, 2).await;
+    insert_logs(&database, 2, &[swap(100, DAY + 5, 2_000_000)], 0).await;
+    assert_eq!(
+        database
+            .count(
+                "SELECT toUInt64(sum(swaps)) FROM dex_candles_1d_v \
+                 WHERE chain = 2"
+            )
+            .await,
+        1
+    );
 
     database.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn pool_rows_survive_forgeries_and_reorgs() {
+    let database = TestDb::create().await;
+    let pair = address(fixtures::V2_USDC_WETH);
+    let pool_id = word(&pool_id_of(pair));
+
+    let current = |database: &TestDb| {
+        let sql = format!(
+            "SELECT lower(hex(token0)), source, toUInt64(created_block), \
+             candidates FROM dex_pool_current_v WHERE chain = {CHAIN} \
+             AND pool_id = {pool_id}"
+        );
+        let client = database.client.clone();
+        async move {
+            client
+                .query(&sql)
+                .fetch_all::<(String, String, u64, u64)>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let creation = |token0: Address, block: u32| {
+        constructed(
+            Address::repeat_byte(0xf2),
+            &[
+                events::V2_PAIR_CREATED.topic0,
+                token0.into_word(),
+                address(fixtures::WETH).into_word(),
+            ],
+            [pair.into_word().to_vec(), number(1)].concat(),
+            block,
+            0,
+            DAY,
+        )
+    };
+
+    let usdc = fixtures::USDC[2..].to_string();
+    let forged_token = Address::repeat_byte(0x66);
+
+    // The real creation, a forged one 10 blocks later (inserted later, so
+    // it has the newer version) and a resolver row on top.
+    insert_logs(
+        &database,
+        CHAIN,
+        &[creation(address(fixtures::USDC), 90)],
+        0,
+    )
+    .await;
+    insert_logs(&database, CHAIN, &[creation(forged_token, 100)], 0).await;
+
+    let mut resolver =
+        decode(CHAIN, &[creation(Address::repeat_byte(0x77), 1)]);
+    resolver.pools[0].source = PoolSource::Rpc;
+    resolver.pools[0].created_block = 0;
+    resolver.set_version(next_version());
+    database.insert(&resolver).await;
+
+    assert_eq!(
+        current(&database).await,
+        vec![(usdc.clone(), "event".to_string(), 90, 3)]
+    );
+
+    // An unrelated purge (from block 95, and even a gap heal from block 0
+    // of another range) leaves the resolver row alone; the forged row at
+    // block 100 goes away.
+    purge(&database, CHAIN, 95, 1, DAY).await;
+    assert_eq!(
+        current(&database).await,
+        vec![(usdc.clone(), "event".to_string(), 90, 2)]
+    );
+
+    // The creation itself is reorged out: the pool falls back to what the
+    // chain STATE said (resolver row), it does not vanish.
+    purge(&database, CHAIN, 0, 2, DAY).await;
+    assert_eq!(
+        current(&database).await,
+        vec![("77".repeat(20), "rpc".to_string(), 0, 1)]
+    );
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_pools FINAL WHERE chain = {CHAIN} \
+                 AND source = 'event'"
+            ))
+            .await,
+        0
+    );
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_pools_by_token FINAL \
+                 WHERE chain = {CHAIN} AND source = 'event'"
+            ))
+            .await,
+        0
+    );
+
+    // Re-created on the canonical chain, in the new epoch: at the SAME
+    // position (must beat its own tombstone) and alive again.
+    insert_logs(
+        &database,
+        CHAIN,
+        &[creation(address(fixtures::USDC), 90)],
+        2,
+    )
+    .await;
+    assert_eq!(
+        current(&database).await,
+        vec![(usdc.clone(), "event".to_string(), 90, 2)]
+    );
+
+    // A pool without any creation event (first seen mid-history): only
+    // the resolver row, which no purge touches.
+    let other = Address::repeat_byte(0x44);
+    let mut seen = decode(CHAIN, &[late_pair(0x44, 1, 0)]);
+    seen.pools[0].source = PoolSource::Rpc;
+    seen.pools[0].created_block = 0;
+    seen.set_version(next_version());
+    database.insert(&seen).await;
+    purge(&database, CHAIN, 0, 3, DAY).await;
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM dex_pool_current_v WHERE chain = \
+                 {CHAIN} AND pool_id = {} AND source = 'rpc'",
+                word(&pool_id_of(other))
+            ))
+            .await,
+        1
+    );
+
+    database.drop().await;
+}
+
+const CONCURRENT_CHAINS: u64 = 8;
+const REORG_ROUNDS: u32 = 10;
+
+/// Round `round` of a chain: the block that gets orphaned (3 swaps) and
+/// the canonical one that replaces it (1 swap, other amounts).
+fn round_blocks(
+    chain: u64,
+    round: u32,
+) -> (Vec<DatabaseLog>, Vec<DatabaseLog>) {
+    let pair = address(fixtures::V2_USDC_WETH);
+    let block = 1_000 + round;
+    let timestamp = DAY + 60 * round + 10;
+    let unit = 1_000_000 * u128::from(chain) * u128::from(round);
+
+    let orphan = (0..3u16)
+        .map(|index| {
+            v2_swap(
+                pair,
+                TRADER_X,
+                [unit * 7, 0, 0, unit * 3],
+                block,
+                index,
+                timestamp,
+            )
+        })
+        .collect();
+
+    let canonical = vec![v2_swap(
+        pair,
+        TRADER_X,
+        [unit, 0, 0, unit * 2],
+        block,
+        0,
+        timestamp,
+    )];
+
+    (orphan, canonical)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn eight_chains_reorg_concurrently_on_the_same_tables() {
+    let database = std::sync::Arc::new(TestDb::create().await);
+    let clean = TestDb::create().await;
+
+    for chain in 1..=CONCURRENT_CHAINS {
+        seed_reference(&database, chain).await;
+        seed_reference(&clean, chain).await;
+    }
+
+    let mut tasks = Vec::new();
+
+    for chain in 1..=CONCURRENT_CHAINS {
+        let database = database.clone();
+
+        tasks.push(tokio::spawn(async move {
+            insert_logs(&database, chain, &swaps(), 0).await;
+
+            for round in 1..=REORG_ROUNDS {
+                let (orphan, canonical) = round_blocks(chain, round);
+
+                insert_logs(&database, chain, &orphan, round - 1).await;
+                purge(
+                    &database,
+                    chain,
+                    u64::from(1_000 + round),
+                    round,
+                    DAY,
+                )
+                .await;
+                insert_logs(&database, chain, &canonical, round).await;
+            }
+        }));
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    for chain in 1..=CONCURRENT_CHAINS {
+        let mut canonical = swaps();
+        for round in 1..=REORG_ROUNDS {
+            canonical.extend(round_blocks(chain, round).1);
+        }
+        insert_logs(&clean, chain, &canonical, 0).await;
+    }
+
+    for chain in 1..=CONCURRENT_CHAINS {
+        let actual = visible_state(&database, chain).await;
+        let expected = visible_state(&clean, chain).await;
+        assert_same_state(&actual, &expected, &format!("chain {chain}"));
+
+        // By hand: 11 scenario swaps + one canonical swap per round.
+        assert_eq!(
+            database
+                .count(&format!(
+                    "SELECT count() FROM dex_swaps FINAL WHERE chain = {chain}"
+                ))
+                .await,
+            11 + u64::from(REORG_ROUNDS)
+        );
+
+        let rounds: u64 = (1..=u64::from(REORG_ROUNDS)).sum();
+        let volume = database
+            .client
+            .query(&format!(
+                "SELECT volume0, swaps FROM dex_candles_1d_v WHERE chain = \
+                 {chain} AND pool_id = {}",
+                word(&pool_id_of(address(fixtures::V2_USDC_WETH)))
+            ))
+            .fetch_one::<(f64, u64)>()
+            .await
+            .unwrap();
+        assert_eq!(
+            volume,
+            (
+                10_624_963.0 + (1_000_000 * chain * rounds) as f64,
+                4 + u64::from(REORG_ROUNDS)
+            ),
+            "chain {chain}"
+        );
+    }
+
+    // Every purge of every chain was recorded, nothing was lost.
+    assert_eq!(
+        database.count("SELECT count() FROM reorgs").await,
+        CONCURRENT_CHAINS * u64::from(REORG_ROUNDS)
+    );
+
+    clean.drop().await;
+    std::sync::Arc::try_unwrap(database)
+        .unwrap_or_else(|_| panic!("tasks are done"))
+        .drop()
+        .await;
 }
 
 #[tokio::test]
@@ -1160,99 +1613,76 @@ async fn maximal_amounts_do_not_wrap_the_aggregates() {
             DAY,
         )
     };
+    let extreme = |index: u16| {
+        constructed(
+            Address::repeat_byte(0x5b),
+            &[
+                events::V3_SWAP.topic0,
+                TRADER_X.into_word(),
+                TRADER_X.into_word(),
+            ],
+            [
+                I256::MAX.to_be_bytes::<32>().to_vec(),
+                I256::MIN.to_be_bytes::<32>().to_vec(),
+                number(1 << 96),
+                number(1),
+                number(0),
+            ]
+            .concat(),
+            100,
+            index,
+            DAY,
+        )
+    };
 
-    let mut rows = decode(
-        CHAIN,
-        &[
-            // 2^256 - 1, then 10 more: a UInt256 sum would wrap to 9.
-            exchange(U256::MAX, 0),
-            exchange(U256::from(10u8), 1),
-            // Int256 extremes on a V3 shaped swap.
-            constructed(
-                Address::repeat_byte(0x5b),
-                &[
-                    events::V3_SWAP.topic0,
-                    TRADER_X.into_word(),
-                    TRADER_X.into_word(),
-                ],
-                [
-                    I256::MAX.to_be_bytes::<32>().to_vec(),
-                    I256::MIN.to_be_bytes::<32>().to_vec(),
-                    number(1 << 96),
-                    number(1),
-                    number(0),
-                ]
-                .concat(),
-                100,
-                2,
-                DAY,
-            ),
-            constructed(
-                Address::repeat_byte(0x5b),
-                &[
-                    events::V3_SWAP.topic0,
-                    TRADER_X.into_word(),
-                    TRADER_X.into_word(),
-                ],
-                [
-                    I256::MAX.to_be_bytes::<32>().to_vec(),
-                    I256::MIN.to_be_bytes::<32>().to_vec(),
-                    number(1 << 96),
-                    number(1),
-                    number(0),
-                ]
-                .concat(),
-                100,
-                3,
-                DAY,
-            ),
-        ],
-    );
-    assert_eq!(rows.swaps.len(), 4);
-    assert_eq!(rows.swaps[0].amount_in, U256::MAX);
-    rows.set_version(1);
-    database.insert(&rows).await;
+    let logs = [
+        // 2^256 - 1, then 10 more: a UInt256 sum would wrap to 9.
+        exchange(U256::MAX, 0),
+        exchange(U256::from(10u8), 1),
+        // Int256 extremes on a V3 shaped swap, twice.
+        extreme(2),
+        extreme(3),
+    ];
+    assert_eq!(decode(CHAIN, &logs).swaps[0].amount_in, U256::MAX);
+    insert_logs(&database, CHAIN, &logs, 0).await;
 
     let max = 1.157_920_892_373_162e77;
 
-    let leg = database
-        .client
-        .query(&format!(
-            "SELECT volume_in FROM dex_pool_volume_1d_v WHERE chain = \
-             {CHAIN} AND protocol = 'curve' AND leg_index = 0"
-        ))
-        .fetch_one::<f64>()
-        .await
-        .unwrap();
-    assert!(close(leg, max), "{leg}");
+    let check = |database: &TestDb| {
+        let client = database.client.clone();
+        async move {
+            let leg = client
+                .query(&format!(
+                    "SELECT volume_in FROM dex_pool_volume_1d_v WHERE chain \
+                     = {CHAIN} AND protocol = 'curve' AND leg_index = 0"
+                ))
+                .fetch_one::<f64>()
+                .await
+                .unwrap();
+            assert!(close(leg, max), "{leg}");
 
-    let candle = database
-        .client
-        .query(&format!(
-            "SELECT volume0, volume1 FROM dex_candles_1d_v \
-             WHERE chain = {CHAIN}"
-        ))
-        .fetch_one::<(f64, f64)>()
-        .await
-        .unwrap();
-    // 2 * (2^255 - 1) and 2 * 2^255: finite, positive, not wrapped.
-    assert!(close(candle.0, max), "{candle:?}");
-    assert!(close(candle.1, max), "{candle:?}");
+            let candle = client
+                .query(&format!(
+                    "SELECT volume0, volume1 FROM dex_candles_1d_v \
+                     WHERE chain = {CHAIN}"
+                ))
+                .fetch_one::<(f64, f64)>()
+                .await
+                .unwrap();
+            // 2 * (2^255 - 1) and 2 * 2^255: finite, positive, not wrapped.
+            assert!(close(candle.0, max), "{candle:?}");
+            assert!(close(candle.1, max), "{candle:?}");
+        }
+    };
 
-    // The rebuild agrees.
-    for table in DEX_DERIVED {
-        let view = format!("{}_v", table.name);
-        let before = database.snapshot(&view).await;
-        database
-            .execute(&format!(
-                "DELETE FROM {} WHERE chain = {CHAIN} AND {} >= \
-                 toDateTime({DAY}) SETTINGS lightweight_deletes_sync = 2",
-                table.name, table.bucket_column
-            ))
-            .await;
-        database.execute(&render_rebuild(table, CHAIN, DAY)).await;
-        assert_eq!(database.snapshot(&view).await, before, "{view}");
-    }
+    check(&database).await;
+
+    // The rebuild (another code path over the same amounts) agrees.
+    let before = visible_state(&database, CHAIN).await;
+    purge(&database, CHAIN, 1_000, 1, DAY).await;
+    check(&database).await;
+    let after = visible_state(&database, CHAIN).await;
+    assert_same_state(&after, &before, "after the rebuild");
 
     database.drop().await;
 }

@@ -56,9 +56,12 @@ pub struct GapRow {
     pub gap_end: i64,
 }
 
+/// `FINAL`: a tombstoned block (rolled back, docs/design.md section 2) is
+/// NOT indexed, it has to show up as a gap and be streamed again. Without
+/// it the dead row would still be seen and the range would look complete.
 fn indexed_numbers_sql(chain: u64, range: BlockRange) -> String {
     format!(
-        "SELECT DISTINCT number FROM blocks \
+        "SELECT DISTINCT number FROM blocks FINAL \
          WHERE chain = {chain} \
          AND number >= {from} AND number < {to}",
         from = range.from,
@@ -322,6 +325,8 @@ mod tests {
         let sql = gaps_sql(56, range, 1000);
 
         assert!(sql.contains("chain = 56"));
+        // Tombstoned blocks must count as missing.
+        assert!(sql.contains("FROM blocks FINAL "));
         assert!(sql.contains("number >= 0 AND number < 500"));
         // First row compares against `from - 1` (signed, from may be 0).
         assert!(sql.contains("toInt64(0) - 1"));
@@ -331,6 +336,7 @@ mod tests {
         let sql = stats_sql(56, range);
         assert!(sql.contains("count()"));
         assert!(sql.contains("max(number)"));
+        assert!(sql.contains("FROM blocks FINAL "));
         assert!(sql.contains("chain = 56"));
     }
 }

@@ -5,7 +5,13 @@
 FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 WORKDIR /app
 
+# The build context is an allow-list, see .dockerignore: only Cargo.toml,
+# Cargo.lock, build.rs, bin/, src/ and migrations/ are sent to the daemon.
+
 # ---- planner: compute the dependency recipe -------------------------------
+# `cargo chef prepare` only reads the manifests and the target layout (it has
+# to see build.rs to know the package has a build script); it never runs
+# build.rs, so migrations/ is not needed in this stage.
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY bin ./bin
@@ -22,7 +28,9 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# build.rs embeds migrations/*.sql into the binary (see src/db/migrate.rs).
+# build.rs embeds migrations/*.sql into the binary (see src/db/migrate.rs)
+# and fails the build on a malformed migration set, so the directory must be
+# present here. The image needs no SQL files at runtime.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY bin ./bin
 COPY src ./src
@@ -42,5 +50,13 @@ COPY --from=builder /app/target/release/indexer /usr/local/bin/indexer
 
 USER indexer
 
+# Documentation only: the port used for --metrics-addr / METRICS_ADDR in
+# docker-compose.yml (/metrics, /healthz, /readyz). Metrics are off unless
+# that option is set, which is why there is no HEALTHCHECK here; compose
+# defines one (it uses bash's /dev/tcp, the image ships no curl or wget).
+EXPOSE 9090
+
+# `indexer` without a subcommand is `indexer run`; `indexer migrate` and
+# `indexer verify` are the other subcommands.
 # All flags can also be supplied as environment variables (see README.md).
 ENTRYPOINT ["indexer"]

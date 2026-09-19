@@ -14,7 +14,7 @@ use std::{
     collections::HashSet,
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -39,17 +39,18 @@ use super::{
 
 /// Where resolved pools are written, and what is already there.
 pub trait PoolSink: Send + Sync + 'static {
-    /// The subset of `pool_ids` that already has a `dex_pools` row (of any
+    /// The subset of `pool_ids` that has a LIVE `dex_pools` row (of any
     /// source). Keeps the worker from asking the RPC about pools whose
-    /// creation event was indexed long ago:
-    /// `SELECT pool_id FROM dex_pools WHERE chain = ? AND pool_id IN ?`.
+    /// creation event was indexed long ago: `SELECT pool_id FROM dex_pools
+    /// FINAL WHERE chain = ? AND pool_id IN ?` (`FINAL`: a tombstoned pool
+    /// is not known).
     fn known_pools<'a>(
         &'a self,
         pool_ids: &'a [B256],
     ) -> BoxFuture<'a, anyhow::Result<HashSet<B256>>>;
 
-    /// Inserts into `dex_pools`. Must be idempotent (ReplacingMergeTree)
-    /// and must keep the rows' `_version` untouched.
+    /// Inserts into `dex_pools`. Must be idempotent (ReplacingMergeTree).
+    /// The rows arrive stamped (`_version`, `epoch`).
     fn insert_pools<'a>(
         &'a self,
         rows: &'a [DexPool],
@@ -173,6 +174,8 @@ struct Shared {
     counters: Counters,
     memory: Mutex<Memory>,
     breaker_open: AtomicBool,
+    /// Purge generation stamped on the rows the worker writes.
+    epoch: AtomicU32,
 }
 
 impl Shared {
@@ -221,6 +224,7 @@ impl PoolWorker {
             }),
             counters: Counters::default(),
             breaker_open: AtomicBool::new(false),
+            epoch: AtomicU32::new(0),
             options,
         });
 
@@ -298,6 +302,13 @@ impl PoolWorker {
         for id in pool_ids {
             memory.known.put(id, ());
         }
+    }
+
+    /// The chain's current purge generation (docs/design.md §2): call it at
+    /// startup and whenever `purge_range` adopts a new epoch. Rows written
+    /// by the worker carry it, like every other block scoped row.
+    pub fn set_epoch(&self, epoch: u32) {
+        self.shared.epoch.store(epoch, Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> PoolWorkerStats {
@@ -647,6 +658,14 @@ impl Task {
             return;
         }
 
+        // Stamped like a flush of the pipeline: one version per insert.
+        let version = crate::db::next_version();
+        let epoch = self.shared.epoch.load(Ordering::Relaxed);
+        for row in &mut rows {
+            row._version = version;
+            row.epoch = epoch;
+        }
+
         match self.sink.insert_pools(&rows).await {
             Ok(()) => {
                 bump(&counters.inserted, rows.len());
@@ -822,6 +841,7 @@ mod tests {
         );
 
         let pools = [candidate(addr(1), Protocol::UniswapV2)];
+        worker.set_epoch(4);
         worker.discover(&pools);
         worker.discover(&pools);
 
@@ -829,6 +849,8 @@ mod tests {
 
         let row = &sink.rows()[0];
         assert_eq!(row.chain, 7);
+        assert_eq!(row.epoch, 4);
+        assert!(row._version > 1_600_000_000_000);
         assert_eq!(row.source, PoolSource::Rpc);
         assert_eq!(row.tokens, vec![addr(0xa), addr(0xb)]);
 
@@ -900,7 +922,7 @@ mod tests {
         until("the negative row", || sink.rows().len() == 1).await;
 
         assert_eq!(sink.rows()[0].source, PoolSource::Unresolved);
-        assert_eq!(sink.rows()[0]._version, 0);
+        assert_eq!(sink.rows()[0].created_block, 0);
         assert_eq!(worker.stats().negative, 1);
 
         let calls = node.calls();

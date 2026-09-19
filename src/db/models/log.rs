@@ -45,6 +45,9 @@ pub struct DatabaseLog {
     pub topic3: Option<B256>,
     #[serde_as(as = "SerBytes")]
     pub data: Bytes,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
     /// Stamped once per flush, see `RowBatch::set_version`.
     pub _version: u64,
 }
@@ -73,6 +76,7 @@ struct StoredLog {
     topic3: B256,
     #[serde_as(as = "SerBytes")]
     data: Bytes,
+    epoch: u32,
     _version: u64,
 }
 
@@ -96,6 +100,7 @@ impl From<StoredLog> for DatabaseLog {
             topic2: topic(2, log.topic2),
             topic3: topic(3, log.topic3),
             data: log.data,
+            epoch: log.epoch,
             _version: log._version,
         }
     }
@@ -160,6 +165,7 @@ impl DatabaseLog {
             topic2,
             topic3,
             data: log.data.as_ref().map(data_to_bytes).unwrap_or_default(),
+            epoch: 0,
             _version: 0,
         })
     }
@@ -185,6 +191,7 @@ pub(crate) mod test_support {
             topic2: topics.get(2).copied(),
             topic3: topics.get(3).copied(),
             data: Bytes::from(data),
+            epoch: 0,
             _version: 0,
         }
     }

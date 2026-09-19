@@ -184,14 +184,12 @@ async fn flush<S: Sink>(
         .unwrap_or_else(|| "-".to_string());
 
     info!(
-        "Stored {} blocks ({span}): transactions ({}) logs ({}) traces ({}) \
-         contracts ({}) withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) \
-         tokens ({}) in {:?}.",
+        "Stored {} blocks ({span}): transactions ({}) logs ({}) \
+         withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) tokens ({}) \
+         in {:?}.",
         batch.blocks.len(),
         batch.transactions.len(),
         batch.logs.len(),
-        batch.traces.len(),
-        batch.contracts.len(),
         batch.withdrawals.len(),
         batch.erc20_transfers.len(),
         batch.erc721_transfers.len(),
