@@ -675,7 +675,7 @@ indexer run --chain solana --start-block 448000000
 
 **There is no fork-point search.** On data served at finality there is no fork to find, so a continuity break is treated as what it is — something that is not supposed to happen. The indexer **stops**, loudly, with a message naming the slot, both hashes and what to check; nothing at or above the break is written. It is not repaired silently, because the repair would be indistinguishable from a wrong endpoint. The tombstone / epoch machinery stays fully in place and is used for gap heals: a flush that died between its children and its `sol_slots` insert is purged before the range is streamed again.
 
-`indexer verify --chain solana` runs the Solana checks (cursor tiling, height chain, parent chain, orphan rows, candles against `sol_dex_swaps`) and reports skipped slots as skipped rather than missing. Give it the slot you actually started from — `indexer verify --chain solana --start-block 448378313`. It defaults to 0, and after a `--new-blocks-only` run that is honest but unhelpful: everything below the start really was never asked for, so the report is one enormous hole.
+`indexer verify --chain solana` runs the Solana checks (cursor tiling, height chain, parent chain, orphan rows, candles against `sol_dex_swaps`) and reports skipped slots as skipped rather than missing. It starts at the chain's [coverage floor](#what-it-promises-the-coverage-floor), the same as on every other chain: below the floor nothing was ever asked for, so counting it as missing would print one enormous hole about a healthy database. `--start-block` still means exactly what it says, including below the floor, and the report then names the floor so the hole reads as a choice.
 
 ### Cost and rate limit
 

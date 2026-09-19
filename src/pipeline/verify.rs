@@ -9,6 +9,20 @@
 //!    them on its next start (gap heal), until then the aggregates of those
 //!    days may count them.
 //! 3. **Checkpoints**: a live checkpoint must never claim a missing block.
+//!
+//! # Where a verification starts
+//!
+//! At the chain's **coverage floor** (docs/design.md section 16), not at
+//! block 0. The floor is what the database promises; below it there is
+//! nothing and there is meant to be nothing. Checking from 0 made every
+//! healthy database report the whole of history as one missing range and
+//! print `PROBLEMS FOUND` for ever - which is the fastest way to teach an
+//! operator to ignore the one command that tells them the truth.
+//!
+//! An explicit `--start-block` still means exactly what it says, including
+//! below the floor: the blocks down there really are missing, the report
+//! says so, and it names the floor so the number reads as a choice rather
+//! than as damage.
 
 use crate::{
     coverage,
@@ -161,6 +175,11 @@ pub struct VerifyReport {
     /// been stored yet, which is a database no `indexer run` has ever
     /// started against.
     pub coverage: Option<String>,
+    /// The operator asked for a start BELOW the coverage floor, and this is
+    /// the floor. Everything between the two is missing on purpose, so the
+    /// report says whose choice that was rather than leaving a reader to
+    /// conclude the database is damaged.
+    pub below_floor: Option<u64>,
 }
 
 impl VerifyReport {
@@ -209,6 +228,17 @@ impl fmt::Display for VerifyReport {
         // is being kept.
         if let Some(coverage) = &self.coverage {
             writeln!(f, "{coverage}")?;
+        }
+
+        if let Some(floor) = self.below_floor {
+            writeln!(
+                f,
+                "--start-block {} is BELOW this chain's coverage floor \
+                 (block {floor}). Blocks [{}, {floor}) were never promised \
+                 and are listed as missing below, which is what was asked \
+                 for. Without --start-block the check starts at the floor.",
+                self.range.from, self.range.from
+            )?;
         }
 
         if self.gaps.is_empty() {
@@ -295,10 +325,15 @@ impl fmt::Display for VerifyReport {
         }
 
         if self.checkpoint_conflicts.is_empty() {
+            // FROM the start of the range, not "up to N" from an implied
+            // zero: the range starts at the coverage floor, and a line
+            // that says "contiguous up to block 0" about a healthy chain
+            // reads as "nothing is covered".
             writeln!(
                 f,
-                "Checkpoints: consistent (contiguous up to block {}).",
-                self.checkpoint_resume
+                "Checkpoints: consistent (contiguous from block {} to \
+                 block {}).",
+                self.range.from, self.checkpoint_resume
             )?;
         } else {
             writeln!(
@@ -364,13 +399,82 @@ fn child_tables(
     tables
 }
 
-/// Runs the checks. `end_block` 0 = up to the highest indexed block.
+/// The stored coverage floor of this chain, or `None`.
+///
+/// Never fatal: a database from before floors existed has no
+/// `chain_coverage` row (and, on the oldest ones, no table), and that is a
+/// reason to check from 0 rather than a reason to refuse to check at all.
+async fn stored_floor(db: &Database) -> Option<u64> {
+    match coverage::store::stored(db).await {
+        Ok(floor) => floor.map(|floor| floor.block),
+        Err(e) => {
+            log::debug!("could not read the coverage floor: {e:#}");
+            None
+        }
+    }
+}
+
+/// Where a verification starts: what the operator asked for, or - when
+/// they asked for nothing - this chain's coverage floor.
+///
+/// This is the whole of the "verify starts at the floor" rule, in one
+/// place, so both families and the fleet answer it the same way.
+pub async fn start_of(db: &Database, explicit: Option<u64>) -> u64 {
+    match explicit {
+        Some(block) => block,
+        None => stored_floor(db).await.unwrap_or(0),
+    }
+}
+
+/// The lowest STORED block (or Solana slot) of `date` or later, for a
+/// `--start-date` / `--from-date` that has to become a number.
+///
+/// Deliberately a question about what is stored rather than a binary
+/// search over the source's headers (`coverage::resolve`): `verify` and
+/// `backfill` read this database and nothing else, so asking the source
+/// would be a network call to answer a question the database already
+/// knows. `None` means nothing is stored on or after that day.
+pub async fn block_at_date(
+    db: &Database,
+    date: coverage::date::Date,
+) -> Result<Option<u64>> {
+    let solana = db.chain_id == crate::pipeline::solana::SOLANA_CHAIN_ID;
+    let (table, column) = if solana {
+        ("sol_slots", "block_number")
+    } else {
+        ("blocks", "number")
+    };
+
+    let sql = format!(
+        "SELECT toUInt64(count()), toUInt64(min(`{column}`)) \
+         FROM `{table}` FINAL WHERE chain = {} \
+         AND timestamp >= toDateTime({})",
+        db.chain_id,
+        date.midnight()
+    );
+
+    let (found, lowest) =
+        db.db.query(&sql).fetch_one::<(u64, u64)>().await.with_context(
+            || format!("find the first stored block of {date} or later"),
+        )?;
+
+    Ok((found > 0).then_some(lowest))
+}
+
+/// Runs the checks.
+///
+/// `start_block` `None` = start at the coverage floor (see the module
+/// header); `end_block` 0 = up to the highest indexed block.
 pub async fn verify(
     db: &Database,
-    start_block: u64,
+    start_block: Option<u64>,
     end_block: u64,
 ) -> Result<VerifyReport> {
     let chain = db.chain_id;
+
+    let floor = stored_floor(db).await;
+    let start_block = start_block.unwrap_or(floor.unwrap_or(0));
+    let below_floor = floor.filter(|floor| start_block < *floor);
 
     let end = if end_block > 0 {
         end_block
@@ -530,13 +634,41 @@ pub async fn verify(
              parts are not known",
         );
     } else {
+        // THE DAY OF THE FLOOR IS COMPARED, from the floor onwards.
+        //
+        // It is a partial day - the floor lands in the middle of one - but
+        // the comparison is still exact, and that is the only thing that
+        // matters here: the view counts every stored row of the day, the
+        // base table is read from `range.from` up, and on a floor-to-head
+        // database there IS nothing stored below the floor. Skipping it
+        // instead would leave a Solana chain (whose floor is the head)
+        // with nothing to check for its first two days, which is exactly
+        // when a doubled write is most likely.
+        //
+        // The one case where the day would NOT be comparable is a start
+        // below the oldest stored block's day with rows beneath it - an
+        // explicit `--start-block` in the middle of the data. Hence the
+        // question asked here is "is anything stored below where we
+        // start", not "did we start at zero". The Solana twin
+        // (`pipeline::solana_verify`) decides this identically.
+        let nothing_below_the_start = coverage::store::lowest_stored(db)
+            .await
+            .unwrap_or(None)
+            .is_none_or(|lowest| range.from <= lowest);
+
         let parts = subtract_ranges(&[range], &gaps);
         aggregate_parts_skipped =
             parts.len().saturating_sub(MAX_AGGREGATE_PARTS);
 
         for part in parts.iter().take(MAX_AGGREGATE_PARTS) {
+            // Only the FIRST part starts where the range does; every later
+            // one starts after a gap, and the blocks below it in that day
+            // are counted by the view but not by the base side.
+            let first_day_complete =
+                part.from == range.from && nothing_below_the_start;
+
             let Some((first_day, last_day)) =
-                complete_days(db, *part).await?
+                complete_days(db, *part, first_day_complete).await?
             else {
                 continue;
             };
@@ -581,6 +713,7 @@ pub async fn verify(
         heal_pending,
         epoch: db.current_epoch().await?,
         coverage: coverage_line(db).await,
+        below_floor,
     })
 }
 
@@ -644,12 +777,19 @@ pub async fn block_timestamp(db: &Database, number: u64) -> Option<u32> {
         .filter(|timestamp| *timestamp > 0)
 }
 
-/// `[first, last)`: the UTC days the verified range covers COMPLETELY.
-/// The day of the first stored block and the day of the last one are left
-/// out - the range starts and ends inside them.
+/// `[first, last)`: the UTC days of `range` whose stored rows can be
+/// compared with the aggregates exactly.
+///
+/// The day of the LAST stored block is always left out: the range ends
+/// inside it, so blocks of that day above `range.to` are counted by the
+/// view and not by the base side. The day of the FIRST stored block is
+/// left out unless `first_day_complete`, which the caller sets when
+/// nothing is stored below `range.from` - the coverage floor being the
+/// ordinary case.
 async fn complete_days(
     db: &Database,
     range: BlockRange,
+    first_day_complete: bool,
 ) -> Result<Option<(u32, u32)>> {
     const DAY: u32 = 86_400;
 
@@ -667,10 +807,10 @@ async fn complete_days(
         return Ok(None);
     }
 
-    // The first day is complete only when the range starts at block 0:
-    // otherwise the blocks before `range.from` belong to it too.
-    let first = if range.from == 0 && low % DAY == 0 {
-        low
+    // `low` is the first stored block's timestamp. Its day is comparable
+    // when nothing is stored below it inside this range.
+    let first = if first_day_complete {
+        low - low % DAY
     } else {
         low - low % DAY + DAY
     };
@@ -777,6 +917,7 @@ mod tests {
             heal_pending: false,
             epoch: 0,
             coverage: None,
+            below_floor: None,
         }
     }
 
@@ -800,6 +941,52 @@ mod tests {
         // rather than printing an empty or invented one.
         let quiet = report().to_string();
         assert!(!quiet.contains("Coverage:"), "{quiet}");
+    }
+
+    /// The checkpoint line used to say "contiguous up to block 0" on a
+    /// perfectly healthy chain whose floor is a year back, because the
+    /// verification started at 0. It now says where it started FROM.
+    #[test]
+    fn the_checkpoint_line_says_the_range_it_covered() {
+        let floored = VerifyReport {
+            range: BlockRange::new(23_399_283, 23_412_807),
+            checkpoint_resume: 23_412_807,
+            ..report()
+        };
+
+        let text = floored.to_string();
+        assert!(
+            text.contains(
+                "Checkpoints: consistent (contiguous from block 23399283 \
+                 to block 23412807)."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("up to block 0"), "{text}");
+    }
+
+    /// A start below the floor is honoured, and the hole it exposes is
+    /// explained rather than left to look like damage.
+    #[test]
+    fn a_start_below_the_floor_names_the_floor() {
+        let below = VerifyReport {
+            range: BlockRange::new(0, 1_000),
+            gaps: vec![BlockRange::new(0, 500)],
+            below_floor: Some(500),
+            ..report()
+        };
+
+        assert!(!below.is_consistent());
+        let text = below.to_string();
+        assert!(
+            text.contains("BELOW this chain's coverage floor"),
+            "{text}"
+        );
+        assert!(text.contains("block 500"), "{text}");
+        assert!(text.contains("[0, 500)"), "{text}");
+
+        // And the note is absent when the start IS the floor.
+        assert!(!report().to_string().contains("BELOW this chain's"));
     }
 
     #[test]

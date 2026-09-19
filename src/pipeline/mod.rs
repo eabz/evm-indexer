@@ -297,7 +297,6 @@ struct SyncSettings {
     end_block: u64,
     /// Blocks to stay behind the chain head.
     confirmations: u64,
-    new_blocks_only: bool,
     /// Minimum time between two commits while following the head: fewer,
     /// larger inserts (every insert of a flush is a synchronous ClickHouse
     /// part, and 50+ chains share the server).
@@ -520,8 +519,13 @@ pub async fn run_with<S: BlockSource>(
     // pass and answers the same question without that hole, so the
     // checkpoints stay what they are: an index for operators and for
     // `indexer verify`, and the log line below.
-    let resume =
-        verify::resume_point(&db, config.start_block).await.unwrap_or(0);
+    // On a query error: "the checkpoints cover nothing above the floor",
+    // which silences the line below. `unwrap_or(0)` said "nothing above
+    // block zero" and happened to mean the same only because the line is
+    // guarded - a coincidence, now that the floor is rarely zero.
+    let resume = verify::resume_point(&db, config.start_block)
+        .await
+        .unwrap_or(config.start_block);
     if resume > config.start_block {
         info!(
             "Checkpoints cover blocks [{}, {resume}) without a hole.",
@@ -651,7 +655,9 @@ pub async fn run_with<S: BlockSource>(
             start_block: config.start_block,
             end_block: config.end_block,
             confirmations: config.confirmations,
-            new_blocks_only: config.new_blocks_only,
+            // `--new-blocks-only` is not carried past this point: it
+            // already said everything it had to say by becoming the
+            // coverage floor, which `start_block` is (see `sync`).
             tip_interval: Duration::from_millis(
                 config.flush_interval_ms.saturating_mul(2),
             ),
@@ -825,12 +831,20 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
         }
 
         // Everything below the cursor is known to be stored.
-        let mut cursor = if self.settings.new_blocks_only {
-            // Same horizon the loop syncs to: nothing unconfirmed is stored.
-            head.saturating_sub(confirmations)
-        } else {
-            self.settings.start_block
-        };
+        //
+        // `--new-blocks-only` is NOT a special case any more: the coverage
+        // floor it set is the head of the chain's first start, and
+        // `start_block` IS that floor (set in `run_with`). Re-deriving the
+        // cursor from a SECOND head poll was an off-by-one that never
+        // indexed the floor's own block, so the first checkpoint started
+        // one block above the floor, `coverage_v`'s fold never left it and
+        // every surface said "Coverage: nothing stored yet" for ever about
+        // a chain that was following the head perfectly.
+        //
+        // Nothing unconfirmed is stored either way: that is the loop's
+        // TARGET (`target_block`), which has always been `head -
+        // confirmations` and is unchanged.
+        let mut cursor = self.settings.start_block;
 
         info!(
             "Chain head is {head}. Syncing from block {cursor}{}{}.",

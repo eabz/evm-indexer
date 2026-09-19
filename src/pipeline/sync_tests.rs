@@ -466,7 +466,6 @@ fn settings(start_block: u64, end_block: u64) -> SyncSettings {
         start_block,
         end_block,
         confirmations: 0,
-        new_blocks_only: false,
         tip_interval: Duration::ZERO,
     }
 }
@@ -548,29 +547,28 @@ async fn follows_the_head_as_it_grows() {
     assert_eq!(*store.flushes.lock().unwrap(), vec![20, 3, 8, 9]);
 }
 
+/// `--new-blocks-only` reaches the loop as a `start_block`, and nothing
+/// else: `run_with` turns the flag into a coverage floor at the head
+/// (`head - 1`, the last block the source has) and hands that over.
+///
+/// The loop must therefore START at it, including the floor's own block.
+/// It used to re-derive the cursor from a second head poll, which sat one
+/// block above the floor and left it unindexed for ever - so `coverage_v`
+/// said "nothing stored yet" about a chain following the head perfectly
+/// (`pipeline::acceptance::new_blocks_only_indexes_the_block_its_floor_promises`).
 #[tokio::test(start_paused = true)]
-async fn new_blocks_only_starts_at_the_current_head() {
+async fn the_cursor_is_the_floor_even_when_the_floor_is_the_head() {
     let source = MockSource::new(&[100, 105, 110]);
     let store = MemoryStore::default();
 
-    let mut indexer = indexer(
-        source.clone(),
-        store.clone(),
-        SyncSettings {
-            chain_id: 1,
-            start_block: 0,
-            end_block: 110,
-            confirmations: 0,
-            new_blocks_only: true,
-            tip_interval: Duration::ZERO,
-        },
-    )
-    .await;
+    // What `--new-blocks-only` writes as the floor at head 100.
+    let mut indexer =
+        indexer(source.clone(), store.clone(), settings(99, 110)).await;
 
     indexer.sync().await.unwrap();
     indexer.writer.shutdown().await.unwrap();
 
-    assert_eq!(store.numbers(), (100..110).collect::<Vec<_>>());
+    assert_eq!(store.numbers(), (99..110).collect::<Vec<_>>());
 }
 
 #[tokio::test(start_paused = true)]
@@ -682,27 +680,30 @@ async fn confirmed_blocks_are_indexed_as_the_head_moves() {
     );
 }
 
+/// Confirmations hold the TARGET back, never the start.
+///
+/// The start is the coverage floor and nothing else: at head 100 with
+/// `--new-blocks-only` that is block 99, so nothing below it is indexed
+/// however many confirmations are asked for - and nothing within ten
+/// blocks of the head is stored until the head has moved on.
 #[tokio::test(start_paused = true)]
-async fn new_blocks_only_with_confirmations_starts_at_the_confirmed_head()
-{
+async fn confirmations_hold_the_target_back_and_not_the_floor() {
     let source = MockSource::new(&[100, 120]);
     let store = MemoryStore::default();
 
     let mut indexer = indexer(
         source.clone(),
         store.clone(),
-        SyncSettings {
-            confirmations: 10,
-            new_blocks_only: true,
-            ..settings(0, 105)
-        },
+        SyncSettings { confirmations: 10, ..settings(99, 105) },
     )
     .await;
 
     indexer.sync().await.unwrap();
     indexer.writer.shutdown().await.unwrap();
 
-    assert_eq!(store.numbers(), (90..105).collect::<Vec<_>>());
+    // Head 100 leaves nothing to do (target 90 is below the floor); head
+    // 120 opens [99, 105).
+    assert_eq!(store.numbers(), (99..105).collect::<Vec<_>>());
 }
 
 #[tokio::test(start_paused = true)]
@@ -735,14 +736,10 @@ async fn a_bounded_run_over_a_stored_range_still_drains_the_stale_queue() {
     let source = MockSource::new(&[50]);
     let store = MemoryStore::with_blocks(0..50);
 
-    // `--new-blocks-only --end-block 50` at head 50: the cursor starts at
-    // the head and the target is the head, so there is nothing to sync.
-    let mut indexer = indexer(
-        source.clone(),
-        store.clone(),
-        SyncSettings { new_blocks_only: true, ..settings(0, 50) },
-    )
-    .await;
+    // A floor of 50 and `--end-block 50` at head 50: the cursor starts at
+    // the floor and the target is the floor, so there is nothing to sync.
+    let mut indexer =
+        indexer(source.clone(), store.clone(), settings(50, 50)).await;
 
     *indexer.stale.lock().unwrap() = vec![BlockRange::new(10, 20)];
 

@@ -139,7 +139,8 @@ async fn lower_the_floor_if_earned(
     }
 
     let report =
-        pipeline::verify::verify(db, from_block, floor.block).await?;
+        pipeline::verify::verify(db, Some(from_block), floor.block)
+            .await?;
 
     if !report.gaps.is_empty() {
         let missing: u64 = report.gaps.iter().map(|gap| gap.len()).sum();
@@ -257,6 +258,33 @@ async fn run_registry_history(
 async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
     let db = Database::new(&config.database_url, config.chain_id).await?;
 
+    // What the operator asked for, as a block. `None` here means they
+    // asked for nothing, and `verify` then starts at the coverage floor -
+    // the whole point of the floor being that nothing below it is
+    // promised, so nothing below it is missing (docs/design.md section 16).
+    let start = match (config.start_block, config.start_date) {
+        (Some(block), _) => Some(block),
+        (None, Some(date)) => {
+            match pipeline::verify::block_at_date(&db, date).await? {
+                Some(block) => {
+                    println!(
+                        "--start-date {date} is block {block}, the first \
+                         one stored on that day or later."
+                    );
+                    Some(block)
+                }
+                None => {
+                    println!(
+                        "Nothing is stored on {date} or later, so there is \
+                         nothing to verify from there."
+                    );
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+        }
+        (None, None) => None,
+    };
+
     let consistent = if is_solana(config.chain_id) {
         // The coverage promise, in the same words as everywhere else
         // (docs/design.md section 16). Printed here rather than inside the
@@ -277,22 +305,14 @@ async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
             );
         }
 
-        let report = pipeline::solana::verify(
-            &db,
-            config.start_block,
-            config.end_block,
-        )
-        .await?;
+        let report =
+            pipeline::solana::verify(&db, start, config.end_block).await?;
 
         println!("{report}");
         report.is_consistent()
     } else {
-        let report = pipeline::verify::verify(
-            &db,
-            config.start_block,
-            config.end_block,
-        )
-        .await?;
+        let report =
+            pipeline::verify::verify(&db, start, config.end_block).await?;
 
         println!("{report}");
         report.is_consistent()
@@ -303,6 +323,62 @@ async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
     } else {
         ExitCode::from(EXIT_PROBLEMS_FOUND)
     })
+}
+
+/// Where `indexer backfill` starts, as a block.
+///
+/// `--from-block` wins; `--from-date` becomes the first block stored on
+/// that day or later; and with neither the answer is the **coverage
+/// floor**, not block 0. A backfill re-decodes logs this database already
+/// has, and below the floor it has none: starting at 0 meant thousands of
+/// guaranteed-empty chunk queries before the first stored log, and then a
+/// floor check that printed "blocks [0, N) are not all stored" about
+/// blocks nobody ever asked for.
+///
+/// `--from-block 0` still means genesis, which is how an operator asks to
+/// lower the floor - the flag having no default is what keeps the two
+/// apart.
+async fn backfill_start(
+    db: &Database,
+    config: &BackfillConfig,
+) -> Result<u64> {
+    if let Some(block) = config.from_block {
+        return Ok(block);
+    }
+
+    if let Some(date) = config.from_date {
+        // Silently ignored before this: `--from-date` was parsed, stored
+        // and never read, so the backfill ran from block 0 instead.
+        return match pipeline::verify::block_at_date(db, date).await? {
+            Some(block) => {
+                println!(
+                    "--from-date {date} is block {block}, the first one \
+                     stored on that day or later."
+                );
+                Ok(block)
+            }
+            None => anyhow::bail!(
+                "nothing is stored on {date} or later, so there are no \
+                 logs to re-decode from there. `indexer verify` prints the \
+                 window this database covers."
+            ),
+        };
+    }
+
+    let floor = evm_indexer::coverage::store::stored(db)
+        .await?
+        .map(|floor| floor.block)
+        .unwrap_or(0);
+
+    if floor > 0 {
+        println!(
+            "Starting at block {floor}, this chain's coverage floor: \
+             below it this database stores no logs to re-decode. Pass \
+             --from-block to start somewhere else."
+        );
+    }
+
+    Ok(floor)
 }
 
 async fn run_backfill(config: BackfillConfig) -> Result<()> {
@@ -316,10 +392,12 @@ async fn run_backfill(config: BackfillConfig) -> Result<()> {
         return run_registry_history(&db, &config).await;
     }
 
+    let from_block = backfill_start(&db, &config).await?;
+
     let report = pipeline::backfill::backfill(
         &db,
         &config.module,
-        config.from_block,
+        from_block,
         config.to_block,
         config.chunk_blocks,
     )
@@ -328,7 +406,7 @@ async fn run_backfill(config: BackfillConfig) -> Result<()> {
     // A backfill that reached below the coverage floor may have made the
     // promise bigger - but only if the older range really is complete
     // (docs/design.md section 16). Checked, never assumed.
-    lower_the_floor_if_earned(&db, config.from_block).await?;
+    lower_the_floor_if_earned(&db, from_block).await?;
 
     match report.rewritten {
         None => println!(
