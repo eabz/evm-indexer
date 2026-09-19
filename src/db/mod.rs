@@ -23,9 +23,11 @@ use models::{
     transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
 };
 use ranges::{
-    assemble_missing_ranges, contiguous_ranges, gaps_sql, is_dense,
-    stats_sql, BlockRange, DatabaseCheckpoint, GapRow, MissingRanges,
-    RangeStats, MAX_GAPS_PER_PASS,
+    assemble_missing_ranges, compaction_writes, contiguous_ranges,
+    gaps_sql, is_dense, stats_sql, BlockRange, CheckpointWrite,
+    DatabaseCheckpoint, GapRow, MissingRanges, RangeStats,
+    COMPACT_CHECKPOINTS_ABOVE, MAX_CHECKPOINTS_PER_COMPACTION,
+    MAX_GAPS_PER_PASS,
 };
 use serde::Serialize;
 use std::{
@@ -667,6 +669,77 @@ impl Database {
         };
 
         Ok(assemble_missing_ranges(range, stats, &gaps, MAX_GAPS_PER_PASS))
+    }
+
+    /// Collapses runs of contiguous live `checkpoints` of this chain into
+    /// one covering row each. Returns the rows it replaced.
+    ///
+    /// `checkpoints` gains one row per flush and nothing ever removes
+    /// them, so a chain that has been following the head for a year holds
+    /// millions of rows that all say the same thing. This keeps the answer
+    /// identical (the union of the live ranges never changes) and the
+    /// table at "one row per hole, plus one".
+    ///
+    /// Insert only: the covering row and the tombstones of the rows it
+    /// replaces go out in ONE insert, so they become visible together and
+    /// a crash before it leaves the table exactly as it was. Bounded:
+    /// at most [`MAX_CHECKPOINTS_PER_COMPACTION`] rows are read per call,
+    /// the rest waits for the next one. Nothing below
+    /// [`COMPACT_CHECKPOINTS_ABOVE`] rows is touched.
+    ///
+    /// The CALLER must hold the chain's lease: this rewrites rows a purge
+    /// of another process could be splitting at the same moment.
+    pub async fn compact_checkpoints(&self) -> Result<u64> {
+        let live: Vec<DatabaseCheckpoint> = self
+            .db
+            .query(&format!(
+                "SELECT chain, from_block, to_block, epoch, _version \
+                 FROM checkpoints FINAL WHERE chain = {} \
+                 ORDER BY from_block ASC, to_block ASC LIMIT {}",
+                self.chain_id, MAX_CHECKPOINTS_PER_COMPACTION
+            ))
+            .fetch_all()
+            .await
+            .context("read the live checkpoints to compact")?;
+
+        if live.len() <= COMPACT_CHECKPOINTS_ABOVE {
+            return Ok(0);
+        }
+
+        let writes = compaction_writes(&live, next_version());
+        let replaced =
+            writes.iter().filter(|row| row.is_deleted == 1).count() as u64;
+
+        if replaced == 0 {
+            return Ok(0);
+        }
+
+        let writes: Vec<&CheckpointWrite> = writes.iter().collect();
+        self.insert_flush_refs(
+            "checkpoints",
+            &writes,
+            &FlushKey {
+                chain: self.chain_id,
+                // Not a flush of blocks: the span identifies THIS
+                // compaction, so a retry of it is deduplicated and two
+                // different ones never collide.
+                span: (
+                    live[0].from_block,
+                    live.iter().map(|c| c.to_block).max().unwrap_or(0),
+                ),
+                version: writes[0]._version,
+            },
+        )
+        .await?;
+
+        info!(
+            "Chain {}: compacted {replaced} checkpoint row(s) into {} \
+             covering range(s).",
+            self.chain_id,
+            writes.len() as u64 - replaced
+        );
+
+        Ok(replaced)
     }
 
     /// Hash of an indexed canonical block, if present. `FINAL`: the latest

@@ -410,6 +410,8 @@ async fn indexer(
         metrics: Metrics::disabled(),
         committed: Vec::new(),
         stale: Default::default(),
+        fence: crate::pipeline::lease::Fence::open(),
+        compacted: None,
     }
 }
 
