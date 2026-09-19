@@ -467,6 +467,181 @@ pub const AERODROME_BURN: RawLog = RawLog {
     log_index: 0xfd,
 };
 
+// ------------------------------------------- real transfers of those swaps
+//
+// The ERC-20 `Transfer` logs of the fixture transactions above (same
+// receipts, same public endpoints): what corroborates each swap leg.
+
+pub const TRANSFER_TOPIC: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+macro_rules! real_transfer {
+    ($name:ident, $doc:literal, $token:expr, $from:literal, $to:literal, $amount:literal, $like:expr, $index:literal) => {
+        #[doc = $doc]
+        pub const $name: RawLog = RawLog {
+            address: $token,
+            topics: &[TRANSFER_TOPIC, $from, $to],
+            data: $amount,
+            block_number: $like.block_number,
+            transaction_hash: $like.transaction_hash,
+            log_index: $index,
+        };
+    };
+}
+
+real_transfer!(
+    V2_SWAP_WETH_IN,
+    "Real. Router -> pair, 0.001 WETH, log 246 (the swap is log 249).",
+    WETH,
+    "0x0000000000000000000000007a250d5630b4cf539739df2c5dacb4c659f2488d",
+    "0x000000000000000000000000b4e16d0168e52d35cacd2c6185b44281ec28c9dc",
+    "0x00000000000000000000000000000000000000000000000000038d7ea4c68000",
+    V2_SWAP,
+    246
+);
+real_transfer!(
+    V2_SWAP_USDC_OUT,
+    "Real. Pair -> recipient, 2.624963 USDC, log 247.",
+    USDC,
+    "0x000000000000000000000000b4e16d0168e52d35cacd2c6185b44281ec28c9dc",
+    "0x000000000000000000000000a524ecb8ca2592ac3ed9a562fd467c02e09e003e",
+    "0x0000000000000000000000000000000000000000000000000000000000280dc3",
+    V2_SWAP,
+    247
+);
+real_transfer!(
+    V3_SWAP_USDC_OUT,
+    "Real. Pool -> recipient, 32,942.903993 USDC, log 0 (the swap is log 2).",
+    USDC,
+    "0x00000000000000000000000088e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+    "0x000000000000000000000000bdb3ba9ffe392549e1f8658dd2630c141fdf47b6",
+    "0x00000000000000000000000000000000000000000000000000000007ab8cd2b9",
+    V3_SWAP,
+    0
+);
+real_transfer!(
+    V3_SWAP_WETH_IN,
+    "Real. Callback payment, 12.57 WETH -> pool, log 1.",
+    WETH,
+    "0x000000000000000000000000bdb3ba9ffe392549e1f8658dd2630c141fdf47b6",
+    "0x00000000000000000000000088e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+    "0x000000000000000000000000000000000000000000000000ae7b5bf58b5d2800",
+    V3_SWAP,
+    1
+);
+real_transfer!(
+    V4_TX_USDC_TAKEN,
+    "Real. PoolManager -> caller, 29,558 USDC units, log 0 (before the swaps).",
+    USDC,
+    "0x000000000000000000000000000000000004444c5dc75cb358380d2e3de08a90",
+    "0x0000000000000000000000000000000aa232009084bd71a5797d089aa4edfad4",
+    "0x0000000000000000000000000000000000000000000000000000000000007376",
+    V4_SWAP_USDC_IN,
+    0
+);
+real_transfer!(
+    V4_TX_WETH_TAKEN,
+    "Real. PoolManager -> caller, 1.2318 WETH = the SUM of both swaps' output, log 1.",
+    WETH,
+    "0x000000000000000000000000000000000004444c5dc75cb358380d2e3de08a90",
+    "0x0000000000000000000000000000000aa232009084bd71a5797d089aa4edfad4",
+    "0x000000000000000000000000000000000000000000000000111845ae817f739c",
+    V4_SWAP_USDC_IN,
+    1
+);
+real_transfer!(
+    V4_TX_USDC_SETTLED,
+    "Real. Caller -> PoolManager, 1,793,618,318 = swap input + the 29,558 taken, log 4 (AFTER the swaps).",
+    USDC,
+    "0x0000000000000000000000000000000aa232009084bd71a5797d089aa4edfad4",
+    "0x000000000000000000000000000000000004444c5dc75cb358380d2e3de08a90",
+    "0x000000000000000000000000000000000000000000000000000000006ae8718e",
+    V4_SWAP_USDC_IN,
+    4
+);
+real_transfer!(
+    V4_TX_USDT_SETTLED,
+    "Real. Caller -> PoolManager, exactly the second swap's 1,428,368,405 USDT, log 5.",
+    USDT,
+    "0x0000000000000000000000000000000aa232009084bd71a5797d089aa4edfad4",
+    "0x000000000000000000000000000000000004444c5dc75cb358380d2e3de08a90",
+    "0x0000000000000000000000000000000000000000000000000000000055232c15",
+    V4_SWAP_USDC_IN,
+    5
+);
+real_transfer!(
+    BALANCER_SWAP_TOKEN_IN,
+    "Real. Sender -> Vault, the swap's amountIn, log 631 (AFTER the Swap, log 630).",
+    "0x0f2d719407fdbeff09d87557abb7232601fd9f29",
+    "0x0000000000000000000000008ead31c4801322619584f1dc324cb5925f538049",
+    "0x000000000000000000000000ba12222222228d8ba445958a75a0704d566bf2c8",
+    "0x0000000000000000000000000000000000000000000000012a21770000000000",
+    BALANCER_SWAP,
+    631
+);
+real_transfer!(
+    BALANCER_SWAP_WETH_OUT,
+    "Real. Vault -> sender, the swap's amountOut, log 633.",
+    WETH,
+    "0x000000000000000000000000ba12222222228d8ba445958a75a0704d566bf2c8",
+    "0x0000000000000000000000008ead31c4801322619584f1dc324cb5925f538049",
+    "0x0000000000000000000000000000000000000000000000000005e482f3f57278",
+    BALANCER_SWAP,
+    633
+);
+real_transfer!(
+    CURVE_3POOL_USDT_IN,
+    "Real. Router -> 3pool, 0.099206 USDT, log 424 (the exchange is log 426).",
+    USDT,
+    "0x000000000000000000000000ad6cea45f98444a922a2b4fe96b8c90f0862d2f4",
+    "0x000000000000000000000000bebc44782c7db0a1a60cb6fe97d0b483032ff1c7",
+    "0x0000000000000000000000000000000000000000000000000000000000018386",
+    CURVE_3POOL_EXCHANGE,
+    424
+);
+real_transfer!(
+    CURVE_3POOL_USDC_OUT,
+    "Real. 3pool -> router, 0.099112 USDC, log 425.",
+    USDC,
+    "0x000000000000000000000000bebc44782c7db0a1a60cb6fe97d0b483032ff1c7",
+    "0x000000000000000000000000ad6cea45f98444a922a2b4fe96b8c90f0862d2f4",
+    "0x0000000000000000000000000000000000000000000000000000000000018328",
+    CURVE_3POOL_EXCHANGE,
+    425
+);
+
+/// An ERC-20 `Transfer` of `token` (constructed).
+#[allow(clippy::too_many_arguments)]
+pub fn transfer(
+    token: Address,
+    from: Address,
+    to: Address,
+    amount: U256,
+    block_number: u32,
+    log_index: u16,
+    timestamp: u32,
+) -> DatabaseLog {
+    build(
+        token,
+        &[hash(TRANSFER_TOPIC), from.into_word(), to.into_word()],
+        amount.to_be_bytes::<32>().to_vec(),
+        block_number,
+        log_index,
+        timestamp,
+    )
+}
+
+/// Puts `logs` into one transaction.
+pub fn same_transaction(
+    mut logs: Vec<DatabaseLog>,
+    transaction: u64,
+) -> Vec<DatabaseLog> {
+    for log in &mut logs {
+        log.transaction_hash = B256::from(U256::from(transaction));
+    }
+    logs
+}
+
 // ---------------------------------------------------------- constructed logs
 
 fn padded(address: Address) -> B256 {
@@ -551,7 +726,11 @@ mod tests {
         // USDC left the pool, WETH entered it.
         assert_eq!(swap.amount0, signed("-2624963"));
         assert_eq!(swap.amount1, signed("1000000000000000"));
-        assert_eq!(swap.amount_in, U256::ZERO);
+        // Every family: what went in, what came out.
+        assert_eq!(swap.amount_in, unsigned("1000000000000000"));
+        assert_eq!(swap.amount_out, unsigned("2624963"));
+        // Alone, nothing proves the legs.
+        assert_eq!(swap.verified_in, Address::ZERO);
         assert_eq!(swap.sqrt_price_x96, U256::ZERO);
     }
 
@@ -960,9 +1139,11 @@ mod tests {
             ]
         );
 
-        // Only contract pools not created in the batch can be asked.
+        // Contract pools are asked - the one announced in this batch too
+        // (its event is only a claim) - singletons never.
         let candidates = rows.pool_candidates();
-        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(candidates[3].protocol, Protocol::UniswapV3);
         assert_eq!(candidates[0].address, address(V2_USDC_WETH));
         assert_eq!(candidates[1].address, address(V3_USDC_WETH));
         assert_eq!(candidates[2].protocol, Protocol::Curve);

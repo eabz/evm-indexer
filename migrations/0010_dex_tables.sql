@@ -21,18 +21,19 @@
 -- dex_pools by chain (lookups must not fan out per month). A tombstone
 -- copies its row, so it always lands in the partition of the row it kills.
 
--- One row per CREATION EVENT of a pool (plus at most one row written by
--- the RPC resolver), positional like every other block scoped table: a
--- re-inserted block replaces itself, a reorged-out creation is tombstoned
--- by created_block, a re-creation on the canonical chain is simply
--- another (or a newer) row. Several live rows of one pool are possible -
--- forged PairCreated events cost one transaction - so readers never pick
--- "a" row, they pick THE row through dex_pool_current_v below: creation
--- events before rpc rows, then the earliest (created_block, log_index).
--- The first creation event wins, a later forgery can not replace it.
--- Rows of the RPC resolver (source 'rpc' / 'unresolved') have
--- created_block = 0 and log_index = 0: no purge range ever contains them,
--- pool metadata read from the chain state does not depend on the fork.
+-- One row per CREATION EVENT of a pool plus at most one row written by the
+-- RPC resolver (created_block = 0, log_index = 0), positional like every
+-- other block scoped table: a re-inserted block replaces itself, a
+-- reorged-out creation is tombstoned by created_block, a re-creation on the
+-- canonical chain is simply another (or a newer) row.
+-- A creation event is a CLAIM of whoever emitted it - a forged PairCreated
+-- costs one transaction, and V2 / V3 pool addresses are predictable, so it
+-- can even be emitted BEFORE the real one. Never read this table directly:
+-- dex_pool_current_v decides what is known about a pool.
+-- source: 'event' | 'rpc' (the pool's own getters answered) | 'unresolved'
+-- (it is not a pool) | 'no_answer' (no code / no usable answer yet, asked
+-- again with a backoff on attempts). Resolver rows are chain STATE, not
+-- part of a block: no purge range ever contains them.
 CREATE TABLE IF NOT EXISTS dex_pools (
   chain UInt64,
   pool_id FixedString(32),
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS dex_pools (
   transaction_hash FixedString(32),
   log_index UInt32,
   source LowCardinality(String),
+  attempts UInt32 DEFAULT 0,
   epoch UInt32 DEFAULT 0,
   _version UInt64,
   is_deleted UInt8 DEFAULT 0
@@ -61,38 +63,78 @@ PARTITION BY chain
 ORDER BY (chain, pool_id, emitter, created_block, log_index)
 SETTINGS do_not_merge_across_partitions_select_final = 1;
 
--- THE row of every pool (see dex_pools). Negative resolver results
--- ('unresolved') are not pools.
+-- What is known about every pool, and how well (status):
+--   'verified'   a pool that is its own contract answered token0() /
+--                token1() / coins(i) itself (rpc row). That answer WINS over
+--                every creation event: it is the one thing a third party can
+--                not forge. factory, fee, created_block... come from the
+--                first creation event that names the same tokens, if any.
+--   'event'      pools of a singleton (Uniswap V4 PoolManager, Balancer
+--                Vault): only the singleton can emit for its own (pool_id,
+--                emitter) key, so its first event is authoritative FOR THAT
+--                EMITTER. Whether the emitter is the real singleton is a
+--                separate question: dex_trusted_emitters.
+--   'unverified' creation event(s) naming one token set, not confirmed yet.
+--   'contested'  creation events naming DIFFERENT token sets.
+-- trusted = status IN ('verified', 'event'). Views that depend on pool
+-- metadata use it only when trusted = 1 and yield NULL otherwise. Verified
+-- swap legs (dex_swaps.verified_in / verified_out) do not depend on this
+-- view at all.
 CREATE VIEW IF NOT EXISTS dex_pool_current_v AS
 SELECT
   chain, pool_id, emitter,
-  tupleElement(best, 1) AS factory,
-  tupleElement(best, 2) AS protocol,
-  tupleElement(best, 3) AS token0,
-  tupleElement(best, 4) AS token1,
-  tupleElement(best, 5) AS tokens,
-  tupleElement(best, 6) AS underlying_tokens,
-  tupleElement(best, 7) AS fee,
-  tupleElement(best, 8) AS tick_spacing,
-  tupleElement(best, 9) AS hooks,
-  tupleElement(best, 10) AS stable,
-  tupleElement(best, 11) AS created_block,
-  tupleElement(best, 12) AS timestamp,
-  tupleElement(best, 13) AS transaction_hash,
-  tupleElement(best, 14) AS log_index,
-  tupleElement(best, 15) AS source,
-  candidates
+  multiIf(singleton, 'event', has_rpc, 'verified', token_sets > 1, 'contested', 'unverified') AS status,
+  status IN ('verified', 'event') AS trusted,
+  multiIf(singleton, events[1], has_rpc AND length(matching) > 0, matching[1], has_rpc, rpcs[1], events[1]) AS chosen,
+  tupleElement(chosen, 1) AS created_block,
+  tupleElement(chosen, 2) AS log_index,
+  tupleElement(chosen, 3) AS factory,
+  tupleElement(chosen, 4) AS protocol,
+  tupleElement(chosen, 5) AS token0,
+  tupleElement(chosen, 6) AS token1,
+  tupleElement(chosen, 7) AS tokens,
+  if(has_rpc, tupleElement(rpcs[1], 8), tupleElement(chosen, 8)) AS underlying_tokens,
+  tupleElement(chosen, 9) AS fee,
+  tupleElement(chosen, 10) AS tick_spacing,
+  tupleElement(chosen, 11) AS hooks,
+  tupleElement(chosen, 12) AS stable,
+  tupleElement(chosen, 13) AS timestamp,
+  tupleElement(chosen, 14) AS transaction_hash,
+  tupleElement(chosen, 15) AS source,
+  toUInt64(length(events) + length(rpcs)) AS candidates,
+  token_sets
 FROM
 (
   SELECT
-    chain, pool_id, emitter,
-    argMin((factory, toString(protocol), token0, token1, tokens, underlying_tokens, fee, tick_spacing, hooks, stable, created_block, timestamp, transaction_hash, log_index, toString(source)), (source != 'event', created_block, log_index)) AS best,
-    count() AS candidates
-  FROM dex_pools FINAL
-  WHERE source != 'unresolved'
-  GROUP BY chain, pool_id, emitter
+    chain, pool_id, emitter, events, rpcs, singleton,
+    length(rpcs) > 0 AND NOT singleton AS has_rpc,
+    arrayFilter(e -> tupleElement(e, 7) = tupleElement(rpcs[1], 7), events) AS matching,
+    toUInt64(length(arrayDistinct(arrayMap(e -> tupleElement(e, 7), events)))) AS token_sets
+  FROM
+  (
+    SELECT
+      chain, pool_id, emitter,
+      arraySort(groupArrayIf(facts, source = 'event')) AS events,
+      groupArrayIf(facts, source = 'rpc') AS rpcs,
+      countIf(source = 'event' AND protocol IN ('uniswap_v4', 'balancer_v2')) > 0 AS singleton
+    FROM
+    (
+      SELECT
+        chain, pool_id, emitter, source, protocol,
+        (created_block, log_index, factory, toString(protocol), token0, token1, tokens, underlying_tokens, fee, tick_spacing, hooks, stable, timestamp, transaction_hash, toString(source)) AS facts
+      FROM dex_pools FINAL
+      WHERE source IN ('event', 'rpc')
+    )
+    GROUP BY chain, pool_id, emitter
+  )
 );
 
+-- token_in / token_out are what the EVENT says (Balancer), a claim.
+-- verified_in / verified_out are the tokens PROVEN to have moved: an ERC-20
+-- Transfer of exactly amount_in to the emitter / amount_out from the
+-- emitter in the same transaction, emitted by that token (all zero bytes
+-- when nothing proves the leg). Every USD number is built on them and on
+-- nothing else. reserve0 / reserve1: V2 / Solidly reserves after the swap.
 CREATE TABLE IF NOT EXISTS dex_swaps (
   chain UInt64,
   block_number UInt64 CODEC(Delta, ZSTD),
@@ -113,6 +155,10 @@ CREATE TABLE IF NOT EXISTS dex_swaps (
   token_out FixedString(20),
   amount_in UInt256,
   amount_out UInt256,
+  verified_in FixedString(20),
+  verified_out FixedString(20),
+  reserve0 UInt256,
+  reserve1 UInt256,
   coin_in UInt8,
   coin_out UInt8,
   underlying Bool,
@@ -180,6 +226,24 @@ CREATE TABLE IF NOT EXISTS quote_tokens (
 ENGINE = ReplacingMergeTree(_version)
 ORDER BY (chain, token);
 
+-- User populated, never written by the indexer, not block scoped. Pools of
+-- the singleton families (Uniswap V4, Balancer V2) can not be asked
+-- anything over RPC, and any contract can emit their events: their swaps
+-- count towards USD numbers ONLY when the emitter is listed here (protocol
+-- '' retires a row). price_source = 1 on any row of a chain additionally
+-- restricts the native coin price of that chain to the listed emitters
+-- (pool addresses for the contract families): the only defence against
+-- wash trades at a fake price that does not depend on counting pools.
+CREATE TABLE IF NOT EXISTS dex_trusted_emitters (
+  chain UInt64,
+  emitter FixedString(20),
+  protocol LowCardinality(String),
+  price_source UInt8 DEFAULT 0,
+  _version UInt64 DEFAULT toUnixTimestamp64Milli(now64(3))
+)
+ENGINE = ReplacingMergeTree(_version)
+ORDER BY (chain, emitter);
+
 -- Read path: swaps of a pool.
 CREATE TABLE IF NOT EXISTS dex_swaps_by_pool (
   chain UInt64,
@@ -197,6 +261,8 @@ CREATE TABLE IF NOT EXISTS dex_swaps_by_pool (
   token_out FixedString(20),
   amount_in UInt256,
   amount_out UInt256,
+  verified_in FixedString(20),
+  verified_out FixedString(20),
   coin_in UInt8,
   coin_out UInt8,
   underlying Bool,
@@ -215,8 +281,8 @@ TO dex_swaps_by_pool AS
 SELECT
   chain, pool_id, block_number, log_index, timestamp, emitter, protocol,
   transaction_hash, trader, amount0, amount1, token_in, token_out,
-  amount_in, amount_out, coin_in, coin_out, underlying, sqrt_price_x96,
-  epoch, _version, is_deleted
+  amount_in, amount_out, verified_in, verified_out, coin_in, coin_out,
+  underlying, sqrt_price_x96, epoch, _version, is_deleted
 FROM dex_swaps;
 
 -- Read path: swaps of a trader (tx sender when known, see dex_swaps.trader).
@@ -250,6 +316,10 @@ FROM dex_swaps;
 -- Read path: pools of a token, one row per (token, dex_pools row).
 -- block_number / log_index are the position of the creation event (0 / 0
 -- for resolver rows), so the key mirrors dex_pools and tombstones match.
+-- A CLAIM index like dex_pools: join dex_pool_current_v for what is known.
+-- The resolver never replaces an 'rpc' row by one with other tokens (it
+-- does not ask again once a pool answered), so resolver rows here can not
+-- go stale. 'unresolved' / 'no_answer' rows have no tokens and no rows.
 CREATE TABLE IF NOT EXISTS dex_pools_by_token (
   chain UInt64,
   token FixedString(20),
@@ -276,4 +346,4 @@ SELECT
   pool_id, emitter, protocol, created_block AS block_number, log_index,
   source, epoch, _version, is_deleted
 FROM dex_pools
-WHERE source != 'unresolved';
+WHERE source IN ('event', 'rpc');

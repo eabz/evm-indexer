@@ -13,6 +13,7 @@ use crate::{
         ranges::BlockRange,
         RowBatch,
     },
+    pipeline::modules::{self, DecodeState, EnabledModules},
     tokens::TokenStandard,
     utils::events::{
         ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
@@ -47,15 +48,34 @@ struct BlockContext {
     base_fee_per_gas: Option<U256>,
 }
 
-/// Converts a response covering exactly the blocks of `covered`.
-///
-/// The response must contain EVERY block of `covered` (the query asks for
-/// all blocks). Anything else is an error: storing a partial range would
-/// leave silent holes, and rows can not be timestamped without their block.
+/// [`transform_with`] without any decoder module: the core rows only.
+/// The pipeline itself always goes through [`transform_with`].
 pub fn transform(
     chain: u64,
     data: &ResponseRows,
     covered: BlockRange,
+) -> Result<Transformed> {
+    transform_with(
+        chain,
+        data,
+        covered,
+        EnabledModules::none(),
+        &mut DecodeState::default(),
+    )
+}
+
+/// Converts a response covering exactly the blocks of `covered`, and runs
+/// the enabled decoder modules (DEX, ...) over ALL of its logs.
+///
+/// The response must contain EVERY block of `covered` (the query asks for
+/// all blocks). Anything else is an error: storing a partial range would
+/// leave silent holes, and rows can not be timestamped without their block.
+pub fn transform_with(
+    chain: u64,
+    data: &ResponseRows,
+    covered: BlockRange,
+    enabled: EnabledModules,
+    state: &mut DecodeState,
 ) -> Result<Transformed> {
     let mut rows = RowBatch::default();
 
@@ -154,6 +174,13 @@ pub fn transform(
         decode_transfers(&row, &mut rows, &mut tokens_seen);
 
         rows.logs.push(row);
+    }
+
+    // Every log of the response, never a filtered subset.
+    rows.modules = modules::decode(enabled, chain, &rows, state);
+
+    for (address, standard) in rows.modules.token_hints() {
+        tokens_seen.entry(address).or_insert(standard);
     }
 
     Ok(Transformed { rows, tokens_seen })

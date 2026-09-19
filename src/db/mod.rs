@@ -11,6 +11,7 @@ pub use schema::{
     BASE_TABLES, SIDE_TABLES,
 };
 
+use crate::{metrics::Metrics, pipeline::modules::ModuleRows};
 use alloy::primitives::B256;
 use anyhow::{anyhow, bail, Context, Result};
 use clickhouse::{Client, Row};
@@ -19,16 +20,19 @@ use models::{
     block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-    token::DatabaseToken, transaction::DatabaseTransaction,
-    withdrawal::DatabaseWithdrawal,
+    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
 };
 use ranges::{
-    assemble_missing_ranges, gaps_sql, is_dense, stats_sql, BlockRange,
-    GapRow, MissingRanges, RangeStats, MAX_GAPS_PER_PASS,
+    assemble_missing_ranges, contiguous_ranges, gaps_sql, is_dense,
+    stats_sql, BlockRange, DatabaseCheckpoint, GapRow, MissingRanges,
+    RangeStats, MAX_GAPS_PER_PASS,
 };
 use serde::Serialize;
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -107,7 +111,9 @@ pub struct RowBatch {
     pub erc20_transfers: Vec<DatabaseERC20Transfer>,
     pub erc721_transfers: Vec<DatabaseERC721Transfer>,
     pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
-    pub tokens: Vec<DatabaseToken>,
+    /// Rows of the decoder modules (DEX, ...), decoded from `logs` in
+    /// transform. Stored BEFORE `blocks`, like every other child.
+    pub modules: ModuleRows,
 }
 
 impl RowBatch {
@@ -120,7 +126,7 @@ impl RowBatch {
             + self.erc20_transfers.len()
             + self.erc721_transfers.len()
             + self.erc1155_transfers.len()
-            + self.tokens.len()
+            + self.modules.rows()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,14 +142,14 @@ impl RowBatch {
         self.erc20_transfers.append(&mut other.erc20_transfers);
         self.erc721_transfers.append(&mut other.erc721_transfers);
         self.erc1155_transfers.append(&mut other.erc1155_transfers);
-        self.tokens.append(&mut other.tokens);
+        self.modules.append(&mut other.modules);
     }
 
-    /// Stamps `_version` on every block scoped row of the batch. Called
-    /// once per flush with [`next_version`]. (`tokens` rows get their
-    /// version from the server, they are not part of a block.)
+    /// Stamps `_version` on every block scoped row of the batch (module
+    /// rows included). Called once per flush with [`next_version`].
     pub fn set_version(&mut self, version: u64) {
         stamp!(self, _version = version);
+        self.modules.set_version(version);
     }
 
     /// Stamps the chain's current purge generation on every block scoped
@@ -152,6 +158,17 @@ impl RowBatch {
     /// under the epoch of the rows it came from.
     pub fn set_epoch(&mut self, epoch: u32) {
         stamp!(self, epoch = epoch);
+        self.modules.set_epoch(epoch);
+    }
+
+    /// `_version` of the batch (0 before [`Self::set_version`]).
+    pub fn version(&self) -> u64 {
+        self.blocks.first().map(|block| block._version).unwrap_or(0)
+    }
+
+    /// `epoch` of the batch (0 before [`Self::set_epoch`]).
+    pub fn epoch(&self) -> u32 {
+        self.blocks.first().map(|block| block.epoch).unwrap_or(0)
     }
 
     /// Lowest and highest block number in the batch.
@@ -269,10 +286,48 @@ impl DatabaseParams {
     }
 }
 
+/// Identifies one flush for the server side insert deduplication
+/// (docs/design.md, section 2, "Retried inserts must not double count"):
+/// the same rows retried carry the same token, so ClickHouse drops the
+/// second copy INCLUDING what it would have pushed through the
+/// materialized views. `version` is unique per flush, so rows that are
+/// legitimately written again later (re-streamed after a purge) never
+/// collide with an old token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushKey {
+    pub chain: u64,
+    /// First and last block of the flush (inclusive).
+    pub span: (u64, u64),
+    pub version: u64,
+}
+
+impl FlushKey {
+    /// `insert_deduplication_token` of this flush for `table`.
+    pub fn token(&self, table: &str) -> String {
+        format!(
+            "{table}:{}:{}-{}:{}",
+            self.chain, self.span.0, self.span.1, self.version
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct Database {
     pub chain_id: u64,
+    /// Queries and the block scoped inserts of a flush: SYNCHRONOUS
+    /// inserts. An acknowledged insert is a written part, which is what
+    /// makes `blocks`-last a commit marker. (Asynchronous inserts are not
+    /// an option for them: ClickHouse refuses
+    /// `deduplicate_blocks_in_dependent_materialized_views` together with
+    /// `async_insert`, and a flush is one big batch anyway.)
     pub db: Client,
+    /// Small, frequent inserts of the background workers (`tokens`,
+    /// resolver rows of `dex_pools`): batched server side, acknowledged
+    /// once durable.
+    small: Client,
+    metrics: Metrics,
+    /// The chain's purge generation, stamped on every row of a flush.
+    epoch: Arc<AtomicU32>,
 }
 
 impl Database {
@@ -292,19 +347,63 @@ impl Database {
             .with_url(&params.endpoint)
             .with_user(&params.user)
             .with_password(&params.password)
-            .with_database(&params.database)
-            // Server side batching of the inserts. Waiting for the async
-            // insert to be flushed is REQUIRED: an acknowledged insert must
-            // mean durable data, otherwise writing `blocks` last would not
-            // make it a commit marker.
+            .with_database(&params.database);
+
+        let small = db
+            .clone()
             .with_option("async_insert", "1")
+            // REQUIRED: an acknowledged insert must mean durable data.
             .with_option("wait_for_async_insert", "1");
 
-        let database = Self { chain_id, db };
+        let database = Self {
+            chain_id,
+            db,
+            small,
+            metrics: Metrics::disabled(),
+            epoch: Arc::new(AtomicU32::new(0)),
+        };
 
         database.wait_until_ready().await?;
 
         Ok(database)
+    }
+
+    /// Same database, reporting rows / retries to `metrics`.
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// The epoch the next flush is stamped with.
+    pub fn epoch(&self) -> u32 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Adopts `epoch` (after a purge). Shared by every clone.
+    pub fn set_epoch(&self, epoch: u32) {
+        self.epoch.store(epoch, Ordering::SeqCst);
+    }
+
+    /// The chain's current purge generation: `max(epoch)` of its `reorgs`
+    /// rows, 0 when it never had a purge.
+    pub async fn current_epoch(&self) -> Result<u32> {
+        self.db
+            .query(&format!(
+                "SELECT toUInt32(max(epoch)) FROM reorgs WHERE chain = {}",
+                self.chain_id
+            ))
+            .fetch_one::<u32>()
+            .await
+            .context("query the current epoch")
+    }
+
+    /// Reads [`Self::current_epoch`] and adopts it when it is NEWER (a
+    /// purge of another process, e.g. `indexer backfill`; `reorgs` may lag
+    /// behind a purge of this process for a moment, so it never goes
+    /// back). Returns the epoch in force.
+    pub async fn refresh_epoch(&self) -> Result<u32> {
+        let stored = self.current_epoch().await?;
+        Ok(self.epoch.fetch_max(stored, Ordering::SeqCst).max(stored))
     }
 
     async fn wait_until_ready(&self) -> Result<()> {
@@ -391,24 +490,65 @@ impl Database {
         Ok(row.map(|row| row.hash))
     }
 
-    /// Stores a batch. Every non-block table is written concurrently, then
-    /// `blocks` LAST: a block row only exists once all of its data is
-    /// durable, which is what resume / gap detection relies on.
+    /// Highest live block of the chain (`FINAL`), `None` when empty.
+    pub async fn stored_head(&self) -> Result<Option<u64>> {
+        let (count, max): (u64, u64) = self
+            .db
+            .query(&format!(
+                "SELECT toUInt64(count()), toUInt64(max(number)) \
+                 FROM blocks FINAL WHERE chain = {}",
+                self.chain_id
+            ))
+            .fetch_one()
+            .await
+            .context("query the stored head")?;
+
+        Ok((count > 0).then_some(max))
+    }
+
+    /// Stores a batch. Every non-block table (module tables included) is
+    /// written concurrently, then `blocks` LAST: a block row only exists
+    /// once all of its data is durable, which is what resume / gap
+    /// detection relies on. The checkpoint rows follow `blocks`.
     ///
     /// Returns an error only after every retry is exhausted, in which case
-    /// NO block row of this batch was written.
+    /// NO block row of this batch was written (or, for a failed checkpoint
+    /// insert, everything was: checkpoints are an index, `blocks` decides).
     pub async fn store(&self, batch: &RowBatch) -> Result<()> {
+        let Some(span) = batch.block_span() else {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            // Rows can not be committed without their block.
+            bail!("refusing to store a batch of rows without block rows");
+        };
+
+        let key = FlushKey {
+            chain: self.chain_id,
+            span,
+            version: batch.version(),
+        };
+
         let results = tokio::join!(
-            self.insert_rows("logs", &batch.logs),
-            self.insert_rows("transactions", &batch.transactions),
-            self.insert_rows("withdrawals", &batch.withdrawals),
-            self.insert_rows("erc20_transfers", &batch.erc20_transfers),
-            self.insert_rows("erc721_transfers", &batch.erc721_transfers),
-            self.insert_rows(
-                "erc1155_transfers",
-                &batch.erc1155_transfers
+            self.insert_flush("logs", &batch.logs, &key),
+            self.insert_flush("transactions", &batch.transactions, &key),
+            self.insert_flush("withdrawals", &batch.withdrawals, &key),
+            self.insert_flush(
+                "erc20_transfers",
+                &batch.erc20_transfers,
+                &key
             ),
-            self.insert_rows("tokens", &batch.tokens),
+            self.insert_flush(
+                "erc721_transfers",
+                &batch.erc721_transfers,
+                &key
+            ),
+            self.insert_flush(
+                "erc1155_transfers",
+                &batch.erc1155_transfers,
+                &key
+            ),
+            batch.modules.store(self, &key),
         );
 
         let (r0, r1, r2, r3, r4, r5, r6) = results;
@@ -422,13 +562,62 @@ impl Database {
             bail!("failed to store batch: {}", failures.join("; "));
         }
 
-        self.insert_rows("blocks", &batch.blocks).await
+        self.insert_flush("blocks", &batch.blocks, &key).await?;
+
+        let checkpoints: Vec<DatabaseCheckpoint> =
+            contiguous_ranges(batch.blocks.iter().map(|b| b.number))
+                .into_iter()
+                .map(|range| DatabaseCheckpoint {
+                    chain: self.chain_id,
+                    from_block: range.from,
+                    to_block: range.to,
+                    epoch: batch.epoch(),
+                    _version: key.version,
+                })
+                .collect();
+
+        self.insert_flush("checkpoints", &checkpoints, &key).await
+    }
+
+    /// Inserts rows of a flush into a block scoped `table`: synchronous,
+    /// with the flush's deduplication token, so a retry of an insert that
+    /// was applied but not acknowledged is dropped by the server - in the
+    /// table AND in everything its materialized views feed.
+    pub async fn insert_flush<T>(
+        &self,
+        table: &'static str,
+        rows: &[T],
+        key: &FlushKey,
+    ) -> Result<()>
+    where
+        T: Serialize,
+        for<'a> T: Row<Value<'a> = T>,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let client = self
+            .db
+            .clone()
+            .with_option("async_insert", "0")
+            .with_option("insert_deduplicate", "1")
+            .with_option("insert_deduplication_token", key.token(table))
+            .with_option(
+                "deduplicate_blocks_in_dependent_materialized_views",
+                "1",
+            );
+
+        self.insert_retrying(&client, table, rows).await
     }
 
     /// Inserts `rows` into `table`, retrying with exponential backoff.
+    /// For rows that are NOT part of a flush (`tokens`, resolver rows):
+    /// server side batching, no deduplication token. The target must be
+    /// idempotent (`ReplacingMergeTree`).
     pub async fn insert_rows<T>(
         &self,
-        table: &str,
+        table: &'static str,
         rows: &[T],
     ) -> Result<()>
     where
@@ -439,13 +628,29 @@ impl Database {
             return Ok(());
         }
 
+        self.insert_retrying(&self.small, table, rows).await
+    }
+
+    async fn insert_retrying<T>(
+        &self,
+        client: &Client,
+        table: &'static str,
+        rows: &[T],
+    ) -> Result<()>
+    where
+        T: Serialize,
+        for<'a> T: Row<Value<'a> = T>,
+    {
         let mut attempt = 0;
 
         loop {
             attempt += 1;
 
-            match self.insert_once(table, rows).await {
-                Ok(()) => return Ok(()),
+            match Self::insert_once(client, table, rows).await {
+                Ok(()) => {
+                    self.metrics.rows_inserted(table, rows.len() as u64);
+                    return Ok(());
+                }
                 Err(e) if attempt >= INSERT_ATTEMPTS => {
                     return Err(e.context(format!(
                         "insert of {} rows into '{table}' failed after \
@@ -454,6 +659,7 @@ impl Database {
                     )));
                 }
                 Err(e) => {
+                    self.metrics.flush_retry(table);
                     let wait = insert_backoff(attempt);
                     warn!(
                         "Insert of {} rows into '{table}' failed (attempt \
@@ -467,7 +673,11 @@ impl Database {
         }
     }
 
-    async fn insert_once<T>(&self, table: &str, rows: &[T]) -> Result<()>
+    async fn insert_once<T>(
+        client: &Client,
+        table: &str,
+        rows: &[T],
+    ) -> Result<()>
     where
         T: Serialize,
         for<'a> T: Row<Value<'a> = T>,
@@ -479,7 +689,7 @@ impl Database {
         // of the table does not matter and columns that are not part of
         // the struct get their DEFAULT. The integration tests are the
         // type check: they insert and read back every table.
-        let client = self.db.clone().with_validation(false);
+        let client = client.clone().with_validation(false);
 
         // Timeouts surface as ordinary errors, so the caller retries them
         // like any other failed insert.
@@ -645,22 +855,42 @@ mod tests {
 
     #[test]
     fn row_batch_append_moves_rows() {
+        use crate::db::models::log::test_support::log_with;
+
         let mut a = RowBatch::default();
         let mut b = RowBatch::default();
-        b.tokens.push(DatabaseToken {
-            address: Default::default(),
-            name: "n".into(),
-            symbol: "s".into(),
-            decimals: 18,
-            r#type: "ERC20".into(),
-            chain: 1,
-        });
+        b.logs.push(log_with(&[], vec![]));
+        b.modules = crate::pipeline::modules::test_support::dex_rows(1, 5);
+        assert_eq!(b.modules.rows(), 1);
 
         assert!(a.is_empty());
         a.append(&mut b);
-        assert_eq!(a.rows(), 1);
+        assert_eq!(a.rows(), 2);
         assert!(b.is_empty());
         assert_eq!(a.block_span(), None);
+    }
+
+    #[test]
+    fn flush_tokens_are_deterministic_and_unique_per_flush() {
+        let key = FlushKey { chain: 137, span: (10, 19), version: 1_234 };
+
+        // A retry of the same flush: the same token.
+        assert_eq!(key.token("logs"), "logs:137:10-19:1234");
+        assert_eq!(key.token("logs"), key.token("logs"));
+        // Another table, chain, span or flush: another token.
+        assert_ne!(key.token("logs"), key.token("blocks"));
+        assert_ne!(
+            key.token("logs"),
+            FlushKey { chain: 1, ..key }.token("logs")
+        );
+        assert_ne!(
+            key.token("logs"),
+            FlushKey { span: (10, 20), ..key }.token("logs")
+        );
+        assert_ne!(
+            key.token("logs"),
+            FlushKey { version: 1_235, ..key }.token("logs")
+        );
     }
 
     #[test]
@@ -685,8 +915,20 @@ mod tests {
         batch.blocks.push(block_row(6, 6, 5));
         batch.logs.push(log_with(&[], vec![]));
 
+        batch.modules =
+            crate::pipeline::modules::test_support::dex_rows(1, 5);
+
         batch.set_version(1_234);
         batch.set_epoch(7);
+
+        assert_eq!((batch.version(), batch.epoch()), (1_234, 7));
+        assert!(!batch.modules.dex.liquidity.is_empty());
+        assert!(batch
+            .modules
+            .dex
+            .liquidity
+            .iter()
+            .all(|row| row._version == 1_234 && row.epoch == 7));
 
         assert!(batch.blocks.iter().all(|row| row._version == 1_234));
         assert!(batch.logs.iter().all(|row| row._version == 1_234));

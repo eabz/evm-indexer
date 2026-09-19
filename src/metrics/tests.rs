@@ -145,6 +145,7 @@ fn golden_known_state() {
         cache_misses: 104,
         breaker_open: false,
         endpoints_healthy: 2,
+        ..Default::default()
     });
     metrics.set_ready(true);
 
@@ -252,15 +253,42 @@ evm_indexer_purged_blocks_total{chain="1"} 5
 # HELP evm_indexer_resolver_queue_depth Addresses waiting to be resolved by a background worker.
 # TYPE evm_indexer_resolver_queue_depth gauge
 evm_indexer_resolver_queue_depth{chain="1",worker="tokens"} 12
-# HELP evm_indexer_resolver_resolved_total Addresses resolved with metadata.
+# HELP evm_indexer_resolver_resolved_total Addresses resolved WITH metadata (negatives not included).
 # TYPE evm_indexer_resolver_resolved_total counter
 evm_indexer_resolver_resolved_total{chain="1",worker="tokens"} 100
 # HELP evm_indexer_resolver_negative_total Addresses resolved to nothing (reverts, garbage).
 # TYPE evm_indexer_resolver_negative_total counter
 evm_indexer_resolver_negative_total{chain="1",worker="tokens"} 3
+# HELP evm_indexer_resolver_codeless_total Addresses without contract code (asked again later).
+# TYPE evm_indexer_resolver_codeless_total counter
+evm_indexer_resolver_codeless_total{chain="1",worker="tokens"} 0
 # HELP evm_indexer_resolver_dropped_total Discoveries dropped because the queue was full.
 # TYPE evm_indexer_resolver_dropped_total counter
 evm_indexer_resolver_dropped_total{chain="1",worker="tokens"} 1
+# HELP evm_indexer_resolver_inserted_total Rows durably inserted by the worker.
+# TYPE evm_indexer_resolver_inserted_total counter
+evm_indexer_resolver_inserted_total{chain="1",worker="tokens"} 0
+# HELP evm_indexer_resolver_insert_failures_total Batches the worker could not store after its retries.
+# TYPE evm_indexer_resolver_insert_failures_total counter
+evm_indexer_resolver_insert_failures_total{chain="1",worker="tokens"} 0
+# HELP evm_indexer_resolver_rpc_failures_total Addresses the RPC could not be asked about.
+# TYPE evm_indexer_resolver_rpc_failures_total counter
+evm_indexer_resolver_rpc_failures_total{chain="1",worker="tokens"} 0
+# HELP evm_indexer_resolver_backfill_found_total Addresses the database backfill reported as missing.
+# TYPE evm_indexer_resolver_backfill_found_total counter
+evm_indexer_resolver_backfill_found_total{chain="1",worker="tokens"} 0
+# HELP evm_indexer_resolver_backfill_failures_total Backfill queries that failed.
+# TYPE evm_indexer_resolver_backfill_failures_total counter
+evm_indexer_resolver_backfill_failures_total{chain="1",worker="tokens"} 0
+# HELP evm_indexer_resolver_unconfirmed_total Answers of a public endpoint no second provider confirmed.
+# TYPE evm_indexer_resolver_unconfirmed_total counter
+evm_indexer_resolver_unconfirmed_total{chain="1",worker="tokens"} 0
+# HELP evm_indexer_resolver_blank_rechecked_total Blank rows that were verified again.
+# TYPE evm_indexer_resolver_blank_rechecked_total counter
+evm_indexer_resolver_blank_rechecked_total{chain="1",worker="tokens"} 0
+# HELP evm_indexer_resolver_blank_healed_total Blank rows replaced by real metadata on a recheck.
+# TYPE evm_indexer_resolver_blank_healed_total counter
+evm_indexer_resolver_blank_healed_total{chain="1",worker="tokens"} 0
 # HELP evm_indexer_resolver_cache_hits_total Resolver cache hits.
 # TYPE evm_indexer_resolver_cache_hits_total counter
 evm_indexer_resolver_cache_hits_total{chain="1",worker="tokens"} 900
@@ -270,9 +298,15 @@ evm_indexer_resolver_cache_misses_total{chain="1",worker="tokens"} 104
 # HELP evm_indexer_resolver_breaker_open 1 when every RPC endpoint's circuit breaker is open.
 # TYPE evm_indexer_resolver_breaker_open gauge
 evm_indexer_resolver_breaker_open{chain="1",worker="tokens"} 0
+# HELP evm_indexer_resolver_endpoints_total RPC endpoints configured or discovered.
+# TYPE evm_indexer_resolver_endpoints_total gauge
+evm_indexer_resolver_endpoints_total{chain="1",worker="tokens"} 0
 # HELP evm_indexer_resolver_endpoints_healthy RPC endpoints currently considered healthy.
 # TYPE evm_indexer_resolver_endpoints_healthy gauge
 evm_indexer_resolver_endpoints_healthy{chain="1",worker="tokens"} 2
+# HELP evm_indexer_resolver_endpoints_distrusted RPC endpoints caught contradicting the others.
+# TYPE evm_indexer_resolver_endpoints_distrusted gauge
+evm_indexer_resolver_endpoints_distrusted{chain="1",worker="tokens"} 0
 "#;
 
     assert_eq!(metrics.render_at((START + 660) * 1000), expected);
@@ -462,6 +496,46 @@ fn clones_share_state() {
 }
 
 #[test]
+fn a_failed_or_stuck_flush_is_not_ready_even_while_the_head_is_polled() {
+    let metrics = fixed("1");
+    let t0 = START * 1000;
+    metrics.set_ready(true);
+    metrics.set_head_at(100, t0);
+    metrics.flush_observed_at(Duration::ZERO, 1, true, t0);
+    assert_eq!(metrics.readiness_at(t0), Ok(()));
+
+    // A flush that is retrying: fine at first, not ready once it has been
+    // at it for longer than the staleness limit - although head polls
+    // keep arriving.
+    metrics.flush_started_at(t0 + 1_000);
+    metrics.set_head_at(101, t0 + 100_000);
+    assert_eq!(metrics.readiness_at(t0 + 100_000), Ok(()));
+    metrics.set_head_at(102, t0 + 125_000);
+    assert_eq!(
+        metrics.readiness_at(t0 + 125_000).unwrap_err(),
+        "not ready: a flush has been retrying for 124s (limit 120s)"
+    );
+
+    // It failed for good: not ready, however fresh the head poll is.
+    metrics.flush_observed_at(
+        Duration::from_secs(130),
+        1,
+        false,
+        t0 + 131_000,
+    );
+    metrics.set_head_at(103, t0 + 131_000);
+    assert_eq!(
+        metrics.readiness_at(t0 + 131_000).unwrap_err(),
+        "not ready: the most recent flush failed"
+    );
+
+    // The next successful flush clears it.
+    metrics.flush_started_at(t0 + 132_000);
+    metrics.flush_observed_at(Duration::ZERO, 1, true, t0 + 132_500);
+    assert_eq!(metrics.readiness_at(t0 + 133_000), Ok(()));
+}
+
+#[test]
 fn readiness_needs_the_flag_and_a_recent_sign_of_life() {
     let metrics = fixed("1");
     let t0 = START * 1000;
@@ -486,7 +560,10 @@ fn readiness_needs_the_flag_and_a_recent_sign_of_life() {
 
     // A failed flush is not a sign of life, a successful one is.
     metrics.flush_observed_at(Duration::ZERO, 1, false, t0 + 121_000);
-    assert!(metrics.readiness_at(t0 + 121_000).is_err());
+    assert_eq!(
+        metrics.readiness_at(t0 + 121_000).unwrap_err(),
+        "not ready: the most recent flush failed"
+    );
     metrics.flush_observed_at(Duration::ZERO, 1, true, t0 + 121_000);
     assert_eq!(metrics.readiness_at(t0 + 121_000), Ok(()));
 
@@ -505,7 +582,8 @@ fn readiness_needs_the_flag_and_a_recent_sign_of_life() {
 async fn concurrent_updates_are_not_lost() {
     const TASKS: u64 = 32;
     const ROUNDS: u64 = 2_000;
-    const TABLES: [&str; 4] = ["blocks", "logs", "traces", "transactions"];
+    const TABLES: [&str; 4] =
+        ["blocks", "logs", "dex_swaps", "transactions"];
 
     let metrics = Metrics::new(1, Duration::from_secs(60));
 

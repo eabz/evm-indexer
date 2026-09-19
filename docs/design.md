@@ -191,6 +191,26 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
    the abandoned partial epoch invisible.
 
+**Corrections found by the reorg-core proof (implemented in `src/reorg/`, binding for the pipeline):**
+   - Checkpoints are tombstoned FIRST, not last: with "after blocks" a crash leaves a
+     checkpoint claiming dead blocks (the crash matrix fails). This supersedes step 5's
+     wording and section 3.
+   - Gap heal is only crash safe if `has_orphan_children` counts tombstoned rows too (no
+     `FINAL`): once orphans are tombstoned nothing else marks the unfinished heal.
+   - `from_ts` includes `blocks` rows: a reorged range of EMPTY blocks has no child row,
+     yet `daily_block_stats` needs repair.
+   - The writer adopts the new epoch right after the `reorgs` row is written and re-reads
+     it after any failed purge; otherwise a surviving process writes rows the validity
+     rule hides.
+   - No read-your-writes also bites: the epoch read (keep the epoch in memory; back-to-back
+     purges must never reuse one), the detector seed read (a stale "not stored" would skip
+     the parent check for ever: read it several times, and lookup ERRORS are errors, never
+     "not stored"), `min_timestamp`, and `missing_ranges` after a barrier.
+   - **Epochs and the validity rule are per CHAIN, not per module.** Anything that writes
+     a `reorgs` row - including `indexer backfill --module X` - must rebuild EVERY derived
+     table of every module for the affected buckets, or it silently zeroes the others.
+     Two indexer processes on the same chain are unsupported (refuse at startup).
+
 **No read-your-writes (ClickHouse 25.12, observed on the macOS build).** Right after an
 `INSERT` returns, the next query can miss the new part for a few milliseconds when
 several writers are active (44-137 misses per 3,200 in the schema engineer's repro; it
@@ -398,3 +418,84 @@ HyperSync serves; two verified event families cover ~86% of that). Module
   `launchpad_frontends` table. Never add front-end volume to venue volume.
 - Forgery rules from the DEX review apply: curve trades are valued only when
   corroborated by the token/quote ERC-20 (or native value) movement in the same tx.
+
+## 12. Code layout - ONE structure: feature modules
+
+The codebase must not mix "by layer" (`db/models`, `utils`) and "by feature" (`dex/`,
+`predictions/`). **Feature modules win.** Rule: *a dataset owns everything about itself;
+infrastructure owns nothing about any dataset.*
+
+```
+src/
+  configs/        CLI + env parsing
+  source/         HyperSync client wrapper (ingest only)
+  pipeline/       orchestration: stream -> transform -> writer, module seam, workers
+  db/             INFRASTRUCTURE ONLY: client + insert path, migrate, schema helpers
+                  (tombstone_sql...), ranges/checkpoints, the DerivedTable TYPE, format.rs
+                  (ClickHouse serializers). No row models, no dataset constants.
+  reorg/          fork-point search + purge orchestration (traits, no ClickHouse)
+  tokens/         token metadata worker + RPC endpoints
+  metrics/
+  core/           DATA MODULE: blocks, transactions, logs, withdrawals, ERC-20/721/1155 transfers
+  dex/            DATA MODULE
+  predictions/    DATA MODULE
+  launchpads/     DATA MODULE
+```
+
+Every DATA MODULE has the same files and the same public surface, so the pipeline seam
+treats them uniformly: `mod.rs` (API + `BASE_TABLES`, `SIDE_TABLES`, `*_DERIVED`),
+`models.rs` (row structs), `events.rs` (keccak-checked signatures), `decode.rs` (pure, no
+I/O: source rows/logs -> module rows), `derived.rs`, optional `worker.rs`/`resolve.rs`,
+`integration_tests.rs`, `README.md`; and owns a migration range (`0001-0009` core,
+`0010-0019` dex, `0020-0029` predictions, `0030-0039` launchpads, `0090+` cross-module).
+
+Moves this implies (mechanical, `git mv`, no behaviour change): `src/db/models/*` ->
+`src/core/models.rs` (or `core/models/`); HyperSync -> row conversions and transfer
+decoding out of `src/pipeline/transform.rs` -> `src/core/decode.rs` (transform keeps only
+orchestration); `src/utils/events.rs`, `convert.rs` -> `src/core/`; `src/utils/format.rs`
+-> `src/db/format.rs`; `CORE_DERIVED` + core table constants -> `src/core/`; `src/utils/`
+disappears. **Timing:** one dedicated refactor right after the pipeline wiring lands and
+before the final gate and review round 2 - never while another engineer has those files
+open. Until then: new code follows this layout; nobody moves existing files.
+
+## 13. Chain-neutral analytics tables (owner decision 2026-09-18: YES, now)
+
+Binding spec: `docs/solana-research.md` section 0 (fold its table into this section at
+the final docs cleanup). Applies to the analytics DATA MODULES only - `dex_*`,
+`launchpad_*`, `prediction_*` - NOT to the EVM `core` tables.
+
+- Identity columns (pool, token, trader, creator, emitter, factory, recipient, holder,
+  `tx_from`, `tx_to`...) are `FixedString(32)`: EVM address = 12 zero bytes + 20 address
+  bytes (same convention `dex_pools.pool_id` already uses); Solana pubkey = 32 raw bytes.
+- Transaction id: `tx_id String` (raw bytes: 32 on EVM, 64 on Solana). Never in a sort key.
+- Position key: `(chain, block_number, tx_index, ordinal)`; the column NAME
+  `block_number` stays (purge/tombstone/checkpoint code keys on it) and holds the slot on
+  Solana. EVM: `tx_index` = transaction index, `ordinal UInt64` = log index.
+- `chains (chain UInt64, name String, family LowCardinality(String) 'evm'|'svm')`
+  registry (migration `0006_chains.sql`, user/indexer populated) so views and UIs know how
+  to print an id: `concat('0x', lower(hex(substring(id, 13))))` vs `base58Encode(id)`.
+- Shared Rust helpers live with the serializers: `SerId32` (alloy `Address` <-> 32 bytes
+  left-padded), `SerTxId` (raw bytes). Every module uses the same ones.
+
+## 14. Solana (owner decision 2026-09-18: GO)
+
+Basis: `docs/solana-research.md` (sections 3, 4, 6, 7 are the working spec). One binary,
+one database: `indexer run --chain solana`. **Analytics-only, program-filtered** - no
+wallet history, no chain-wide transfers, and the schema/README must say so.
+
+- Layout (section 12 vocabulary): a second `source` (Envio Solana HyperSync,
+  `hypersync-client-solana`), a small `svm/` core data module (`sol_*` tables: slots as
+  the commit marker, the matched transactions/instructions actually needed), and the
+  SAME `dex/` and `launchpads/` modules with a second decoder front end writing the same
+  chain-neutral tables (section 13). `db/`, `reorg/` (detector variant on `parent_slot`;
+  skipped slots are normal), migrator, metrics, `DerivedTable`, tombstones + epochs reuse.
+- Decoding is PER INSTRUCTION SUBTREE, never per transaction net balance. Two always-on
+  layers: a generic token-movement decoder (every venue: price, size, real trader) and
+  per-program decoders for venues with a public format (fees, pool state). SPL/Token-2022
+  transfer instructions must be selected in the same query (a matched instruction does
+  not return its children). Aggregators/routers are attribution, never venue volume.
+- Chain id for Solana: 1399811149 (no standard exists; recorded in `chains`).
+- Order: (1) source + `svm` core + generic movement decoder + PumpSwap and pump.fun
+  curve decoders, validated live with the owner's token; (2) Raydium / Orca / Meteora
+  per-program decoders; (3) launchpads on Solana (pump.fun, Meteora DBC, LaunchLab) into
+  `launchpad_*`; (4) history backfill strategy (Envio serves from 2026-01-03).

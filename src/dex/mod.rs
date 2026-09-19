@@ -15,12 +15,19 @@
 //!   `amountIn - amountOut` pairs are netted into it, Uniswap V4 deltas
 //!   (caller relative) are negated into it. Mints are positive, burns
 //!   negative.
-//! * Two token families fill `amount0` / `amount1`; the multi asset
-//!   families fill `amount_in` / `amount_out` plus `token_in` /
-//!   `token_out` (Balancer, carried by the event) or `coin_in` /
-//!   `coin_out` (Curve, indices into `dex_pools.tokens`). A swap uses
-//!   exactly one of the two representations; `dex_swaps_v` unifies them at
-//!   query time.
+//! * `amount_in` / `amount_out` are filled for every family (two token
+//!   families: the positive / negative side of `amount0` / `amount1`).
+//!   Balancer adds the `token_in` / `token_out` its event names, Curve
+//!   `coin_in` / `coin_out` (indices into `dex_pools.tokens`).
+//! * **An event is a claim.** Anyone can deploy a contract that emits swap
+//!   or pool creation shaped events, so [`corroborate`] looks for the
+//!   ERC-20 `Transfer`s that prove each swap leg and stores the proven
+//!   token in `verified_in` / `verified_out`. Every USD number is built on
+//!   verified legs only; an unverified leg is unpriced, never guessed.
+//!   Pool metadata is trusted only when the pool answered `token0()` /
+//!   `token1()` itself (or, for singleton families, per emitter), see the
+//!   `dex_pool_current_v` view. "A wrong number is worse than a missing
+//!   one."
 //! * `pool_id` is 32 bytes: the pool address left padded with zeros, or
 //!   the native `bytes32` id (V4, Balancer). `emitter` is the contract that
 //!   emitted the event (pool, PoolManager, Vault) and is part of the pool's
@@ -30,9 +37,11 @@
 //!   [`PoolWorker`] and joined at query time.
 //! * `dex_pools` holds one row per creation EVENT (positional key, like
 //!   every block scoped table) plus at most one row of the RPC resolver.
-//!   Readers go through the `dex_pool_current_v` view: event rows before
-//!   resolver rows, then the earliest position - the first creation event
-//!   wins, a forged later `PairCreated` can not replace a pool's tokens.
+//!   Readers go through the `dex_pool_current_v` view: for pools that are
+//!   their own contract the resolver row WINS (V2 / V3 addresses are
+//!   predictable, a forged `PairCreated` can even precede the real one),
+//!   and until it exists the pool is `unverified` / `contested` and
+//!   metadata dependent views yield NULL.
 //! * Nothing is ever deleted (docs/design.md §2): a purge INSERTs
 //!   tombstones into [`BASE_TABLES`] ([`tombstone_sql`]), the side tables
 //!   follow through their materialized views, the aggregates are keyed by
@@ -61,6 +70,7 @@
 //! To retire a quote token insert it again with `kind = ''`. The views pick
 //! the change up immediately (nothing about USD is materialized).
 
+pub mod corroborate;
 pub mod decode;
 pub mod derived;
 pub mod events;
@@ -156,25 +166,39 @@ pub fn tombstone_sql(
     sql
 }
 
-/// Pool ids of `dex_swaps` / `dex_liquidity` without a `dex_pools` row, for
-/// the [`MissingPoolSource`] of the pipeline. Placeholders: `{chain}`,
-/// `{limit}`. Columns: `pool_id FixedString(32)`, `emitter
-/// FixedString(20)`, `protocol String`. Families described by events only
-/// (V4, Balancer) are excluded: RPC can not resolve them. `dex_pools` is
-/// read with `FINAL` (a tombstoned pool IS missing); the swap side is not,
-/// on purpose: it is the big side, and resolving the pool of a reorged-out
-/// swap is harmless.
+/// The resolver's work list, for the [`MissingPoolSource`] of the pipeline:
+/// contract pools that traded and have NOT answered over RPC yet - no
+/// `dex_pools` row at all, only (forgeable) creation events, or a
+/// `no_answer` row whose backoff (1 h x 2^attempts, at most 30 days) is
+/// over. Placeholders: `{chain}`, `{limit}`. Columns: `pool_id
+/// FixedString(32)`, `emitter FixedString(20)`, `protocol String`,
+/// `attempts UInt32`.
+///
+/// Driven by the small hourly aggregate, not by the swap tables. Stable
+/// order: pools with contradicting creation events first, then by number of
+/// swaps - the pools that matter resolve first - then by id. Every verdict
+/// of the worker is persisted (`rpc`, `unresolved`, `no_answer`), so dead
+/// emitters leave the list instead of filling every page.
 pub const MISSING_POOLS_SQL: &str = "\
-SELECT pool_id, emitter, any(family) AS protocol FROM (\
-SELECT pool_id, emitter, toString(protocol) AS family \
-FROM dex_swaps_by_pool WHERE chain = {chain} \
-UNION ALL \
-SELECT pool_id, emitter, toString(protocol) AS family \
-FROM dex_liquidity WHERE chain = {chain}) \
-WHERE family NOT IN ('uniswap_v4', 'balancer_v2') \
-AND (pool_id, emitter) NOT IN (\
-SELECT pool_id, emitter FROM dex_pools FINAL WHERE chain = {chain}) \
-GROUP BY pool_id, emitter \
+SELECT a.pool_id AS pool_id, a.emitter AS emitter, a.family AS protocol, \
+toUInt32(ifNull(r.r_attempts, 0)) AS attempts \
+FROM (SELECT pool_id, emitter, any(toString(protocol)) AS family, \
+sum(swaps) AS activity FROM dex_pool_volume_1h \
+WHERE chain = {chain} AND protocol NOT IN ('uniswap_v4', 'balancer_v2') \
+GROUP BY pool_id, emitter) AS a \
+LEFT JOIN (SELECT pool_id AS r_pool_id, emitter AS r_emitter, \
+toString(source) AS r_source, attempts AS r_attempts, _version AS r_version \
+FROM dex_pools FINAL WHERE chain = {chain} AND source != 'event') AS r \
+ON r.r_pool_id = a.pool_id AND r.r_emitter = a.emitter \
+LEFT JOIN (SELECT pool_id AS c_pool_id, emitter AS c_emitter, \
+uniqExact(tokens) AS token_sets FROM dex_pools FINAL \
+WHERE chain = {chain} AND source = 'event' GROUP BY pool_id, emitter) AS c \
+ON c.c_pool_id = a.pool_id AND c.c_emitter = a.emitter \
+WHERE ifNull(r.r_source, '') = '' OR (r.r_source = 'no_answer' \
+AND r.r_version + least(3600000 * pow(2, least(r.r_attempts, 20)), \
+2592000000) < toUnixTimestamp64Milli(now64(3))) \
+ORDER BY ifNull(c.token_sets, 0) > 1 DESC, a.activity DESC, \
+a.pool_id, a.emitter \
 LIMIT {limit}";
 
 /// A pool whose tokens are unknown and can be asked over RPC.
@@ -185,6 +209,8 @@ pub struct PoolCandidate {
     pub address: Address,
     /// Family of the event that revealed the pool: which getters to try.
     pub protocol: Protocol,
+    /// How often the pool was asked without an answer (`no_answer` row).
+    pub attempts: u32,
 }
 
 /// `from` and `to` of a transaction.
@@ -271,34 +297,29 @@ impl DexRows {
         }
     }
 
-    /// Pools that traded in this batch, were not created in it and can be
-    /// resolved over RPC: what to hand to [`PoolWorker::discover`].
-    /// Deduplicated, in first-seen order.
+    /// Contract pools that traded or were announced in this batch: what to
+    /// hand to [`PoolWorker::discover`]. Pools CREATED in the batch are
+    /// included on purpose - a creation event is a claim, the pool's own
+    /// `token0()` / `token1()` is the proof. Deduplicated, first-seen order.
     pub fn pool_candidates(&self) -> Vec<PoolCandidate> {
-        let created: HashSet<(B256, Address)> = self
-            .pools
-            .iter()
-            .map(|pool| (pool.pool_id, pool.emitter))
-            .collect();
-
         let mut seen: HashSet<B256> = HashSet::new();
         let mut candidates = Vec::new();
 
-        let traded = self
-            .swaps
-            .iter()
-            .map(|swap| (swap.pool_id, swap.emitter, swap.protocol))
-            .chain(
-                self.liquidity
-                    .iter()
-                    .map(|row| (row.pool_id, row.emitter, row.protocol)),
-            );
+        let mentioned =
+            self.swaps
+                .iter()
+                .map(|swap| (swap.pool_id, swap.emitter, swap.protocol))
+                .chain(
+                    self.liquidity.iter().map(|row| {
+                        (row.pool_id, row.emitter, row.protocol)
+                    }),
+                )
+                .chain(self.pools.iter().map(|pool| {
+                    (pool.pool_id, pool.emitter, pool.protocol)
+                }));
 
-        for (pool_id, emitter, protocol) in traded {
-            if !protocol.resolvable_by_rpc()
-                || created.contains(&(pool_id, emitter))
-                || !seen.insert(pool_id)
-            {
+        for (pool_id, emitter, protocol) in mentioned {
+            if !protocol.resolvable_by_rpc() || !seen.insert(pool_id) {
                 continue;
             }
 
@@ -306,6 +327,7 @@ impl DexRows {
                 pool_id,
                 address: emitter,
                 protocol,
+                attempts: 0,
             });
         }
 
@@ -362,6 +384,10 @@ mod tests {
             token_out: Address::ZERO,
             amount_in: U256::ZERO,
             amount_out: U256::ZERO,
+            verified_in: Address::ZERO,
+            verified_out: Address::ZERO,
+            reserve0: U256::ZERO,
+            reserve1: U256::ZERO,
             coin_in: 0,
             coin_out: 0,
             underlying: false,
@@ -464,29 +490,27 @@ mod tests {
     }
 
     #[test]
-    fn candidates_skip_singletons_and_pools_created_in_the_batch() {
-        let known = Address::repeat_byte(7);
+    fn candidates_are_contract_pools_created_ones_included() {
+        let created = Address::repeat_byte(7);
         let unknown = Address::repeat_byte(8);
         let manager = Address::repeat_byte(9);
 
         let mut rows = DexRows::default();
-        rows.swaps.push(swap(known, Protocol::UniswapV2));
         rows.swaps.push(swap(unknown, Protocol::UniswapV3));
         rows.swaps.push(swap(unknown, Protocol::UniswapV3));
         rows.swaps.push(swap(manager, Protocol::UniswapV4));
 
-        let logs = [crate::dex::fixtures::v2_pair_created_for(known)];
+        let logs = [crate::dex::fixtures::v2_pair_created_for(created)];
         rows.pools = decode(1, &logs).pools;
         assert_eq!(rows.pools.len(), 1);
 
-        assert_eq!(
-            rows.pool_candidates(),
-            vec![PoolCandidate {
-                pool_id: pool_id_of(unknown),
-                address: unknown,
-                protocol: Protocol::UniswapV3,
-            }]
-        );
+        let candidates = rows.pool_candidates();
+        let addresses: Vec<Address> =
+            candidates.iter().map(|candidate| candidate.address).collect();
+
+        // The announced pair must be asked too: its event is only a claim.
+        assert_eq!(addresses, vec![unknown, created]);
+        assert_eq!(candidates[1].protocol, Protocol::UniswapV2);
     }
 
     #[test]
@@ -621,7 +645,12 @@ mod tests {
                     "{name}"
                 );
             } else {
-                assert_eq!(name, "quote_tokens");
+                // User populated, not block scoped.
+                assert!(
+                    ["quote_tokens", "dex_trusted_emitters"]
+                        .contains(&name.as_str()),
+                    "{name}"
+                );
             }
 
             // 50+ chains in one database: months only for the base
@@ -641,7 +670,7 @@ mod tests {
     #[test]
     fn side_tables_follow_tombstones_and_aggregates_skip_them() {
         let views = materialized_views();
-        assert_eq!(views.len(), 8);
+        assert_eq!(views.len(), 7);
 
         for (name, target, select) in views {
             if SIDE_TABLES.contains(&target.as_str()) {
@@ -686,6 +715,8 @@ mod tests {
     #[test]
     fn missing_pools_sql_has_its_placeholders() {
         assert_eq!(MISSING_POOLS_SQL.matches("{chain}").count(), 3);
+        assert!(MISSING_POOLS_SQL.contains("FROM dex_pool_volume_1h "));
+        assert!(MISSING_POOLS_SQL.contains("ORDER BY"));
         assert!(MISSING_POOLS_SQL.contains("FROM dex_pools FINAL"));
         assert_eq!(MISSING_POOLS_SQL.matches("{limit}").count(), 1);
     }

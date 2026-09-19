@@ -6,7 +6,7 @@
 //! missing RANGES travel to the indexer.
 
 use clickhouse::Row;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Half open block range `[from, to)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,101 @@ impl std::fmt::Display for BlockRange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}, {})", self.from, self.to)
     }
+}
+
+/// Row of `checkpoints`: `[from_block, to_block)` was committed by one
+/// flush (written AFTER its `blocks` rows; docs/design.md, section 3).
+#[derive(
+    Debug, Clone, Copy, Row, Serialize, Deserialize, PartialEq, Eq,
+)]
+pub struct DatabaseCheckpoint {
+    pub chain: u64,
+    pub from_block: u64,
+    /// Exclusive.
+    pub to_block: u64,
+    pub epoch: u32,
+    pub _version: u64,
+}
+
+/// The contiguous ranges covered by `numbers` (any order, duplicates
+/// allowed), ascending. A flush normally covers one range; a pass healing
+/// several gaps can put more than one into the same flush.
+pub fn contiguous_ranges(
+    numbers: impl IntoIterator<Item = u64>,
+) -> Vec<BlockRange> {
+    let mut numbers: Vec<u64> = numbers.into_iter().collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+
+    let mut ranges: Vec<BlockRange> = Vec::new();
+
+    for number in numbers {
+        match ranges.last_mut() {
+            Some(last) if last.to == number => last.to = number + 1,
+            _ => ranges
+                .push(BlockRange::new(number, number.saturating_add(1))),
+        }
+    }
+
+    ranges
+}
+
+/// Live checkpoints of a chain ending above `start`, ordered for
+/// [`contiguous_until`]. `FINAL`: a purge tombstones the checkpoints it
+/// overlaps.
+pub fn checkpoints_sql(chain: u64, start: u64) -> String {
+    format!(
+        "SELECT from_block, to_block FROM checkpoints FINAL \
+         WHERE chain = {chain} AND to_block > {start} \
+         ORDER BY from_block ASC, to_block ASC"
+    )
+}
+
+/// Resume point: the block up to which the checkpoints cover `start`
+/// onwards without a hole (`start` itself when nothing covers it).
+/// `checkpoints` must be ordered by `from_block`; they may overlap.
+pub fn contiguous_until(
+    start: u64,
+    checkpoints: impl IntoIterator<Item = (u64, u64)>,
+) -> u64 {
+    let mut until = start;
+
+    for (from, to) in checkpoints {
+        if from > until {
+            break;
+        }
+        until = until.max(to);
+    }
+
+    until
+}
+
+/// `ranges` without the blocks of `known` (both ordered or not; the result
+/// is ordered when `ranges` is). Used to keep blocks this process has
+/// just committed out of a gap listing that may not see them yet
+/// (ClickHouse gives no read-your-writes guarantee; docs/design.md,
+/// section 2).
+pub fn subtract_ranges(
+    ranges: &[BlockRange],
+    known: &[BlockRange],
+) -> Vec<BlockRange> {
+    let mut result: Vec<BlockRange> = ranges.to_vec();
+
+    for cut in known.iter().filter(|cut| !cut.is_empty()) {
+        result = result
+            .into_iter()
+            .flat_map(|range| {
+                let left =
+                    BlockRange::new(range.from, range.to.min(cut.from));
+                let right =
+                    BlockRange::new(range.from.max(cut.to), range.to);
+                [left, right]
+            })
+            .filter(|range| !range.is_empty())
+            .collect();
+    }
+
+    result
 }
 
 /// Upper bound on the gap rows fetched per pass, so memory stays bounded
@@ -182,6 +277,59 @@ pub fn assemble_missing_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contiguous_ranges_of_block_numbers() {
+        assert!(contiguous_ranges([]).is_empty());
+        assert_eq!(
+            contiguous_ranges([7, 5, 6, 6, 10, 12, 11]),
+            vec![BlockRange::new(5, 8), BlockRange::new(10, 13)]
+        );
+        assert_eq!(
+            contiguous_ranges([u64::MAX]),
+            vec![BlockRange::new(u64::MAX, u64::MAX)]
+        );
+    }
+
+    #[test]
+    fn resume_point_is_the_end_of_the_contiguous_checkpoints() {
+        assert_eq!(contiguous_until(10, []), 10);
+        // Starts above the start block: nothing is covered.
+        assert_eq!(contiguous_until(10, [(11, 20)]), 10);
+        assert_eq!(contiguous_until(10, [(10, 20), (20, 30)]), 30);
+        // A checkpoint straddling the start block counts.
+        assert_eq!(contiguous_until(10, [(0, 15), (15, 18)]), 18);
+        // Overlaps and contained ranges.
+        assert_eq!(
+            contiguous_until(0, [(0, 10), (2, 5), (8, 12), (12, 13)]),
+            13
+        );
+        // A hole stops it, whatever comes later.
+        assert_eq!(contiguous_until(0, [(0, 10), (11, 50)]), 10);
+    }
+
+    #[test]
+    fn subtracting_known_ranges() {
+        let r = BlockRange::new;
+
+        assert_eq!(subtract_ranges(&[r(0, 10)], &[]), vec![r(0, 10)]);
+        assert_eq!(subtract_ranges(&[r(0, 10)], &[r(0, 10)]), vec![]);
+        assert_eq!(
+            subtract_ranges(&[r(0, 10)], &[r(3, 5)]),
+            vec![r(0, 3), r(5, 10)]
+        );
+        assert_eq!(
+            subtract_ranges(
+                &[r(0, 10), r(20, 30)],
+                &[r(8, 25), r(28, 40)]
+            ),
+            vec![r(0, 8), r(25, 28)]
+        );
+        assert_eq!(
+            subtract_ranges(&[r(0, 10)], &[r(50, 60), r(5, 5)]),
+            vec![r(0, 10)]
+        );
+    }
 
     fn stats(indexed: u64, max_number: u64) -> RangeStats {
         RangeStats { indexed, max_number }

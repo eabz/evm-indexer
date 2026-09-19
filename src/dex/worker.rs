@@ -33,17 +33,18 @@ use crate::tokens::multicall::EthCaller;
 
 use super::{
     models::DexPool,
-    resolve::{resolve_pool, unresolved_pool, Resolution},
+    resolve::{no_answer_pool, resolve_pool, unresolved_pool, Resolution},
     PoolCandidate,
 };
 
 /// Where resolved pools are written, and what is already there.
 pub trait PoolSink: Send + Sync + 'static {
-    /// The subset of `pool_ids` that has a LIVE `dex_pools` row (of any
-    /// source). Keeps the worker from asking the RPC about pools whose
-    /// creation event was indexed long ago: `SELECT pool_id FROM dex_pools
-    /// FINAL WHERE chain = ? AND pool_id IN ?` (`FINAL`: a tombstoned pool
-    /// is not known).
+    /// The subset of `pool_ids` that already has a live RESOLVER row
+    /// (`rpc`, `unresolved` or `no_answer`): `SELECT pool_id FROM dex_pools
+    /// FINAL WHERE chain = ? AND source != 'event' AND pool_id IN ?`.
+    /// Creation events do NOT make a pool known: they are claims the
+    /// worker exists to check. `no_answer` rows come back through the
+    /// backfill when their backoff is over.
     fn known_pools<'a>(
         &'a self,
         pool_ids: &'a [B256],
@@ -86,6 +87,9 @@ pub struct PoolWorkerOptions {
     /// only).
     pub no_answer_ttl: Duration,
     pub no_answer_capacity: usize,
+    /// Transient failures of ONE pool (while others answer) before it is
+    /// parked as `no_answer`.
+    pub max_strikes: u32,
     /// Consecutive batches without a single RPC answer before pausing.
     pub breaker_threshold: u32,
     pub breaker_cooldown: Duration,
@@ -106,6 +110,7 @@ impl Default for PoolWorkerOptions {
             known_capacity: 500_000,
             no_answer_ttl: Duration::from_secs(1_800),
             no_answer_capacity: 50_000,
+            max_strikes: 3,
             breaker_threshold: 3,
             breaker_cooldown: Duration::from_secs(30),
             breaker_max_cooldown: Duration::from_secs(600),
@@ -128,7 +133,8 @@ pub struct PoolWorkerStats {
     pub resolved: u64,
     /// Definitely not a pool (`source = 'unresolved'` rows).
     pub negative: u64,
-    /// No code at the address (not cached persistently).
+    /// No usable answer (no code, or parked after repeated failures):
+    /// `no_answer` rows, asked again with a backoff.
     pub codeless: u64,
     pub inserted: u64,
     pub insert_failures: u64,
@@ -166,6 +172,8 @@ struct Memory {
     pending: HashSet<B256>,
     /// Addresses without code -> when they may be asked again.
     no_answer: LruCache<B256, Instant>,
+    /// Consecutive transient RPC failures of one pool.
+    strikes: LruCache<B256, u32>,
 }
 
 struct Shared {
@@ -219,6 +227,9 @@ impl PoolWorker {
                 known: LruCache::new(capacity(options.known_capacity)),
                 pending: HashSet::new(),
                 no_answer: LruCache::new(capacity(
+                    options.no_answer_capacity,
+                )),
+                strikes: LruCache::new(capacity(
                     options.no_answer_capacity,
                 )),
             }),
@@ -292,15 +303,6 @@ impl PoolWorker {
                 }
                 Err(_) => bump(&self.shared.counters.dropped, 1),
             }
-        }
-    }
-
-    /// Pools the pipeline stored itself (creation events): they will never
-    /// be asked over RPC.
-    pub fn mark_known<I: IntoIterator<Item = B256>>(&self, pool_ids: I) {
-        let mut memory = self.shared.memory();
-        for id in pool_ids {
-            memory.known.put(id, ());
         }
     }
 
@@ -617,6 +619,8 @@ impl Task {
             .await;
 
         let mut rows: Vec<DexPool> = Vec::new();
+        // Only parked when the RPC answered for SOMEBODY in this batch.
+        let mut parked: Vec<DexPool> = Vec::new();
         let mut answered = 0usize;
         let mut failed = 0usize;
         let retry_at = Instant::now() + self.shared.options.no_answer_ttl;
@@ -640,6 +644,9 @@ impl Task {
                         .memory()
                         .no_answer
                         .put(candidate.pool_id, retry_at);
+                    // Persisted: the backfill asks again after a backoff
+                    // on `attempts` instead of on every run.
+                    rows.push(no_answer_pool(chain_id, &candidate));
                 }
                 Resolution::Retry(error) => {
                     failed += 1;
@@ -648,11 +655,40 @@ impl Task {
                         "dex pool {} not resolved: {error}",
                         candidate.address
                     );
+
+                    // One contract that keeps failing while the RPC works
+                    // for others (a gas bomb...) must not sit at the head
+                    // of every backfill page: after a few strikes it is
+                    // parked like an address without code.
+                    let strikes = {
+                        let mut memory = self.shared.memory();
+                        let strikes = memory
+                            .strikes
+                            .get(&candidate.pool_id)
+                            .copied()
+                            .unwrap_or_default()
+                            + 1;
+                        memory.strikes.put(candidate.pool_id, strikes);
+                        strikes
+                    };
+
+                    if strikes >= self.shared.options.max_strikes.max(1) {
+                        self.shared
+                            .memory()
+                            .strikes
+                            .pop(&candidate.pool_id);
+                        parked.push(no_answer_pool(chain_id, &candidate));
+                    }
                 }
             }
         }
 
         self.track_breaker(answered, failed);
+
+        if answered > 0 {
+            bump(&counters.codeless, parked.len());
+            rows.append(&mut parked);
+        }
 
         if rows.is_empty() {
             return;
@@ -790,6 +826,7 @@ mod tests {
             pool_id: pool_id_of(pool),
             address: pool,
             protocol,
+            attempts: 0,
         }
     }
 
@@ -889,11 +926,6 @@ mod tests {
         assert_eq!(node.calls(), 0);
         assert!(sink.rows().is_empty());
 
-        // Pools the pipeline stored itself are not even queued.
-        worker.mark_known([pool_id_of(addr(2))]);
-        worker.discover(&[candidate(addr(2), Protocol::UniswapV3)]);
-        assert_eq!(worker.stats().queued, 1);
-
         stop(&worker, handle).await;
     }
 
@@ -969,7 +1001,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codeless_addresses_get_no_row_and_are_asked_again_later() {
+    async fn codeless_addresses_are_parked_and_asked_again_later() {
         let node = Arc::new(FakeNode::default());
         let sink = Arc::new(MemorySink::default());
 
@@ -983,18 +1015,34 @@ mod tests {
 
         let pools = [candidate(addr(1), Protocol::UniswapV2)];
         worker.discover(&pools);
-        until("the empty answer", || worker.stats().codeless == 1).await;
-        assert!(sink.rows().is_empty());
+        until("the empty answer", || sink.rows().len() == 1).await;
+        // Persisted with its attempt count: no tokens, not a pool row.
+        assert_eq!(sink.rows()[0].source, PoolSource::NoAnswer);
+        assert_eq!(sink.rows()[0].attempts, 1);
+        assert!(sink.rows()[0].tokens.is_empty());
 
         // Within the TTL: not asked.
         worker.discover(&pools);
         assert_eq!(worker.stats().queued, 1);
 
-        // The node catches up.
+        // The node catches up; the backfill presents the pool again once
+        // its backoff is over (here: a second attempt).
         node.pair(addr(1), addr(0xa), addr(0xb));
+        let again = PoolCandidate { attempts: 1, ..pools[0] };
+        assert_eq!(
+            no_answer_pool(1, &again).attempts,
+            2,
+            "attempts grow with every unanswered try"
+        );
         tokio::time::sleep(Duration::from_millis(40)).await;
         worker.discover(&pools);
-        until("the pool row", || sink.rows().len() == 1).await;
+        until("the queue to drain", || worker.stats().queue_depth == 0)
+            .await;
+        assert_eq!(
+            sink.rows().len(),
+            1,
+            "known in this process: not asked"
+        );
 
         stop(&worker, handle).await;
     }

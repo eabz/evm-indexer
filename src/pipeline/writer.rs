@@ -6,7 +6,10 @@
 //! bounded, so a slow database slows the HyperSync stream down instead of
 //! growing memory.
 
-use crate::db::{next_version, RowBatch};
+use crate::{
+    db::{next_version, RowBatch},
+    metrics::Metrics,
+};
 use anyhow::{Context, Result};
 use log::{error, info};
 use std::{future::Future, time::Duration};
@@ -17,12 +20,19 @@ use tokio::{
 };
 
 /// Batches in flight between the transformer and the writer.
-const CHANNEL_CAPACITY: usize = 4;
+pub const CHANNEL_CAPACITY: usize = 4;
 
 /// Destination of the flushed batches. `store` must only return `Ok` once
 /// the whole batch is durable (block rows last), and must do its own
 /// retries: an error is final and stops the indexer.
 pub trait Sink: Send + Sync + 'static {
+    /// The chain's purge generation (docs/design.md, section 2) to stamp
+    /// on the rows of the flush that is about to happen. Called once per
+    /// flush, right before [`Sink::store`].
+    fn epoch(&self) -> impl Future<Output = Result<u32>> + Send {
+        async { Ok(0) }
+    }
+
     fn store(
         &self,
         batch: &RowBatch,
@@ -56,11 +66,21 @@ impl WriterStopped {
 enum Message {
     Rows(Box<RowBatch>),
     Barrier(oneshot::Sender<()>),
+    /// Final flush, then the task ends (handles may still exist).
+    Stop,
 }
 
 pub struct Writer {
-    tx: mpsc::Sender<Message>,
+    handle: WriterHandle,
     task: JoinHandle<Result<()>>,
+}
+
+/// Sending side of the writer. Cheap to clone; the reorg logic holds one
+/// to quiesce the writer before a purge.
+#[derive(Clone)]
+pub struct WriterHandle {
+    tx: mpsc::Sender<Message>,
+    metrics: Metrics,
 }
 
 impl Writer {
@@ -69,11 +89,57 @@ impl Writer {
         flush_rows: usize,
         flush_interval: Duration,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let task = tokio::spawn(run(sink, rx, flush_rows, flush_interval));
-        Self { tx, task }
+        Self::spawn_with_metrics(
+            sink,
+            flush_rows,
+            flush_interval,
+            Metrics::disabled(),
+        )
     }
 
+    pub fn spawn_with_metrics<S: Sink>(
+        sink: S,
+        flush_rows: usize,
+        flush_interval: Duration,
+        metrics: Metrics,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let task = tokio::spawn(run(
+            sink,
+            rx,
+            flush_rows,
+            flush_interval,
+            metrics.clone(),
+        ));
+        Self { handle: WriterHandle { tx, metrics }, task }
+    }
+
+    pub fn handle(&self) -> WriterHandle {
+        self.handle.clone()
+    }
+
+    /// See [`WriterHandle::send`].
+    pub async fn send(&self, rows: RowBatch) -> Result<()> {
+        self.handle.send(rows).await
+    }
+
+    /// See [`WriterHandle::barrier`].
+    pub async fn barrier(&self) -> Result<()> {
+        self.handle.barrier().await
+    }
+
+    /// Flushes what is left and returns the writer's final result (the
+    /// flush error if it stopped early).
+    pub async fn shutdown(self) -> Result<()> {
+        // Ignored on purpose: a closed channel means the task already
+        // ended, and its result is what is returned below.
+        let _ = self.handle.tx.send(Message::Stop).await;
+        drop(self.handle);
+        self.task.await.context("writer task panicked")?
+    }
+}
+
+impl WriterHandle {
     /// Queues rows (whole blocks). Waits while the writer is busy. Fails
     /// when the writer stopped because a flush failed.
     pub async fn send(&self, rows: RowBatch) -> Result<()> {
@@ -81,10 +147,18 @@ impl Writer {
             return Ok(());
         }
 
-        self.tx
+        let sent = self
+            .tx
             .send(Message::Rows(Box::new(rows)))
             .await
-            .map_err(|_| WriterStopped.into())
+            .map_err(|_| WriterStopped.into());
+
+        self.metrics.channel_fill(
+            CHANNEL_CAPACITY - self.tx.capacity(),
+            CHANNEL_CAPACITY,
+        );
+
+        sent
     }
 
     /// Returns once everything queued so far is durably stored.
@@ -100,13 +174,6 @@ impl Writer {
         // flush failed and the writer task is returning its error.
         done.await.map_err(|_| WriterStopped.into())
     }
-
-    /// Flushes what is left and returns the writer's final result (the
-    /// flush error if it stopped early).
-    pub async fn shutdown(self) -> Result<()> {
-        drop(self.tx);
-        self.task.await.context("writer task panicked")?
-    }
 }
 
 async fn run<S: Sink>(
@@ -114,6 +181,7 @@ async fn run<S: Sink>(
     mut rx: mpsc::Receiver<Message>,
     flush_rows: usize,
     flush_interval: Duration,
+    metrics: Metrics,
 ) -> Result<()> {
     let mut buffer = RowBatch::default();
     // When the oldest buffered row has to be flushed.
@@ -130,10 +198,13 @@ async fn run<S: Sink>(
 
         match message {
             // Interval elapsed.
-            None => flush(&sink, &mut buffer, &mut deadline).await?,
-            // Every sender is gone: final flush.
-            Some(None) => {
-                return flush(&sink, &mut buffer, &mut deadline).await;
+            None => {
+                flush(&sink, &mut buffer, &mut deadline, &metrics).await?
+            }
+            // Shutdown, or every sender is gone: final flush.
+            Some(None) | Some(Some(Message::Stop)) => {
+                return flush(&sink, &mut buffer, &mut deadline, &metrics)
+                    .await;
             }
             Some(Some(Message::Rows(mut rows))) => {
                 buffer.append(&mut rows);
@@ -143,11 +214,12 @@ async fn run<S: Sink>(
                 }
 
                 if buffer.rows() >= flush_rows {
-                    flush(&sink, &mut buffer, &mut deadline).await?;
+                    flush(&sink, &mut buffer, &mut deadline, &metrics)
+                        .await?;
                 }
             }
             Some(Some(Message::Barrier(ack))) => {
-                flush(&sink, &mut buffer, &mut deadline).await?;
+                flush(&sink, &mut buffer, &mut deadline, &metrics).await?;
                 // The requester may have gone away; nothing to do then.
                 let _ = ack.send(());
             }
@@ -161,6 +233,7 @@ async fn flush<S: Sink>(
     sink: &S,
     buffer: &mut RowBatch,
     deadline: &mut Option<Instant>,
+    metrics: &Metrics,
 ) -> Result<()> {
     *deadline = None;
 
@@ -169,13 +242,30 @@ async fn flush<S: Sink>(
     }
 
     let mut batch = std::mem::take(buffer);
-    // One `_version` per flush: a re-inserted block replaces itself.
-    batch.set_version(next_version());
+    let rows = batch.rows() as u64;
     let started = Instant::now();
+    metrics.flush_started();
 
-    if let Err(e) = sink.store(&batch).await {
+    let stored = async {
+        // One `_version` and one `epoch` per flush: a re-inserted block
+        // replaces itself, and the aggregates file every contribution
+        // under the purge generation it was written in.
+        batch.set_version(next_version());
+        batch.set_epoch(sink.epoch().await.context("read the epoch")?);
+        sink.store(&batch).await
+    }
+    .await;
+
+    metrics.flush_observed(started.elapsed(), rows, stored.is_ok());
+
+    if let Err(e) = stored {
         error!("Flush failed, stopping: {e:#}");
         return Err(e);
+    }
+
+    if let Some(last) = batch.blocks.iter().max_by_key(|b| b.number) {
+        metrics.set_indexed_height(last.number);
+        metrics.set_indexed_timestamp(u64::from(last.timestamp));
     }
 
     let span = batch
@@ -183,9 +273,17 @@ async fn flush<S: Sink>(
         .map(|(min, max)| format!("{min}..={max}"))
         .unwrap_or_else(|| "-".to_string());
 
+    let modules: String = batch
+        .modules
+        .counts()
+        .into_iter()
+        .filter(|(_, rows)| *rows > 0)
+        .map(|(table, rows)| format!(" {table} ({rows})"))
+        .collect();
+
     info!(
         "Stored {} blocks ({span}): transactions ({}) logs ({}) \
-         withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}) tokens ({}) \
+         withdrawals ({}) erc20 ({}) erc721 ({}) erc1155 ({}){modules} \
          in {:?}.",
         batch.blocks.len(),
         batch.transactions.len(),
@@ -194,7 +292,6 @@ async fn flush<S: Sink>(
         batch.erc20_transfers.len(),
         batch.erc721_transfers.len(),
         batch.erc1155_transfers.len(),
-        batch.tokens.len(),
         started.elapsed(),
     );
 
@@ -204,7 +301,7 @@ async fn flush<S: Sink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::token::DatabaseToken;
+    use crate::db::models::log::test_support::log_with;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -236,14 +333,7 @@ mod tests {
     fn rows(count: usize) -> RowBatch {
         let mut batch = RowBatch::default();
         for _ in 0..count {
-            batch.tokens.push(DatabaseToken {
-                address: Default::default(),
-                name: String::new(),
-                symbol: String::new(),
-                decimals: 0,
-                r#type: String::new(),
-                chain: 1,
-            });
+            batch.logs.push(log_with(&[], vec![]));
         }
         batch
     }
