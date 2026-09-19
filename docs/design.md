@@ -205,6 +205,12 @@ calls). So the RPC must never be able to block or lose anything:
   transfer tables (and `dex_pools`) with no `tokens` row and feeds them to the worker. An
   RPC outage of any length self-heals; nothing depends on having seen the transfer live.
   Expose as a trait (`MissingTokenSource`) so the pipeline wires ClickHouse in.
+- **`--rpc` defaults to `auto`** (owner decision: DEX analytics are on by default and
+  are meaningless without token decimals). Unset/blank = `auto`; `none` disables RPC
+  features explicitly; `https://mine,auto` = own endpoint first, public fallback
+  (recommended for production). Discovery can never fail startup. README must state
+  that the default fetches `https://chainid.network/chains.json` and that public
+  endpoints are best-effort.
 - **Multi-endpoint failover.** `--rpc` takes a comma-separated list; per-endpoint circuit
   breakers, rotate on failure, chain-id checked per endpoint. `--rpc auto` discovers
   public endpoints for the chain id from `https://chainid.network/chains.json` (filter
