@@ -12,32 +12,32 @@ use crate::utils::{
     format::{SerAddress, SerB256, SerU256},
 };
 
+/// Row of `erc1155_transfers`. Field names are the column names.
+/// `TransferSingle` is stored as one element arrays.
 #[serde_as]
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct DatabaseERC1155Transfer {
-    #[serde_as(as = "SerAddress")]
-    pub address: Address,
-    #[serde_as(as = "Vec<SerU256>")]
-    pub amounts: Vec<U256>,
-    pub block_number: u32,
     pub chain: u64,
-    #[serde_as(as = "SerAddress")]
-    pub from: Address,
-    #[serde_as(as = "Vec<SerU256>")]
-    pub ids: Vec<U256>,
-    pub log_index: u16,
-    pub log_type: Option<String>,
-    #[serde_as(as = "SerAddress")]
-    pub operator: Address,
-    pub removed: bool,
-    pub timestamp: u32,
-    #[serde_as(as = "SerAddress")]
-    pub to: Address,
-    #[serde_as(as = "SerAddress")]
-    pub token_address: Address,
+    pub block_number: u64,
+    pub log_index: u32,
+    pub transaction_index: u32,
     #[serde_as(as = "SerB256")]
     pub transaction_hash: B256,
-    pub transaction_log_index: Option<u16>,
+    pub timestamp: u32,
+    #[serde_as(as = "SerAddress")]
+    pub token_address: Address,
+    #[serde_as(as = "SerAddress")]
+    pub operator: Address,
+    #[serde_as(as = "SerAddress")]
+    pub from: Address,
+    #[serde_as(as = "SerAddress")]
+    pub to: Address,
+    #[serde_as(as = "Vec<SerU256>")]
+    pub ids: Vec<U256>,
+    #[serde_as(as = "Vec<SerU256>")]
+    pub amounts: Vec<U256>,
+    /// Stamped once per flush, see `RowBatch::set_version`.
+    pub _version: u64,
 }
 
 const WORD: usize = 32;
@@ -103,21 +103,19 @@ impl DatabaseERC1155Transfer {
             };
 
         Some(Self {
-            address: log.address,
-            amounts,
-            block_number: log.block_number,
             chain: log.chain,
-            from: Address::from_word(topic2),
-            ids,
+            block_number: log.block_number,
             log_index: log.log_index,
-            log_type: log.log_type.clone(),
-            operator: Address::from_word(topic1),
-            removed: log.removed,
-            timestamp: log.timestamp,
-            to: Address::from_word(topic3),
-            token_address: log.address,
+            transaction_index: log.transaction_index,
             transaction_hash: log.transaction_hash,
-            transaction_log_index: log.transaction_log_index,
+            timestamp: log.timestamp,
+            token_address: log.address,
+            operator: Address::from_word(topic1),
+            from: Address::from_word(topic2),
+            to: Address::from_word(topic3),
+            ids,
+            amounts,
+            _version: 0,
         })
     }
 }

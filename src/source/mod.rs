@@ -19,14 +19,18 @@ use hypersync_client::{
 use log::{info, warn};
 use tokio::sync::mpsc::{self, Receiver};
 
+// Field selection (docs/design.md, section 8): HyperSync is asked for
+// exactly what a column stores, nothing else. Dropping a column drops the
+// field from the query (`logs_bloom` is gone from both). The
+// `selection_is_exactly_what_the_rows_need` test enforces both directions.
+
 /// Block header fields needed by `DatabaseBlock` and the withdrawals.
-const BLOCK_FIELDS: [BlockField; 22] = [
+const BLOCK_FIELDS: [BlockField; 21] = [
     BlockField::Number,
     BlockField::Hash,
     BlockField::ParentHash,
     BlockField::Nonce,
     BlockField::Sha3Uncles,
-    BlockField::LogsBloom,
     BlockField::TransactionsRoot,
     BlockField::StateRoot,
     BlockField::ReceiptsRoot,
@@ -239,6 +243,15 @@ impl BlockSource for Source {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::transform::transform;
+    use hypersync_client::{
+        format::{
+            AccessList, Address as HsAddress, Data, Hash, LogArgument,
+            Nonce, Quantity, TransactionStatus, TransactionType, UInt,
+            Withdrawal,
+        },
+        simple_types::{Block, Log, Trace, Transaction},
+    };
 
     #[test]
     fn query_covers_everything_in_a_bounded_range() {
@@ -268,7 +281,462 @@ mod tests {
     }
 
     #[test]
+    fn dropped_columns_are_not_requested() {
+        assert!(!BLOCK_FIELDS.contains(&BlockField::LogsBloom));
+    }
+
+    #[test]
     fn malformed_token_is_an_error_not_a_panic() {
         assert!(Source::new(1, None, "not-a-uuid", false).is_err());
+    }
+
+    // ---- selection <-> models ------------------------------------------
+    //
+    // A response with EVERY field populated is reduced to the selected
+    // fields (what HyperSync would actually return) and transformed:
+    //
+    // 1. the rows must equal the rows of the full response, i.e. every
+    //    field a model reads is selected
+    // 2. dropping any single selected field must change the rows, i.e.
+    //    nothing is requested that no column needs
+
+    const BLOCK: u64 = 100;
+
+    fn full_block() -> Block {
+        Block {
+            number: Some(BLOCK),
+            hash: Some(Hash::from([0xb1; 32])),
+            parent_hash: Some(Hash::from([0xb0; 32])),
+            nonce: Some(Nonce::from([0x42; 8])),
+            sha3_uncles: Some(Hash::from([0x01; 32])),
+            logs_bloom: Some(Data::from(vec![0xff; 256])),
+            transactions_root: Some(Hash::from([0x02; 32])),
+            state_root: Some(Hash::from([0x03; 32])),
+            receipts_root: Some(Hash::from([0x04; 32])),
+            miner: Some(HsAddress::from([0x05; 20])),
+            difficulty: Some(Quantity::from(6u64)),
+            total_difficulty: Some(Quantity::from(7u64)),
+            extra_data: Some(Data::from(vec![8u8])),
+            size: Some(Quantity::from(9u64)),
+            gas_limit: Some(Quantity::from(10u64)),
+            gas_used: Some(Quantity::from(11u64)),
+            timestamp: Some(Quantity::from(1_700_000_000u64)),
+            uncles: Some(vec![Hash::from([0x0c; 32])]),
+            base_fee_per_gas: Some(Quantity::from(13u64)),
+            withdrawals_root: Some(Hash::from([0x0e; 32])),
+            withdrawals: Some(vec![Withdrawal {
+                index: Some(Quantity::from(15u64)),
+                validator_index: Some(Quantity::from(16u64)),
+                address: Some(HsAddress::from([0x11; 20])),
+                amount: Some(Quantity::from(18u64)),
+            }]),
+            mix_hash: Some(Hash::from([0x13; 32])),
+            ..Default::default()
+        }
+    }
+
+    fn project_block(full: &Block, fields: &[BlockField]) -> Block {
+        let mut block = Block::default();
+        for field in fields {
+            match field {
+                BlockField::Number => block.number = full.number,
+                BlockField::Hash => block.hash = full.hash.clone(),
+                BlockField::ParentHash => {
+                    block.parent_hash = full.parent_hash.clone()
+                }
+                BlockField::Nonce => block.nonce = full.nonce.clone(),
+                BlockField::Sha3Uncles => {
+                    block.sha3_uncles = full.sha3_uncles.clone()
+                }
+                BlockField::TransactionsRoot => {
+                    block.transactions_root =
+                        full.transactions_root.clone()
+                }
+                BlockField::StateRoot => {
+                    block.state_root = full.state_root.clone()
+                }
+                BlockField::ReceiptsRoot => {
+                    block.receipts_root = full.receipts_root.clone()
+                }
+                BlockField::Miner => block.miner = full.miner.clone(),
+                BlockField::Difficulty => {
+                    block.difficulty = full.difficulty.clone()
+                }
+                BlockField::TotalDifficulty => {
+                    block.total_difficulty = full.total_difficulty.clone()
+                }
+                BlockField::ExtraData => {
+                    block.extra_data = full.extra_data.clone()
+                }
+                BlockField::Size => block.size = full.size.clone(),
+                BlockField::GasLimit => {
+                    block.gas_limit = full.gas_limit.clone()
+                }
+                BlockField::GasUsed => {
+                    block.gas_used = full.gas_used.clone()
+                }
+                BlockField::Timestamp => {
+                    block.timestamp = full.timestamp.clone()
+                }
+                BlockField::Uncles => block.uncles = full.uncles.clone(),
+                BlockField::BaseFeePerGas => {
+                    block.base_fee_per_gas = full.base_fee_per_gas.clone()
+                }
+                BlockField::WithdrawalsRoot => {
+                    block.withdrawals_root = full.withdrawals_root.clone()
+                }
+                BlockField::Withdrawals => {
+                    block.withdrawals = full.withdrawals.clone()
+                }
+                BlockField::MixHash => {
+                    block.mix_hash = full.mix_hash.clone()
+                }
+                other => panic!("add {other:?} to project_block"),
+            }
+        }
+        block
+    }
+
+    fn full_transaction() -> Transaction {
+        Transaction {
+            block_hash: Some(Hash::from([0xb1; 32])),
+            block_number: Some(UInt::from(BLOCK)),
+            from: Some(HsAddress::from([0x21; 20])),
+            gas: Some(Quantity::from(22u64)),
+            gas_price: Some(Quantity::from(23u64)),
+            hash: Some(Hash::from([0x24; 32])),
+            input: Some(Data::from(vec![0xa9, 0x05, 0x9c, 0xbb, 0x25])),
+            nonce: Some(Quantity::from(26u64)),
+            to: Some(HsAddress::from([0x27; 20])),
+            transaction_index: Some(UInt::from(3u64)),
+            value: Some(Quantity::from(28u64)),
+            max_priority_fee_per_gas: Some(Quantity::from(29u64)),
+            max_fee_per_gas: Some(Quantity::from(30u64)),
+            access_list: Some(vec![AccessList {
+                address: Some(HsAddress::from([0x31; 20])),
+                storage_keys: Some(vec![Hash::from([0x32; 32])]),
+            }]),
+            cumulative_gas_used: Some(Quantity::from(33u64)),
+            effective_gas_price: Some(Quantity::from(34u64)),
+            gas_used: Some(Quantity::from(35u64)),
+            contract_address: Some(HsAddress::from([0x36; 20])),
+            type_: Some(TransactionType::from(2u8)),
+            status: Some(TransactionStatus::Success),
+            ..Default::default()
+        }
+    }
+
+    fn project_transaction(
+        full: &Transaction,
+        fields: &[TransactionField],
+    ) -> Transaction {
+        let mut tx = Transaction::default();
+        for field in fields {
+            match field {
+                TransactionField::BlockHash => {
+                    tx.block_hash = full.block_hash.clone()
+                }
+                TransactionField::BlockNumber => {
+                    tx.block_number = full.block_number
+                }
+                TransactionField::From => tx.from = full.from.clone(),
+                TransactionField::Gas => tx.gas = full.gas.clone(),
+                TransactionField::GasPrice => {
+                    tx.gas_price = full.gas_price.clone()
+                }
+                TransactionField::Hash => tx.hash = full.hash.clone(),
+                TransactionField::Input => tx.input = full.input.clone(),
+                TransactionField::Nonce => tx.nonce = full.nonce.clone(),
+                TransactionField::To => tx.to = full.to.clone(),
+                TransactionField::TransactionIndex => {
+                    tx.transaction_index = full.transaction_index
+                }
+                TransactionField::Value => tx.value = full.value.clone(),
+                TransactionField::MaxPriorityFeePerGas => {
+                    tx.max_priority_fee_per_gas =
+                        full.max_priority_fee_per_gas.clone()
+                }
+                TransactionField::MaxFeePerGas => {
+                    tx.max_fee_per_gas = full.max_fee_per_gas.clone()
+                }
+                TransactionField::AccessList => {
+                    tx.access_list = full.access_list.clone()
+                }
+                TransactionField::CumulativeGasUsed => {
+                    tx.cumulative_gas_used =
+                        full.cumulative_gas_used.clone()
+                }
+                TransactionField::EffectiveGasPrice => {
+                    tx.effective_gas_price =
+                        full.effective_gas_price.clone()
+                }
+                TransactionField::GasUsed => {
+                    tx.gas_used = full.gas_used.clone()
+                }
+                TransactionField::ContractAddress => {
+                    tx.contract_address = full.contract_address.clone()
+                }
+                TransactionField::Type => tx.type_ = full.type_,
+                TransactionField::Status => tx.status = full.status,
+                other => panic!("add {other:?} to project_transaction"),
+            }
+        }
+        tx
+    }
+
+    /// An ERC721 transfer: all four topics are read.
+    fn full_log() -> Log {
+        let mut log = Log {
+            log_index: Some(UInt::from(5u64)),
+            transaction_index: Some(UInt::from(3u64)),
+            transaction_hash: Some(Hash::from([0x24; 32])),
+            block_number: Some(UInt::from(BLOCK)),
+            address: Some(HsAddress::from([0x41; 20])),
+            data: Some(Data::from(vec![0x42; 32])),
+            ..Default::default()
+        };
+        log.topics.push(Some(LogArgument::from(
+            crate::utils::events::TRANSFER_EVENT_SIGNATURE.0,
+        )));
+        log.topics.push(Some(LogArgument::from([0x43; 32])));
+        log.topics.push(Some(LogArgument::from([0x44; 32])));
+        log.topics.push(Some(LogArgument::from([0x45; 32])));
+        log
+    }
+
+    fn project_log(full: &Log, fields: &[LogField]) -> Log {
+        let mut log = Log::default();
+        for _ in 0..4 {
+            log.topics.push(None);
+        }
+        for field in fields {
+            match field {
+                LogField::LogIndex => log.log_index = full.log_index,
+                LogField::TransactionIndex => {
+                    log.transaction_index = full.transaction_index
+                }
+                LogField::TransactionHash => {
+                    log.transaction_hash = full.transaction_hash.clone()
+                }
+                LogField::BlockNumber => {
+                    log.block_number = full.block_number
+                }
+                LogField::Address => log.address = full.address.clone(),
+                LogField::Data => log.data = full.data.clone(),
+                LogField::Topic0 => log.topics[0] = full.topics[0].clone(),
+                LogField::Topic1 => log.topics[1] = full.topics[1].clone(),
+                LogField::Topic2 => log.topics[2] = full.topics[2].clone(),
+                LogField::Topic3 => log.topics[3] = full.topics[3].clone(),
+                other => panic!("add {other:?} to project_log"),
+            }
+        }
+        log
+    }
+
+    /// One trace per action type, together they populate every field.
+    fn full_traces() -> Vec<Trace> {
+        let base = |type_: &str, path: u64| Trace {
+            block_hash: Some(Hash::from([0xb1; 32])),
+            block_number: Some(BLOCK),
+            subtraces: Some(2),
+            trace_address: Some(vec![path]),
+            // Not a transaction of the response: the position can not be
+            // recovered from it, it has to come from the trace.
+            transaction_hash: Some(Hash::from([0x25; 32])),
+            transaction_position: Some(3),
+            type_: Some(type_.to_string()),
+            ..Default::default()
+        };
+
+        vec![
+            Trace {
+                from: Some(HsAddress::from([0x51; 20])),
+                to: Some(HsAddress::from([0x52; 20])),
+                call_type: Some("delegatecall".to_string()),
+                gas: Some(Quantity::from(53u64)),
+                input: Some(Data::from(vec![0x54])),
+                value: Some(Quantity::from(55u64)),
+                gas_used: Some(Quantity::from(56u64)),
+                output: Some(Data::from(vec![0x57])),
+                error: Some("Reverted".to_string()),
+                ..base("call", 0)
+            },
+            Trace {
+                from: Some(HsAddress::from([0x51; 20])),
+                init: Some(Data::from(vec![0x58])),
+                address: Some(HsAddress::from([0x59; 20])),
+                code: Some(Data::from(vec![0x5a])),
+                ..base("create", 1)
+            },
+            Trace {
+                action_address: Some(HsAddress::from([0x5b; 20])),
+                balance: Some(Quantity::from(0x5cu64)),
+                refund_address: Some(HsAddress::from([0x5d; 20])),
+                ..base("suicide", 2)
+            },
+            Trace {
+                author: Some(HsAddress::from([0x5e; 20])),
+                reward_type: Some("block".to_string()),
+                value: Some(Quantity::from(0x5fu64)),
+                transaction_hash: None,
+                transaction_position: None,
+                ..base("reward", 3)
+            },
+        ]
+    }
+
+    fn project_trace(full: &Trace, fields: &[TraceField]) -> Trace {
+        let mut trace = Trace::default();
+        for field in fields {
+            match field {
+                TraceField::From => trace.from = full.from.clone(),
+                TraceField::To => trace.to = full.to.clone(),
+                TraceField::CallType => {
+                    trace.call_type = full.call_type.clone()
+                }
+                TraceField::Gas => trace.gas = full.gas.clone(),
+                TraceField::Input => trace.input = full.input.clone(),
+                TraceField::Init => trace.init = full.init.clone(),
+                TraceField::Value => trace.value = full.value.clone(),
+                TraceField::Author => trace.author = full.author.clone(),
+                TraceField::RewardType => {
+                    trace.reward_type = full.reward_type.clone()
+                }
+                TraceField::BlockHash => {
+                    trace.block_hash = full.block_hash.clone()
+                }
+                TraceField::BlockNumber => {
+                    trace.block_number = full.block_number
+                }
+                TraceField::Address => {
+                    trace.address = full.address.clone()
+                }
+                TraceField::Code => trace.code = full.code.clone(),
+                TraceField::GasUsed => {
+                    trace.gas_used = full.gas_used.clone()
+                }
+                TraceField::Output => trace.output = full.output.clone(),
+                TraceField::Subtraces => trace.subtraces = full.subtraces,
+                TraceField::TraceAddress => {
+                    trace.trace_address = full.trace_address.clone()
+                }
+                TraceField::TransactionHash => {
+                    trace.transaction_hash = full.transaction_hash.clone()
+                }
+                TraceField::TransactionPosition => {
+                    trace.transaction_position = full.transaction_position
+                }
+                TraceField::Type => trace.type_ = full.type_.clone(),
+                TraceField::Error => trace.error = full.error.clone(),
+                TraceField::ActionAddress => {
+                    trace.action_address = full.action_address.clone()
+                }
+                TraceField::Balance => {
+                    trace.balance = full.balance.clone()
+                }
+                TraceField::RefundAddress => {
+                    trace.refund_address = full.refund_address.clone()
+                }
+                other => panic!("add {other:?} to project_trace"),
+            }
+        }
+        trace
+    }
+
+    /// Rows produced from a response reduced to the given selection, as a
+    /// comparable string (`Err` included: a missing identity field fails).
+    fn rows_for(
+        blocks: &[BlockField],
+        transactions: &[TransactionField],
+        logs: &[LogField],
+        traces: &[TraceField],
+    ) -> String {
+        let data = ResponseRows {
+            blocks: vec![vec![project_block(&full_block(), blocks)]],
+            transactions: vec![vec![project_transaction(
+                &full_transaction(),
+                transactions,
+            )]],
+            logs: vec![vec![project_log(&full_log(), logs)]],
+            traces: vec![full_traces()
+                .iter()
+                .map(|trace| project_trace(trace, traces))
+                .collect()],
+        };
+
+        match transform(1, &data, BlockRange::new(BLOCK, BLOCK + 1)) {
+            Ok(transformed) => format!("{:?}", transformed.rows),
+            Err(error) => format!("error: {error:#}"),
+        }
+    }
+
+    fn without<T: PartialEq + Copy>(fields: &[T], dropped: T) -> Vec<T> {
+        fields.iter().copied().filter(|f| *f != dropped).collect()
+    }
+
+    #[test]
+    fn selection_is_exactly_what_the_rows_need() {
+        let full = ResponseRows {
+            blocks: vec![vec![full_block()]],
+            transactions: vec![vec![full_transaction()]],
+            logs: vec![vec![full_log()]],
+            traces: vec![full_traces()],
+        };
+        let expected = format!(
+            "{:?}",
+            transform(1, &full, BlockRange::new(BLOCK, BLOCK + 1))
+                .unwrap()
+                .rows
+        );
+
+        // 1. Everything the models read is selected.
+        let selected = rows_for(
+            &BLOCK_FIELDS,
+            &TRANSACTION_FIELDS,
+            &LOG_FIELDS,
+            &TRACE_FIELDS,
+        );
+        assert!(
+            selected == expected,
+            "a field the models read is missing"
+        );
+
+        // 2. Nothing is selected that no row needs.
+        for field in BLOCK_FIELDS {
+            let rows = rows_for(
+                &without(&BLOCK_FIELDS, field),
+                &TRANSACTION_FIELDS,
+                &LOG_FIELDS,
+                &TRACE_FIELDS,
+            );
+            assert!(rows != expected, "{field:?} is selected but unused");
+        }
+        for field in TRANSACTION_FIELDS {
+            let rows = rows_for(
+                &BLOCK_FIELDS,
+                &without(&TRANSACTION_FIELDS, field),
+                &LOG_FIELDS,
+                &TRACE_FIELDS,
+            );
+            assert!(rows != expected, "{field:?} is selected but unused");
+        }
+        for field in LOG_FIELDS {
+            let rows = rows_for(
+                &BLOCK_FIELDS,
+                &TRANSACTION_FIELDS,
+                &without(&LOG_FIELDS, field),
+                &TRACE_FIELDS,
+            );
+            assert!(rows != expected, "{field:?} is selected but unused");
+        }
+        for field in TRACE_FIELDS {
+            let rows = rows_for(
+                &BLOCK_FIELDS,
+                &TRANSACTION_FIELDS,
+                &LOG_FIELDS,
+                &without(&TRACE_FIELDS, field),
+            );
+            assert!(rows != expected, "{field:?} is selected but unused");
+        }
     }
 }
