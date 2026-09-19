@@ -17,6 +17,11 @@
 -- it and filter BEFORE they merge aggregate states. Never read the tables
 -- below directly.
 --
+-- Chain neutral (docs/design.md section 13): identity columns (registry,
+-- collateral_token, trader, exchange, and the uniq states over them) are
+-- FixedString(32), and the open / close of a candle is argMin / argMax by
+-- the position tuple (block_number, tx_index, ordinal).
+--
 -- 256-bit arithmetic rule: amounts are summed as Float64, never as raw
 -- UInt256 (sum() wraps silently and hostile contracts emit 2^256-1). Exact
 -- amounts stay in prediction_trades.
@@ -32,19 +37,19 @@
 
 CREATE TABLE IF NOT EXISTS prediction_candles_1m (
   chain UInt64,
-  registry FixedString(20),
+  registry FixedString(32),
   outcome_token_id UInt256,
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32,
-  open AggregateFunction(argMin, Float64, Tuple(UInt64, UInt32)),
-  close AggregateFunction(argMax, Float64, Tuple(UInt64, UInt32)),
+  open AggregateFunction(argMin, Float64, Tuple(UInt64, UInt32, UInt64)),
+  close AggregateFunction(argMax, Float64, Tuple(UInt64, UInt32, UInt64)),
   high SimpleAggregateFunction(max, Float64),
   low SimpleAggregateFunction(min, Float64),
   volume SimpleAggregateFunction(sum, Float64),
   shares SimpleAggregateFunction(sum, Float64),
   trades SimpleAggregateFunction(sum, UInt64),
   fills SimpleAggregateFunction(sum, UInt64),
-  traders AggregateFunction(uniq, FixedString(20)),
+  traders AggregateFunction(uniq, FixedString(32)),
   last_trade_at SimpleAggregateFunction(max, DateTime)
 )
 ENGINE = AggregatingMergeTree
@@ -58,8 +63,8 @@ SELECT
   chain, registry, tupleElement(print, 1) AS outcome_token_id,
   toDateTime(intDiv(toUInt32(timestamp), 60) * 60, 'UTC') AS bucket,
   epoch,
-  argMinState(price, (block_number, log_index)) AS open,
-  argMaxState(price, (block_number, log_index)) AS close,
+  argMinState(price, (block_number, tx_index, ordinal)) AS open,
+  argMaxState(price, (block_number, tx_index, ordinal)) AS close,
   max(price) AS high,
   min(price) AS low,
   sum(toFloat64(tupleElement(print, 2))) AS volume,
@@ -71,7 +76,7 @@ SELECT
 FROM
 (
   SELECT
-    chain, registry, block_number, log_index, timestamp, epoch, maker, taker, share_amount,
+    chain, registry, block_number, tx_index, ordinal, timestamp, epoch, maker, taker, share_amount,
     arrayJoin(if(maker_outcome_token_id = outcome_token_id, [(outcome_token_id, collateral_amount, toUInt8(1))], [(outcome_token_id, collateral_amount, toUInt8(1)), (maker_outcome_token_id, maker_collateral_amount, toUInt8(0))])) AS print
   FROM prediction_trades
   WHERE is_deleted = 0 AND share_amount != 0
@@ -81,19 +86,19 @@ GROUP BY chain, registry, outcome_token_id, bucket, epoch;
 
 CREATE TABLE IF NOT EXISTS prediction_candles_1h (
   chain UInt64,
-  registry FixedString(20),
+  registry FixedString(32),
   outcome_token_id UInt256,
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32,
-  open AggregateFunction(argMin, Float64, Tuple(UInt64, UInt32)),
-  close AggregateFunction(argMax, Float64, Tuple(UInt64, UInt32)),
+  open AggregateFunction(argMin, Float64, Tuple(UInt64, UInt32, UInt64)),
+  close AggregateFunction(argMax, Float64, Tuple(UInt64, UInt32, UInt64)),
   high SimpleAggregateFunction(max, Float64),
   low SimpleAggregateFunction(min, Float64),
   volume SimpleAggregateFunction(sum, Float64),
   shares SimpleAggregateFunction(sum, Float64),
   trades SimpleAggregateFunction(sum, UInt64),
   fills SimpleAggregateFunction(sum, UInt64),
-  traders AggregateFunction(uniq, FixedString(20)),
+  traders AggregateFunction(uniq, FixedString(32)),
   last_trade_at SimpleAggregateFunction(max, DateTime)
 )
 ENGINE = AggregatingMergeTree
@@ -107,8 +112,8 @@ SELECT
   chain, registry, tupleElement(print, 1) AS outcome_token_id,
   toDateTime(intDiv(toUInt32(timestamp), 3600) * 3600, 'UTC') AS bucket,
   epoch,
-  argMinState(price, (block_number, log_index)) AS open,
-  argMaxState(price, (block_number, log_index)) AS close,
+  argMinState(price, (block_number, tx_index, ordinal)) AS open,
+  argMaxState(price, (block_number, tx_index, ordinal)) AS close,
   max(price) AS high,
   min(price) AS low,
   sum(toFloat64(tupleElement(print, 2))) AS volume,
@@ -120,7 +125,7 @@ SELECT
 FROM
 (
   SELECT
-    chain, registry, block_number, log_index, timestamp, epoch, maker, taker, share_amount,
+    chain, registry, block_number, tx_index, ordinal, timestamp, epoch, maker, taker, share_amount,
     arrayJoin(if(maker_outcome_token_id = outcome_token_id, [(outcome_token_id, collateral_amount, toUInt8(1))], [(outcome_token_id, collateral_amount, toUInt8(1)), (maker_outcome_token_id, maker_collateral_amount, toUInt8(0))])) AS print
   FROM prediction_trades
   WHERE is_deleted = 0 AND share_amount != 0
@@ -130,19 +135,19 @@ GROUP BY chain, registry, outcome_token_id, bucket, epoch;
 
 CREATE TABLE IF NOT EXISTS prediction_candles_1d (
   chain UInt64,
-  registry FixedString(20),
+  registry FixedString(32),
   outcome_token_id UInt256,
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32,
-  open AggregateFunction(argMin, Float64, Tuple(UInt64, UInt32)),
-  close AggregateFunction(argMax, Float64, Tuple(UInt64, UInt32)),
+  open AggregateFunction(argMin, Float64, Tuple(UInt64, UInt32, UInt64)),
+  close AggregateFunction(argMax, Float64, Tuple(UInt64, UInt32, UInt64)),
   high SimpleAggregateFunction(max, Float64),
   low SimpleAggregateFunction(min, Float64),
   volume SimpleAggregateFunction(sum, Float64),
   shares SimpleAggregateFunction(sum, Float64),
   trades SimpleAggregateFunction(sum, UInt64),
   fills SimpleAggregateFunction(sum, UInt64),
-  traders AggregateFunction(uniq, FixedString(20)),
+  traders AggregateFunction(uniq, FixedString(32)),
   last_trade_at SimpleAggregateFunction(max, DateTime)
 )
 ENGINE = AggregatingMergeTree
@@ -156,8 +161,8 @@ SELECT
   chain, registry, tupleElement(print, 1) AS outcome_token_id,
   toDateTime(intDiv(toUInt32(timestamp), 86400) * 86400, 'UTC') AS bucket,
   epoch,
-  argMinState(price, (block_number, log_index)) AS open,
-  argMaxState(price, (block_number, log_index)) AS close,
+  argMinState(price, (block_number, tx_index, ordinal)) AS open,
+  argMaxState(price, (block_number, tx_index, ordinal)) AS close,
   max(price) AS high,
   min(price) AS low,
   sum(toFloat64(tupleElement(print, 2))) AS volume,
@@ -169,7 +174,7 @@ SELECT
 FROM
 (
   SELECT
-    chain, registry, block_number, log_index, timestamp, epoch, maker, taker, share_amount,
+    chain, registry, block_number, tx_index, ordinal, timestamp, epoch, maker, taker, share_amount,
     arrayJoin(if(maker_outcome_token_id = outcome_token_id, [(outcome_token_id, collateral_amount, toUInt8(1))], [(outcome_token_id, collateral_amount, toUInt8(1)), (maker_outcome_token_id, maker_collateral_amount, toUInt8(0))])) AS print
   FROM prediction_trades
   WHERE is_deleted = 0 AND share_amount != 0
@@ -182,16 +187,16 @@ GROUP BY chain, registry, outcome_token_id, bucket, epoch;
 --   open interest = sum(split) - sum(merged) - sum(redeemed)
 CREATE TABLE IF NOT EXISTS prediction_market_flows_1d (
   chain UInt64,
-  registry FixedString(20),
+  registry FixedString(32),
   market_id FixedString(32),
-  collateral_token FixedString(20),
+  collateral_token FixedString(32),
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
   epoch UInt32,
   split SimpleAggregateFunction(sum, Float64),
   merged SimpleAggregateFunction(sum, Float64),
   redeemed SimpleAggregateFunction(sum, Float64),
   events SimpleAggregateFunction(sum, UInt64),
-  stakeholders AggregateFunction(uniq, FixedString(20))
+  stakeholders AggregateFunction(uniq, FixedString(32))
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(bucket)
@@ -221,8 +226,8 @@ GROUP BY chain, registry, market_id, collateral_token, bucket, epoch;
 CREATE TABLE IF NOT EXISTS prediction_trader_trades_1d (
   chain UInt64,
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
-  trader FixedString(20),
-  exchange FixedString(20),
+  trader FixedString(32),
+  exchange FixedString(32),
   epoch UInt32,
   bought SimpleAggregateFunction(sum, Float64),
   sold SimpleAggregateFunction(sum, Float64),
@@ -265,8 +270,8 @@ GROUP BY chain, bucket, trader, exchange, epoch;
 CREATE TABLE IF NOT EXISTS prediction_trader_flows_1d (
   chain UInt64,
   bucket DateTime('UTC') CODEC(DoubleDelta, ZSTD),
-  trader FixedString(20),
-  collateral_token FixedString(20),
+  trader FixedString(32),
+  collateral_token FixedString(32),
   epoch UInt32,
   split SimpleAggregateFunction(sum, Float64),
   merged SimpleAggregateFunction(sum, Float64),

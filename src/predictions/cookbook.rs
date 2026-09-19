@@ -4,8 +4,19 @@
 //! integration tests run every one of them against real Polymarket data.
 //!
 //! Placeholders (`{chain}`, `{market_id}`...) stand for request
-//! parameters. Ids are passed as hex without `0x` through `unhex()`, token
-//! ids as decimal strings through `toUInt256()`.
+//! parameters. **Every id placeholder is filled with plain hex, no `0x`**,
+//! and token ids with a decimal string; the query does the rest.
+//!
+//! Identity columns are chain neutral `FixedString(32)` (docs/design.md
+//! §13), so an id is 64 hex characters. A UI holding a 20 byte EVM address
+//! passes its 40 characters unchanged: the PARAMETERIZED views
+//! (`prediction_candles_*_v`, `prediction_trades_v`,
+//! `prediction_holders_v`, `prediction_positions_v`,
+//! `prediction_activity_v`) left pad it with 12 zero bytes themselves, and
+//! the primary key range read survives the padding (it is a constant
+//! expression, verified with `EXPLAIN indexes = 1`). Queries against
+//! `prediction_markets_v` take ids that are 32 bytes on every chain
+//! (`market_id`, `event_id`), so they just `unhex()` them.
 
 /// A screen and the query that serves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +76,7 @@ pub const PRICE_CHART: Recipe = Recipe {
     screen: "Price chart",
     sql: "\
 SELECT bucket, open, high, low, close, volume, shares, trades, traders
-FROM prediction_candles_1h_v(chain = {chain}, registry = unhex('{registry}'),
+FROM prediction_candles_1h_v(chain = {chain}, registry = '{registry}',
                              outcome_token_id = toUInt256('{token}'))
 WHERE bucket >= now() - INTERVAL 30 DAY
 ORDER BY bucket",
@@ -76,9 +87,9 @@ pub const TRADES_TAPE: Recipe = Recipe {
     screen: "Trades tape",
     sql: "\
 SELECT timestamp, outcome_index, outcome, side, price, shares, collateral,
-       trader, transaction_hash
-FROM prediction_trades_v(chain = {chain}, market_id = unhex('{market_id}'))
-ORDER BY block_number DESC, log_index DESC
+       trader, tx_id
+FROM prediction_trades_v(chain = {chain}, market_id = '{market_id}')
+ORDER BY block_number DESC, tx_index DESC, ordinal DESC
 LIMIT 50",
 };
 
@@ -88,7 +99,7 @@ pub const HOLDERS: Recipe = Recipe {
     sql: "\
 SELECT outcome_index, outcome, holder, shares, avg_entry_price,
        current_price, value
-FROM prediction_holders_v(chain = {chain}, market_id = unhex('{market_id}'))
+FROM prediction_holders_v(chain = {chain}, market_id = '{market_id}')
 ORDER BY outcome_index, shares DESC
 LIMIT 100",
 };
@@ -101,7 +112,7 @@ pub const PORTFOLIO: Recipe = Recipe {
 SELECT market_id, title, outcome, status, shares, avg_entry_price,
        current_price, value, unrealized_pnl, realized_pnl, redeemable,
        unpriced_shares
-FROM prediction_positions_v(chain = {chain}, holder = unhex('{holder}'))
+FROM prediction_positions_v(chain = {chain}, holder = '{holder}')
 ORDER BY value DESC NULLS LAST, realized_pnl DESC NULLS LAST",
 };
 
@@ -110,10 +121,10 @@ pub const WALLET_TRADES: Recipe = Recipe {
     screen: "Wallet trade history",
     sql: "\
 SELECT timestamp, title, outcome, action, role, price, shares, collateral,
-       fee, transaction_hash
-FROM prediction_activity_v(chain = {chain}, holder = unhex('{holder}'))
+       fee, tx_id
+FROM prediction_activity_v(chain = {chain}, holder = '{holder}')
 WHERE action IN ('buy', 'sell')
-ORDER BY block_number DESC, log_index DESC
+ORDER BY block_number DESC, tx_index DESC, ordinal DESC
 LIMIT 50",
 };
 

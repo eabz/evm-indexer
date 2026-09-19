@@ -87,6 +87,8 @@ use std::collections::HashSet;
 
 use alloy::primitives::{Address, B256};
 
+use crate::utils::format::tx_hash_of;
+
 pub use self::{
     decode::decode,
     derived::PREDICTIONS_DERIVED,
@@ -167,7 +169,7 @@ pub fn block_column(_table: &str) -> &'static str {
 /// Exchanges / pools that traded in the last week and have no
 /// `prediction_venues` row, for the [`MissingVenueSource`] of the pipeline.
 /// Placeholders: `{chain}`, `{limit}`. Columns: `exchange
-/// FixedString(20)`, `protocol String`.
+/// FixedString(32)`, `protocol String`.
 pub const MISSING_VENUES_SQL: &str = "\
 SELECT exchange, any(toString(protocol)) AS protocol \
 FROM prediction_trades \
@@ -178,7 +180,7 @@ GROUP BY exchange \
 LIMIT {limit}";
 
 /// Registries known to the database, to seed a [`RegistrySet`].
-/// Placeholder: `{chain}`. Column: `registry FixedString(20)`.
+/// Placeholder: `{chain}`. Column: `registry FixedString(32)`.
 pub const KNOWN_REGISTRIES_SQL: &str = "\
 SELECT DISTINCT registry FROM prediction_markets FINAL \
 WHERE chain = {chain}";
@@ -305,18 +307,27 @@ impl PredictionRows {
         F: Fn(&B256) -> Option<TxOrigin>,
     {
         for trade in &mut self.trades {
-            if let Some(origin) = lookup(&trade.transaction_hash) {
+            let Some(hash) = tx_hash_of(&trade.tx_id) else {
+                continue;
+            };
+            if let Some(origin) = lookup(&hash) {
                 trade.tx_from = origin.from;
                 trade.tx_to = origin.to.unwrap_or_default();
             }
         }
         for market in &mut self.markets {
-            if let Some(origin) = lookup(&market.transaction_hash) {
+            let Some(hash) = tx_hash_of(&market.tx_id) else {
+                continue;
+            };
+            if let Some(origin) = lookup(&hash) {
                 market.tx_from = origin.from;
             }
         }
         for event in &mut self.position_events {
-            if let Some(origin) = lookup(&event.transaction_hash) {
+            let Some(hash) = tx_hash_of(&event.tx_id) else {
+                continue;
+            };
+            if let Some(origin) = lookup(&hash) {
                 event.tx_from = origin.from;
             }
         }

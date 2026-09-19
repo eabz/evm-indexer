@@ -2,20 +2,39 @@
 //! (`migrations/0020_prediction_tables.sql`).
 //!
 //! Field order is irrelevant (the clickhouse crate inserts by name), field
-//! NAMES must match the columns. Hashes / addresses / amounts go through
-//! the `crate::utils::format` serializers, which write the binary column
-//! types of docs/design.md §1 (`FixedString(32)`, `FixedString(20)`,
-//! `UInt256`, `Int256`). `is_deleted` is never written by the decoder (it
-//! defaults to 0; tombstones are server side `INSERT ... SELECT`s).
+//! NAMES must match the columns. Hashes / ids / amounts go through the
+//! `crate::utils::format` serializers, which write the binary column types
+//! of docs/design.md §1 (`FixedString(32)`, `UInt256`, `Int256`).
+//! `is_deleted` is never written by the decoder (it defaults to 0;
+//! tombstones are server side `INSERT ... SELECT`s).
+//!
+//! **Chain neutral** (docs/design.md §13): these tables are shared with
+//! whatever non-EVM prediction venue is fed into them later, so
+//!
+//! * every identity field is an `Address` written through [`SerId32`] as
+//!   `FixedString(32)` (12 zero bytes + the 20 address bytes). The Rust
+//!   type stays `Address` because THIS decoder only ever sees EVM logs; a
+//!   non-EVM front end writes the same columns from its own row type.
+//! * the transaction id is `tx_id`: `Bytes` through [`SerTxId`] into a
+//!   `String` column of RAW bytes, because a Solana signature is 64 bytes
+//!   and a `B256` cannot hold one. Never a sorting key column.
+//!   [`tx_hash_of`] gives the EVM hash back.
+//! * the position is `(chain, block_number, tx_index, ordinal)`:
+//!   `tx_index` = the transaction index, `ordinal` = the log index.
+//!   `block_number` keeps its name on every chain.
+//!
+//! [`SerId32`]: crate::utils::format::SerId32
+//! [`SerTxId`]: crate::utils::format::SerTxId
+//! [`tx_hash_of`]: crate::utils::format::tx_hash_of
 
 use std::{fmt, str::FromStr};
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
-use crate::utils::format::{SerAddress, SerB256, SerBytes, SerU256};
+use crate::utils::format::{SerB256, SerBytes, SerId32, SerTxId, SerU256};
 
 macro_rules! string_enum {
     ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident => $text:literal),+ $(,)? }) => {
@@ -190,12 +209,30 @@ pub const VERSION_UNRESOLVED: u64 = 0;
 /// `_version` that DEcreases with the position of an event, so the FIRST
 /// sighting wins whatever the insertion order and a re-inserted block
 /// yields the same version (idempotent). Used for the outcome token map.
-pub fn first_seen_version(block_number: u64, log_index: u32) -> u64 {
-    const LOG_BITS: u32 = 24;
-    let log_index = u64::from(log_index).min((1 << LOG_BITS) - 1);
-    let block_number = block_number.min((1 << (63 - LOG_BITS)) - 1);
+///
+/// The position is `(block_number, tx_index, ordinal)` (docs/design.md
+/// §13) packed into 39 + 12 + 12 bits, each saturating. The total stays
+/// under 63 bits so every event row beats [`VERSION_RPC`]. Saturation only
+/// costs tie breaking between two sightings of the SAME token in the same
+/// block, which differ in `first_seen_block` / `first_seen_timestamp`
+/// alone.
+pub fn first_seen_version(
+    block_number: u64,
+    tx_index: u32,
+    ordinal: u64,
+) -> u64 {
+    const ORDINAL_BITS: u32 = 12;
+    const TX_BITS: u32 = 12;
+    const BLOCK_BITS: u32 = 39;
 
-    u64::MAX - ((block_number << LOG_BITS) | log_index)
+    let ordinal = ordinal.min((1 << ORDINAL_BITS) - 1);
+    let tx_index = u64::from(tx_index).min((1 << TX_BITS) - 1);
+    let block_number = block_number.min((1 << BLOCK_BITS) - 1);
+
+    u64::MAX
+        - ((block_number << (TX_BITS + ORDINAL_BITS))
+            | (tx_index << ORDINAL_BITS)
+            | ordinal)
 }
 
 /// `prediction_markets`: one row per `ConditionPreparation` (plus at most
@@ -211,13 +248,13 @@ pub struct PredictionMarket {
     pub market_id: B256,
     /// The contract holding the positions (the CTF). Part of the market's
     /// identity: a forged registry can not collide with the real one.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub registry: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub protocol: Protocol,
     /// Who may report the payouts (UmaCtfAdapter, NegRiskAdapter,
     /// Reality.eth proxy...). Zero for RPC rows.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub oracle: Address,
     #[serde_as(as = "SerB256")]
     pub question_id: B256,
@@ -225,10 +262,11 @@ pub struct PredictionMarket {
     /// 0 for RPC rows (never purged: chain state, not fork dependent).
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub log_index: u32,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    pub tx_index: u32,
+    pub ordinal: u64,
+    #[serde_as(as = "SerId32")]
     pub tx_from: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub source: RowSource,
@@ -243,9 +281,9 @@ pub struct PredictionResolution {
     pub chain: u64,
     #[serde_as(as = "SerB256")]
     pub market_id: B256,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub registry: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub oracle: Address,
     #[serde_as(as = "SerB256")]
     pub question_id: B256,
@@ -259,9 +297,10 @@ pub struct PredictionResolution {
     pub payout_denominator: U256,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub log_index: u32,
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    pub tx_index: u32,
+    pub ordinal: u64,
     pub epoch: u32,
     pub _version: u64,
 }
@@ -277,7 +316,7 @@ pub struct PredictionQuestion {
     #[serde_as(as = "SerB256")]
     pub question_id: B256,
     /// The adapter that emitted the event.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub emitter: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub kind: QuestionKind,
@@ -296,15 +335,15 @@ pub struct PredictionQuestion {
     pub outcomes: Vec<String>,
     /// The raw on chain payload (UMA ancillary data / NegRisk data).
     #[serde_as(as = "SerBytes")]
-    pub data: alloy::primitives::Bytes,
+    pub data: Bytes,
     /// UMA: who initialized the question.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub creator: Address,
     /// NegRisk `MarketPrepared`: the oracle (operator) of the event.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub oracle: Address,
     /// UMA proposer reward / bond (raw units of `reward_token`).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub reward_token: Address,
     #[serde_as(as = "SerU256")]
     pub reward: U256,
@@ -314,9 +353,10 @@ pub struct PredictionQuestion {
     pub fee_bips: u32,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub log_index: u32,
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    pub tx_index: u32,
+    pub ordinal: u64,
     pub epoch: u32,
     pub _version: u64,
 }
@@ -331,14 +371,14 @@ pub struct PredictionQuestion {
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct PredictionOutcomeToken {
     pub chain: u64,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub registry: Address,
     #[serde_as(as = "SerU256")]
     pub outcome_token_id: U256,
     #[serde_as(as = "SerB256")]
     pub market_id: B256,
     pub outcome_index: u16,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub collateral_token: Address,
     /// Block of the first event that revealed the token (informational).
     pub first_seen_block: u64,
@@ -355,34 +395,35 @@ pub struct PredictionTrade {
     pub chain: u64,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub transaction_index: u32,
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    /// Index of the transaction inside the block.
+    pub tx_index: u32,
     /// Log index of the maker order's `OrderFilled` (or of the AMM event).
-    pub log_index: u32,
+    pub ordinal: u64,
     #[serde_as(as = "DisplayFromStr")]
     pub protocol: Protocol,
     /// Emitter: the exchange, or the AMM pool.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub exchange: Address,
     /// The ERC-1155 contract that moved the outcome token in the same
     /// transaction; zero when no such transfer exists (the trade then
     /// belongs to no market).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub registry: Address,
     /// Hash of the maker order, zero for AMM trades.
     #[serde_as(as = "SerB256")]
     pub order_hash: B256,
     /// Owner of the resting order (the AMM pool for `fpmm`).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub maker: Address,
     /// Owner of the order that crossed the book (the buyer / seller for
     /// `fpmm`, the operator for a `direct` fill).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub taker: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub tx_from: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub tx_to: Address,
     /// The token the TAKER bought or sold.
     #[serde_as(as = "SerU256")]
@@ -434,25 +475,26 @@ pub struct PredictionPositionEvent {
     pub chain: u64,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub log_index: u32,
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    pub tx_index: u32,
+    pub ordinal: u64,
     /// `ctf`: the registry itself (the source of open interest).
     /// `neg_risk`: the adapter naming the real user (attribution only).
     #[serde_as(as = "DisplayFromStr")]
     pub protocol: Protocol,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub emitter: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub kind: PositionEventKind,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub stakeholder: Address,
     /// conditionId; for `convert` the NegRisk event (market) id.
     #[serde_as(as = "SerB256")]
     pub market_id: B256,
     /// Zero when the event does not carry it and no sibling event of the
     /// same transaction does.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub collateral_token: Address,
     #[serde_as(as = "SerB256")]
     pub parent_collection_id: B256,
@@ -464,7 +506,7 @@ pub struct PredictionPositionEvent {
     /// of a conversion.
     #[serde_as(as = "SerU256")]
     pub amount: U256,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub tx_from: Address,
     pub epoch: u32,
     pub _version: u64,
@@ -477,19 +519,20 @@ pub struct PredictionTransfer {
     pub chain: u64,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
-    pub log_index: u32,
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
+    pub tx_index: u32,
+    pub ordinal: u64,
     /// Position inside a `TransferBatch`, 0 for `TransferSingle`.
     pub batch_index: u32,
     /// Emitter of the ERC-1155 event.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub registry: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub operator: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub from: Address,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub to: Address,
     #[serde_as(as = "SerU256")]
     pub outcome_token_id: U256,
@@ -516,15 +559,15 @@ pub struct PredictionTransfer {
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct PredictionVenue {
     pub chain: u64,
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub exchange: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub protocol: Protocol,
     /// What trades are paid in (`getCollateral()` / `collateralToken()`).
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub collateral_token: Address,
     /// `getCtf()` / `conditionalTokens()`.
-    #[serde_as(as = "SerAddress")]
+    #[serde_as(as = "SerId32")]
     pub registry: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub source: RowSource,
@@ -556,9 +599,26 @@ mod tests {
 
     #[test]
     fn the_first_sighting_has_the_highest_version() {
-        assert!(first_seen_version(10, 5) > first_seen_version(10, 6));
-        assert!(first_seen_version(10, 6) > first_seen_version(11, 0));
-        assert_eq!(first_seen_version(10, 5), first_seen_version(10, 5));
-        assert!(first_seen_version(u64::MAX, u32::MAX) > VERSION_RPC);
+        // Ordered by (block_number, tx_index, ordinal), descending.
+        assert!(
+            first_seen_version(10, 0, 5) > first_seen_version(10, 0, 6)
+        );
+        assert!(
+            first_seen_version(10, 0, 6) > first_seen_version(10, 1, 0)
+        );
+        assert!(
+            first_seen_version(10, 1, 0) > first_seen_version(11, 0, 0)
+        );
+        assert_eq!(
+            first_seen_version(10, 0, 5),
+            first_seen_version(10, 0, 5)
+        );
+        assert!(
+            first_seen_version(u64::MAX, u32::MAX, u64::MAX) > VERSION_RPC
+        );
+        assert!(
+            first_seen_version(u64::MAX, u32::MAX, u64::MAX)
+                > VERSION_UNRESOLVED
+        );
     }
 }

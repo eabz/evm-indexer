@@ -14,6 +14,22 @@
 --     "which market / wallet" down into every subquery, so each of them is
 --     a primary key range read.
 --
+-- ID PARAMETERS (docs/design.md section 13). Identity columns are
+-- FixedString(32) now, but a UI holding a 20 byte EVM address must not
+-- have to pad it by hand, so EVERY id parameter of EVERY view here is a
+-- String of HEX WITHOUT '0x' and the view pads it:
+--
+--   holder = '4D97DCd97eC945f40cF65F87097ACe5EA0476045'          -- 40 chars,
+--       an EVM address: left padded with 12 zero bytes by the view
+--   holder = '99112233...ddee'                                    -- 64 chars,
+--       any 32 byte id (a Solana pubkey as hex) passes through
+--
+-- The padding is a constant expression ClickHouse folds before it reads a
+-- part, so each of these views is still a primary key range read (checked
+-- with EXPLAIN indexes = 1. leftPad() is NOT folded, hence the
+-- if / concat form below). Anything other than 40 or 64 hex characters is
+-- a caller error: it can only fail to match.
+--
 -- Amounts: *_raw columns are the on chain integers as Float64, the others
 -- are divided by 10^decimals of the collateral token (shares of a CTF
 -- position use the unit of their collateral). They are NULL while the
@@ -21,11 +37,15 @@
 -- Prices are probabilities: collateral per share, 0..1.
 
 CREATE VIEW IF NOT EXISTS prediction_candles_1m_v AS
-WITH (
+WITH
+toFixedString(unhex(if(length({registry:String}) = 40,
+  concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
+(
   SELECT any(toNullable(decimals)) FROM tokens FINAL
   WHERE chain = {chain:UInt64} AND address IN (
-    SELECT collateral_token FROM prediction_outcome_tokens FINAL
-    WHERE chain = {chain:UInt64} AND registry = {registry:FixedString(20)} AND outcome_token_id = {outcome_token_id:UInt256})
+    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+    FROM prediction_outcome_tokens FINAL
+    WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
 SELECT
   a.chain AS chain, a.registry AS registry, a.outcome_token_id AS outcome_token_id, a.bucket AS bucket,
@@ -40,16 +60,20 @@ SELECT
   uniqMerge(a.traders) AS traders
 FROM prediction_candles_1m AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
-WHERE a.chain = {chain:UInt64} AND a.registry = {registry:FixedString(20)} AND a.outcome_token_id = {outcome_token_id:UInt256}
+WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
   AND a.epoch >= f.epoch_floor
 GROUP BY chain, registry, outcome_token_id, bucket;
 
 CREATE VIEW IF NOT EXISTS prediction_candles_1h_v AS
-WITH (
+WITH
+toFixedString(unhex(if(length({registry:String}) = 40,
+  concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
+(
   SELECT any(toNullable(decimals)) FROM tokens FINAL
   WHERE chain = {chain:UInt64} AND address IN (
-    SELECT collateral_token FROM prediction_outcome_tokens FINAL
-    WHERE chain = {chain:UInt64} AND registry = {registry:FixedString(20)} AND outcome_token_id = {outcome_token_id:UInt256})
+    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+    FROM prediction_outcome_tokens FINAL
+    WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
 SELECT
   a.chain AS chain, a.registry AS registry, a.outcome_token_id AS outcome_token_id, a.bucket AS bucket,
@@ -64,16 +88,20 @@ SELECT
   uniqMerge(a.traders) AS traders
 FROM prediction_candles_1h AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
-WHERE a.chain = {chain:UInt64} AND a.registry = {registry:FixedString(20)} AND a.outcome_token_id = {outcome_token_id:UInt256}
+WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
   AND a.epoch >= f.epoch_floor
 GROUP BY chain, registry, outcome_token_id, bucket;
 
 CREATE VIEW IF NOT EXISTS prediction_candles_1d_v AS
-WITH (
+WITH
+toFixedString(unhex(if(length({registry:String}) = 40,
+  concat('000000000000000000000000', {registry:String}), {registry:String})), 32) AS registry_id,
+(
   SELECT any(toNullable(decimals)) FROM tokens FINAL
   WHERE chain = {chain:UInt64} AND address IN (
-    SELECT collateral_token FROM prediction_outcome_tokens FINAL
-    WHERE chain = {chain:UInt64} AND registry = {registry:FixedString(20)} AND outcome_token_id = {outcome_token_id:UInt256})
+    SELECT toFixedString(substring(collateral_token, 13, 20), 20)
+    FROM prediction_outcome_tokens FINAL
+    WHERE chain = {chain:UInt64} AND registry = registry_id AND outcome_token_id = {outcome_token_id:UInt256})
 ) AS collateral_decimals
 SELECT
   a.chain AS chain, a.registry AS registry, a.outcome_token_id AS outcome_token_id, a.bucket AS bucket,
@@ -88,7 +116,7 @@ SELECT
   uniqMerge(a.traders) AS traders
 FROM prediction_candles_1d AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
-WHERE a.chain = {chain:UInt64} AND a.registry = {registry:FixedString(20)} AND a.outcome_token_id = {outcome_token_id:UInt256}
+WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
   AND a.epoch >= f.epoch_floor
 GROUP BY chain, registry, outcome_token_id, bucket;
 
@@ -157,13 +185,13 @@ trading AS (
 prepared AS (
   SELECT
     chain, registry, market_id,
-    argMin(protocol, (block_number, log_index)) AS protocol,
-    argMin(oracle, (block_number, log_index)) AS oracle,
-    argMin(question_id, (block_number, log_index)) AS question_id,
-    argMin(outcome_count, (block_number, log_index)) AS outcome_count,
+    argMin(protocol, (block_number, tx_index, ordinal)) AS protocol,
+    argMin(oracle, (block_number, tx_index, ordinal)) AS oracle,
+    argMin(question_id, (block_number, tx_index, ordinal)) AS question_id,
+    argMin(outcome_count, (block_number, tx_index, ordinal)) AS outcome_count,
     min(block_number) AS created_block,
-    argMin(timestamp, (block_number, log_index)) AS created_at,
-    argMin(transaction_hash, (block_number, log_index)) AS created_tx
+    argMin(timestamp, (block_number, tx_index, ordinal)) AS created_at,
+    argMin(tx_id, (block_number, tx_index, ordinal)) AS created_tx
   FROM prediction_markets FINAL
   GROUP BY chain, registry, market_id
 ),
@@ -187,18 +215,18 @@ market_keys AS (
 questions AS (
   SELECT
     chain, question_id, emitter,
-    argMin(toString(kind), (block_number, log_index)) AS question_kind,
-    argMin(event_id, (block_number, log_index)) AS event_id,
-    argMin(question_index, (block_number, log_index)) AS question_index,
-    argMin(title, (block_number, log_index)) AS title,
-    argMin(description, (block_number, log_index)) AS description,
-    argMin(outcomes, (block_number, log_index)) AS outcomes
+    argMin(toString(kind), (block_number, tx_index, ordinal)) AS question_kind,
+    argMin(event_id, (block_number, tx_index, ordinal)) AS event_id,
+    argMin(question_index, (block_number, tx_index, ordinal)) AS question_index,
+    argMin(title, (block_number, tx_index, ordinal)) AS title,
+    argMin(description, (block_number, tx_index, ordinal)) AS description,
+    argMin(outcomes, (block_number, tx_index, ordinal)) AS outcomes
   FROM prediction_questions FINAL
   WHERE kind IN ('uma_question', 'neg_risk_question')
   GROUP BY chain, question_id, emitter
 ),
 event_titles AS (
-  SELECT chain, event_id, emitter, argMin(title, (block_number, log_index)) AS title
+  SELECT chain, event_id, emitter, argMin(title, (block_number, tx_index, ordinal)) AS title
   FROM prediction_questions FINAL
   WHERE kind = 'neg_risk_event'
   GROUP BY chain, event_id, emitter
@@ -212,17 +240,25 @@ disputes AS (
 resolved AS (
   SELECT
     chain, registry, market_id,
-    argMax(payout_numerators, (block_number, log_index)) AS payout_numerators,
-    argMax(payout_denominator, (block_number, log_index)) AS payout_denominator,
-    argMax(timestamp, (block_number, log_index)) AS resolved_at,
+    argMax(payout_numerators, (block_number, tx_index, ordinal)) AS payout_numerators,
+    argMax(payout_denominator, (block_number, tx_index, ordinal)) AS payout_denominator,
+    argMax(timestamp, (block_number, tx_index, ordinal)) AS resolved_at,
     count() AS resolutions
   FROM prediction_resolutions FINAL
   GROUP BY chain, registry, market_id
 ),
+-- tokens is the EVM-only core table (docs/design.md section 1): its
+-- 20 byte address is padded to the 32 byte id the analytics tables use.
+-- A non-EVM collateral simply does not match, so its amounts stay raw.
 collaterals AS (
-  SELECT chain, address, symbol, decimals, toUInt8(1) AS known
-  FROM tokens FINAL
-  WHERE (chain, address) IN (SELECT chain, collateral_token FROM primary_collateral)
+  SELECT
+    tk.chain AS chain,
+    toFixedString(concat(toFixedString('', 12), tk.address), 32) AS address,
+    tk.symbol AS symbol, tk.decimals AS decimals, toUInt8(1) AS known
+  FROM tokens AS tk FINAL
+  WHERE (tk.chain, tk.address) IN (
+    SELECT chain, toFixedString(substring(collateral_token, 13, 20), 20)
+    FROM primary_collateral)
 ),
 enriched AS (
   SELECT *, toUInt8(1) AS present FROM prediction_market_metadata FINAL
@@ -308,28 +344,31 @@ CREATE VIEW IF NOT EXISTS prediction_markets_v AS
 SELECT * FROM prediction_market_list;
 
 -- Trades tape of a market, from the taker's point of view.
---   SELECT * FROM prediction_trades_v(chain = 137, market_id = unhex('..'))
---   ORDER BY block_number DESC, log_index DESC LIMIT 50
+--   SELECT * FROM prediction_trades_v(chain = 137, market_id = '<hex>')
+--   ORDER BY block_number DESC, tx_index DESC, ordinal DESC LIMIT 50
 CREATE VIEW IF NOT EXISTS prediction_trades_v AS
 WITH
+toFixedString(unhex(if(length({market_id:String}) = 40,
+  concat('000000000000000000000000', {market_id:String}), {market_id:String})), 32) AS market_key,
 mapping AS (
   SELECT registry, outcome_token_id, outcome_index
   FROM prediction_outcome_tokens_by_market FINAL
-  WHERE chain = {chain:UInt64} AND market_id = {market_id:FixedString(32)}
+  WHERE chain = {chain:UInt64} AND market_id = market_key
 ),
 market AS (
   SELECT registry, outcomes, collateral_decimals, collateral_symbol
   FROM prediction_market_list
-  WHERE chain = {chain:UInt64} AND market_id = {market_id:FixedString(32)}
+  WHERE chain = {chain:UInt64} AND market_id = market_key
 )
 SELECT
   s.chain AS chain,
-  {market_id:FixedString(32)} AS market_id,
+  market_key AS market_id,
   s.registry AS registry,
   s.timestamp AS timestamp,
   s.block_number AS block_number,
-  s.log_index AS log_index,
-  s.transaction_hash AS transaction_hash,
+  s.tx_index AS tx_index,
+  s.ordinal AS ordinal,
+  s.tx_id AS tx_id,
   o.outcome_index AS outcome_index,
   if(length(m.outcomes) > o.outcome_index, toNullable(m.outcomes[o.outcome_index + 1]), NULL) AS outcome,
   toString(s.side) AS side,
@@ -355,19 +394,21 @@ WHERE s.chain = {chain:UInt64}
   AND s.share_amount != 0;
 
 -- Holders of a market, per outcome.
---   SELECT * FROM prediction_holders_v(chain = 137, market_id = unhex('..'))
+--   SELECT * FROM prediction_holders_v(chain = 137, market_id = '<hex>')
 --   WHERE outcome_index = 0 ORDER BY shares DESC LIMIT 100
 CREATE VIEW IF NOT EXISTS prediction_holders_v AS
 WITH
+toFixedString(unhex(if(length({market_id:String}) = 40,
+  concat('000000000000000000000000', {market_id:String}), {market_id:String})), 32) AS market_key,
 mapping AS (
   SELECT registry, outcome_token_id, outcome_index
   FROM prediction_outcome_tokens_by_market FINAL
-  WHERE chain = {chain:UInt64} AND market_id = {market_id:FixedString(32)}
+  WHERE chain = {chain:UInt64} AND market_id = market_key
 ),
 market AS (
   SELECT registry, outcomes, outcome_prices, payouts, status, collateral_decimals
   FROM prediction_market_list
-  WHERE chain = {chain:UInt64} AND market_id = {market_id:FixedString(32)}
+  WHERE chain = {chain:UInt64} AND market_id = market_key
 ),
 ledger AS (
   SELECT
@@ -384,7 +425,7 @@ ledger AS (
 )
 SELECT
   {chain:UInt64} AS chain,
-  {market_id:FixedString(32)} AS market_id,
+  market_key AS market_id,
   l.registry AS registry,
   o.outcome_index AS outcome_index,
   if(length(m.outcomes) > o.outcome_index, toNullable(m.outcomes[o.outcome_index + 1]), NULL) AS outcome,
@@ -401,7 +442,7 @@ INNER JOIN mapping AS o ON o.registry = l.registry AND o.outcome_token_id = l.ou
 LEFT JOIN market AS m ON m.registry = l.registry;
 
 -- Portfolio of a wallet: one row per outcome token it ever held or traded.
---   SELECT * FROM prediction_positions_v(chain = 137, holder = unhex('..'))
+--   SELECT * FROM prediction_positions_v(chain = 137, holder = '<hex>')
 --   WHERE balance > 0 ORDER BY value DESC
 --
 -- balance is EXACT (Int256 sum of every ERC-1155 transfer leg). The money
@@ -420,6 +461,8 @@ LEFT JOIN market AS m ON m.registry = l.registry;
 -- wallet never acquired the token at a price.
 CREATE VIEW IF NOT EXISTS prediction_positions_v AS
 WITH
+toFixedString(unhex(if(length({holder:String}) = 40,
+  concat('000000000000000000000000', {holder:String}), {holder:String})), 32) AS holder_id,
 ledger AS (
   SELECT
     registry, outcome_token_id,
@@ -434,7 +477,7 @@ ledger AS (
     min(timestamp) AS first_activity_at,
     max(timestamp) AS last_activity_at
   FROM prediction_ledger_by_holder FINAL
-  WHERE chain = {chain:UInt64} AND holder = {holder:FixedString(20)}
+  WHERE chain = {chain:UInt64} AND holder = holder_id
   GROUP BY registry, outcome_token_id
 ),
 mapping AS (
@@ -451,7 +494,7 @@ markets AS (
 )
 SELECT
   {chain:UInt64} AS chain,
-  {holder:FixedString(20)} AS holder,
+  holder_id AS holder,
   o.market_id AS market_id,
   l.registry AS registry,
   m.venue AS venue,
@@ -485,14 +528,17 @@ LEFT JOIN markets AS m ON m.registry = l.registry AND m.market_id = o.market_id;
 
 -- Activity of a wallet: its trades (at its own price and side, whether it
 -- was the maker or the taker), splits, merges, redemptions and transfers.
---   SELECT * FROM prediction_activity_v(chain = 137, holder = unhex('..'))
---   WHERE action IN ('buy', 'sell') ORDER BY block_number DESC, log_index DESC LIMIT 50
+--   SELECT * FROM prediction_activity_v(chain = 137, holder = '<hex>')
+--   WHERE action IN ('buy', 'sell')
+--   ORDER BY block_number DESC, tx_index DESC, ordinal DESC LIMIT 50
 CREATE VIEW IF NOT EXISTS prediction_activity_v AS
 WITH
+toFixedString(unhex(if(length({holder:String}) = 40,
+  concat('000000000000000000000000', {holder:String}), {holder:String})), 32) AS holder_id,
 ledger AS (
   SELECT *
   FROM prediction_ledger_by_holder FINAL
-  WHERE chain = {chain:UInt64} AND holder = {holder:FixedString(20)}
+  WHERE chain = {chain:UInt64} AND holder = holder_id
     AND reason != 'trade'
 ),
 mapping AS (
@@ -512,8 +558,9 @@ SELECT
   l.holder AS holder,
   l.timestamp AS timestamp,
   l.block_number AS block_number,
-  l.log_index AS log_index,
-  l.transaction_hash AS transaction_hash,
+  l.tx_index AS tx_index,
+  l.ordinal AS ordinal,
+  l.tx_id AS tx_id,
   o.market_id AS market_id,
   l.registry AS registry,
   m.title AS title,
@@ -578,12 +625,16 @@ venues AS (
   FROM prediction_venues FINAL
   WHERE chain = {chain:UInt64} AND source = 'rpc'
 ),
+-- tokens is EVM only: its address is padded to the 32 byte id (see
+-- prediction_markets_live_v).
 decimals AS (
-  SELECT address, decimals, toUInt8(1) AS known
-  FROM tokens FINAL
-  WHERE chain = {chain:UInt64} AND (
-    address IN (SELECT collateral_token FROM venues)
-    OR address IN (SELECT collateral_token FROM funding))
+  SELECT
+    toFixedString(concat(toFixedString('', 12), tk.address), 32) AS address,
+    tk.decimals AS decimals, toUInt8(1) AS known
+  FROM tokens AS tk FINAL
+  WHERE tk.chain = {chain:UInt64} AND (
+    tk.address IN (SELECT toFixedString(substring(collateral_token, 13, 20), 20) FROM venues)
+    OR tk.address IN (SELECT toFixedString(substring(collateral_token, 13, 20), 20) FROM funding))
 ),
 labelled AS (
   SELECT address FROM prediction_venue_labels FINAL WHERE chain = {chain:UInt64}

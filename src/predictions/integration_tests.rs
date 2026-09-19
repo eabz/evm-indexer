@@ -279,6 +279,13 @@ fn bare(hex: &str) -> String {
     hex.trim_start_matches("0x").to_lowercase()
 }
 
+/// The 32 byte id of an EVM address as hex, for the columns that store one
+/// (docs/design.md §13). Never hand rolled: `format::id32` is the one
+/// padding helper.
+fn id32_hex(address: &str) -> String {
+    hex::encode(crate::utils::format::id32(fixtures::address(address)))
+}
+
 /// `tx` decoded as if it had been mined in `block` at `timestamp`.
 fn decoded(
     tx: &RawTx,
@@ -623,7 +630,7 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         .rows(&format!(
             "SELECT outcome_index, side, price, ifNull(shares, -1.) AS shares, \
              ifNull(collateral, -1.) AS collateral, \
-             concat('0x', lower(hex(trader))) AS trader FROM ({tape})"
+             concat('0x', lower(hex(substring(trader, 13)))) AS trader FROM ({tape})"
         ))
         .await;
     assert_eq!(prints.len(), 6);
@@ -649,7 +656,7 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         .render(&[("chain", &chain), ("market_id", &m1_hex)]);
     let holders: Vec<Holder> = database
         .rows(&format!(
-            "SELECT outcome_index, concat('0x', lower(hex(holder))) AS holder, \
+            "SELECT outcome_index, concat('0x', lower(hex(substring(holder, 13)))) AS holder, \
              ifNull(shares, -1.) AS shares, \
              ifNull(avg_entry_price, -1.) AS avg_entry_price FROM ({holders})"
         ))
@@ -731,7 +738,7 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         database
             .rows::<String>(&format!(
                 "SELECT toString(balance) FROM prediction_positions_v(\
-                 chain = {CHAIN}, holder = unhex('{}'))",
+                 chain = {CHAIN}, holder = '{}')",
                 bare(TAKER)
             ))
             .await,
@@ -806,7 +813,7 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
     ]);
     let leaders: Vec<Leader> = database
         .rows(&format!(
-            "SELECT concat('0x', lower(hex(trader))) AS trader, volume, \
+            "SELECT concat('0x', lower(hex(substring(trader, 13)))) AS trader, volume, \
              net_cash_flow, trades FROM ({leaders}) ORDER BY volume DESC"
         ))
         .await;
@@ -826,8 +833,8 @@ async fn the_cookbook_serves_every_screen_from_real_polymarket_data() {
         .execute(&format!(
             "INSERT INTO prediction_venue_labels (chain, address, venue) VALUES \
              ({CHAIN}, unhex('{}'), 'polymarket'), ({CHAIN}, unhex('{}'), 'polymarket')",
-            bare(CTF),
-            bare(NEG_RISK_EXCHANGE)
+            id32_hex(CTF),
+            id32_hex(NEG_RISK_EXCHANGE)
         ))
         .await;
     database.refresh_markets().await;
@@ -931,14 +938,14 @@ async fn everything(database: &TestDb) -> Vec<(String, Vec<String>)> {
         (
             "portfolio of the V1 taker",
             format!(
-                "SELECT * FROM prediction_positions_v(chain = {CHAIN}, holder = unhex('{}'))",
+                "SELECT * FROM prediction_positions_v(chain = {CHAIN}, holder = '{}')",
                 bare(TAKER)
             ),
         ),
         (
             "tape of M1",
             format!(
-                "SELECT * FROM prediction_trades_v(chain = {CHAIN}, market_id = unhex('{}'))",
+                "SELECT * FROM prediction_trades_v(chain = {CHAIN}, market_id = '{}')",
                 hex::encode(m1())
             ),
         ),
@@ -1213,10 +1220,349 @@ async fn hostile_amounts_do_not_wrap_aggregates() {
     database.refresh_markets().await;
     let _ = database
         .snapshot(&format!(
-            "SELECT * FROM prediction_positions_v(chain = {CHAIN}, holder = unhex('{}'))",
+            "SELECT * FROM prediction_positions_v(chain = {CHAIN}, holder = '{}')",
             hex::encode(taker)
         ))
         .await;
+
+    database.drop().await;
+}
+
+// ---------------------------------------------------------- chain neutral
+
+/// A chain that is not EVM: the reserved Solana id (docs/design.md §14).
+const SVM_CHAIN: u64 = 1_399_811_149;
+
+/// 32 byte ids that are NOT left padded EVM addresses - every one has
+/// non-zero bytes in the 12 byte prefix an EVM address leaves empty, so any
+/// code still assuming "the last 20 bytes are the address" mangles them
+/// visibly.
+const SVM_REGISTRY: &str =
+    "b3f1a90c5d2e7481aa6fc03d94e5178b2c6d0f43a97e15bc8d2043fe6719ac85";
+const SVM_EXCHANGE: &str =
+    "7c2d5e8a41f0b96d3ae7c184fb5029d6e3a8710c45bd92fe6018a3c7d54b09ef";
+const SVM_TAKER: &str =
+    "e41a7b0396d5c82f14ae6d093b7c52801faa36d9c4e0b71852fd6a3c09e7b418";
+const SVM_MAKER: &str =
+    "2d90fa4c7b18e635a0cd472e918bf3067ac54d21e8b0937fca6d152048e3b7c9";
+const SVM_COLLATERAL: &str =
+    "5a8c3f19d02b47e6ba71cd8340f29e5b16d7a04c93e281fb60ac57d9138e4b2f";
+const SVM_ORACLE: &str =
+    "cd47e0a8153b96f27ea40d1c85b3097fe2461da05c8bf37962a0e4d81753cb6a";
+const SVM_CREATOR: &str =
+    "81f350ce9a274db6083fac51e7d29b640a5c8371fe4092bd6ac1573e8b04d9f2";
+const SVM_MARKET: &str =
+    "3fa07c15e9b8246d0cf37a5be1948d02c76ba31d905e8437b26cfa0d5187e93a";
+/// A Solana signature is 64 bytes: `tx_id` is a String, never a hash column.
+const SVM_TX: &str = concat!(
+    "9a4c0f71e3b58d26ac190fe74b3d0825c6a1fb39d07e42b85cf1360ad9e274bb",
+    "1f83e0d94a26cb705e3df182ac9460b7d5301fe8ba27c46d90f3581ea7b02d4c",
+);
+
+/// Every `prediction_*` table, materialized view, aggregate, parameterized
+/// view and cookbook query carries a 32 byte NON-EVM id and a 64 byte
+/// transaction id through unmangled (docs/design.md §13).
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn a_non_evm_32_byte_id_round_trips_through_every_table_and_query() {
+    let database = TestDb::create().await;
+    let traded_at = now() - 3_600;
+    let version = crate::db::next_version();
+    // The ERC-1155 style token id is a UInt256 on every chain.
+    let token_id = (U256::MAX - U256::from(1u8)).to_string();
+
+    // A non-EVM front end writes these columns from its own row type: the
+    // EVM decoder's models are `Address` based on purpose (§13), the TABLES
+    // are not. So this test inserts the way that front end would.
+    for sql in [
+        format!(
+            "INSERT INTO prediction_markets (chain, market_id, registry, protocol, \
+             oracle, question_id, outcome_count, block_number, timestamp, tx_id, \
+             tx_index, ordinal, tx_from, source, epoch, _version) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_MARKET}'), unhex('{SVM_REGISTRY}'), 'ctf', \
+             unhex('{SVM_ORACLE}'), unhex('{SVM_MARKET}'), 2, 10, {traded_at}, \
+             unhex('{SVM_TX}'), 3, 77, unhex('{SVM_CREATOR}'), 'event', 0, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_questions (chain, question_id, emitter, kind, \
+             protocol, event_id, question_index, title, description, outcomes, data, \
+             creator, oracle, reward_token, reward, proposal_bond, fee_bips, \
+             block_number, timestamp, tx_id, tx_index, ordinal, epoch, _version) \
+             VALUES ({SVM_CHAIN}, unhex('{SVM_MARKET}'), unhex('{SVM_ORACLE}'), \
+             'uma_question', 'uma', unhex('{SVM_MARKET}'), 0, 'A non-EVM market', '', \
+             ['Yes', 'No'], '', unhex('{SVM_CREATOR}'), unhex('{SVM_ORACLE}'), \
+             unhex('{SVM_COLLATERAL}'), 0, 0, 0, 10, {traded_at}, unhex('{SVM_TX}'), \
+             3, 78, 0, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_outcome_tokens (chain, registry, \
+             outcome_token_id, market_id, outcome_index, collateral_token, \
+             first_seen_block, first_seen_timestamp, _version) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_REGISTRY}'), toUInt256('{token_id}'), \
+             unhex('{SVM_MARKET}'), 0, unhex('{SVM_COLLATERAL}'), 10, {traded_at}, \
+             {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_position_events (chain, block_number, timestamp, \
+             tx_id, tx_index, ordinal, protocol, emitter, kind, stakeholder, \
+             market_id, collateral_token, parent_collection_id, index_sets, amount, \
+             tx_from, epoch, _version) VALUES \
+             ({SVM_CHAIN}, 10, {traded_at}, unhex('{SVM_TX}'), 3, 79, 'ctf', \
+             unhex('{SVM_REGISTRY}'), 'split', unhex('{SVM_MAKER}'), \
+             unhex('{SVM_MARKET}'), unhex('{SVM_COLLATERAL}'), toFixedString('', 32), \
+             [1, 2], 1000000, unhex('{SVM_CREATOR}'), 0, {version})"
+        ),
+        // The split mints a full set to the maker ...
+        format!(
+            "INSERT INTO prediction_transfers (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, batch_index, registry, operator, `from`, `to`, \
+             outcome_token_id, amount, from_reason, to_reason, priced_collateral, \
+             epoch, _version) VALUES \
+             ({SVM_CHAIN}, 10, {traded_at}, unhex('{SVM_TX}'), 3, 80, 0, \
+             unhex('{SVM_REGISTRY}'), unhex('{SVM_REGISTRY}'), toFixedString('', 32), \
+             unhex('{SVM_MAKER}'), toUInt256('{token_id}'), 1000000, 'split', 'split', \
+             500000, 0, {version})"
+        ),
+        // ... and the maker sells 400000 of one outcome to the taker at 0.6.
+        format!(
+            "INSERT INTO prediction_transfers (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, batch_index, registry, operator, `from`, `to`, \
+             outcome_token_id, amount, from_reason, to_reason, priced_collateral, \
+             epoch, _version) VALUES \
+             ({SVM_CHAIN}, 11, {traded_at}, unhex('{SVM_TX}'), 4, 12, 0, \
+             unhex('{SVM_REGISTRY}'), unhex('{SVM_EXCHANGE}'), unhex('{SVM_MAKER}'), \
+             unhex('{SVM_TAKER}'), toUInt256('{token_id}'), 400000, 'trade', 'trade', \
+             0, 0, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_trades (chain, block_number, timestamp, tx_id, \
+             tx_index, ordinal, protocol, exchange, registry, order_hash, maker, \
+             taker, tx_from, tx_to, outcome_token_id, side, share_amount, \
+             collateral_amount, match_type, maker_outcome_token_id, maker_side, \
+             maker_collateral_amount, maker_fee_amount, maker_fee_unit, \
+             taker_fee_amount, taker_fee_unit, epoch, _version) VALUES \
+             ({SVM_CHAIN}, 11, {traded_at}, unhex('{SVM_TX}'), 4, 13, 'ctf_exchange', \
+             unhex('{SVM_EXCHANGE}'), unhex('{SVM_REGISTRY}'), unhex('{SVM_MARKET}'), \
+             unhex('{SVM_MAKER}'), unhex('{SVM_TAKER}'), unhex('{SVM_CREATOR}'), \
+             unhex('{SVM_EXCHANGE}'), toUInt256('{token_id}'), 'buy', 400000, 240000, \
+             'complementary', toUInt256('{token_id}'), 'sell', 240000, 0, \
+             'collateral', 0, 'collateral', 0, {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_venues (chain, exchange, protocol, \
+             collateral_token, registry, source, _version) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_EXCHANGE}'), 'ctf_exchange', \
+             unhex('{SVM_COLLATERAL}'), unhex('{SVM_REGISTRY}'), 'rpc', {version})"
+        ),
+        format!(
+            "INSERT INTO prediction_venue_labels (chain, address, venue) VALUES \
+             ({SVM_CHAIN}, unhex('{SVM_EXCHANGE}'), 'a non-evm venue')"
+        ),
+        format!(
+            "INSERT INTO prediction_market_metadata (chain, market_id, title, source) \
+             VALUES ({SVM_CHAIN}, unhex('{SVM_MARKET}'), 'A non-EVM market', 'gamma')"
+        ),
+    ] {
+        database.execute(&sql).await;
+    }
+
+    // ------------------------------- every stored id comes back unmangled
+    for (table, column, expected) in [
+        ("prediction_markets", "registry", SVM_REGISTRY),
+        ("prediction_markets", "oracle", SVM_ORACLE),
+        ("prediction_markets", "tx_from", SVM_CREATOR),
+        ("prediction_questions", "emitter", SVM_ORACLE),
+        ("prediction_questions", "creator", SVM_CREATOR),
+        ("prediction_questions", "reward_token", SVM_COLLATERAL),
+        ("prediction_outcome_tokens", "registry", SVM_REGISTRY),
+        ("prediction_outcome_tokens", "collateral_token", SVM_COLLATERAL),
+        ("prediction_outcome_tokens_by_market", "registry", SVM_REGISTRY),
+        (
+            "prediction_outcome_tokens_by_market",
+            "collateral_token",
+            SVM_COLLATERAL,
+        ),
+        ("prediction_position_events", "emitter", SVM_REGISTRY),
+        ("prediction_position_events", "stakeholder", SVM_MAKER),
+        ("prediction_position_events", "collateral_token", SVM_COLLATERAL),
+        ("prediction_transfers", "registry", SVM_REGISTRY),
+        ("prediction_trades", "exchange", SVM_EXCHANGE),
+        ("prediction_trades", "maker", SVM_MAKER),
+        ("prediction_trades", "taker", SVM_TAKER),
+        ("prediction_trades", "tx_to", SVM_EXCHANGE),
+        ("prediction_trades_by_token", "registry", SVM_REGISTRY),
+        ("prediction_trades_by_token", "taker", SVM_TAKER),
+        ("prediction_ledger_by_holder", "registry", SVM_REGISTRY),
+        ("prediction_ledger_by_token", "registry", SVM_REGISTRY),
+        ("prediction_venues", "exchange", SVM_EXCHANGE),
+        ("prediction_venue_labels", "address", SVM_EXCHANGE),
+        ("prediction_candles_1m", "registry", SVM_REGISTRY),
+        ("prediction_candles_1d", "registry", SVM_REGISTRY),
+        ("prediction_market_flows_1d", "registry", SVM_REGISTRY),
+        ("prediction_trader_trades_1d", "exchange", SVM_EXCHANGE),
+        ("prediction_trader_flows_1d", "collateral_token", SVM_COLLATERAL),
+    ] {
+        assert_eq!(
+            database
+                .rows::<String>(&format!(
+                    "SELECT DISTINCT lower(hex({column})) FROM {table} \
+                     WHERE chain = {SVM_CHAIN}"
+                ))
+                .await,
+            vec![expected.to_owned()],
+            "{table}.{column}"
+        );
+    }
+
+    // Both parties of the fill and both legs of the mint kept their ids.
+    let mut both = vec![SVM_MAKER.to_owned(), SVM_TAKER.to_owned()];
+    both.sort();
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT DISTINCT lower(hex(holder)) FROM prediction_ledger_by_token \
+                 WHERE chain = {SVM_CHAIN} ORDER BY 1"
+            ))
+            .await,
+        both
+    );
+
+    // A 64 byte transaction id is not truncated to 32 anywhere.
+    assert_eq!(SVM_TX.len(), 128);
+    for table in [
+        "prediction_markets",
+        "prediction_questions",
+        "prediction_position_events",
+        "prediction_transfers",
+        "prediction_trades",
+        "prediction_trades_by_token",
+        "prediction_ledger_by_holder",
+        "prediction_ledger_by_token",
+    ] {
+        assert_eq!(
+            database
+                .rows::<String>(&format!(
+                    "SELECT DISTINCT lower(hex(tx_id)) FROM {table} \
+                     WHERE chain = {SVM_CHAIN}"
+                ))
+                .await,
+            vec![SVM_TX.to_owned()],
+            "{table}.tx_id"
+        );
+    }
+
+    // The 256 bit token id survives too (it is not an identity column).
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT DISTINCT toString(outcome_token_id) FROM prediction_trades \
+                 WHERE chain = {SVM_CHAIN}"
+            ))
+            .await,
+        vec![token_id.clone()]
+    );
+
+    // ---------------------------------------------- every cookbook query
+    database.refresh_markets().await;
+
+    let chain = SVM_CHAIN.to_string();
+    let parameters: [(&str, &str); 9] = [
+        ("chain", &chain),
+        ("market_id", SVM_MARKET),
+        ("event_id", SVM_MARKET),
+        ("registry", SVM_REGISTRY),
+        ("token", &token_id),
+        ("holder", SVM_TAKER),
+        ("text", "non-EVM"),
+        ("from_day", "2020-01-01"),
+        ("to_day", "2100-01-01"),
+    ];
+    for recipe in cookbook::COOKBOOK {
+        let sql = recipe.render(&parameters);
+        assert!(!sql.contains('{'), "{sql}");
+        assert!(
+            database.count(&format!("SELECT count() FROM ({sql})")).await
+                >= 1,
+            "{}: no row",
+            recipe.screen
+        );
+    }
+
+    // ... and the ids the screens PRINT are the stored bytes.
+    let header = cookbook::MARKET_HEADER
+        .render(&[("chain", &chain), ("market_id", SVM_MARKET)]);
+    assert_eq!(
+        database
+            .rows::<(String, String)>(&format!(
+                "SELECT lower(hex(registry)), lower(hex(market_id)) FROM ({header})"
+            ))
+            .await,
+        vec![(SVM_REGISTRY.to_owned(), SVM_MARKET.to_owned())]
+    );
+
+    let tape = cookbook::TRADES_TAPE
+        .render(&[("chain", &chain), ("market_id", SVM_MARKET)]);
+    assert_eq!(
+        database
+            .rows::<(String, String)>(&format!(
+                "SELECT lower(hex(trader)), lower(hex(tx_id)) FROM ({tape})"
+            ))
+            .await,
+        vec![(SVM_TAKER.to_owned(), SVM_TX.to_owned())]
+    );
+
+    let holders = cookbook::HOLDERS
+        .render(&[("chain", &chain), ("market_id", SVM_MARKET)]);
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT lower(hex(holder)) FROM ({holders}) ORDER BY 1"
+            ))
+            .await,
+        both
+    );
+
+    // The portfolio balance is exact even though the collateral has no
+    // decimals: `tokens` is the EVM-only core table, so the Float64 columns
+    // stay NULL rather than guessing (README, chain-neutral section).
+    assert_eq!(
+        database
+            .rows::<(String, String)>(&format!(
+                "SELECT lower(hex(market_id)), toString(balance) FROM \
+                 (SELECT * FROM prediction_positions_v(chain = {SVM_CHAIN}, \
+                 holder = '{SVM_TAKER}'))"
+            ))
+            .await,
+        vec![(SVM_MARKET.to_owned(), "400000".to_owned())]
+    );
+
+    let leaders = cookbook::LEADERBOARD.render(&[
+        ("chain", &chain),
+        ("from_day", "2020-01-01"),
+        ("to_day", "2100-01-01"),
+    ]);
+    // The labelled exchange is not a trader, both parties of the fill are.
+    assert_eq!(
+        database
+            .rows::<String>(&format!(
+                "SELECT lower(hex(trader)) FROM ({leaders}) ORDER BY 1"
+            ))
+            .await,
+        both
+    );
+
+    // The padding of a 40 character parameter is a real distinction: the
+    // last 20 bytes of a Solana id are NOT that id.
+    assert_eq!(
+        database
+            .count(&format!(
+                "SELECT count() FROM prediction_positions_v(chain = {SVM_CHAIN}, \
+                 holder = '{}')",
+                &SVM_TAKER[24..]
+            ))
+            .await,
+        0
+    );
 
     database.drop().await;
 }

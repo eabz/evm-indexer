@@ -156,16 +156,33 @@ Storage follows docs/design.md §1-§2: binary `FixedString` / `UInt256`,
 `ReplacingMergeTree(_version, is_deleted)` + `epoch`, no DELETE ever,
 aggregates keyed by `epoch` with the shared `epoch_floor_v` validity rule.
 
+**These tables are CHAIN NEUTRAL** (docs/design.md §13,
+`docs/solana-research.md` §0): a prediction venue on a non-EVM chain is fed
+into the same `prediction_*` tables later, so nothing here is EVM shaped.
+
+| | Rule |
+|---|---|
+| identity columns (`registry`, `exchange`, `emitter`, `maker`, `taker`, `holder`, `trader`, `oracle`, `creator`, `collateral_token`, `counterparty`, `tx_from`, `tx_to`, label `address`) | `FixedString(32)`. An EVM address is 12 zero bytes + its 20 bytes; a Solana pubkey is its 32 raw bytes. Print with `concat('0x', lower(hex(substring(id, 13))))` on an `evm` chain, `base58Encode(id)` on an `svm` one (the `chains` registry says which) |
+| transaction id | `tx_id String`, the RAW bytes (32 on EVM, 64 on Solana). Never a sorting key column, never called `transaction_hash` |
+| position | `(chain, block_number, tx_index, ordinal)` in every base table, side table, materialized view, aggregate and candle ordering key. `block_number` KEEPS its name (purge / tombstone / checkpoint code keys on it) and holds the slot on Solana; `tx_index UInt32` is the EVM transaction index, `ordinal UInt64` the EVM log index |
+| `market_id`, `question_id`, `event_id`, `order_hash` | unchanged: 32 bytes on every chain already |
+| `outcome_token_id`, amounts | unchanged `UInt256` |
+
+The only EVM-only table these views still touch is the core `tokens` table
+(collateral symbol / decimals); they join it with `substring(id, 13, 20)`,
+and a non-EVM collateral simply stays unpriced until a chain-neutral token
+registry exists (design §13 defers that to the day Solana starts).
+
 | Table | Rows | Sort key | Why |
 |---|---|---|---|
-| `prediction_markets` | one per `ConditionPreparation` | (chain, market_id, registry, block, log) | identity first: FINAL = one row per market |
+| `prediction_markets` | one per `ConditionPreparation` | (chain, market_id, registry, block, tx, ordinal) | identity first: FINAL = one row per market |
 | `prediction_resolutions` | one per `ConditionResolution` | same | payout vector, winning outcome |
 | `prediction_questions` | titles, events, disputes | (chain, question_id, emitter, kind, ...) | joins a market by (question_id, emitter = oracle) |
 | `prediction_outcome_tokens` (+ `_by_market`) | outcome index <-> token id, computed | (chain, registry, token) / (chain, market, ...) | NOT block scoped: arithmetic no reorg can change |
-| `prediction_trades` | THE canonical trade | (chain, block, log), month partitions | base table |
-| `prediction_position_events` | split / merge / redeem / convert | (chain, block, log) | open interest, funding flows |
-| `prediction_transfers` | one per ERC-1155 id moved, with the REASON of both legs | (chain, block, log, batch index) | exact balances |
-| `prediction_trades_by_token` (MV) | tape | (chain, registry, token, block, log) | a market's tape = the tail of two ranges |
+| `prediction_trades` | THE canonical trade | (chain, block, tx, ordinal), month partitions | base table |
+| `prediction_position_events` | split / merge / redeem / convert | (chain, block, tx, ordinal) | open interest, funding flows |
+| `prediction_transfers` | one per ERC-1155 id moved, with the REASON of both legs | (chain, block, tx, ordinal, batch index) | exact balances |
+| `prediction_trades_by_token` (MV) | tape | (chain, registry, token, block, tx, ordinal) | a market's tape = the tail of two ranges |
 | `prediction_ledger_by_holder` / `_by_token` (MV) | everything that changed a balance or has a price, per account | (chain, holder, registry, token, ...) / (chain, registry, token, holder, ...) | a wallet = one range, the holders of an outcome = one range |
 | `prediction_candles_1m/1h/1d` | OHLC of the probability per outcome token, volume, trades, unique traders (`uniqState`) | (chain, registry, token, bucket, epoch) | a chart = one range |
 | `prediction_market_flows_1d` | split / merged / redeemed collateral per market | (chain, registry, market, collateral, bucket, epoch) | open interest |
@@ -187,6 +204,30 @@ indexing from the middle of the chain heal itself), and a parameter is the
 only way to push "which wallet / market" into every subquery of a view, so
 each one is a primary key range read instead of a join over millions of
 tokens.
+
+### How a UI passes an id to a parameterized view
+
+Identity columns are 32 bytes now, but a UI holding a 20 byte EVM address
+must not have to pad it by hand, so **every id parameter of every view is a
+`String` of hex WITHOUT `0x` and the view pads it**:
+
+```sql
+-- 40 hex characters: an EVM address, left padded with 12 zero bytes by the view
+SELECT * FROM prediction_positions_v(chain = 137, holder = 'd218e474776403a330142299f7796e8ba32eb5c9')
+-- 64 hex characters: any 32 byte id (a Solana pubkey as hex) passes through
+SELECT * FROM prediction_positions_v(chain = 1399811149, holder = '9911223344556677889900aabbccddeeff00112233445566778899aabbccddee')
+```
+
+The padding is `toFixedString(unhex(if(length(p) = 40, concat(<24 zeros>, p),
+p)), 32)`: a constant expression ClickHouse folds BEFORE it reads a part, so
+the "one query per screen" promise holds - every one of these is still a
+primary key range read (asserted with `EXPLAIN indexes = 1` in the
+integration tests). `leftPad()` reads better but is *not* folded into a key
+condition on 25.12, which is why the `if` / `concat` form is used. Anything
+other than 40 or 64 hex characters is a caller error and can only fail to
+match. Queries against the plain `prediction_markets_v` take ids that are 32
+bytes on every chain (`market_id`, `event_id`), so they just `unhex()` the
+same hex string.
 
 ### Positions and PnL
 
@@ -212,7 +253,7 @@ tokens.
 ### Current price, volume, open interest, status
 
 `outcome_prices[i]` = last print of outcome i (`argMax` by
-`(block_number, log_index)` through the daily candles); 24h volume from the
+`(block_number, tx_index, ordinal)` through the daily candles); 24h volume from the
 hourly candles; `open_interest` = split - merged - redeemed collateral of
 the registry's own events (it only knows the indexed history: started mid
 chain it can be negative); `status` = `resolved` (a `ConditionResolution`
@@ -222,8 +263,9 @@ a known gap).
 
 ## Query cookbook
 
-Placeholders in `{braces}` are request parameters. Ids go in as hex without
-`0x`. The Rust constants are in `cookbook.rs`; a unit test keeps this
+Placeholders in `{braces}` are request parameters. **Ids go in as plain hex
+without `0x`** - 40 characters for an EVM address, 64 for any 32 byte id;
+the parameterized views pad, the others `unhex()`. The Rust constants are in `cookbook.rs`; a unit test keeps this
 section identical to them and the ClickHouse integration test runs every
 query against the real fixture data and asserts hand computed numbers.
 Latencies: ClickHouse 25.12 on a laptop, fixture sized data - they are
@@ -301,7 +343,7 @@ Price chart of one outcome (1m / 1h / 1d: same query, other view).
 
 ```sql
 SELECT bucket, open, high, low, close, volume, shares, trades, traders
-FROM prediction_candles_1h_v(chain = {chain}, registry = unhex('{registry}'),
+FROM prediction_candles_1h_v(chain = {chain}, registry = '{registry}',
                              outcome_token_id = toUInt256('{token}'))
 WHERE bucket >= now() - INTERVAL 30 DAY
 ORDER BY bucket
@@ -317,13 +359,13 @@ Trades tape of a market, newest first.
 
 ```sql
 SELECT timestamp, outcome_index, outcome, side, price, shares, collateral,
-       trader, transaction_hash
-FROM prediction_trades_v(chain = {chain}, market_id = unhex('{market_id}'))
-ORDER BY block_number DESC, log_index DESC
+       trader, tx_id
+FROM prediction_trades_v(chain = {chain}, market_id = '{market_id}')
+ORDER BY block_number DESC, tx_index DESC, ordinal DESC
 LIMIT 50
 ```
 
-Why it is cheap: `prediction_trades_by_token` is ordered by `(chain, registry, outcome_token_id, block_number, log_index)`: the tape of a market is the tail of two ranges (one per outcome). The market -> token ids lookup is a primary key read of `prediction_outcome_tokens_by_market`.
+Why it is cheap: `prediction_trades_by_token` is ordered by `(chain, registry, outcome_token_id, block_number, tx_index, ordinal)`: the tape of a market is the tail of two ranges (one per outcome). The market -> token ids lookup is a primary key read of `prediction_outcome_tokens_by_market`.
 
 Measured on the fixture data: **11.31 ms** (median of 9).
 
@@ -334,7 +376,7 @@ Top holders of a market, per outcome.
 ```sql
 SELECT outcome_index, outcome, holder, shares, avg_entry_price,
        current_price, value
-FROM prediction_holders_v(chain = {chain}, market_id = unhex('{market_id}'))
+FROM prediction_holders_v(chain = {chain}, market_id = '{market_id}')
 ORDER BY outcome_index, shares DESC
 LIMIT 100
 ```
@@ -351,7 +393,7 @@ Portfolio of a wallet: open positions and what they are worth, realized profit o
 SELECT market_id, title, outcome, status, shares, avg_entry_price,
        current_price, value, unrealized_pnl, realized_pnl, redeemable,
        unpriced_shares
-FROM prediction_positions_v(chain = {chain}, holder = unhex('{holder}'))
+FROM prediction_positions_v(chain = {chain}, holder = '{holder}')
 ORDER BY value DESC NULLS LAST, realized_pnl DESC NULLS LAST
 ```
 
@@ -365,10 +407,10 @@ Trade history of a wallet, newest first.
 
 ```sql
 SELECT timestamp, title, outcome, action, role, price, shares, collateral,
-       fee, transaction_hash
-FROM prediction_activity_v(chain = {chain}, holder = unhex('{holder}'))
+       fee, tx_id
+FROM prediction_activity_v(chain = {chain}, holder = '{holder}')
 WHERE action IN ('buy', 'sell')
-ORDER BY block_number DESC, log_index DESC
+ORDER BY block_number DESC, tx_index DESC, ordinal DESC
 LIMIT 50
 ```
 
@@ -429,11 +471,14 @@ exchange / pool.
 
 Labels (optional, user populated):
 
+`address` is a 32 byte id, so an EVM address is written with its 12 zero
+bytes in front:
+
 ```sql
 INSERT INTO prediction_venue_labels (chain, address, venue) VALUES
-  (137, unhex('4D97DCd97eC945f40cF65F87097ACe5EA0476045'), 'polymarket'),  -- the registry names its markets
-  (137, unhex('e111180000d2663c0091e4f400237545b87b996b'), 'polymarket'),  -- exchanges are not traders
-  (137, unhex('C5d563A36AE78145C45a50134d48A1215220f80a'), 'polymarket');
+  (137, unhex('0000000000000000000000004D97DCd97eC945f40cF65F87097ACe5EA0476045'), 'polymarket'),  -- the registry names its markets
+  (137, unhex('000000000000000000000000e111180000d2663c0091e4f400237545b87b996b'), 'polymarket'),  -- exchanges are not traders
+  (137, unhex('000000000000000000000000C5d563A36AE78145C45a50134d48A1215220f80a'), 'polymarket');
 ```
 
 ## Known gaps

@@ -25,7 +25,7 @@ use std::{
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 
-use crate::db::models::log::DatabaseLog;
+use crate::{db::models::log::DatabaseLog, utils::format::tx_id};
 
 use super::{
     events::{self, EventDef},
@@ -653,7 +653,8 @@ fn decode_transaction(
                             first_seen_timestamp: log.timestamp,
                             _version: first_seen_version(
                                 log.block_number,
-                                log.log_index,
+                                log.transaction_index,
+                                u64::from(log.log_index),
                             ),
                         },
                     );
@@ -695,8 +696,9 @@ fn decode_transaction(
                     outcome_count: *outcomes,
                     block_number: log.block_number,
                     timestamp: log.timestamp,
-                    transaction_hash: log.transaction_hash,
-                    log_index: log.log_index,
+                    tx_id: tx_id(log.transaction_hash),
+                    tx_index: log.transaction_index,
+                    ordinal: u64::from(log.log_index),
                     tx_from: Address::ZERO,
                     source: RowSource::Event,
                     epoch: 0,
@@ -725,8 +727,9 @@ fn decode_transaction(
                     payout_denominator: denominator,
                     block_number: log.block_number,
                     timestamp: log.timestamp,
-                    transaction_hash: log.transaction_hash,
-                    log_index: log.log_index,
+                    tx_id: tx_id(log.transaction_hash),
+                    tx_index: log.transaction_index,
+                    ordinal: u64::from(log.log_index),
                     epoch: 0,
                     _version: 0,
                 });
@@ -834,9 +837,9 @@ fn decode_transaction(
                     chain: context.chain,
                     block_number: log.block_number,
                     timestamp: log.timestamp,
-                    transaction_hash: log.transaction_hash,
-                    transaction_index: log.transaction_index,
-                    log_index: log.log_index,
+                    tx_id: tx_id(log.transaction_hash),
+                    tx_index: log.transaction_index,
+                    ordinal: u64::from(log.log_index),
                     protocol: Protocol::Fpmm,
                     exchange: log.address,
                     registry: movers
@@ -936,9 +939,9 @@ fn close_match(
             chain: context.chain,
             block_number: log.block_number,
             timestamp: log.timestamp,
-            transaction_hash: log.transaction_hash,
-            transaction_index: log.transaction_index,
-            log_index: log.log_index,
+            tx_id: tx_id(log.transaction_hash),
+            tx_index: log.transaction_index,
+            ordinal: u64::from(log.log_index),
             protocol: maker.protocol,
             exchange: log.address,
             registry,
@@ -983,8 +986,9 @@ fn position_event(
         chain,
         block_number: log.block_number,
         timestamp: log.timestamp,
-        transaction_hash: log.transaction_hash,
-        log_index: log.log_index,
+        tx_id: tx_id(log.transaction_hash),
+        tx_index: log.transaction_index,
+        ordinal: u64::from(log.log_index),
         protocol,
         emitter: log.address,
         kind,
@@ -1027,8 +1031,9 @@ fn question(
         fee_bips: draft.fee_bips,
         block_number: log.block_number,
         timestamp: log.timestamp,
-        transaction_hash: log.transaction_hash,
-        log_index: log.log_index,
+        tx_id: tx_id(log.transaction_hash),
+        tx_index: log.transaction_index,
+        ordinal: u64::from(log.log_index),
         epoch: 0,
         _version: 0,
     }
@@ -1080,8 +1085,9 @@ fn transfer(
         chain,
         block_number: log.block_number,
         timestamp: log.timestamp,
-        transaction_hash: log.transaction_hash,
-        log_index: log.log_index,
+        tx_id: tx_id(log.transaction_hash),
+        tx_index: log.transaction_index,
+        ordinal: u64::from(log.log_index),
         batch_index,
         registry: log.address,
         operator,
@@ -1226,7 +1232,7 @@ mod tests {
 
         assert_eq!(trade.protocol, Protocol::CtfExchangeV2);
         assert_eq!(trade.match_type, MatchType::Mint);
-        assert_eq!(trade.log_index, 298);
+        assert_eq!(trade.ordinal, 298);
         assert_eq!(
             trade.maker,
             address("0xcd84d7f9262516865553555751609fb6f52abec6")
