@@ -64,7 +64,7 @@ const PURGE_BUCKETS: &[f64] =
 /// are the number to look at.** A Solana slot is 0.27 s and an Ethereum
 /// block is 12 s, so one `lag_blocks` panel across both families is
 /// meaningless and would be read wrong on the first bad day
-/// (docs/solana-research.md §11.5). `lag_seconds` already exists for every
+/// (the Solana venue research §11.5). `lag_seconds` already exists for every
 /// chain; the Solana loop feeds it from the `block_time` of the last
 /// committed slot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

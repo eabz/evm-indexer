@@ -399,7 +399,7 @@ impl SolanaReorgStore {
     /// Live checkpoints of the chain ending above `start` (and, when
     /// `until` is given, starting below it), ordered for
     /// `db::ranges::contiguous_until`. This is witness 1 of
-    /// docs/solana-research.md §11.4.3: the cursor tiling, which is the
+    /// the Solana venue research §11.4.3: the cursor tiling, which is the
     /// ONLY contiguity test that survives skipped slots, because a
     /// checkpoint's `to_block` is the server's `next_slot` and not
     /// `max(slot) + 1`.
@@ -510,7 +510,7 @@ impl SolanaReorgStore {
     /// and `block_height`: the anchor the next window's continuity check
     /// compares against across a restart and across a window boundary.
     ///
-    /// docs/solana-research.md §11.4.4 proposes carrying this in the
+    /// the Solana venue research §11.4.4 proposes carrying this in the
     /// checkpoint row (`last_block` / `last_hash` / `last_height`) to save
     /// this read. It is one indexed `FINAL` read per resume and per gap
     /// heal, not per flush, so the columns are an optimisation rather than
@@ -734,7 +734,7 @@ impl ReorgStore for SolanaReorgStore {
             // repair window there arms the validity rule from 1970 on and
             // every aggregate of the chain reads as zero until a rebuild
             // of fifty years of months finishes
-            // (docs/review-round-4.md, MAJOR 6). It reads 0 when the
+            // (review round 4, MAJOR 6). It reads 0 when the
             // range holds no row with a real timestamp, which is why the
             // row count and the zero count come with it.
             const COUNTED: &str = "SELECT toUInt64(count()), \

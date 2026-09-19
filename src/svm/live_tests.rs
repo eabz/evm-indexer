@@ -1717,7 +1717,7 @@ async fn live_launchpads_match_the_public_rpc() {
     );
 }
 
-/// The three tricky transactions of docs/solana-research.md are recorded
+/// The three tricky transactions of the Solana venue research are recorded
 /// fixtures and are asserted in `svm::tests`; this checks the RECORDING is
 /// still faithful to what the chain says, so a stale fixture cannot quietly
 /// keep passing.
@@ -2339,7 +2339,7 @@ async fn record_phase2_fixtures() {
 
 // --- review round 4: the two transactions the addendum names --------------
 
-/// The ADDENDUM of docs/review-round-4.md cites two real mainnet
+/// The ADDENDUM of review round 4 cites two real mainnet
 /// transactions by signature. Recording them by SLOT and signature - rather
 /// than scanning for a shape - is what makes those findings reproducible
 /// from the same bytes the reviewer read.

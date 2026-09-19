@@ -30,7 +30,7 @@
 -- writer splits a flush into whole UTC months so that no insert touches
 -- more partitions than ClickHouse allows (`db::flush_windows`). On a
 -- server that was not on UTC a 90-UTC-month slice could therefore land in
--- 91 partitions (docs/review-round-4.md, MINOR 18). The stored value is
+-- 91 partitions (review round 4, MINOR 18). The stored value is
 -- unix seconds either way, so nothing else changes - the aggregates
 -- already declare their bucket columns DateTime('UTC') for the same
 -- reason.

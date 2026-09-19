@@ -339,7 +339,7 @@ impl Lease {
     /// backfill --module X` is a writer too - it purges, bumps the epoch
     /// and rebuilds every aggregate - so two of them on one chain corrupt
     /// it exactly as two indexers would (the lower-epoch rebuild ends up
-    /// hidden by the higher floor, docs/review-round-4.md, MINOR 16). It
+    /// hidden by the higher floor, review round 4, MINOR 16). It
     /// may however run NEXT TO a live indexer, which is documented and
     /// handled (`pipeline::backfill`), so it must not take the run role's
     /// lease.

@@ -20,7 +20,7 @@
 //! server's `next_slot`, NEVER `max(slot) + 1`. Skipped slots are normal,
 //! so "the slots we asked for and were served" is a property of the CURSOR
 //! and the only thing that can tell a skipped slot from an unasked one
-//! (docs/solana-research.md §11.4.3, witness 1).
+//! (the Solana venue research §11.4.3, witness 1).
 
 use crate::{
     db::{next_version, ranges::BlockRange, Database, FlushKey},

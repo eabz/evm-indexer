@@ -1,7 +1,7 @@
 //! The generic token-movement decoder: pure, no I/O.
 //!
 //! It runs PER INSTRUCTION SUBTREE and never on a transaction's net balance
-//! change. That is not a style preference: docs/solana-research.md section
+//! change. That is not a style preference: the Solana venue research section
 //! 2.2 records a real transaction (`Qxpfmre4JbRctxg1...`) holding TWO
 //! PumpSwap swaps on the SAME pool in OPPOSITE directions, where ~6.2 SOL
 //! moves each way and the transaction's net vault delta is ~0.03 SOL. A
@@ -1047,7 +1047,7 @@ enum Classified {
 /// Accounts that RECEIVE one mint and SEND a different one inside this
 /// subtree, i.e. that sit on the other side of BOTH legs.
 ///
-/// **A swap is locally symmetric.** docs/solana-research.md section 3.1
+/// **A swap is locally symmetric.** the Solana venue research section 3.1
 /// proposes "the counterparty accounts of both legs share one owner (the
 /// pool authority)" as the identifying rule, but that is incomplete: the
 /// TAKER also receives one mint and sends the other, so this returns two

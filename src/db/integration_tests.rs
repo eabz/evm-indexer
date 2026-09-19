@@ -2187,7 +2187,7 @@ async fn missing_ranges_are_computed_in_clickhouse() {
 /// else will ever ask for those blocks again: their rows ARE stored, so no
 /// gap query reports them. The running indexer queues them in memory; this
 /// is the same question asked of the database, so a restart does not lose
-/// them (docs/review-round-4.md, MAJOR 3).
+/// them (review round 4, MAJOR 3).
 #[tokio::test]
 #[ignore = "needs TEST_DATABASE_URL"]
 async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart()
@@ -2247,7 +2247,7 @@ async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart()
 /// with more non-contiguous live ranges than one page holds (a partial
 /// backfill: holes everywhere, nothing to merge down there) never reached
 /// the head's fast growing contiguous run, and the table grew without
-/// bound (docs/review-round-4.md, MINOR 15).
+/// bound (review round 4, MINOR 15).
 #[tokio::test]
 #[ignore = "needs TEST_DATABASE_URL"]
 async fn checkpoint_compaction_sweeps_past_a_page_of_holes() {

@@ -7,7 +7,7 @@
 //! live `blocks` row". On Solana **most slots have no block and that is
 //! normal**, so that query would report the whole chain as one long gap,
 //! for ever. The Solana checks are therefore the five of
-//! docs/solana-research.md §11.4.5:
+//! the Solana venue research §11.4.5:
 //!
 //! | # | Check | What only IT can catch |
 //! |---|---|---|
@@ -118,7 +118,7 @@ impl SolanaVerifyReport {
     /// Nothing found that is wrong with what is stored.
     ///
     /// `heal_pending` counts, exactly as it does on the EVM side
-    /// (docs/review-round-4.md, MINOR 14): a repair that is armed and not
+    /// (review round 4, MINOR 14): a repair that is armed and not
     /// completed means rows are tombstoned that nothing has settled, and
     /// the aggregates of those days still count them. The operator need
     /// do nothing about it - the next `indexer run` purges and re-indexes
@@ -801,7 +801,7 @@ mod tests {
     }
 
     /// A pending repair IS a problem right now, exactly as it is on the
-    /// EVM side (docs/review-round-4.md, MINOR 14): rows are tombstoned
+    /// EVM side (review round 4, MINOR 14): rows are tombstoned
     /// that no completed purge settled, and the aggregates of those days
     /// still COUNT them. The operator need do nothing - the next
     /// `indexer run` repairs it - but the numbers are wrong until it does,

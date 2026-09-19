@@ -564,7 +564,7 @@ pub struct FakeStore {
     /// A store that reports a `timestamp` of 0 as the start of the repair
     /// window instead of the oldest REAL timestamp of the range - what a
     /// row with a missing block time does to a store that does not filter
-    /// it out (docs/review-round-4.md, MAJOR 6).
+    /// it out (review round 4, MAJOR 6).
     min_ts_zero: bool,
 }
 

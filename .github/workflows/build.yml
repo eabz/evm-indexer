@@ -36,19 +36,56 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # Unit tests only: everything that needs a service or the network is
-      # `#[ignore]`d (see the `integration` job).
+      # Unit tests, the layout test and the doc tests. Everything that needs a
+      # service or the network is `#[ignore]`d (see the `integration` job).
       - name: Test
         run: cargo test --locked
 
       - name: Build
         run: cargo build --release --locked
 
-  # The `#[ignore]`d tests that need a real ClickHouse (and Redis). They go
-  # through the embedded migrations, so this job is also what proves that a
-  # fresh database can be created by the binary alone.
+  # Every `#[ignore]`d suite that needs a real ClickHouse. They go through the
+  # embedded migrations, so this job is also what proves that a fresh database
+  # can be created by the binary alone.
+  #
+  # ONE MATRIX ENTRY PER SUITE, each with its OWN ClickHouse service container
+  # and its OWN `<name>_test` database. That is deliberate: the suites create
+  # throwaway databases as they go, and a single server collecting all of them
+  # runs into its memory limit long before the tests are at fault. A fresh
+  # server per suite also means one suite can never leave state for another,
+  # and the matrix keeps the wall-clock time of the job at the slowest suite
+  # rather than the sum.
   integration:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The infrastructure: insert path, tombstones, epochs, the validity
+          # rule, missing ranges, and the migrator (which is also the only
+          # suite that needs Redis, for the token cache round trip).
+          - name: core
+            filter: "db::integration_tests:: db::migrate::integration:: redis_round_trip_and_restart"
+          # The end-to-end sync loops: crash matrices, gap heals, reorgs.
+          - name: acceptance
+            filter: "pipeline::acceptance::"
+          - name: solana_acceptance
+            filter: "pipeline::solana_acceptance::"
+          # The data modules.
+          - name: dex
+            filter: "dex::integration_tests::"
+          - name: predictions
+            filter: "predictions::integration_tests::"
+          - name: launchpads
+            filter: "launchpads::integration_tests::"
+          # `svm::integration_tests::` in full, NEVER the bare filter `svm::`:
+          # that would also select `svm::live_tests`, which need an Envio token
+          # and the network.
+          - name: svm
+            filter: "svm::integration_tests::"
+          # The fleet supervisor against a real `fleet_chains` table.
+          - name: fleet
+            filter: "fleet::integration_tests::"
     services:
       clickhouse:
         # Keep in step with docker-compose.yml.
@@ -85,10 +122,10 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      # db::integration_tests DROPs and recreates this database (its name must
-      # end in `_test`); db::migrate and dex create throwaway databases of
-      # their own on the same server.
-      TEST_DATABASE_URL: http://indexer:indexer@localhost:8123/indexer_test
+      # The suites DROP and recreate this database, so its name MUST end in
+      # `_test`; some of them also create throwaway databases of their own on
+      # the same server.
+      TEST_DATABASE_URL: http://indexer:indexer@localhost:8123/${{ matrix.name }}_test
       TOKEN_CACHE_TEST_REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v7
@@ -97,17 +134,29 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The filters are substring matches on the test path, any of them
-      # selects a test. Deliberately NOT selected (they need the internet or
-      # depend on network timing): tokens::*::live_* (chainid.network, public
-      # RPCs, TOKEN_TEST_RPC_URL) and unreachable_redis_never_stalls_or_fails.
-      - name: Integration tests (ClickHouse, Redis)
-        run: >-
-          cargo test --locked --lib -- --ignored
-          db::integration_tests::
-          db::migrate::integration::
-          dex::integration_tests::
-          redis_round_trip_and_restart
+      # The filters are substring matches on the test path, any of them selects
+      # a test. Deliberately NOT selected anywhere (they need the internet or a
+      # token): `tokens::*::live_*` (chainid.network, public RPCs,
+      # TOKEN_TEST_RPC_URL), `svm::live_tests::` and
+      # `unreachable_redis_never_stalls_or_fails`.
+      #
+      # `--test-threads=1`: these suites share one server and assert on row
+      # counts, so they are not safe to interleave.
+      - name: Integration tests (${{ matrix.name }})
+        run: cargo test --locked --lib -- --ignored --test-threads=1 ${{ matrix.filter }}
+
+      # Give the server its memory back even when a suite failed, so the
+      # teardown of the runner is not what reports the problem.
+      - name: Drop the test databases
+        if: always()
+        run: |
+          for db in $(curl -fsS 'http://indexer:indexer@localhost:8123/?query=SHOW+DATABASES' || true); do
+            case "$db" in
+              *_test|*_test_*)
+                curl -fsS "http://indexer:indexer@localhost:8123/?query=DROP+DATABASE+IF+EXISTS+%60$db%60" || true
+                ;;
+            esac
+          done
 
   # The image is only published from main (docker.yml); this catches a broken
   # Dockerfile / .dockerignore (e.g. build.rs not finding migrations/) on the
@@ -134,3 +183,4 @@ jobs:
         run: |
           docker run --rm evm-indexer:ci --version
           docker run --rm evm-indexer:ci migrate --help
+          docker run --rm evm-indexer:ci fleet --help

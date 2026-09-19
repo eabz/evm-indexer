@@ -565,7 +565,7 @@ mod tests {
     /// allows (`db::flush_windows`, `MAX_MONTHS_PER_FLUSH`). On a server
     /// that is not on UTC the two disagree at every month boundary, so a
     /// 90-UTC-month slice could land in 91 partitions
-    /// (docs/review-round-4.md, MINOR 18).
+    /// (review round 4, MINOR 18).
     #[test]
     fn every_monthly_partition_key_is_in_utc() {
         let mut checked = 0;

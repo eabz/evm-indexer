@@ -1,5 +1,11 @@
 # The coverage floor
 
+> **What this is** — the date each chain's data begins at. It is chosen once, on that chain's first start, and never moves by accident afterwards.
+> **What tables** — `chain_coverage` (migration 0008) and the `coverage_v` view; nothing else writes them.
+> **Where the queries are** — `SELECT * FROM coverage_v`, or run `indexer verify`, which prints the same sentence as its first line. The control panel shows it per chain.
+> **Why you care** — "all-time" in any dashboard built on this database means "since the floor", and the floor differs per chain.
+> **Binding design** — `docs/design.md` section 16.
+
 *Binding design: `docs/design.md` section 16.*
 
 ## The promise

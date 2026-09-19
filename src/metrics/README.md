@@ -1,5 +1,11 @@
 # metrics
 
+> **What this is** — the Prometheus endpoint and the `/healthz` and `/readyz` probes, served on `--metrics-addr`. Off unless that is set.
+> **What tables** — none. Everything here is in-process counters and gauges; nothing is written to ClickHouse.
+> **Where the queries are** — the [metric reference](#metric-reference) below, and ready-made Prometheus rules under [Alerts](#alerts).
+> **One endpoint or many** — `indexer run` serves one per chain, `indexer fleet` one for all of them. The series are identical and every one carries a `chain` label, so a dashboard built for one shape works for the other.
+> **Binding design** — `docs/design.md` section 7.
+
 `--metrics-addr <ip:port>` (default off) serves:
 
 | Endpoint | Answer |
