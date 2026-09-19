@@ -162,6 +162,7 @@ The schema lives in `migrations/NNNN_name.sql` and is **compiled into the binary
 
 - Applied migrations are recorded in `schema_migrations (version, name, checksum, applied_at)`. Each start applies whatever is pending, in order.
 - The indexer **refuses to start** when the checksum of an already applied migration differs from the one embedded in the binary, or when the database has a newer migration than the binary knows (an older binary against a newer schema). Never edit an applied migration; add a new one.
+- **Before the first release: databases created from a pre-release build must be recreated.** The versioned `migrations/` set is new and was still being corrected in place while it was written, so a database created by an earlier build of it carries different checksums and the indexer refuses to start against it, by design and with no `ALTER` path. Drop the database and let `indexer migrate` (or `indexer run`) create it again. Do not force the checksum guard past this: some of the corrections changed what a column MEANS - `sol_token_balances` went from a latest-value projection to an append log with a flush-clock `_version` - and rows written under the old meaning would permanently outrank every new one. From the first released version on, this never happens: an applied migration is never edited again.
 - Several indexer processes may start at the same time against an empty database; they converge on one schema.
 - The database name comes from the URL, nothing is hard coded.
 - To control when the schema changes (for example one deploy step in front of 50 indexer processes), run `indexer migrate` once and start the indexers with `--no-migrate`.
@@ -642,7 +643,7 @@ TEST_DATABASE_URL=http://indexer:indexer@localhost:8123/indexer_test \
 
 CI runs the same set against a ClickHouse service container, plus the Redis cache round trip (`redis_round_trip_and_restart`, `TOKEN_CACHE_TEST_REDIS_URL`). The remaining ignored tests (`live_*`) need internet access and are meant to be run by hand.
 
-Schema changes are new files in `migrations/` (`NNNN_name.sql`; `0001`-`0009` core, `0010`-`0019` DEX, `0020`-`0029` prediction markets). Never edit a migration that has been released: its checksum is verified at startup.
+Schema changes are new files in `migrations/` (`NNNN_name.sql`; `0001`-`0009` core, `0010`-`0019` DEX, `0020`-`0029` prediction markets). Never edit a migration that has been released: its checksum is verified at startup. Until the first release the set is still being corrected in place, so a development database from an earlier build of this branch has to be dropped and created again - see the note under [Commands and schema migrations](#commands-and-schema-migrations).
 
 ## Contributing
 

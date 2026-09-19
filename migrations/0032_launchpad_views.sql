@@ -71,7 +71,13 @@
 --   AND length({<id>:String}) IN (40, 64)
 --   AND match({<id>:String}, '^[0-9a-fA-F]+$')
 --
--- exactly once, in the filter that gates its output. The second line is
+-- exactly once, in the filter that gates its output. "Gates its output"
+-- is exact about the ANSWER and not always about the I/O: in four views
+-- the pair sits in a HAVING or in the outer WHERE of a cross join of
+-- materialized subqueries, where a constant-false condition returns no
+-- row but does not stop the subqueries reading (review F, MINOR 14). The
+-- answer is the same in all of them, and only the cost of a malformed id
+-- differs, which is not what the guard is for. The second line is
 -- there because unhex does NOT raise on a non-hex character: measured on
 -- 25.12, every one of the 74 printable non-hex characters becomes the
 -- nibble 0xE or 0xF, so unhex('zz' x 20) is 20 bytes of 0xEF. That cannot

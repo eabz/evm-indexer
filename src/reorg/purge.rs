@@ -195,6 +195,17 @@ pub struct Purger {
 /// verification a purge has.
 const ZERO_READS_REQUIRED: u32 = 2;
 
+/// How many queued spans one [`Purger::purge_queued`] call purges before
+/// it returns and lets its caller get on with the pass.
+///
+/// The queue is drained by re-reading its head, so the writer can push
+/// into it while the drain runs; a cap makes the loop obviously
+/// terminating instead of terminating "in practice" (review F, MINOR 2).
+/// 64 is far above anything a real run queues - a span appears only when a
+/// flush races ANOTHER process's purge - and whatever is left stays
+/// queued for the next pass, exactly as it does after a failure.
+const MAX_QUEUED_PURGES_PER_CALL: usize = 64;
+
 /// Which tombstone statement [`Purger::tombstone_until_gone`] drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -295,7 +306,12 @@ impl Purger {
     /// rest for ever (docs/review-round-4.md, MAJOR 3).
     ///
     /// The entry is looked up again instead of being popped by index: the
-    /// writer task pushes into the same queue while this runs.
+    /// writer task pushes into the same queue while this runs. That is
+    /// also why the call is capped at [`MAX_QUEUED_PURGES_PER_CALL`]
+    /// spans: the writer can enqueue while this drains, so without a cap
+    /// the loop is only bounded in practice and not in principle (review
+    /// F, MINOR 2). What is left stays in the queue and the next pass
+    /// takes it - the same thing that happens after a failure.
     pub async fn purge_queued(
         &self,
         chain: u64,
@@ -305,7 +321,7 @@ impl Purger {
     ) -> Result<Option<u64>, ReorgError> {
         let mut lowest: Option<u64> = None;
 
-        loop {
+        for _ in 0..MAX_QUEUED_PURGES_PER_CALL {
             let Some(range) = queue.lock().unwrap().first().copied()
             else {
                 return Ok(lowest);
@@ -322,6 +338,8 @@ impl Purger {
                 lowest.map_or(range.from, |low: u64| low.min(range.from)),
             );
         }
+
+        Ok(lowest)
     }
 
     /// `rows_expected`: the caller SAW rows in the range (orphaned blocks,

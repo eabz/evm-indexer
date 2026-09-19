@@ -224,7 +224,12 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
      MISSING block time, not a block time of 1970; taking it as the start of the repair
      window arms the validity rule on every day since the epoch and hides a whole chain's
      aggregates until a rebuild of fifty years finishes. `Purger` clamps a 0 it still
-     gets to the last day of the range, loudly.
+     gets to the last day of the range, loudly. **What that costs, deliberately:** when a
+     purged range holds both zero and real timestamps the repair starts at the real day,
+     so whatever the zero-timestamp rows contributed stays in the day-0 bucket for ever
+     and is counted again when the range is re-streamed. A permanently wrong 1970 bucket
+     is the accepted price of not hiding every bucket of the chain; the cure is to stop
+     the source storing a missing block time as 0.
 
 **Changes from the hardening round (implemented, binding):**
    - Purge order is now: checkpoints, children, `reorgs` row (armed), rebuild, `blocks`,

@@ -207,8 +207,11 @@ CREATE TABLE IF NOT EXISTS sol_token_balances (
   _version UInt64,
   is_deleted UInt8 DEFAULT 0,
   -- The holder screen reads by mint, so the sorting key starts there and
-  -- a purge's `block_number >= x` would scan the mints. This is what
-  -- makes the purge skip the parts that hold no slot of its range.
+  -- a purge's `block_number >= x` would otherwise read every granule.
+  -- This skips the GRANULES whose slot range does not overlap the
+  -- purge's - not whole parts: the partition key is the month of
+  -- `timestamp`, and a purge ranges over slots, so every monthly part is
+  -- still opened (review F, MINOR 10).
   INDEX sol_token_balances_slot block_number TYPE minmax GRANULARITY 4
 )
 ENGINE = ReplacingMergeTree(_version, is_deleted)
