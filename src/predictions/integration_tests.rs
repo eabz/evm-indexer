@@ -1646,7 +1646,8 @@ async fn a_dust_print_does_not_set_the_prediction_candle() {
         ),
     ];
 
-    let mut rows = decode(CHAIN, &[dust.as_slice(), real.as_slice()].concat());
+    let mut rows =
+        decode(CHAIN, &[dust.as_slice(), real.as_slice()].concat());
     assert_eq!(rows.trades.len(), 2);
     // Both fills are PROVEN - the registry really moved the shares - so
     // what keeps the dust one off the chart is the floor alone.
@@ -1654,9 +1655,11 @@ async fn a_dust_print_does_not_set_the_prediction_candle() {
     rows.set_version(crate::db::next_version());
     database.insert(&rows).await;
 
-    for table in
-        ["prediction_candles_1m", "prediction_candles_1h", "prediction_candles_1d"]
-    {
+    for table in [
+        "prediction_candles_1m",
+        "prediction_candles_1h",
+        "prediction_candles_1d",
+    ] {
         let sql = format!(
             "SELECT toUInt64(sum(trades)), \
              toFloat64(argMinMerge(open)), toFloat64(max(high)), \
@@ -1673,10 +1676,16 @@ async fn a_dust_print_does_not_set_the_prediction_candle() {
             .await[0];
 
         // The dust print is not counted and, above all, is not the price.
-        assert_eq!(trades, 1, "{table}: the dust print reached the candle");
-        for (what, value) in
-            [("open", open), ("high", high), ("low", low), ("close", close)]
-        {
+        assert_eq!(
+            trades, 1,
+            "{table}: the dust print reached the candle"
+        );
+        for (what, value) in [
+            ("open", open),
+            ("high", high),
+            ("low", low),
+            ("close", close),
+        ] {
             assert!(
                 (value - 0.5).abs() < 1e-9,
                 "{table}: {what} is {value} rather than 0.5 - one raw unit \

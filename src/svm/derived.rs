@@ -151,12 +151,16 @@ mod tests {
     /// The `SELECT` of the materialized view feeding `table`, out of
     /// migration 0042 itself.
     fn view_of(sql: &str, table: &str) -> String {
-        let marker = format!("CREATE MATERIALIZED VIEW IF NOT EXISTS \
-                              {table}_mv");
+        let marker = format!(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS \
+                              {table}_mv"
+        );
         normalize(
             sql.split(&normalize(&marker))
                 .nth(1)
-                .unwrap_or_else(|| panic!("{table}_mv is in the migration"))
+                .unwrap_or_else(|| {
+                    panic!("{table}_mv is in the migration")
+                })
                 .split(';')
                 .next()
                 .unwrap(),
@@ -210,7 +214,9 @@ mod tests {
             &db::migrate::embedded()
                 .unwrap()
                 .iter()
-                .find(|migration| migration.sql.contains("sol_dex_candles_1m"))
+                .find(|migration| {
+                    migration.sql.contains("sol_dex_candles_1m")
+                })
                 .expect("migration 0042 is embedded")
                 .sql,
         );

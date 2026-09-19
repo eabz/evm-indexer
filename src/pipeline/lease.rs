@@ -222,8 +222,10 @@ fn role_of(instance: &str) -> &str {
 /// the chain (review F, MINOR 6). Every other role matches by prefix only:
 /// an id with no `|` is never a backfill.
 fn same_role_sql(role: &str) -> String {
-    let prefixed =
-        format!("startsWith(instance, {})", sql_string(&format!("{role}|")));
+    let prefixed = format!(
+        "startsWith(instance, {})",
+        sql_string(&format!("{role}|"))
+    );
 
     if role == ROLE_RUN {
         format!("({prefixed} OR position(instance, '|') = 0)")
@@ -556,8 +558,7 @@ mod tests {
         // no '|' is never a backfill.
         let backfill = same_role_sql("backfill:dex");
         assert_eq!(
-            backfill,
-            "startsWith(instance, 'backfill:dex|')",
+            backfill, "startsWith(instance, 'backfill:dex|')",
             "{backfill}"
         );
     }

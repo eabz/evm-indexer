@@ -738,10 +738,7 @@ async fn a_bounded_run_over_a_stored_range_still_drains_the_stale_queue() {
     let mut indexer = indexer(
         source.clone(),
         store.clone(),
-        SyncSettings {
-            new_blocks_only: true,
-            ..settings(0, 50)
-        },
+        SyncSettings { new_blocks_only: true, ..settings(0, 50) },
     )
     .await;
 
@@ -753,7 +750,8 @@ async fn a_bounded_run_over_a_stored_range_still_drains_the_stale_queue() {
     // The span was purged, and taken out of the queue only then. (The
     // purge looks at the range's timestamps twice, before and after
     // tombstoning its children, so one purge is two entries.)
-    let mut purged: Vec<PurgedRange> = store.purged.lock().unwrap().clone();
+    let mut purged: Vec<PurgedRange> =
+        store.purged.lock().unwrap().clone();
     purged.dedup();
     assert_eq!(
         purged,
