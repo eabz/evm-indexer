@@ -6,8 +6,11 @@
 use crate::{
     db::ranges::BlockRange,
     pipeline::{transform::ResponseRows, BlockSource, SourceResponse},
+    reorg::{BlockHeader, CanonicalChain},
+    utils::convert::{hash_to_b256, quantity_to_u32},
 };
 use anyhow::{bail, Context, Result};
+use futures::future::BoxFuture;
 use hypersync_client::{
     net_types::{
         BlockField, LogField, LogFilter, Query, TransactionField,
@@ -101,6 +104,27 @@ pub fn build_query(range: BlockRange) -> Query {
         .select_log_fields(LOG_FIELDS)
 }
 
+/// What the fork-point search compares with the stored blocks.
+const HEADER_FIELDS: [BlockField; 4] = [
+    BlockField::Number,
+    BlockField::Hash,
+    BlockField::ParentHash,
+    BlockField::Timestamp,
+];
+
+/// Headers only: no transactions, no logs.
+pub fn build_header_query(range: BlockRange) -> Query {
+    Query::new()
+        .from_block(range.from)
+        .to_block_excl(range.to)
+        .include_all_blocks()
+        .select_block_fields(HEADER_FIELDS)
+}
+
+/// Requests per [`CanonicalChain::headers`] call. One is the norm (the
+/// ranges are a few hundred headers at most).
+const MAX_HEADER_REQUESTS: usize = 16;
+
 #[derive(Clone)]
 pub struct Source {
     client: Client,
@@ -142,6 +166,68 @@ impl Source {
                 Ok(())
             }
         }
+    }
+}
+
+impl CanonicalChain for Source {
+    /// Headers of `[from, to)` as HyperSync has them NOW. Heights it does
+    /// not have (the chain got shorter) are simply absent: the caller
+    /// checks completeness and that the headers chain.
+    fn headers(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> BoxFuture<'_, Result<Vec<BlockHeader>>> {
+        Box::pin(async move {
+            let mut headers = Vec::new();
+            let mut cursor = from;
+
+            for _ in 0..MAX_HEADER_REQUESTS {
+                if cursor >= to {
+                    break;
+                }
+
+                let response = self
+                    .client
+                    .get(&build_header_query(BlockRange::new(cursor, to)))
+                    .await
+                    .with_context(|| {
+                        format!("get HyperSync headers [{cursor}, {to})")
+                    })?;
+
+                for block in response.data.blocks.iter().flatten() {
+                    let (Some(number), Some(hash), Some(parent_hash)) =
+                        (block.number, &block.hash, &block.parent_hash)
+                    else {
+                        bail!("HyperSync returned a header without number or hashes");
+                    };
+
+                    let timestamp = block
+                        .timestamp
+                        .as_ref()
+                        .map(quantity_to_u32)
+                        .unwrap_or_default();
+
+                    headers.push(BlockHeader {
+                        number,
+                        hash: hash_to_b256(hash),
+                        parent_hash: hash_to_b256(parent_hash),
+                        timestamp,
+                    });
+                }
+
+                // No progress: the archive ends here.
+                if response.next_block <= cursor {
+                    break;
+                }
+                cursor = response.next_block;
+            }
+
+            headers.sort_unstable_by_key(|header| header.number);
+            headers.dedup_by_key(|header| header.number);
+
+            Ok(headers)
+        })
     }
 }
 
@@ -230,6 +316,21 @@ mod tests {
             TRANSACTION_FIELDS.len()
         );
         assert_eq!(query.field_selection.log.len(), LOG_FIELDS.len());
+    }
+
+    #[test]
+    fn header_query_asks_for_headers_only() {
+        let query = build_header_query(BlockRange::new(10, 20));
+
+        assert_eq!(query.from_block, 10);
+        assert_eq!(query.to_block, Some(20));
+        assert!(query.include_all_blocks);
+        assert!(query.transactions.is_empty());
+        assert!(query.logs.is_empty());
+        assert!(query.traces.is_empty());
+        assert_eq!(query.field_selection.block.len(), 4);
+        assert!(query.field_selection.transaction.is_empty());
+        assert!(query.field_selection.log.is_empty());
     }
 
     #[test]

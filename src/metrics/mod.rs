@@ -95,6 +95,13 @@ pub struct WorkerStatsSnapshot {
     pub backfill_found: u64,
     /// Backfill queries that failed.
     pub backfill_failures: u64,
+    /// Answers of an untrusted (public) endpoint no second provider
+    /// confirmed: nothing was stored, asked again later.
+    pub unconfirmed: u64,
+    /// Blank rows verified again / replaced by real metadata: a stale
+    /// node said "nothing there" about a good token.
+    pub blank_rechecked: u64,
+    pub blank_healed: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     /// True when every RPC endpoint's circuit breaker is open.
@@ -103,12 +110,16 @@ pub struct WorkerStatsSnapshot {
     pub endpoints_total: u64,
     /// RPC endpoints currently considered healthy.
     pub endpoints_healthy: u64,
+    /// RPC endpoints caught giving answers the others contradict.
+    pub endpoints_distrusted: u64,
 }
 
 /// Argument of [`Metrics::set_token_stats`].
 pub type TokenStatsSnapshot = WorkerStatsSnapshot;
 /// Argument of [`Metrics::set_pool_stats`].
 pub type PoolStatsSnapshot = WorkerStatsSnapshot;
+/// Argument of [`Metrics::set_venue_stats`].
+pub type VenueStatsSnapshot = WorkerStatsSnapshot;
 
 /// Handle to the indexer's metrics. Cloning is one `Arc` increment; every
 /// recording method is a handful of atomic operations and never blocks,
@@ -148,11 +159,15 @@ struct WorkerStats {
     rpc_failures: Counter,
     backfill_found: Counter,
     backfill_failures: Counter,
+    unconfirmed: Counter,
+    blank_rechecked: Counter,
+    blank_healed: Counter,
     cache_hits: Counter,
     cache_misses: Counter,
     breaker_open: AtomicBool,
     endpoints_total: AtomicU64,
     endpoints_healthy: AtomicU64,
+    endpoints_distrusted: AtomicU64,
 }
 
 impl WorkerStats {
@@ -167,11 +182,16 @@ impl WorkerStats {
         self.rpc_failures.set(stats.rpc_failures);
         self.backfill_found.set(stats.backfill_found);
         self.backfill_failures.set(stats.backfill_failures);
+        self.unconfirmed.set(stats.unconfirmed);
+        self.blank_rechecked.set(stats.blank_rechecked);
+        self.blank_healed.set(stats.blank_healed);
         self.cache_hits.set(stats.cache_hits);
         self.cache_misses.set(stats.cache_misses);
         self.breaker_open.store(stats.breaker_open, Relaxed);
         self.endpoints_total.store(stats.endpoints_total, Relaxed);
         self.endpoints_healthy.store(stats.endpoints_healthy, Relaxed);
+        self.endpoints_distrusted
+            .store(stats.endpoints_distrusted, Relaxed);
         self.seen.store(true, Relaxed);
     }
 
@@ -187,11 +207,15 @@ impl WorkerStats {
             rpc_failures: self.rpc_failures.get(),
             backfill_found: self.backfill_found.get(),
             backfill_failures: self.backfill_failures.get(),
+            unconfirmed: self.unconfirmed.get(),
+            blank_rechecked: self.blank_rechecked.get(),
+            blank_healed: self.blank_healed.get(),
             cache_hits: self.cache_hits.get(),
             cache_misses: self.cache_misses.get(),
             breaker_open: self.breaker_open.load(Relaxed),
             endpoints_total: self.endpoints_total.load(Relaxed),
             endpoints_healthy: self.endpoints_healthy.load(Relaxed),
+            endpoints_distrusted: self.endpoints_distrusted.load(Relaxed),
         })
     }
 }
@@ -235,6 +259,7 @@ struct Inner {
 
     tokens: WorkerStats,
     pools: WorkerStats,
+    venues: WorkerStats,
 }
 
 fn unix_ms() -> u64 {
@@ -295,6 +320,7 @@ impl Metrics {
                 purged_blocks: Counter::default(),
                 tokens: WorkerStats::default(),
                 pools: WorkerStats::default(),
+                venues: WorkerStats::default(),
             })),
         }
     }
@@ -454,6 +480,13 @@ impl Metrics {
         let Some(inner) = &self.inner else { return };
 
         inner.pools.set(stats);
+    }
+
+    /// Prediction market venue resolver.
+    pub fn set_venue_stats(&self, stats: VenueStatsSnapshot) {
+        let Some(inner) = &self.inner else { return };
+
+        inner.venues.set(stats);
     }
 
     /// Startup (migrations, gap healing, first head poll) is complete.
@@ -764,11 +797,14 @@ impl Metrics {
 
 /// One family per field, one series per worker that reported.
 fn render_workers(e: &mut Encoder, inner: &Inner) {
-    let workers: Vec<(&str, WorkerStatsSnapshot)> =
-        [("tokens", &inner.tokens), ("pools", &inner.pools)]
-            .into_iter()
-            .filter_map(|(name, stats)| Some((name, stats.get()?)))
-            .collect();
+    let workers: Vec<(&str, WorkerStatsSnapshot)> = [
+        ("tokens", &inner.tokens),
+        ("pools", &inner.pools),
+        ("venues", &inner.venues),
+    ]
+    .into_iter()
+    .filter_map(|(name, stats)| Some((name, stats.get()?)))
+    .collect();
 
     if workers.is_empty() {
         return;
@@ -776,7 +812,7 @@ fn render_workers(e: &mut Encoder, inner: &Inner) {
 
     type Field = fn(&WorkerStatsSnapshot) -> u64;
 
-    let families: [(&str, &str, Kind, Field); 15] = [
+    let families: [(&str, &str, Kind, Field); 19] = [
         (
             "resolver_queue_depth",
             "Addresses waiting to be resolved by a background worker.",
@@ -838,6 +874,24 @@ fn render_workers(e: &mut Encoder, inner: &Inner) {
             |s| s.backfill_failures,
         ),
         (
+            "resolver_unconfirmed_total",
+            "Answers of a public endpoint no second provider confirmed.",
+            Kind::Counter,
+            |s| s.unconfirmed,
+        ),
+        (
+            "resolver_blank_rechecked_total",
+            "Blank rows that were verified again.",
+            Kind::Counter,
+            |s| s.blank_rechecked,
+        ),
+        (
+            "resolver_blank_healed_total",
+            "Blank rows replaced by real metadata on a recheck.",
+            Kind::Counter,
+            |s| s.blank_healed,
+        ),
+        (
             "resolver_cache_hits_total",
             "Resolver cache hits.",
             Kind::Counter,
@@ -866,6 +920,12 @@ fn render_workers(e: &mut Encoder, inner: &Inner) {
             "RPC endpoints currently considered healthy.",
             Kind::Gauge,
             |s| s.endpoints_healthy,
+        ),
+        (
+            "resolver_endpoints_distrusted",
+            "RPC endpoints caught contradicting the others.",
+            Kind::Gauge,
+            |s| s.endpoints_distrusted,
         ),
     ];
 

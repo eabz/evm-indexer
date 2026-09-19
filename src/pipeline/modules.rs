@@ -29,6 +29,22 @@ use alloy::primitives::{Address, B256};
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 
+/// Rows as strings with the per-flush stamps zeroed.
+macro_rules! fingerprint {
+    ($($rows:expr),+ $(,)?) => {{
+        let mut prints: Vec<String> = Vec::new();
+        $(
+            prints.extend($rows.iter().map(|row| {
+                let mut row = row.clone();
+                row._version = 0;
+                row.epoch = 0;
+                format!("{row:?}")
+            }));
+        )+
+        prints
+    }};
+}
+
 /// Which modules decode. Everything is ON by default (owner decision);
 /// `--no-<module>` opts out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +131,31 @@ impl ModuleRows {
             .collect()
     }
 
+    /// The block scoped rows of module `name` as comparable strings
+    /// (without `_version` / `epoch`), sorted: what `indexer backfill`
+    /// compares with [`stored_fingerprints`].
+    pub fn fingerprints(&self, name: &str) -> Vec<String> {
+        let mut prints: Vec<String> = match name {
+            "dex" => fingerprint!(
+                self.dex.swaps,
+                self.dex.liquidity,
+                self.dex.pools
+            ),
+            "predictions" => fingerprint!(
+                self.predictions.trades,
+                self.predictions.transfers,
+                self.predictions.position_events,
+                self.predictions.resolutions,
+                self.predictions.questions,
+                self.predictions.markets
+            ),
+            // MODULE: one arm per module
+            _ => Vec::new(),
+        };
+        prints.sort_unstable();
+        prints
+    }
+
     /// `(table, rows)` for the flush log line and the tests.
     pub fn counts(&self) -> Vec<(&'static str, usize)> {
         vec![
@@ -142,14 +183,19 @@ impl ModuleRows {
     /// insert order. Called by `Database::store` next to the core
     /// children, i.e. BEFORE `blocks`. The rows go out through the structs'
     /// own column lists, so a module adding a column changes nothing here.
-    pub async fn store(&self, db: &Database, key: &FlushKey) -> Result<()> {
+    pub async fn store(
+        &self,
+        db: &Database,
+        key: &FlushKey,
+    ) -> Result<()> {
         for table in dex::BASE_TABLES.iter().copied() {
             match table {
                 "dex_swaps" => {
                     db.insert_flush(table, &self.dex.swaps, key).await?
                 }
                 "dex_liquidity" => {
-                    db.insert_flush(table, &self.dex.liquidity, key).await?
+                    db.insert_flush(table, &self.dex.liquidity, key)
+                        .await?
                 }
                 "dex_pools" => {
                     db.insert_flush(table, &self.dex.pools, key).await?
@@ -207,6 +253,106 @@ pub struct DecodeState {
     pub registries: RegistrySet,
 }
 
+/// Live rows of a module table in `range`, read back through its model.
+async fn read_rows<T>(
+    db: &Database,
+    spec: &ModuleSpec,
+    table: &str,
+    range: crate::db::ranges::BlockRange,
+) -> Result<Vec<T>>
+where
+    T: clickhouse::Row + for<'b> serde::Deserialize<'b> + 'static,
+    for<'a> T: clickhouse::Row<Value<'a> = T>,
+{
+    // Validation off: the crate can not validate (U)Int256 columns.
+    db.db
+        .clone()
+        .with_validation(false)
+        .query(&format!(
+            "SELECT ?fields FROM `{table}` FINAL WHERE {}",
+            range_predicate(
+                spec,
+                table,
+                db.chain_id,
+                range.from,
+                Some(range.to)
+            )
+        ))
+        .fetch_all::<T>()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(e).context(format!("read back '{table}'"))
+        })
+}
+
+/// [`ModuleRows::fingerprints`] of what is STORED for `spec` in `range`.
+pub async fn stored_fingerprints(
+    db: &Database,
+    spec: &ModuleSpec,
+    range: crate::db::ranges::BlockRange,
+) -> Result<Vec<String>> {
+    let mut rows = ModuleRows::default();
+
+    match spec.name {
+        "dex" => {
+            rows.dex.swaps =
+                read_rows(db, spec, "dex_swaps", range).await?;
+            rows.dex.liquidity =
+                read_rows(db, spec, "dex_liquidity", range).await?;
+            rows.dex.pools =
+                read_rows(db, spec, "dex_pools", range).await?;
+        }
+        "predictions" => {
+            let p = &mut rows.predictions;
+            p.trades =
+                read_rows(db, spec, "prediction_trades", range).await?;
+            p.transfers =
+                read_rows(db, spec, "prediction_transfers", range).await?;
+            p.position_events =
+                read_rows(db, spec, "prediction_position_events", range)
+                    .await?;
+            p.resolutions =
+                read_rows(db, spec, "prediction_resolutions", range)
+                    .await?;
+            p.questions =
+                read_rows(db, spec, "prediction_questions", range).await?;
+            p.markets =
+                read_rows(db, spec, "prediction_markets", range).await?;
+        }
+        // MODULE: one arm per module
+        other => bail!("module '{other}' has no read path"),
+    }
+
+    Ok(rows.fingerprints(spec.name))
+}
+
+/// The position registries already stored, to seed [`DecodeState`].
+pub async fn known_registries(
+    db: &Database,
+    enabled: EnabledModules,
+) -> Result<RegistrySet> {
+    if !enabled.predictions {
+        return Ok(RegistrySet::default());
+    }
+
+    #[serde_with::serde_as]
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct RegistryRow {
+        #[serde_as(as = "crate::utils::format::SerAddress")]
+        registry: Address,
+    }
+
+    let sql = predictions::KNOWN_REGISTRIES_SQL
+        .replace("{chain}", &db.chain_id.to_string());
+
+    let rows =
+        db.db.query(&sql).fetch_all::<RegistryRow>().await.map_err(
+            |e| anyhow::anyhow!(e).context("query known registries"),
+        )?;
+
+    Ok(RegistrySet::new(rows.into_iter().map(|row| row.registry)))
+}
+
 /// Decodes every enabled module from the rows of one response. Pure, no
 /// I/O, never awaits: it runs inside transform.
 ///
@@ -219,20 +365,35 @@ pub fn decode(
     rows: &RowBatch,
     state: &mut DecodeState,
 ) -> ModuleRows {
-    let mut modules = ModuleRows::default();
-
     if !enabled.any() {
-        return modules;
+        return ModuleRows::default();
     }
 
     // `from` / `to` of the batch's transactions, for attribution
     // (`dex_liquidity.tx_from` = who seeded the liquidity; the event
     // `sender` is usually a router).
-    let origins: HashMap<B256, (Address, Option<Address>)> = rows
+    let origins: TxOrigins = rows
         .transactions
         .iter()
         .map(|tx| (tx.hash, (tx.from, tx.to)))
         .collect();
+
+    decode_with_origins(enabled, chain, rows, &origins, state)
+}
+
+/// `from` / `to` by transaction hash.
+pub type TxOrigins = HashMap<B256, (Address, Option<Address>)>;
+
+/// [`decode`] with the transaction origins given (the backfill reads them
+/// from the `transactions` table instead of the batch).
+pub fn decode_with_origins(
+    enabled: EnabledModules,
+    chain: u64,
+    rows: &RowBatch,
+    origins: &TxOrigins,
+    state: &mut DecodeState,
+) -> ModuleRows {
+    let mut modules = ModuleRows::default();
 
     if enabled.dex {
         modules.dex = dex::decode(chain, &rows.logs);
@@ -278,7 +439,8 @@ pub struct ModuleSpec {
     /// a block (e.g. not the RPC resolver's rows of `dex_pools`).
     pub purge_filter: fn(&str) -> Option<&'static str>,
     /// The tombstone INSERT for `[from, to)` of a base table.
-    pub tombstone_sql: fn(&str, u64, u64, Option<u64>, u64) -> Result<String>,
+    pub tombstone_sql:
+        fn(&str, u64, u64, Option<u64>, u64) -> Result<String>,
 }
 
 fn no_filter(_table: &str) -> Option<&'static str> {
@@ -390,10 +552,8 @@ mod tests {
 
     #[test]
     fn dex_is_decoded_by_default_and_not_when_disabled() {
-        let batch = RowBatch {
-            logs: vec![sync_log(1, 5)],
-            ..Default::default()
-        };
+        let batch =
+            RowBatch { logs: vec![sync_log(1, 5)], ..Default::default() };
 
         let mut state = DecodeState::default();
 
@@ -462,7 +622,10 @@ mod tests {
 
         for spec in ALL_MODULES {
             for table in spec.base_tables {
-                assert!(listed.contains(table), "{table} has no row count");
+                assert!(
+                    listed.contains(table),
+                    "{table} has no row count"
+                );
             }
         }
 

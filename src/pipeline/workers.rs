@@ -12,9 +12,13 @@ use crate::{
     },
     metrics::{Metrics, WorkerStatsSnapshot},
     pipeline::modules::{EnabledModules, ModuleRows},
+    predictions::{
+        self, MissingVenueSource, PredictionVenue, VenueCandidate,
+        VenueSink, VenueWorker, VenueWorkerOptions, VenueWorkerStats,
+    },
     tokens::{
-        multicall::EthCaller, MissingTokenSource, TokenSink, TokenStandard,
-        TokenWorker, TokenWorkerOptions, TokenWorkerStats,
+        multicall::EthCaller, MissingTokenSource, TokenSink,
+        TokenStandard, TokenWorker, TokenWorkerOptions, TokenWorkerStats,
     },
     utils::format::{SerAddress, SerB256},
 };
@@ -26,10 +30,7 @@ use log::{info, warn};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 use tokio::task::JoinHandle;
@@ -46,43 +47,51 @@ pub struct ClickhouseWorkerStore {
     db: Database,
     /// Include the tokens of `dex_pools` in the token backfill.
     dex: bool,
-    /// Rotates the order of the token backfill, see [`missing_tokens_sql`].
-    salt: Arc<AtomicU64>,
 }
 
 impl ClickhouseWorkerStore {
     pub fn new(db: Database, dex: bool) -> Self {
-        Self { db, dex, salt: Arc::new(AtomicU64::new(0)) }
+        Self { db, dex }
     }
 }
 
-/// Token addresses referenced by stored data without a `tokens` row.
+fn after_predicate(after: Option<Address>) -> String {
+    after
+        .map(|after| {
+            format!(" AND address > unhex('{}')", hex_of(after.as_slice()))
+        })
+        .unwrap_or_default()
+}
+
+/// Token addresses referenced by stored data without a `tokens` row, by
+/// address, after the cursor.
 ///
 /// Cost: this runs for the lifetime of a multi-billion-row database, so it
 /// never touches a transfer table. It reads `seen_tokens` (one row per
 /// token, fed by materialized views of the three transfer tables,
-/// migration 0005) and `dex_pools_by_token`, both partitioned by chain and
-/// a few million rows at most, and anti-joins them against the chain's
-/// `tokens` keys.
+/// migration 0005) and `dex_pools_by_token`, both partitioned by chain,
+/// sorted by address and a few million rows at most, and anti-joins them
+/// against the chain's `tokens` keys.
 ///
-/// Order: deterministic for a given `salt` (a hash of the address), and
-/// the salt changes with every call. A fixed order would put the same
-/// addresses first forever; addresses that can not be resolved right now
-/// (no code yet, RPC trouble) would then starve everything behind them.
-/// No `FINAL` anywhere: duplicates collapse in the `GROUP BY`, `tokens` is
-/// never tombstoned, and resolving the token of a reorged-out transfer is
-/// harmless.
+/// Order: stable (`ORDER BY address`), paged by the worker with the
+/// `after` cursor, so tokens that can not be resolved right now never hide
+/// the ones behind them. No `FINAL` anywhere: duplicates collapse in the
+/// `GROUP BY`, `tokens` is never tombstoned, and resolving the token of a
+/// reorged-out transfer is harmless.
 pub fn missing_tokens_sql(
     chain: u64,
     dex: bool,
-    salt: u64,
+    after: Option<Address>,
     limit: usize,
 ) -> String {
+    let after = after_predicate(after);
+
     let pools = if dex {
         format!(
             " UNION ALL SELECT token AS address, 'ERC20' AS type \
              FROM dex_pools_by_token WHERE chain = {chain} \
-             AND source != 'unresolved'"
+             AND source != 'unresolved'{}",
+            after.replace("address", "token")
         )
     } else {
         String::new()
@@ -91,15 +100,33 @@ pub fn missing_tokens_sql(
     format!(
         "SELECT address, any(type) AS type FROM (\
          SELECT address, toString(type) AS type FROM seen_tokens \
-         WHERE chain = {chain}{pools}) \
+         WHERE chain = {chain}{after}{pools}) \
          WHERE address NOT IN (\
-         SELECT address FROM tokens WHERE chain = {chain}) \
+         SELECT address FROM tokens WHERE chain = {chain}{after}) \
          AND address NOT IN (\
          unhex('0000000000000000000000000000000000000000'), \
          unhex('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee')) \
          GROUP BY address \
-         ORDER BY cityHash64(address, {salt}) \
+         ORDER BY address ASC \
          LIMIT {limit}"
+    )
+}
+
+/// Tokens whose stored row is blank and older than `older_than_ms` (unix
+/// ms; `tokens._version` is the insert time), by address after the cursor.
+/// `FINAL`: a blank row that was replaced by a good one is not blank.
+pub fn blank_tokens_sql(
+    chain: u64,
+    after: Option<Address>,
+    limit: usize,
+    older_than_ms: u64,
+) -> String {
+    format!(
+        "SELECT address, toString(type) AS type FROM tokens FINAL \
+         WHERE chain = {chain}{} AND name = '' AND symbol = '' \
+         AND decimals = 0 AND _version < {older_than_ms} \
+         ORDER BY address ASC LIMIT {limit}",
+        after_predicate(after)
     )
 }
 
@@ -130,29 +157,68 @@ impl TokenSink for ClickhouseWorkerStore {
     }
 }
 
+impl ClickhouseWorkerStore {
+    async fn token_listing(
+        &self,
+        sql: String,
+        what: &'static str,
+    ) -> Result<Vec<(Address, TokenStandard)>> {
+        let rows = self
+            .db
+            .db
+            .query(&sql)
+            .fetch_all::<MissingTokenRow>()
+            .await
+            .context(what)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.address, standard_of(&row.r#type)))
+            .collect())
+    }
+}
+
 impl MissingTokenSource for ClickhouseWorkerStore {
     fn missing_tokens<'a>(
         &'a self,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<(Address, TokenStandard)>>> {
-        Box::pin(async move {
-            let salt = self.salt.fetch_add(1, Ordering::Relaxed);
-            let sql =
-                missing_tokens_sql(self.db.chain_id, self.dex, salt, limit);
+        self.missing_tokens_after(None, limit)
+    }
 
-            let rows = self
-                .db
-                .db
-                .query(&sql)
-                .fetch_all::<MissingTokenRow>()
-                .await
-                .context("query tokens without metadata")?;
+    fn missing_tokens_after<'a>(
+        &'a self,
+        after: Option<Address>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<(Address, TokenStandard)>>> {
+        Box::pin(self.token_listing(
+            missing_tokens_sql(self.db.chain_id, self.dex, after, limit),
+            "query tokens without metadata",
+        ))
+    }
 
-            Ok(rows
-                .into_iter()
-                .map(|row| (row.address, standard_of(&row.r#type)))
-                .collect())
-        })
+    fn blank_tokens<'a>(
+        &'a self,
+        after: Option<Address>,
+        limit: usize,
+        older_than: Duration,
+    ) -> BoxFuture<'a, Result<Vec<(Address, TokenStandard)>>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        let older_than_ms =
+            now_ms.saturating_sub(older_than.as_millis() as u64);
+
+        Box::pin(self.token_listing(
+            blank_tokens_sql(
+                self.db.chain_id,
+                after,
+                limit,
+                older_than_ms,
+            ),
+            "query blank tokens",
+        ))
     }
 }
 
@@ -171,6 +237,7 @@ struct MissingPoolRow {
     #[serde_as(as = "SerAddress")]
     emitter: Address,
     protocol: String,
+    attempts: u32,
 }
 
 impl PoolSink for ClickhouseWorkerStore {
@@ -184,7 +251,9 @@ impl PoolSink for ClickhouseWorkerStore {
             for chunk in pool_ids.chunks(KNOWN_POOLS_CHUNK) {
                 let ids: Vec<String> = chunk
                     .iter()
-                    .map(|id| format!("unhex('{}')", hex_of(id.as_slice())))
+                    .map(|id| {
+                        format!("unhex('{}')", hex_of(id.as_slice()))
+                    })
                     .collect();
 
                 // `FINAL`: a tombstoned pool is not known.
@@ -245,6 +314,97 @@ impl MissingPoolSource for ClickhouseWorkerStore {
                         pool_id: row.pool_id,
                         address: row.emitter,
                         protocol,
+                        attempts: row.attempts,
+                    })
+                })
+                .collect())
+        })
+    }
+}
+
+#[serde_with::serde_as]
+#[derive(Debug, Row, Deserialize)]
+struct ExchangeRow {
+    #[serde_as(as = "SerAddress")]
+    exchange: Address,
+}
+
+#[serde_with::serde_as]
+#[derive(Debug, Row, Deserialize)]
+struct MissingVenueRow {
+    #[serde_as(as = "SerAddress")]
+    exchange: Address,
+    protocol: String,
+}
+
+impl VenueSink for ClickhouseWorkerStore {
+    fn known_venues<'a>(
+        &'a self,
+        exchanges: &'a [Address],
+    ) -> BoxFuture<'a, Result<HashSet<Address>>> {
+        Box::pin(async move {
+            let mut known = HashSet::new();
+
+            for chunk in exchanges.chunks(KNOWN_POOLS_CHUNK) {
+                let ids: Vec<String> = chunk
+                    .iter()
+                    .map(|a| format!("unhex('{}')", hex_of(a.as_slice())))
+                    .collect();
+
+                let sql = format!(
+                    "SELECT DISTINCT exchange FROM prediction_venues \
+                     WHERE chain = {} AND exchange IN ({})",
+                    self.db.chain_id,
+                    ids.join(", ")
+                );
+
+                let rows = self
+                    .db
+                    .db
+                    .query(&sql)
+                    .fetch_all::<ExchangeRow>()
+                    .await
+                    .context("query known venues")?;
+
+                known.extend(rows.into_iter().map(|row| row.exchange));
+            }
+
+            Ok(known)
+        })
+    }
+
+    fn insert_venues<'a>(
+        &'a self,
+        rows: &'a [PredictionVenue],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(self.db.insert_rows("prediction_venues", rows))
+    }
+}
+
+impl MissingVenueSource for ClickhouseWorkerStore {
+    fn missing_venues<'a>(
+        &'a self,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<VenueCandidate>>> {
+        Box::pin(async move {
+            let sql = predictions::MISSING_VENUES_SQL
+                .replace("{chain}", &self.db.chain_id.to_string())
+                .replace("{limit}", &limit.to_string());
+
+            let rows = self
+                .db
+                .db
+                .query(&sql)
+                .fetch_all::<MissingVenueRow>()
+                .await
+                .context("query venues without a prediction_venues row")?;
+
+            Ok(rows
+                .into_iter()
+                .filter_map(|row| {
+                    Some(VenueCandidate {
+                        exchange: row.exchange,
+                        protocol: row.protocol.parse().ok()?,
                     })
                 })
                 .collect())
@@ -262,7 +422,9 @@ fn hex_of(bytes: &[u8]) -> String {
 /// INCLUDING the negative ones; the metric `resolver_resolved_total` means
 /// "with metadata", so the negatives are taken out here and reported only
 /// as `resolver_negative_total`.
-pub fn token_stats_snapshot(stats: &TokenWorkerStats) -> WorkerStatsSnapshot {
+pub fn token_stats_snapshot(
+    stats: &TokenWorkerStats,
+) -> WorkerStatsSnapshot {
     WorkerStatsSnapshot {
         queue_depth: stats.queue_depth as u64,
         resolved: stats.resolved.saturating_sub(stats.negative),
@@ -274,18 +436,24 @@ pub fn token_stats_snapshot(stats: &TokenWorkerStats) -> WorkerStatsSnapshot {
         rpc_failures: stats.rpc_failures,
         backfill_found: stats.backfill_found,
         backfill_failures: stats.backfill_failures,
+        unconfirmed: stats.unconfirmed,
+        blank_rechecked: stats.blank_rechecked,
+        blank_healed: stats.blank_healed,
         cache_hits: stats.cache_hits,
         cache_misses: stats.cache_misses,
         breaker_open: stats.breaker_open,
         endpoints_total: stats.endpoints_total as u64,
         endpoints_healthy: stats.endpoints_healthy as u64,
+        endpoints_distrusted: stats.endpoints_distrusted as u64,
     }
 }
 
 /// `dex::PoolWorkerStats` as the metrics see it (`resolved` and `negative`
 /// are already disjoint there). The pool worker shares the token worker's
 /// RPC caller, whose endpoint health is reported by the `tokens` series.
-pub fn pool_stats_snapshot(stats: &PoolWorkerStats) -> WorkerStatsSnapshot {
+pub fn pool_stats_snapshot(
+    stats: &PoolWorkerStats,
+) -> WorkerStatsSnapshot {
     WorkerStatsSnapshot {
         queue_depth: stats.queue_depth as u64,
         resolved: stats.resolved,
@@ -300,8 +468,28 @@ pub fn pool_stats_snapshot(stats: &PoolWorkerStats) -> WorkerStatsSnapshot {
         cache_hits: stats.already_known,
         cache_misses: stats.queued,
         breaker_open: stats.breaker_open,
-        endpoints_total: 0,
-        endpoints_healthy: 0,
+        ..Default::default()
+    }
+}
+
+/// `predictions::VenueWorkerStats` as the metrics see it.
+pub fn venue_stats_snapshot(
+    stats: &VenueWorkerStats,
+) -> WorkerStatsSnapshot {
+    WorkerStatsSnapshot {
+        queue_depth: stats.queue_depth as u64,
+        resolved: stats.resolved,
+        negative: stats.negative,
+        dropped: stats.dropped,
+        inserted: stats.inserted,
+        insert_failures: stats.insert_failures,
+        rpc_failures: stats.rpc_failures,
+        backfill_found: stats.backfill_found,
+        backfill_failures: stats.backfill_failures,
+        cache_hits: stats.already_known,
+        cache_misses: stats.queued,
+        breaker_open: stats.breaker_open,
+        ..Default::default()
     }
 }
 
@@ -310,6 +498,7 @@ pub fn pool_stats_snapshot(stats: &PoolWorkerStats) -> WorkerStatsSnapshot {
 pub struct WorkerOptions {
     pub tokens: TokenWorkerOptions,
     pub pools: PoolWorkerOptions,
+    pub venues: VenueWorkerOptions,
 }
 
 /// Handles of the background workers.
@@ -318,6 +507,8 @@ pub struct Workers {
     tokens_task: JoinHandle<()>,
     /// `None` with `--no-dex`.
     pools: Option<(PoolWorker, JoinHandle<()>)>,
+    /// `None` with `--no-predictions`.
+    venues: Option<(VenueWorker, JoinHandle<()>)>,
     stats_task: JoinHandle<()>,
 }
 
@@ -332,7 +523,8 @@ impl Workers {
         metrics: Metrics,
         options: WorkerOptions,
     ) -> Result<Self> {
-        let store = Arc::new(ClickhouseWorkerStore::new(db.clone(), enabled.dex));
+        let store =
+            Arc::new(ClickhouseWorkerStore::new(db.clone(), enabled.dex));
 
         if caller.is_none() {
             info!(
@@ -363,9 +555,20 @@ impl Workers {
             (worker, task)
         });
 
+        let venues = enabled.predictions.then(|| {
+            VenueWorker::spawn(
+                db.chain_id,
+                caller.clone(),
+                store.clone(),
+                Some(store.clone()),
+                options.venues,
+            )
+        });
+
         let stats_task = {
             let tokens = tokens.clone();
             let pools = pools.as_ref().map(|(worker, _)| worker.clone());
+            let venues = venues.as_ref().map(|(worker, _)| worker.clone());
             let rpc = caller.is_some();
 
             tokio::spawn(async move {
@@ -377,18 +580,24 @@ impl Workers {
                 let mut tick = tokio::time::interval(STATS_INTERVAL);
                 loop {
                     tick.tick().await;
-                    metrics
-                        .set_token_stats(token_stats_snapshot(&tokens.stats()));
+                    metrics.set_token_stats(token_stats_snapshot(
+                        &tokens.stats(),
+                    ));
                     if let Some(pools) = &pools {
                         metrics.set_pool_stats(pool_stats_snapshot(
                             &pools.stats(),
+                        ));
+                    }
+                    if let Some(venues) = &venues {
+                        metrics.set_venue_stats(venue_stats_snapshot(
+                            &venues.stats(),
                         ));
                     }
                 }
             })
         };
 
-        Ok(Self { tokens, tokens_task, pools, stats_task })
+        Ok(Self { tokens, tokens_task, pools, venues, stats_task })
     }
 
     /// Cheap handle for the code that discovers (the sync loop, the sink).
@@ -396,6 +605,7 @@ impl Workers {
         Discovery {
             tokens: self.tokens.clone(),
             pools: self.pools.as_ref().map(|(worker, _)| worker.clone()),
+            venues: self.venues.as_ref().map(|(worker, _)| worker.clone()),
         }
     }
 
@@ -423,6 +633,13 @@ impl Workers {
                 warn!("Pool worker task ended abnormally: {e}");
             }
         }
+
+        if let Some((worker, task)) = self.venues {
+            worker.shutdown().await;
+            if let Err(e) = task.await {
+                warn!("Venue worker task ended abnormally: {e}");
+            }
+        }
     }
 }
 
@@ -433,6 +650,7 @@ impl Workers {
 pub struct Discovery {
     tokens: TokenWorker,
     pools: Option<PoolWorker>,
+    venues: Option<VenueWorker>,
 }
 
 impl Discovery {
@@ -443,18 +661,27 @@ impl Discovery {
         }
     }
 
-    /// Module rows that were just stored: pools that traded without a
-    /// creation event in the batch go to the pool resolver, pools created
-    /// in it are marked as known.
-    pub fn stored(&self, modules: &ModuleRows) {
-        let Some(pools) = &self.pools else { return };
+    /// Highest block handed to the writer / the chain head: lets the RPC
+    /// layer reject nodes that are behind the indexer. One atomic store.
+    pub fn set_head(&self, block: u64) {
+        self.tokens.set_head(block);
+    }
 
-        if modules.dex.is_empty() {
-            return;
+    /// Module rows that were just stored: pools that traded go to the pool
+    /// resolver (creation events are forgeable, the contract is asked
+    /// either way); same for prediction market venues.
+    pub fn stored(&self, modules: &ModuleRows) {
+        if let Some(pools) = &self.pools {
+            if !modules.dex.is_empty() {
+                pools.discover(&modules.dex.pool_candidates());
+            }
         }
 
-        pools.mark_known(modules.dex.pools.iter().map(|pool| pool.pool_id));
-        pools.discover(&modules.dex.pool_candidates());
+        if let Some(venues) = &self.venues {
+            if !modules.predictions.is_empty() {
+                venues.discover(&modules.predictions.venue_candidates());
+            }
+        }
     }
 
     /// A purge adopted a new epoch: resolver rows written from now on
@@ -473,18 +700,34 @@ mod tests {
     #[test]
     fn token_backfill_never_reads_a_transfer_table() {
         for dex in [false, true] {
-            let sql = missing_tokens_sql(137, dex, 7, 500);
+            let sql = missing_tokens_sql(137, dex, None, 500);
 
             assert!(sql.contains("FROM seen_tokens WHERE chain = 137"));
             assert!(sql.contains("FROM tokens WHERE chain = 137"));
-            assert!(sql.contains("LIMIT 500"));
-            assert!(sql.contains("cityHash64(address, 7)"));
+            assert!(sql.contains("ORDER BY address ASC LIMIT 500"));
             assert_eq!(sql.contains("dex_pools_by_token"), dex);
 
             for big in ["erc20_transfers", "erc721_transfers", "logs"] {
                 assert!(!sql.contains(big), "{big}: {sql}");
             }
         }
+    }
+
+    #[test]
+    fn token_listings_are_paged_by_address() {
+        let after = Address::repeat_byte(0xab);
+        let cursor = format!("> unhex('{}')", "ab".repeat(20));
+
+        let sql = missing_tokens_sql(1, true, Some(after), 10);
+        assert_eq!(sql.matches(&format!("address {cursor}")).count(), 2);
+        assert_eq!(sql.matches(&format!("token {cursor}")).count(), 1);
+
+        let sql = blank_tokens_sql(1, Some(after), 10, 1_700_000_000_000);
+        assert!(sql.contains(&format!("address {cursor}")));
+        assert!(sql.contains("FROM tokens FINAL"));
+        assert!(sql.contains("name = '' AND symbol = '' AND decimals = 0"));
+        assert!(sql.contains("_version < 1700000000000"));
+        assert!(sql.contains("ORDER BY address ASC LIMIT 10"));
     }
 
     #[test]
