@@ -981,6 +981,12 @@ not "all of history". History is fetched only where consistency needs it.
   have those adapters in `prediction_trusted`. This is the module's existing trust model,
   not a new rule, and `src/predictions/README.md` says so where it matters.
 
+- **Everything that reads a range starts at the floor.** With no explicit start, `indexer verify`, `indexer backfill`, the gap heal and
+  the `--new-blocks-only` cursor all begin at the stored floor, never at 0: blocks below the floor are absent on purpose and are
+  not a gap. The floor's own (partial) day IS cross-checked, because nothing is stored below the floor so both sides count the same
+  rows. An explicit start below the floor is honoured and the report names the floor. `verify` exits 0 on a healthy floor-to-head
+  database (found by the live release run, 2026-09-19).
+
 ## 17. Decisions log
 
 Every question that was closed, with the date, what was decided, why, and what

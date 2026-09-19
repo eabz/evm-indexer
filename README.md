@@ -343,7 +343,8 @@ Note that `--chain`, and every `--admin-*` flag, have **no environment variable*
 |------|----------------------|---------|-------------|
 | `--chain` | `CHAIN_ID` | `1` | Chain to verify: a chain id, or `solana` |
 | `--database` | `DATABASE_URL` | *required* | |
-| `--start-block` | `START_BLOCK` | `0` | First block to verify. On Solana, a slot |
+| `--start-block` | `START_BLOCK` | *unset* | First block to verify. Not given = the chain's coverage floor, so a healthy database verifies clean. A value below the floor is honoured and the report names the floor. On Solana, a slot |
+| `--start-date` | `START_DATE` | *unset* | The same as a `YYYY-MM-DD` UTC day (EVM only). Mutually exclusive with `--start-block` |
 | `--end-block` | `END_BLOCK` | `0` | Block to stop at, exclusive. `0` verifies up to the highest indexed block |
 | `--debug` | `DEBUG` | `false` | Enable debug logging |
 
@@ -354,7 +355,7 @@ Note that `--chain`, and every `--admin-*` flag, have **no environment variable*
 | `--module` | | *required* | `dex`, `predictions` or `launchpads` |
 | `--chain` | `CHAIN_ID` | `1` | Chain to backfill: a chain id, or `solana` |
 | `--database` | `DATABASE_URL` | *required* | |
-| `--from-block` (alias `--start-block`) | | `0` | First block to re-decode. Below the chain's coverage floor this lowers the floor too, but only after a check that every block in between really is stored and gap-free |
+| `--from-block` (alias `--start-block`) | | *unset* | First block to re-decode. Not given = the chain's coverage floor. Below the chain's coverage floor this lowers the floor too, but only after a check that every block in between really is stored and gap-free |
 | `--from-date` (alias `--start-date`) | | *unset* | The same as a `YYYY-MM-DD` UTC day. Mutually exclusive with `--from-block` |
 | `--registry-only` | | `false` | Prediction markets only: fetch the metadata and the settlement events of markets created below the coverage floor, from the module's own trusted addresses. No trades are stored outside the covered window |
 | `--to-block` | | `0` | Block to stop at, exclusive. `0` = up to the highest indexed block |
