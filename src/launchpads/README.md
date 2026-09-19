@@ -226,8 +226,16 @@ screen and the creator screen), `launchpad_creator_fees_1d` per
 
 **`emitter` is in every aggregate key on purpose.** It is the only thing a
 reader can still use after aggregation to keep a forger's rows out. A
-rebuild is month-chunked (`derived::rebuild_statements`) because one INSERT
-spanning more than 100 monthly partitions is refused by ClickHouse.
+rebuild is month-chunked
+(`derived::rebuild_statements(table, chain, from_ts, to_ts, epoch, purged)`)
+because one INSERT spanning more than 100 monthly partitions is refused by
+ClickHouse. `to_ts` is `reorgs.to_ts`, the exclusive end of the repaired
+window (never `u32::MAX`). `purged` is the BLOCK range the purge is
+removing, `(from, None)` when it is open ended, and the statement excludes
+it itself: **a rebuild never depends on seeing the tombstones**
+(docs/design.md §2, "No read-your-writes"). The canonical rows of that
+range add themselves through the materialized view when they are written
+again.
 
 ### 2.3 No background resolver
 

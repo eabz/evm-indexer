@@ -63,6 +63,17 @@ const GRADUATION_BLOCK: u64 = 66_679_555;
 /// The graduation threshold of that curve, in wei of the native coin.
 const THRESHOLD: f64 = 4.2e18;
 
+/// How long a read is given to catch up with an acknowledged INSERT.
+///
+/// ClickHouse 25.12 has no read-your-writes: measured on this build, 3 %
+/// of the reads issued right after an acknowledged INSERT miss the new
+/// part, and they heal within milliseconds (docs/design.md §2, "No
+/// read-your-writes").
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Between two attempts of a settling read.
+const RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
 struct TestDb {
     admin: Client,
     client: Client,
@@ -167,7 +178,9 @@ impl TestDb {
         .await
     }
 
-    async fn write<T>(&self, table: &str, rows: &[T])
+    /// Inserts `rows`, which all carry `_version = version`, and does not
+    /// return before they can be read back ([`Self::await_part`]).
+    async fn write<T>(&self, table: &str, rows: &[T], version: u64)
     where
         T: Serialize,
         for<'a> T: Row<Value<'a> = T>,
@@ -184,16 +197,80 @@ impl TestDb {
             insert.write(row).await.unwrap();
         }
         insert.end().await.unwrap();
+
+        self.await_part(table, version).await;
     }
 
+    /// Waits until the rows `version` just wrote into `table` are readable.
+    ///
+    /// ClickHouse 25.12 has no read-your-writes ([`SETTLE`]), so a read
+    /// issued right after an acknowledged INSERT can miss the new part for
+    /// a few milliseconds. ONE row at that version is the whole signal: a
+    /// batch is one part and a part becomes readable as a whole.
+    ///
+    /// The two things that do not work: waiting for the number of rows
+    /// WRITTEN (rows sharing a sorting key collapse inside the part), and
+    /// waiting for `count()` to GROW (ClickHouse deduplicates an insert
+    /// block identical to a recent one, so re-inserting the same rows
+    /// stores nothing although the data is there).
+    async fn await_part(&self, table: &str, version: u64) {
+        let sql = format!(
+            "SELECT count() FROM {table} WHERE _version = {version}"
+        );
+        self.await_rows(&sql, 1).await;
+    }
+
+    /// Waits until the single number `sql` answers is at least `expected`.
+    async fn await_rows(&self, sql: &str, expected: u64) {
+        let started = std::time::Instant::now();
+
+        loop {
+            let seen = self.count(sql).await;
+            if seen >= expected {
+                return;
+            }
+            assert!(
+                started.elapsed() < SETTLE,
+                "`{sql}` never reached {expected} (last {seen})"
+            );
+            tokio::time::sleep(RETRY).await;
+        }
+    }
+
+    /// In `INSERT_ORDER`, like the pipeline. Every row of a batch carries
+    /// the same `_version`, which is what each table is then waited for.
     async fn store(&self, rows: &LaunchpadRows) {
-        self.write("launchpad_tokens", &rows.tokens).await;
-        self.write("launchpad_trades", &rows.trades).await;
-        self.write("launchpad_graduations", &rows.graduations).await;
-        self.write("launchpad_creator_fees", &rows.creator_fees).await;
+        let at = |version: Option<u64>| version.unwrap_or_default();
+
+        self.write(
+            "launchpad_tokens",
+            &rows.tokens,
+            at(rows.tokens.first().map(|row| row._version)),
+        )
+        .await;
+        self.write(
+            "launchpad_trades",
+            &rows.trades,
+            at(rows.trades.first().map(|row| row._version)),
+        )
+        .await;
+        self.write(
+            "launchpad_graduations",
+            &rows.graduations,
+            at(rows.graduations.first().map(|row| row._version)),
+        )
+        .await;
+        self.write(
+            "launchpad_creator_fees",
+            &rows.creator_fees,
+            at(rows.creator_fees.first().map(|row| row._version)),
+        )
+        .await;
     }
 
-    /// The operator data every headline view depends on.
+    /// The operator data every headline view depends on: an empty
+    /// `launchpad_trusted_emitters` means empty screens, so a test that
+    /// read one before this insert was readable would see nothing.
     async fn trust_the_real_venues(&self) {
         self.execute(&format!(
             "INSERT INTO launchpad_trusted_emitters \
@@ -207,6 +284,12 @@ impl TestDb {
             id_literal(FLAP_RH),
             id_literal(FLAP_BNB),
         ))
+        .await;
+
+        self.await_rows(
+            "SELECT count() FROM launchpad_trusted_emitters",
+            4,
+        )
         .await;
     }
 
@@ -393,7 +476,8 @@ async fn the_cookbook_runs_on_real_data() {
     let db = TestDb::create("cookbook").await;
     let rows = rows_of(fixtures::ALL, 1, 0);
     db.store(&rows).await;
-    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0)).await;
+    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0), 1)
+        .await;
     db.trust_the_real_venues().await;
     store_the_destination_pool(&db).await;
     db.execute(&format!(
@@ -647,10 +731,19 @@ async fn a_purge_and_a_rebuild_equal_a_clean_index() {
          {GRADUATION_BLOCK}, 12, 0, 'reorg')"
     ))
     .await;
+    // `(fork, None)`: the block range the purge above removed. The
+    // rebuild leaves it out by itself rather than trusting the tombstones
+    // to be readable already (docs/design.md §2, "No read-your-writes");
+    // the canonical tail below adds itself through the materialized view.
     for table in LAUNCHPADS_DERIVED {
-        for sql in
-            rebuild_statements(table, CHAIN, from_ts, 1_790_000_000, epoch)
-        {
+        for sql in rebuild_statements(
+            table,
+            CHAIN,
+            from_ts,
+            1_790_000_000,
+            epoch,
+            (fork, None),
+        ) {
             db.execute(&sql).await;
         }
     }
@@ -879,7 +972,8 @@ async fn a_forged_venue_moves_no_headline_number() {
 async fn a_forged_curve_moves_no_token_page_number() {
     let db = TestDb::create("tokenpage").await;
     db.store(&rows_of(fixtures::ALL, 1, 0)).await;
-    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0)).await;
+    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0), 1)
+        .await;
     db.trust_the_real_venues().await;
 
     let token = id_hex(TOKEN);
@@ -1312,7 +1406,8 @@ async fn a_forged_launch_moves_no_creator_page_number() {
 async fn an_empty_or_wrong_length_id_parameter_matches_nothing() {
     let db = TestDb::create("emptyid").await;
     db.store(&rows_of(fixtures::ALL, 1, 0)).await;
-    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0)).await;
+    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0), 1)
+        .await;
     db.trust_the_real_venues().await;
 
     // A curve trade whose token leg stayed unverified and whose family
