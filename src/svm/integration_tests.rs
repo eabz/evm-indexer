@@ -243,7 +243,13 @@ async fn the_migrations_apply_on_top_of_every_other_module() {
         // rather than something Solana does differently.
     }
 
-    // The chain registry knows how a Solana id should be printed.
+    // The chain registry knows how a Solana id should be printed. Migrations
+    // carry no seed rows: the indexer registers its chain at startup.
+    db.client()
+        .query(crate::svm::REGISTER_CHAIN_SQL)
+        .execute()
+        .await
+        .expect("register the chain");
     let family = db
         .scalar(&format!(
             "SELECT family FROM chains FINAL WHERE chain = {CHAIN}"

@@ -104,19 +104,7 @@ SETTINGS do_not_merge_across_partitions_select_final = 1;
 -- outside any plausible EIP-155 allocation. This table is what makes the
 -- choice reversible.
 --
--- TODO(merge): `dex-neutral` owns migration 0006_chains.sql per design §13.
--- If that lands first, delete this CREATE and keep only the INSERT.
-CREATE TABLE IF NOT EXISTS chains (
-  chain UInt64,
-  name LowCardinality(String),
-  family LowCardinality(String),
-  id_source LowCardinality(String),
-  _version UInt64 DEFAULT toUnixTimestamp64Milli(now64(3)),
-  is_deleted UInt8 DEFAULT 0
-)
-ENGINE = ReplacingMergeTree(_version, is_deleted)
-ORDER BY chain
-SETTINGS index_granularity = 8192;
-
-INSERT INTO chains (chain, name, family, id_source) VALUES
-  (1399811149, 'solana', 'svm', 'internal');
+-- The `chains` registry itself is created by migration 0006_chains.sql.
+-- Migrations carry no seed rows (they must be replayable): the indexer
+-- registers its chain at startup - `indexer run --chain solana` writes
+-- (1399811149, 'solana', 'svm') - so nothing is inserted here.

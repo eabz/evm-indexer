@@ -210,3 +210,9 @@ pub fn decode(chain: u64, batches: &[SvmSlotBatch]) -> SvmRows {
 
     rows
 }
+
+/// Registers Solana in the `chains` registry (migration 0006). Run once at
+/// startup by `indexer run --chain solana`; idempotent (`chains` is a
+/// ReplacingMergeTree keyed by `chain`). Migrations carry no seed rows.
+pub const REGISTER_CHAIN_SQL: &str =
+    "INSERT INTO chains (chain, name, family) VALUES (1399811149, 'solana', 'svm')";

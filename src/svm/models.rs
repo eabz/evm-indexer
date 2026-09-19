@@ -48,7 +48,7 @@ pub const ZERO_PUBKEY: Pubkey = [0u8; 32];
 /// No standard integer chain id for Solana exists. This is the Hyperlane
 /// domain id, adopted because real bridge infrastructure already uses it for
 /// exactly this purpose and it is far outside any plausible EIP-155
-/// allocation. Recorded in the `chains` table with `id_source = 'internal'`;
+/// allocation. Recorded in the `chains` registry (migration 0006) at startup;
 /// nothing outside that table may hard-code it.
 pub const SOLANA_CHAIN: u64 = 1_399_811_149;
 
