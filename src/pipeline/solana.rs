@@ -539,6 +539,23 @@ pub fn check_flags(config: &Config) -> Result<()> {
         );
     }
 
+    // REFUSED: there is nothing to resolve a date against. A slot is not a
+    // block and carries no timestamp of its own, so the binary search that
+    // turns a date into a block on EVM (src/coverage/resolve.rs) has
+    // nothing to bisect here. Rounding a date to a slot by arithmetic
+    // would be a guess, and the coverage floor it wrote would be wrong for
+    // ever.
+    if config.start_date.is_some() {
+        bail!(
+            "--start-date does not work on Solana. A slot carries no \
+             timestamp, so there is nothing to resolve a date against, and \
+             this indexer will not guess one into a coverage floor it can \
+             never move later. Use --start-block <slot> (the first slot \
+             Envio serves is {FIRST_SERVED_SLOT}, 2026-01-03), or \
+             --new-blocks-only to start at the head, which is the default."
+        );
+    }
+
     // REFUSED: a start below the served history can never be satisfied,
     // and the server's answer to it (empty, `next_slot` not advancing) is
     // indistinguishable from "caught up" unless it is caught here.
@@ -964,11 +981,47 @@ pub async fn run_with<S: SlotSource>(
         Arc::new(metrics.clone()) as Arc<dyn ReorgMetrics>,
     );
 
-    let start_slot = if config.start_block == 0 {
-        FIRST_SERVED_SLOT
-    } else {
-        config.start_block
-    };
+    // The coverage floor (docs/design.md section 16). Solana's default is
+    // the HEAD, not a year of history: Envio serves Solana from 2026-01-03
+    // and the free tier is slow, so going back is an explicit choice. Like
+    // every other chain the floor is written once and never moves by
+    // itself afterwards.
+    //
+    // There is no binary search here because there is nothing to bisect: a
+    // slot is not a block, and `--start-date` is refused by `check_flags`
+    // rather than rounded to one (`coverage::slot_floor`).
+    let wanted = crate::coverage::Wanted::of(
+        config.start_block,
+        config.start_date,
+        config.new_blocks_only,
+        crate::coverage::Family::Svm,
+    );
+
+    let head = runtime.source.head().await.context(
+        "ask the source for the head to place the coverage floor",
+    )?;
+
+    let floor = crate::coverage::store::set_if_absent(
+        &db,
+        &lease.fence(),
+        crate::coverage::slot_floor(
+            head,
+            crate::coverage::date::now(),
+            wanted,
+        ),
+    )
+    .await
+    .context("establish the chain's coverage floor")?;
+
+    if let Some(warning) =
+        crate::coverage::store::disagreement(floor, &wanted)
+    {
+        warn!("Chain {chain}: {warning}");
+    }
+
+    // A stored floor below the first served slot cannot be honoured by this
+    // source, so the cursor still starts where Envio's history does.
+    let start_slot = floor.block.max(FIRST_SERVED_SLOT);
 
     // One HyperSync token serves every chain, and Envio meters the TOKEN:
     // a fleet passes one budget in and every Solana chain draws from it.

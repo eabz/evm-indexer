@@ -11,6 +11,7 @@
 //! 3. **Checkpoints**: a live checkpoint must never claim a missing block.
 
 use crate::{
+    coverage,
     db::{
         ranges::{
             checkpoints_sql, contiguous_until, subtract_ranges, BlockRange,
@@ -155,6 +156,11 @@ pub struct VerifyReport {
     /// way - tombstoned rows nothing has settled - is invisible there.
     pub heal_pending: bool,
     pub epoch: u32,
+    /// The one line an owner reads: what this database promises for this
+    /// chain (docs/design.md section 16). `None` when no coverage floor has
+    /// been stored yet, which is a database no `indexer run` has ever
+    /// started against.
+    pub coverage: Option<String>,
 }
 
 impl VerifyReport {
@@ -198,6 +204,12 @@ impl fmt::Display for VerifyReport {
             self.range.len(),
             self.epoch
         )?;
+
+        // The promise first: everything below is detail about whether it
+        // is being kept.
+        if let Some(coverage) = &self.coverage {
+            writeln!(f, "{coverage}")?;
+        }
 
         if self.gaps.is_empty() {
             writeln!(f, "Gaps: none.")?;
@@ -568,7 +580,55 @@ pub async fn verify(
         aggregate_parts_skipped,
         heal_pending,
         epoch: db.current_epoch().await?,
+        coverage: coverage_line(db).await,
     })
+}
+
+/// "gap-free from DATE (block N) to DATE (block M)", or what is missing
+/// (docs/design.md section 16).
+///
+/// Never fatal and never a reason to fail a verification: an older database
+/// may have no floor at all, and a sentence nobody can print is not a
+/// problem with the data.
+async fn coverage_line(db: &Database) -> Option<String> {
+    let coverage = match coverage::store::coverage(db).await {
+        Ok(coverage) => coverage?,
+        Err(e) => {
+            log::debug!("could not read the coverage of the chain: {e:#}");
+            return None;
+        }
+    };
+
+    // The date of the last covered block: one primary-key point read, and
+    // only when there IS a covered block to name.
+    let covered_to_date = if coverage.is_empty() {
+        None
+    } else {
+        block_date(db, coverage.covered_to_block.saturating_sub(1)).await
+    };
+
+    let stored_head = db.stored_head().await.ok().flatten();
+
+    Some(coverage::store::sentence(
+        &coverage,
+        covered_to_date.as_deref(),
+        stored_head,
+    ))
+}
+
+/// The UTC day one stored block was mined on. A point lookup on the
+/// primary key, so it costs nothing next to the rest of a verification.
+async fn block_date(db: &Database, number: u64) -> Option<String> {
+    let sql = format!(
+        "SELECT toUInt32(timestamp) FROM blocks FINAL \
+         WHERE chain = {} AND number = {number}",
+        db.chain_id
+    );
+
+    let timestamp = db.db.query(&sql).fetch_all::<u32>().await.ok()?;
+    let timestamp = timestamp.into_iter().next().filter(|ts| *ts > 0)?;
+
+    Some(coverage::date::format(i64::from(timestamp)))
 }
 
 /// `[first, last)`: the UTC days the verified range covers COMPLETELY.
@@ -703,7 +763,30 @@ mod tests {
             aggregate_parts_skipped: 0,
             heal_pending: false,
             epoch: 0,
+            coverage: None,
         }
+    }
+
+    /// The one line the owner is actually reading for
+    /// (docs/design.md section 16): it comes FIRST, before the detail.
+    #[test]
+    fn the_coverage_promise_is_the_first_thing_verify_prints() {
+        let mut with_floor = report();
+        with_floor.coverage = Some(
+            "Coverage: gap-free from 2024-03-01 (block 500) to 2025-09-19 \
+             (block 40000000)."
+                .to_string(),
+        );
+
+        let text = with_floor.to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("Coverage: gap-free from"), "{text}");
+        assert!(lines[2].starts_with("Gaps:"), "{text}");
+
+        // A database with no floor stored simply does not print the line,
+        // rather than printing an empty or invented one.
+        let quiet = report().to_string();
+        assert!(!quiet.contains("Coverage:"), "{quiet}");
     }
 
     #[test]

@@ -49,6 +49,7 @@ mod solana_acceptance;
 use crate::{
     configs::Config,
     core::{self, convert::hash_to_b256, RowBatch},
+    coverage,
     db::{
         ranges::{subtract_ranges, BlockRange, MissingRanges},
         Database,
@@ -402,7 +403,7 @@ pub async fn run(config: Config) -> Result<()> {
 
 /// [`run`] over explicit backends.
 pub async fn run_with<S: BlockSource>(
-    config: Config,
+    mut config: Config,
     runtime: Runtime<S>,
 ) -> Result<()> {
     // The fleet hands its own handle in, already labelled with this chain,
@@ -465,6 +466,37 @@ pub async fn run_with<S: BlockSource>(
         if runtime.caller.is_some() { "on" } else { "off (--rpc none)" },
         // MODULE: one placeholder and one arm in the line above.
     );
+
+    // The coverage floor (docs/design.md section 16). Decided once, on
+    // this chain's first start, and from then on a fact about the data:
+    // this is where `--start-block` / `--start-date` stop being settings
+    // and start being history. After the lease on purpose - one process
+    // per chain is what makes "the first writer wins" a statement about
+    // two starts rather than about two threads - and before anything reads
+    // `config.start_block`, which it overwrites.
+    //
+    // `--new-blocks-only` keeps its own meaning further down (the cursor
+    // starts at the head); the floor it sets is the head too, so the two
+    // agree about what this database promises.
+    let floor = coverage::establish(
+        &db,
+        &lease.fence(),
+        &*runtime.canonical,
+        runtime.source.head().await.context(
+            "ask the source for the chain head to place the coverage floor",
+        )?,
+        coverage::date::now(),
+        coverage::Wanted::of(
+            config.start_block,
+            config.start_date,
+            config.new_blocks_only,
+            coverage::Family::Evm,
+        ),
+    )
+    .await
+    .context("establish the chain's coverage floor")?;
+
+    config.start_block = floor.block;
 
     // Checkpoints say where a previous run got to; `blocks` stays the
     // truth: the first pass verifies the whole range with the gap query.

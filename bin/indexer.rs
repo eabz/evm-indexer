@@ -121,6 +121,22 @@ async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
     let db = Database::new(&config.database_url, config.chain_id).await?;
 
     let consistent = if is_solana(config.chain_id) {
+        // The coverage promise, in the same words as everywhere else
+        // (docs/design.md section 16). Printed here rather than inside the
+        // Solana report because slots have no timestamps to date the head
+        // with, so the line is the floor and the tiled head and nothing
+        // that would need a second query.
+        if let Ok(Some(coverage)) =
+            evm_indexer::coverage::store::coverage(&db).await
+        {
+            println!(
+                "{}",
+                evm_indexer::coverage::store::sentence(
+                    &coverage, None, None
+                )
+            );
+        }
+
         let report = pipeline::solana::verify(
             &db,
             config.start_block,

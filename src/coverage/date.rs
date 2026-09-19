@@ -113,6 +113,16 @@ pub fn start_of_day(timestamp: i64) -> i64 {
     timestamp.div_euclid(SECONDS_PER_DAY) * SECONDS_PER_DAY
 }
 
+/// Unix seconds, now.
+///
+/// A clock before 1970 is a broken machine, not a date, so it reads as 0
+/// rather than as a negative number that would resolve to genesis.
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
+}
+
 /// `YYYY-MM-DD` of a unix timestamp, for a log line or a web page.
 pub fn format(timestamp: i64) -> String {
     Date::of(timestamp).to_string()

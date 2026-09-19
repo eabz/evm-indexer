@@ -207,17 +207,15 @@ async fn highest(
         format!("read the headers of [{from}, {head})")
     })?;
 
-    headers
-        .into_iter()
-        .filter(|header| header.timestamp > 0)
-        .next_back()
-        .with_context(|| {
+    headers.into_iter().rfind(|header| header.timestamp > 0).with_context(
+        || {
             format!(
                 "the source served no block header in [{from}, {head}), \
                  although it reports a height of {head}. Give \
                  --start-block instead."
             )
-        })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -298,7 +296,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(found.block, 12_345_679);
-        assert!(i64::from(found.timestamp) >= wanted + 1);
+        assert!(i64::from(found.timestamp) > wanted);
     }
 
     /// The whole reason this is a binary search: the owner pays for it
