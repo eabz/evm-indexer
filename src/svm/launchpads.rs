@@ -1466,11 +1466,12 @@ fn decode_dbc_trade(
         rows.diagnostics.trade_unverified += 1;
     }
 
-    let (token_amount, quote_amount) = if is_buy {
-        (event.output_amount, event.included_fee_input_amount)
-    } else {
-        (event.included_fee_input_amount, event.output_amount)
-    };
+    let (token_amount, quote_amount) = legs(
+        swap,
+        is_buy,
+        event.included_fee_input_amount,
+        event.output_amount,
+    );
 
     let graduating = events_of(tx, instruction).any(|event| {
         event.data.get(8..16) == Some(&DISC_DBC_CURVE_COMPLETE[..])
@@ -1494,8 +1495,8 @@ fn decode_dbc_trade(
         // available answer and the row says so by putting it in both.
         trader: position.tx.fee_payer,
         caller: position.tx.fee_payer,
-        token_amount: U256::from(token_amount),
-        quote_amount: U256::from(quote_amount),
+        token_amount,
+        quote_amount,
         fee_amount: U256::from(event.total_fee()),
         tax_amount: U256::ZERO,
         // DBC is the one family that states its own progress: the event
@@ -1766,11 +1767,8 @@ fn decode_launchlab_trade(
         rows.diagnostics.trade_unverified += 1;
     }
 
-    let (token_amount, quote_amount) = if is_buy {
-        (event.amount_out, event.amount_in)
-    } else {
-        (event.amount_in, event.amount_out)
-    };
+    let (token_amount, quote_amount) =
+        legs(swap, is_buy, event.amount_in, event.amount_out);
 
     rows.trades.push(SolLaunchpadTrade {
         chain: position.chain,
@@ -1788,8 +1786,8 @@ fn decode_launchlab_trade(
         side: if is_buy { SIDE_BUY } else { SIDE_SELL }.to_owned(),
         trader: position.tx.fee_payer,
         caller: position.tx.fee_payer,
-        token_amount: U256::from(token_amount),
-        quote_amount: U256::from(quote_amount),
+        token_amount,
+        quote_amount,
         fee_amount: U256::from(event.total_fee()),
         tax_amount: U256::ZERO,
         progress_wad: U256::ZERO,
@@ -1804,6 +1802,33 @@ fn decode_launchlab_trade(
         epoch: 0,
         _version: 0,
     });
+}
+
+/// The `(token_amount, quote_amount)` of a curve trade.
+///
+/// Prefers the SWAP row, which holds what was actually SENT, over the
+/// event's own figures, which some venues report net of a fee the taker
+/// never saw. Raydium LaunchLab's `TradeEvent` states the amount the pool
+/// was CREDITED, so on a Token-2022 mint it is 1-3% below the transfer the
+/// taker signed - and a trade screen has to show what the trader parted
+/// with. It also keeps `launchpad_trades` and `sol_dex_swaps` reporting
+/// the same number for the same trade, which is what a UI joining them
+/// expects.
+///
+/// Falls back to the event where the movement layer produced no row.
+fn legs(
+    swap: Option<&SvmSwap>,
+    is_buy: bool,
+    event_in: u64,
+    event_out: u64,
+) -> (U256, U256) {
+    match swap {
+        // A buy takes the quote in and pays the token out.
+        Some(swap) if is_buy => (swap.amount_out_gross, swap.amount_in),
+        Some(swap) => (swap.amount_in, swap.amount_out_gross),
+        None if is_buy => (U256::from(event_out), U256::from(event_in)),
+        None => (U256::from(event_in), U256::from(event_out)),
+    }
 }
 
 /// A leg is VERIFIED when the movement layer's swap row at this ordinal

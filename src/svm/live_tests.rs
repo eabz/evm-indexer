@@ -1396,6 +1396,327 @@ async fn live_swaps_match_the_public_rpc() {
     }
 }
 
+/// Every account the RPC lists for a transaction, as base58.
+fn account_keys(result: &Value) -> Vec<String> {
+    result["transaction"]["message"]["accountKeys"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|key| {
+            key.get("pubkey")
+                .and_then(|v| v.as_str())
+                .or_else(|| key.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The raw instruction data of every instruction the RPC did NOT parse,
+/// decoded from its base58.
+///
+/// This is the second independent witness for a value that is an
+/// instruction ARGUMENT rather than an account - pump.fun's `create` takes
+/// its `creator` that way, so the wallet credited with a launch need never
+/// sign or even appear in the account list. The bytes here are the RPC's,
+/// not HyperSync's, so finding a pubkey in them proves the two servers
+/// agree about what the transaction contained.
+fn raw_instruction_data(result: &Value) -> Vec<Vec<u8>> {
+    fn collect(instructions: &Value, out: &mut Vec<Vec<u8>>) {
+        for instruction in instructions.as_array().into_iter().flatten() {
+            let Some(data) =
+                instruction.get("data").and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            if let Ok(bytes) = bs58::decode(data).into_vec() {
+                out.push(bytes);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    collect(&result["transaction"]["message"]["instructions"], &mut out);
+    for group in result["meta"]["innerInstructions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        collect(&group["instructions"], &mut out);
+    }
+    out
+}
+
+/// Every mint the RPC's own token-balance metadata names.
+fn mints_of(meta: &Value) -> std::collections::HashSet<String> {
+    ["preTokenBalances", "postTokenBalances"]
+        .into_iter()
+        .flat_map(|key| {
+            meta.get(key).and_then(|v| v.as_array()).into_iter().flatten()
+        })
+        .filter_map(|entry| {
+            entry.get("mint").and_then(|v| v.as_str()).map(str::to_owned)
+        })
+        .collect()
+}
+
+/// (iii) LAUNCHES and CURVE TRADES must match the public RPC exactly.
+///
+/// The counterpart of `live_swaps_match_the_public_rpc`, for the launchpad
+/// tables. Nothing here comes from HyperSync: every value is recomputed
+/// from the RPC's own `getTransaction` - its account list, its
+/// `jsonParsed` transfer instructions and its balance metadata - which is
+/// a different server, a different wire format and a different parser.
+///
+/// # What is asserted, and why these particular equalities
+///
+/// A launch:
+/// 1. the mint the launch names is a real account of that transaction AND
+///    the RPC's own token metadata names it, so it is a mint and not any
+///    other account;
+/// 2. the CURVE is an account of the transaction, and re-derives as the
+///    program's PDA of that mint - the forgery-proof part;
+/// 3. the creator is an account of the transaction;
+/// 4. `tx_from` is the fee payer, which the RPC puts first.
+///
+/// A curve trade:
+/// 5. the traded token is one the RPC's balance metadata names;
+/// 6. a real SPL transfer of EXACTLY `token_amount` happened, as the RPC's
+///    own parser reads it. This is a SENDER-side equality on purpose: a
+///    Token-2022 transfer fee comes out of what the receiver is credited,
+///    never out of what the sender is debited, so it needs no tolerance;
+/// 7. on a SOL curve the quote leg is the curve's own lamport delta, to
+///    the unit - the leg that has no instruction at all.
+#[tokio::test]
+#[ignore]
+async fn live_launchpads_match_the_public_rpc() {
+    use crate::svm::launchpads::SolFamily;
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+    /// Launches and curve trades to cross-check.
+    const LAUNCHES: usize = 15;
+    const TRADES: usize = 30;
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+    let mut cursor = head - HEAD_MARGIN - 250;
+    let end = cursor + 250;
+
+    let mut rows = svm::SvmRows::default();
+    while cursor < end {
+        let batch = source.fetch(cursor, end).await.expect("fetch");
+        assert!(batch.next_slot > cursor, "no progress at {cursor}");
+        let mut decoded = svm::decode(SOLANA_CHAIN, &batch.batches);
+        rows.append(&mut decoded);
+        cursor = batch.next_slot;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let wsol = to_base58(&crate::svm::programs::registry().wsol);
+
+    // --- launches ---------------------------------------------------
+    let mut checked_launches = 0usize;
+    let mut creators_in_data = 0usize;
+    let mut per_family: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unavailable = 0usize;
+
+    for launch in &rows.launchpads.tokens {
+        if checked_launches >= LAUNCHES {
+            break;
+        }
+        let signature = bs58::encode(&launch.tx_id).into_string();
+        let Some(result) = rpc_transaction(&client, &signature).await
+        else {
+            unavailable += 1;
+            continue;
+        };
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let keys = account_keys(&result);
+        let meta = result.get("meta").expect("meta");
+        let mints = mints_of(meta);
+        let token = to_base58(&launch.token);
+        let curve = to_base58(&launch.curve);
+
+        // (4) the fee payer.
+        assert_eq!(
+            keys.first().map(String::as_str),
+            Some(to_base58(&launch.tx_from).as_str()),
+            "{signature}: tx_from must be the fee payer"
+        );
+        // (1) the mint is a real account, and really is a mint.
+        assert!(
+            keys.contains(&token),
+            "{signature}: the launched mint {token} is not an account of \
+             its own launch transaction"
+        );
+        assert!(
+            mints.contains(&token),
+            "{signature}: the RPC's token metadata does not know {token} \
+             as a mint"
+        );
+        // (2) the curve is a real account, and is the program's PDA.
+        assert!(
+            keys.contains(&curve),
+            "{signature}: the curve {curve} is not an account of the launch"
+        );
+        let seeds: &[&[u8]] = match launch.family.as_str() {
+            "pumpfun" => &[b"bonding-curve", &launch.token],
+            "raydium_launchlab" => {
+                &[b"pool", &launch.token, &launch.quote_token]
+            }
+            // Meteora DBC sorts its two mints and mixes in the config, so
+            // the quote mint - which lives on the config account this
+            // pipeline does not read - is not available here.
+            _ => &[],
+        };
+        if !seeds.is_empty() {
+            let (derived, _) = crate::svm::pda::find_program_address(
+                seeds,
+                &launch.emitter,
+            )
+            .expect("a bump exists");
+            assert_eq!(
+                to_base58(&derived),
+                curve,
+                "{signature}: the curve is not the program's PDA of the \
+                 launch's own fields"
+            );
+        }
+        // (3) the creator. It is an instruction ARGUMENT, not an account -
+        //     pump.fun's `create` takes `creator: Pubkey` - so a launch can
+        //     credit a wallet that never signs and never appears in the
+        //     account list. The RPC's own raw instruction bytes are
+        //     therefore the witness, and finding the 32 bytes there proves
+        //     the two servers saw the same transaction.
+        if launch.creator != crate::svm::models::ZERO_PUBKEY {
+            let named = keys.contains(&to_base58(&launch.creator))
+                || raw_instruction_data(&result).iter().any(|data| {
+                    data.windows(32).any(|window| window == launch.creator)
+                });
+            assert!(
+                named,
+                "{signature}: the creator {} is in neither the account \
+                 list nor the RPC's own instruction bytes",
+                to_base58(&launch.creator)
+            );
+            creators_in_data += 1;
+        }
+
+        *per_family.entry(launch.family.clone()).or_insert(0) += 1;
+        checked_launches += 1;
+    }
+
+    // --- curve trades -------------------------------------------------
+    // One trade per transaction, so a per-transaction transfer list can be
+    // matched against one row without ambiguity.
+    let mut once: BTreeMap<(u64, u32), usize> = BTreeMap::new();
+    for trade in &rows.launchpads.trades {
+        *once.entry((trade.block_number, trade.tx_index)).or_insert(0) +=
+            1;
+    }
+
+    let mut checked_trades = 0usize;
+    let mut native_legs = 0usize;
+    let mut trades_per_family: BTreeMap<String, usize> = BTreeMap::new();
+
+    for trade in &rows.launchpads.trades {
+        if checked_trades >= TRADES {
+            break;
+        }
+        if once[&(trade.block_number, trade.tx_index)] != 1 {
+            continue;
+        }
+        if trade.token_verified != 1 {
+            continue;
+        }
+        let signature = bs58::encode(&trade.tx_id).into_string();
+        let Some(result) = rpc_transaction(&client, &signature).await
+        else {
+            unavailable += 1;
+            continue;
+        };
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let meta = result.get("meta").expect("meta");
+        let mints = mints_of(meta);
+        let token = to_base58(&trade.token);
+
+        // (5) the RPC knows the mint.
+        assert!(
+            mints.contains(&token),
+            "{signature}: the RPC's metadata does not name {token}"
+        );
+
+        // (6) a transfer of exactly this many token units happened.
+        let amount: i128 =
+            trade.token_amount.to_string().parse().expect("fits i128");
+        let transfers = transfer_amounts(&result);
+        assert!(
+            transfers.contains(&amount),
+            "{signature} ({}): the RPC shows no transfer of exactly \
+             {amount} {token}; it saw {transfers:?}",
+            trade.family
+        );
+
+        // (7) a SOL curve's quote leg is the curve's own lamport delta.
+        let quote = to_base58(&trade.quote_token);
+        if quote == wsol && trade.family == SolFamily::PumpFun.as_str() {
+            let curve = to_base58(&trade.emitter);
+            if let Some(delta) = lamport_delta(&result, &curve) {
+                let expected: i128 = trade
+                    .quote_amount
+                    .to_string()
+                    .parse()
+                    .expect("fits i128");
+                let signed =
+                    if trade.side == "buy" { expected } else { -expected };
+                assert_eq!(
+                    delta, signed,
+                    "{signature}: the curve's lamport delta is not the \
+                     quote leg the event reported"
+                );
+                native_legs += 1;
+            }
+        }
+
+        *trades_per_family.entry(trade.family.clone()).or_insert(0) += 1;
+        checked_trades += 1;
+    }
+
+    println!("\n=== launchpad cross-check against {RPC} ===");
+    println!(
+        "launches matched exactly: {checked_launches} ({creators_in_data} \
+         with their creator confirmed by the RPC's own bytes)"
+    );
+    for (family, count) in &per_family {
+        println!("  {family:<18} {count}");
+    }
+    println!("curve trades matched exactly: {checked_trades}");
+    for (family, count) in &trades_per_family {
+        println!("  {family:<18} {count}");
+    }
+    println!(
+        "  of those, {native_legs} had their SOL leg checked against the \
+         curve's own lamport delta"
+    );
+    println!("  {unavailable} the RPC could not serve");
+
+    assert!(
+        checked_launches >= LAUNCHES,
+        "wanted {LAUNCHES} launches cross-checked, got {checked_launches}"
+    );
+    assert!(
+        checked_trades >= TRADES,
+        "wanted {TRADES} curve trades cross-checked, got {checked_trades}"
+    );
+}
+
 /// The three tricky transactions of docs/solana-research.md are recorded
 /// fixtures and are asserted in `svm::tests`; this checks the RECORDING is
 /// still faithful to what the chain says, so a stale fixture cannot quietly
