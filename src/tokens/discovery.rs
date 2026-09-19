@@ -36,6 +36,9 @@ pub const CHAIN_REGISTRY_URL: &str = "https://chainid.network/chains.json";
 /// The `--rpc` value that turns discovery on.
 pub const AUTO: &str = "auto";
 
+/// `--rpc` value that disables every RPC backed feature.
+pub const NONE: &str = "none";
+
 /// Tunables of [`discover_with`] / [`build_caller_with`].
 #[derive(Debug, Clone)]
 pub struct DiscoveryOptions {
@@ -378,10 +381,13 @@ pub async fn discover_public_rpcs(
 /// The RPC backend for the `--rpc` argument, shared by the token worker
 /// and the DEX pool resolver:
 ///
-/// * `None` (or blank): `Ok(None)`, RPC features are disabled;
-/// * `"a,b,c"`: those endpoints with failover (blanks ignored);
+/// * `None` (or blank): the default, same as `"auto"` (docs/design.md
+///   section 4: DEX analytics are on by default and need token decimals);
 /// * `"auto"`: public endpoints discovered for `chain_id`, kept fresh in
-///   the background. May be mixed: `"https://mine,auto"`.
+///   the background. May be mixed: `"https://mine,auto"` (recommended for
+///   production: own endpoint first, public fallback);
+/// * `"a,b,c"`: those endpoints with failover (blanks ignored);
+/// * `"none"`: `Ok(None)`, RPC features are explicitly disabled.
 ///
 /// Errors are configuration mistakes only: an invalid URL, or every
 /// configured endpoint answering with another chain id. Endpoints that
@@ -416,7 +422,17 @@ pub async fn build_caller_with(
         .filter(|entry| !entry.is_empty())
         .collect();
 
-    if entries.is_empty() {
+    // Unset / blank is the default: discover public endpoints.
+    let entries = if entries.is_empty() { vec![AUTO] } else { entries };
+
+    if entries.iter().any(|e| e.eq_ignore_ascii_case(NONE)) {
+        if entries.len() > 1 {
+            bail!(
+                "`{NONE}` disables RPC features and cannot be combined with \
+                 other --rpc entries"
+            );
+        }
+        info!("RPC features disabled (--rpc {NONE}): no token or pool metadata");
         return Ok(None);
     }
 
@@ -849,9 +865,17 @@ mod tests {
             )
         };
 
-        assert!(build(None).await.unwrap().is_none());
-        assert!(build(Some("")).await.unwrap().is_none());
-        assert!(build(Some(" , ,")).await.unwrap().is_none());
+        // `none` is the only way to switch RPC features off.
+        assert!(build(Some("none")).await.unwrap().is_none());
+        assert!(build(Some(" NONE ")).await.unwrap().is_none());
+        assert_eq!(registry.fetches.load(Ordering::SeqCst), 0);
+        // ...and it cannot be combined with endpoints.
+        let error = build(Some("none,https://b.example.org"))
+            .await
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_default();
+        assert!(error.contains("cannot be combined"), "{error}");
 
         let caller = build(Some(
             " https://a.example.org/v2/KEY , ,https://b.example.org,\
@@ -878,6 +902,30 @@ mod tests {
                 .unwrap_or_default();
         assert!(error.contains("#2"), "{error}");
         assert!(!error.contains("KEY2"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unset_or_blank_rpc_argument_means_auto() {
+        for arg in [None, Some(""), Some(" , ,")] {
+            let internet = Arc::new(Internet::default());
+            let registry = FixtureRegistry::new(FIXTURE);
+            let caller = build_caller_with(
+                1,
+                arg,
+                CallerOptions::default(),
+                registry.clone(),
+                Some(internet.connector()),
+            )
+            .await
+            .unwrap();
+
+            // A caller exists and discovery ran, exactly as for "auto".
+            assert!(caller.is_some(), "{arg:?}");
+            assert!(
+                registry.fetches.load(Ordering::SeqCst) >= 1,
+                "{arg:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
