@@ -1001,14 +1001,36 @@ pub async fn run_with<S: SlotSource>(
         "ask the source for the head to place the coverage floor",
     )?;
 
-    let floor = crate::coverage::store::set_if_absent(
-        &db,
-        &lease.fence(),
-        crate::coverage::slot_floor(
+    // A database that was already indexing before floors existed keeps what
+    // it has: the default here is the HEAD, so without this an upgrade
+    // would promise nothing and stop healing everything below it
+    // (docs/design.md section 16).
+    let proposed = match crate::coverage::store::lowest_stored(&db).await?
+    {
+        Some(lowest) => {
+            warn!(
+                "Chain {chain}: this database already holds slots down to \
+                 {lowest}, so that is its coverage floor rather than the \
+                 head. Nothing is lost and nothing changes about what gets \
+                 indexed."
+            );
+            crate::coverage::store::Floor {
+                block: lowest,
+                timestamp: 0,
+                reason: crate::coverage::store::Reason::Existing,
+            }
+        }
+        None => crate::coverage::slot_floor(
             head,
             crate::coverage::date::now(),
             wanted,
         ),
+    };
+
+    let floor = crate::coverage::store::set_if_absent(
+        &db,
+        &lease.fence(),
+        proposed,
     )
     .await
     .context("establish the chain's coverage floor")?;
