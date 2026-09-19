@@ -293,6 +293,14 @@ form.login { max-width: 360px; margin: 10vh auto; }
     }
     card.appendChild(grid);
 
+    // What this chain PROMISES, as opposed to where it has got to
+    // (docs/design.md section 16). Read-only here, like the start block
+    // it comes from: the floor is a fact about the stored data and the
+    // panel is not allowed to move it.
+    if (chain.coverage) {
+      card.appendChild(text("div", "muted", chain.coverage));
+    }
+
     if (chain.retry_at_unix_ms) {
       var wait = Math.max(0, (chain.retry_at_unix_ms - Date.now()) / 1000);
       card.appendChild(text("div", "muted",

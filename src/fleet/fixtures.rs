@@ -205,6 +205,9 @@ impl ChainRunner for FakeRunner {
 pub struct MemoryStore {
     rows: Mutex<BTreeMap<u64, DesiredChain>>,
     foreign: Mutex<Vec<ForeignChain>>,
+    /// What each chain promises (docs/design.md section 16), as
+    /// `coverage_v` would answer it.
+    coverage: Mutex<BTreeMap<u64, String>>,
     /// Every write fails: the panel must still work.
     pub broken: std::sync::atomic::AtomicBool,
 }
@@ -232,6 +235,13 @@ impl MemoryStore {
     pub fn set_foreign(&self, chains: Vec<ForeignChain>) {
         *self.foreign.lock().unwrap_or_else(|e| e.into_inner()) = chains;
     }
+
+    pub fn set_coverage(&self, chain: u64, sentence: &str) {
+        self.coverage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chain, sentence.to_string());
+    }
 }
 
 impl DesiredStore for MemoryStore {
@@ -257,6 +267,19 @@ impl DesiredStore for MemoryStore {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(chain.chain, chain);
             Ok(())
+        })
+    }
+
+    fn coverage(&self) -> BoxFuture<'_, Result<BTreeMap<u64, String>>> {
+        Box::pin(async move {
+            if self.broken.load(Ordering::SeqCst) {
+                return Err(anyhow!("ClickHouse is down"));
+            }
+            Ok(self
+                .coverage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone())
         })
     }
 

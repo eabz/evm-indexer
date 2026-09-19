@@ -23,6 +23,7 @@ struct Panel {
     addr: SocketAddr,
     supervisor: Arc<Supervisor>,
     runner: Arc<FakeRunner>,
+    store: Arc<MemoryStore>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -83,7 +84,7 @@ impl Panel {
             Box::pin(std::future::pending()),
         ));
 
-        Self { addr, supervisor, runner, server }
+        Self { addr, supervisor, runner, store, server }
     }
 
     fn origin(&self) -> String {
@@ -1146,6 +1147,82 @@ async fn signing_out_ends_the_session_for_that_cookie() {
     )
     .await;
     assert_eq!(reply.status, 401);
+
+    panel.stop().await;
+}
+
+/// The coverage promise, per chain, on the page the owner actually looks
+/// at (docs/design.md section 16). It is the same sentence
+/// `indexer verify` prints, and it is READ-ONLY here: the floor is a fact
+/// about the stored data, and `start-block` / `start-date` are on the list
+/// of options a web page may never change.
+#[tokio::test]
+async fn the_panel_shows_what_each_chain_promises_and_can_not_change_it() {
+    let panel = Panel::start(&[1, 8453]).await;
+    panel.store.set_coverage(
+        1,
+        "Coverage: gap-free from 2024-09-19 (block 20779400) to block \
+         23400512.",
+    );
+    let cookie = sign_in(&panel).await;
+
+    let reply = request(
+        panel.addr,
+        "GET",
+        "/api/chains",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+
+    assert_eq!(reply.status, 200);
+    let body = reply.json();
+    let chains = body["chains"].as_array().unwrap();
+
+    let one =
+        chains.iter().find(|chain| chain["chain"] == 1).expect("chain 1");
+    assert!(
+        one["coverage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("gap-free from 2024-09-19"),
+        "{one}"
+    );
+
+    // A chain with no floor stored shows no sentence at all rather than an
+    // invented one.
+    let other = chains
+        .iter()
+        .find(|chain| chain["chain"] == 8453)
+        .expect("chain 8453");
+    assert!(other["coverage"].is_null(), "{other}");
+
+    // And the floor is not editable from here: the settings form does not
+    // offer it, and a PATCH that tries is refused by the same parser the
+    // command line uses.
+    let settings = body["settings"].as_array().unwrap();
+    assert!(
+        settings.iter().all(|setting| {
+            let name = setting["name"].as_str().unwrap_or_default();
+            name != "start-block" && name != "start-date"
+        }),
+        "the coverage floor is offered as a setting"
+    );
+
+    for attempt in [
+        "{\"settings\":{\"start-block\":\"1\"}}",
+        "{\"settings\":{\"start-date\":\"2020-01-01\"}}",
+    ] {
+        let reply = request(
+            panel.addr,
+            "PATCH",
+            "/api/chains/1",
+            &[("Cookie", cookie.as_str()), ("Origin", &panel.origin())],
+            Some(attempt),
+        )
+        .await;
+        assert_eq!(reply.status, 400, "{attempt} was accepted: {reply:?}");
+    }
 
     panel.stop().await;
 }

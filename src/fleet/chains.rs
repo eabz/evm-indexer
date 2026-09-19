@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use clickhouse::Row;
 use log::warn;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 /// One row of `fleet_chains`, as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +177,51 @@ pub async fn foreign(
         .fetch_all::<ForeignChain>()
         .await
         .context("look for chains indexed by another process")
+}
+
+/// What every chain in this database promises, in the one sentence
+/// `indexer verify` and the panel both use (docs/design.md section 16).
+///
+/// One query for the whole fleet: `coverage_v` is one row per chain, and
+/// the panel asks for every chain at once. A chain with no floor stored
+/// yet is simply absent from the map, and its card shows no coverage line
+/// rather than an invented one.
+///
+/// The head is named by its BLOCK and not by its date here. Dating it would
+/// be one point read per chain on every poll of the panel, for a number
+/// that is moving anyway; `indexer verify` is the place that spends that
+/// read.
+pub async fn coverage(db: &Database) -> Result<BTreeMap<u64, String>> {
+    let rows = db
+        .db
+        .query(
+            "SELECT chain, coverage_from_block, coverage_from_ts, reason, \
+             covered_to_block FROM coverage_v ORDER BY chain",
+        )
+        .fetch_all::<(u64, u64, u32, String, u64)>()
+        .await
+        .context("read what each chain promises (coverage_v)")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(chain, block, timestamp, reason, covered_to_block)| {
+            let coverage = crate::coverage::store::Coverage {
+                floor: crate::coverage::store::Floor {
+                    block,
+                    timestamp,
+                    reason: crate::coverage::store::Reason::parse(&reason)
+                        .unwrap_or(
+                            crate::coverage::store::Reason::StartBlock,
+                        ),
+                },
+                covered_to_block,
+            };
+            (
+                chain,
+                crate::coverage::store::sentence(&coverage, None, None),
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]

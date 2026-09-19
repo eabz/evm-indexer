@@ -279,6 +279,13 @@ impl DesiredStore for ClickhouseStore {
             chains::foreign(&self.db, self.lease_ttl_ms, &mine).await
         })
     }
+
+    fn coverage(
+        &self,
+    ) -> BoxFuture<'_, Result<std::collections::BTreeMap<u64, String>>>
+    {
+        Box::pin(chains::coverage(&self.db))
+    }
 }
 
 /// Logged once at start, so an operator who never opens the panel still

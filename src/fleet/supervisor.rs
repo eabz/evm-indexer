@@ -42,7 +42,7 @@ use crate::{
 };
 use anyhow::Result;
 use futures::future::BoxFuture;
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -126,6 +126,17 @@ pub trait DesiredStore: Send + Sync + 'static {
         &self,
         mine: Vec<u64>,
     ) -> BoxFuture<'_, Result<Vec<ForeignChain>>>;
+
+    /// What each chain promises, in the one sentence every surface uses
+    /// (docs/design.md section 16, `coverage::store::sentence`).
+    ///
+    /// Answered for every chain in the database at once, because
+    /// `coverage_v` is one row per chain and the panel wants them all. A
+    /// store that has no database - the tests' in-memory one - says
+    /// nothing, and the panel simply shows no coverage line.
+    fn coverage(&self) -> BoxFuture<'_, Result<BTreeMap<u64, String>>> {
+        Box::pin(async { Ok(BTreeMap::new()) })
+    }
 }
 
 struct Entry {
@@ -628,6 +639,16 @@ impl Supervisor {
     /// Every chain this process manages, plus the ones another process is
     /// indexing into the same database (read-only).
     pub async fn views(&self) -> Vec<ChainView> {
+        // One query for every chain in the database, before the per-chain
+        // work: the panel shows the promise next to the progress.
+        let coverage = match self.store.coverage().await {
+            Ok(coverage) => coverage,
+            Err(e) => {
+                debug!("Could not read the coverage of the chains: {e:#}");
+                BTreeMap::new()
+            }
+        };
+
         let mut views: Vec<ChainView> = self
             .lock()
             .iter()
@@ -639,6 +660,7 @@ impl Supervisor {
                 settings: redact_settings(&entry.settings),
                 live: entry.status.view(),
                 host: None,
+                coverage: coverage.get(chain).cloned(),
             })
             .collect();
 
@@ -658,6 +680,9 @@ impl Supervisor {
                         ..LiveView::default()
                     },
                     host: Some(other.host),
+                    // The promise is about the DATA, so it is the same
+                    // whoever is doing the indexing.
+                    coverage: coverage.get(&other.chain).cloned(),
                 }))
             }
             Err(e) => warn!(
@@ -891,6 +916,9 @@ pub struct ChainView {
     pub host: Option<String>,
     #[serde(flatten)]
     pub live: LiveView,
+    /// What this chain promises, in one sentence (docs/design.md section
+    /// 16). `None` on a database with no coverage floor stored yet.
+    pub coverage: Option<String>,
 }
 
 /// Why a panel command was refused. Every variant is safe to show a
