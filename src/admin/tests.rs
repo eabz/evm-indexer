@@ -53,6 +53,10 @@ impl Panel {
             Supervisor::new(settings, runner.clone(), store.clone());
         supervisor.load_and_start().await.unwrap();
 
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
         let mut admin = Admin {
             supervisor: supervisor.clone(),
             password: Password::new(PASSWORD).unwrap(),
@@ -61,13 +65,13 @@ impl Panel {
             secure_cookie: false,
             trust_forwarded_proto: false,
             trusted_proxy: None,
+            // The port is only known after the bind, and the allow-list is
+            // built from it exactly as `start` does.
+            hosts: AllowedHosts::new(addr, &[]),
             csp: page::content_security_policy(),
         };
         tweak(&mut admin);
 
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let app = router(Arc::new(admin));
 
         // The REAL accept loop, with its real limits: a test that spoke to
@@ -123,10 +127,21 @@ async fn request(
     extra: &[(&str, &str)],
     body: Option<&str>,
 ) -> Reply {
+    // Exactly ONE Host header: a test that wants to invent one supplies it
+    // in `extra`, and sending two would be ambiguous (and is refused).
+    let host = extra
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| (*value).to_string())
+        .unwrap_or_else(|| addr.to_string());
+
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n"
     );
     for (name, value) in extra {
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(body) = body {
@@ -569,6 +584,90 @@ async fn guessing_is_throttled_per_address() {
     assert_eq!(reply.status, 429, "{reply:?}");
     assert_eq!(reply.header("set-cookie"), None);
     assert!(reply.json()["retry_after_seconds"].as_u64().unwrap() > 0);
+
+    panel.stop().await;
+}
+
+// ------------------------------- MAJOR 3: which server is this, really
+
+/// The review's own reproduction: with `Host` and `Origin` both invented
+/// and agreeing, a state-changing request was accepted and a chain stopped.
+/// Both headers come from the client, so their agreeing said nothing.
+#[tokio::test]
+async fn a_request_for_a_host_we_do_not_answer_to_is_refused() {
+    let panel = Panel::start(&[8453]).await;
+    let cookie = sign_in(&panel).await;
+
+    until("indexing", || panel.runner.is_live(8453)).await;
+
+    let reply = request(
+        panel.addr,
+        "POST",
+        "/api/chains/8453/stop",
+        &[
+            ("Cookie", cookie.as_str()),
+            // A name that a DNS rebind pointed at 127.0.0.1. The browser
+            // believes it is same-origin, so it sends both of these.
+            ("Host", "panel.evil.example"),
+            ("Origin", "http://panel.evil.example"),
+        ],
+        None,
+    )
+    .await;
+
+    assert_eq!(reply.status, 421, "{reply:?}");
+    assert!(
+        panel.runner.is_live(8453),
+        "a rebound web page stopped a chain"
+    );
+
+    panel.stop().await;
+}
+
+/// 421 before routing means a foreign name gets NOTHING - not the page, not
+/// a login form, not an error that confirms what is listening.
+#[tokio::test]
+async fn a_foreign_host_reaches_no_route_at_all() {
+    let panel = Panel::start(&[1]).await;
+
+    for (method, path) in [
+        ("GET", "/"),
+        ("POST", "/api/login"),
+        ("GET", "/api/chains"),
+        ("GET", "/nothing-here"),
+    ] {
+        let reply = request(
+            panel.addr,
+            method,
+            path,
+            &[("Host", "evil.example"), ("Origin", "http://evil.example")],
+            None,
+        )
+        .await;
+
+        assert_eq!(reply.status, 421, "{method} {path}: {reply:?}");
+        assert!(
+            !reply.body.contains("Indexer control panel"),
+            "the page leaked"
+        );
+        assert!(!reply.body.contains("chains"), "{}", reply.body);
+    }
+
+    panel.stop().await;
+}
+
+#[tokio::test]
+async fn the_names_the_panel_answers_to_still_work() {
+    let panel = Panel::start(&[]).await;
+    let port = panel.addr.port();
+
+    for host in [format!("127.0.0.1:{port}"), format!("localhost:{port}")]
+    {
+        let reply =
+            request(panel.addr, "GET", "/", &[("Host", &host)], None)
+                .await;
+        assert_eq!(reply.status, 200, "{host}: {reply:?}");
+    }
 
     panel.stop().await;
 }

@@ -194,6 +194,13 @@ pub struct FleetArgs {
     pub admin_trust_forwarded_proto: bool,
 
     #[arg(
+        long = "admin-host",
+        value_name = "NAME",
+        help = "A host name the control panel answers to, on top of its own address and the loopback names. Repeatable. Needed when a reverse proxy serves the panel under a name (`indexer.example.com`): a request for any other name is refused with 421 before it is routed, which is what stops a web page you merely visit from reaching the panel through DNS rebinding."
+    )]
+    pub admin_hosts: Vec<String>,
+
+    #[arg(
         long,
         value_name = "IP",
         help = "The address of the reverse proxy in front of the control panel. ONLY when a connection comes from exactly this address is `X-Forwarded-For` used to tell one sign-in attempt from another; otherwise the header is ignored entirely. Without this, every client behind a proxy shares one throttle and one attacker's lock-out falls on you too."
@@ -749,6 +756,7 @@ impl TryFrom<FleetArgs> for FleetConfig {
             admin_secure_cookie: args.admin_secure_cookie,
             admin_trust_forwarded_proto: args.admin_trust_forwarded_proto,
             admin_trusted_proxy: args.admin_trusted_proxy,
+            admin_hosts: args.admin_hosts,
             chains: args.chains,
             max_inflight_mb: args.fleet_max_inflight_mb.max(1),
             solana_queries_per_minute: args

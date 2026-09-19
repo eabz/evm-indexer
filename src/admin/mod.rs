@@ -43,7 +43,9 @@ use crate::{
     fleet::supervisor::{ChainView, CommandError, Supervisor},
 };
 use anyhow::Result;
-use auth::{Allowed, LoginRefused, Password, RateLimiter, Sessions};
+use auth::{
+    Allowed, AllowedHosts, LoginRefused, Password, RateLimiter, Sessions,
+};
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -77,6 +79,9 @@ pub struct Admin {
     /// The one address whose `X-Forwarded-For` the login throttle believes
     /// (`--admin-trusted-proxy`). `None` = the header is ignored.
     trusted_proxy: Option<std::net::IpAddr>,
+    /// The `Host` values this panel answers to. Anything else is refused
+    /// before routing (`auth::AllowedHosts`).
+    hosts: AllowedHosts,
     /// The Content-Security-Policy, with the hashes of the page's own
     /// inline script and style. Computed once at start.
     csp: String,
@@ -101,11 +106,16 @@ pub async fn start(
         return Ok(None);
     };
 
-    let config = supervisor.config();
-    let addr = config.admin_addr;
-    let secure_cookie = config.admin_secure_cookie;
-    let trust_forwarded_proto = config.admin_trust_forwarded_proto;
-    let trusted_proxy = config.admin_trusted_proxy;
+    let (addr, secure_cookie, trust_forwarded_proto, trusted_proxy, hosts) = {
+        let config = supervisor.config();
+        (
+            config.admin_addr,
+            config.admin_secure_cookie,
+            config.admin_trust_forwarded_proto,
+            config.admin_trusted_proxy,
+            AllowedHosts::new(config.admin_addr, &config.admin_hosts),
+        )
+    };
 
     let admin = Arc::new(Admin {
         supervisor,
@@ -115,6 +125,7 @@ pub async fn start(
         secure_cookie,
         trust_forwarded_proto,
         trusted_proxy,
+        hosts,
         csp: page::content_security_policy(),
     });
 
@@ -152,7 +163,56 @@ pub fn router(admin: Arc<Admin>) -> Router {
         .route("/api/chains/{chain}/restart", post(restart_chain))
         .route("/api/chains/{chain}/events", get(chain_events))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        // BEFORE any route: which server does this browser think it is
+        // talking to? (`auth::AllowedHosts`, review MAJOR 3.)
+        .layer(axum::middleware::from_fn_with_state(
+            admin.clone(),
+            known_host,
+        ))
         .with_state(admin)
+}
+
+/// Refuses a request whose `Host` is not one this panel answers to, on
+/// EVERY route including `GET /` and the fallback.
+///
+/// 421 Misdirected Request is the honest code: the request reached a server
+/// that does not serve that name. A rebound `evil.example` therefore gets
+/// nothing at all - not the page, not a login form, not an error that
+/// confirms something is listening.
+async fn known_host(
+    State(admin): State<Arc<Admin>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // Exactly one `Host`. Two of them is ambiguous by construction - which
+    // one a proxy in the chain acted on and which one we check need not be
+    // the same - so it is refused rather than resolved.
+    let mut seen = request.headers().get_all(header::HOST).iter();
+    let host = seen
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let duplicated = seen.next().is_some();
+
+    if duplicated || !admin.hosts.accepts(host) {
+        warn!(
+            "Control panel: refused a request for host {:?}. It answers to \
+             {}. Add --admin-host <name> if a reverse proxy serves it under \
+             another name.",
+            host,
+            admin.hosts.known().join(", ")
+        );
+
+        return secured(
+            &admin,
+            json_error(
+                StatusCode::MISDIRECTED_REQUEST,
+                "This is not a name the control panel answers to.",
+            ),
+        );
+    }
+
+    next.run(request).await
 }
 
 // --------------------------------------------------------- the responses

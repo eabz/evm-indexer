@@ -21,7 +21,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -394,6 +394,93 @@ fn prune(attempts: &mut HashMap<IpAddr, Attempts>, now: Instant) {
             break;
         };
         attempts.remove(&oldest);
+    }
+}
+
+/// The `Host` values this panel answers to.
+///
+/// # The attack this answers
+///
+/// Without it, the same-origin check compared two headers the CLIENT sends:
+/// `expected_origin` was built from the request's own `Host`, and `Origin`
+/// was compared to that. Two headers agreeing says nothing about which
+/// server the request was aimed at.
+///
+/// The practical consequence is DNS rebinding. A page on `evil.example`
+/// whose name is re-pointed at `127.0.0.1` is, to the browser, same-origin
+/// with the panel: the browser sends `Host: evil.example` and
+/// `Origin: http://evil.example`, they match, and a website the owner
+/// merely VISITED is now talking to the panel from inside their machine. It
+/// still needs the password - but "it only listens on localhost", which is
+/// this panel's primary control, stops meaning anything.
+///
+/// So `Host` is checked against a list the OPERATOR fixed before any
+/// routing happens: the address the panel was bound to, the loopback names,
+/// and whatever `--admin-host` adds for a reverse proxy.
+#[derive(Debug, Clone)]
+pub struct AllowedHosts {
+    /// Lowercased, each either `name` or `name:port`.
+    entries: Vec<String>,
+    /// The port the panel was bound to, so a `--admin-host` written without
+    /// one still matches a browser that sends one.
+    port: u16,
+}
+
+impl AllowedHosts {
+    /// The default list for a panel bound to `addr`, plus the operator's
+    /// own names.
+    pub fn new(addr: SocketAddr, extra: &[String]) -> Self {
+        let port = addr.port();
+        let mut entries = vec![
+            addr.to_string(),
+            format!("localhost:{port}"),
+            "localhost".to_string(),
+            format!("127.0.0.1:{port}"),
+            "127.0.0.1".to_string(),
+            format!("[::1]:{port}"),
+            "[::1]".to_string(),
+        ];
+
+        entries.extend(
+            extra
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty()),
+        );
+
+        entries.sort();
+        entries.dedup();
+
+        Self { entries, port }
+    }
+
+    /// Is this `Host` header one we answer to?
+    ///
+    /// An entry written WITHOUT a port also matches that name on the
+    /// panel's own port, because a browser writes the port whenever it is
+    /// not the scheme's default. An entry written WITH one must match
+    /// exactly.
+    pub fn accepts(&self, host: &str) -> bool {
+        let host = host.trim().to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+
+        self.entries.iter().any(|entry| {
+            *entry == host
+                || (!entry.contains(':')
+                    && host == format!("{entry}:{}", self.port))
+                // An IPv6 literal is bracketed, so the only colon that can
+                // introduce a port comes after the closing bracket.
+                || (entry.starts_with('[')
+                    && entry.ends_with(']')
+                    && host == format!("{entry}:{}", self.port))
+        })
+    }
+
+    /// For the message an operator sees when a request is refused.
+    pub fn known(&self) -> &[String] {
+        &self.entries
     }
 }
 
@@ -783,6 +870,50 @@ mod tests {
         }
 
         assert!(limiter.lock().len() <= MAX_TRACKED_ADDRESSES);
+    }
+
+    /// Review MAJOR 3. `Host` decides which server a browser thinks it is
+    /// talking to; if anything is accepted, the same-origin check is just
+    /// two attacker-supplied headers agreeing with each other.
+    #[test]
+    fn only_the_hosts_the_operator_fixed_are_answered() {
+        let addr: SocketAddr = "127.0.0.1:8090".parse().unwrap();
+        let hosts = AllowedHosts::new(addr, &[]);
+
+        // What a browser actually sends to a loopback panel.
+        assert!(hosts.accepts("127.0.0.1:8090"));
+        assert!(hosts.accepts("localhost:8090"));
+        assert!(hosts.accepts("LOCALHOST:8090"));
+        assert!(hosts.accepts("[::1]:8090"));
+        assert!(hosts.accepts(" localhost:8090 "));
+
+        // DNS rebinding: a name that resolves to 127.0.0.1 but is not ours.
+        assert!(!hosts.accepts("evil.example"));
+        assert!(!hosts.accepts("panel.evil.example"));
+        assert!(!hosts.accepts("localhost.evil.example"));
+        assert!(!hosts.accepts("evil.example:8090"));
+        // Our own name on somebody else's port is a different origin.
+        assert!(!hosts.accepts("127.0.0.1:9999"));
+        assert!(!hosts.accepts(""));
+        assert!(!hosts.accepts("   "));
+    }
+
+    #[test]
+    fn a_reverse_proxy_name_is_added_by_the_operator_and_nobody_else() {
+        let addr: SocketAddr = "127.0.0.1:8090".parse().unwrap();
+        let hosts =
+            AllowedHosts::new(addr, &["indexer.example.com".to_string()]);
+
+        // As a browser writes it on 443 (no port) and on our own port.
+        assert!(hosts.accepts("indexer.example.com"));
+        assert!(hosts.accepts("indexer.example.com:8090"));
+        assert!(hosts.accepts("INDEXER.EXAMPLE.COM"));
+
+        // A neighbour is still not us.
+        assert!(!hosts.accepts("other.example.com"));
+        assert!(!hosts.accepts("indexer.example.com.evil.example"));
+        // ... and neither is our name on an arbitrary port.
+        assert!(!hosts.accepts("indexer.example.com:9999"));
     }
 
     #[test]

@@ -255,6 +255,10 @@ pub struct FleetConfig {
     /// The ONE address whose `X-Forwarded-For` the login throttle believes.
     /// `None` = the header is ignored, whoever sends it.
     pub admin_trusted_proxy: Option<std::net::IpAddr>,
+    /// Extra host names the panel answers to (`--admin-host`), for a
+    /// reverse proxy. Its own address and the loopback names are always
+    /// accepted; everything else is refused before routing.
+    pub admin_hosts: Vec<String>,
     /// Chains to index even when `fleet_chains` does not list them yet
     /// (`--chain`, repeatable). A brand new database needs this once.
     pub chains: Vec<u64>,
@@ -435,6 +439,7 @@ mod tests {
             admin_secure_cookie: false,
             admin_trust_forwarded_proto: false,
             admin_trusted_proxy: None,
+            admin_hosts: Vec::new(),
             chains: Vec::new(),
             max_inflight_mb: 2_048,
             solana_queries_per_minute: 25,
