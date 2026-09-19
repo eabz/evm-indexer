@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-19 06:50 (America/Mexico_City)
+**Last updated:** 2026-09-19 08:25 (America/Mexico_City)
 
 ## Where things are
 
@@ -35,7 +35,9 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
-| module-followups | Opus | worktree `agent-afd2d96e1d5a702bb` | dex/predictions/launchpads/svm test harness re-read loops, launchpads rebuild SQL excludes the purged range, README signatures (hand-overs from hardening round 2: `<scratchpad>/handoff/hardening2-report.md`) | commits + tirith notes |
+| module-followups | DONE, merged e49d01c | - | dex flaky test 30/30 after the harness fix; launchpads rebuild excludes the purged range | - |
+| layout | Opus | worktree (see `git worktree list`) | THE layout refactor (design 12): `src/db/models` -> `src/core`, `src/utils` gone, `src/db` infrastructure only; small commits, no behaviour change. NOBODY ELSE MAY EDIT CODE until it is merged | one commit per move + tirith notes |
+| review-e | Opus | read-only (reads snapshot 8c23e33) | review round 4: bounded validity rule, hardening rounds, whole Solana path, SQL fixes | findings to `lead` on tirith |
 
 MAIN TREE IS CLEAN and pushed (HEAD 8c23e33+). EVERYTHING BELOW IS MERGED: HyperSync ingest,
 clean binary schema, insert-only reorgs (tombstones + epochs + BOUNDED validity rule),
@@ -51,8 +53,8 @@ CI on PR #16 has been green on every completed run since the pipeline wiring lan
 
 ## Still to do, in order
 
-1. Merge module-followups when it reports (validate in its worktree against the branch,
-   real `git merge`, remove the worktree).
+1. Merge the layout refactor when it reports (validate, real `git merge`, remove worktree).
+   Review round 4 findings will cite PRE-refactor paths (snapshot 8c23e33): map them.
 2. Review round 4 (independent, read-only, Opus): hardening rounds 1+2 (bounded validity
    rule, side-table repair, checkpoint compaction, month-split flush, lease fencing), the
    whole Solana path (`src/svm/**`, `src/source/solana.rs`, `src/pipeline/solana*.rs`),
