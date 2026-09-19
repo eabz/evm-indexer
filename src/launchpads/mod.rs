@@ -51,8 +51,10 @@ pub mod derived;
 pub mod events;
 pub mod models;
 
+// `pub(crate)`: the pipeline's acceptance test builds its canned stream
+// from these real transactions (src/pipeline/acceptance.rs).
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 #[cfg(test)]
 mod fixtures_data;
 #[cfg(test)]

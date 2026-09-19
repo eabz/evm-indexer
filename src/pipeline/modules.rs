@@ -22,10 +22,11 @@
 use crate::{
     db::{self, derived::DerivedTable, Database, FlushKey, RowBatch},
     dex::{self, DexRows},
+    launchpads::{self, LaunchpadRows},
     predictions::{self, PredictionRows, RegistrySet},
     tokens::TokenStandard,
 };
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 
@@ -51,22 +52,24 @@ macro_rules! fingerprint {
 pub struct EnabledModules {
     pub dex: bool,
     pub predictions: bool,
-    // MODULE: pub launchpads: bool,
+    pub launchpads: bool,
+    // MODULE: pub <module>: bool,
 }
 
 impl Default for EnabledModules {
     fn default() -> Self {
-        Self { dex: true, predictions: true }
+        Self { dex: true, predictions: true, launchpads: true }
     }
 }
 
 impl EnabledModules {
     pub fn none() -> Self {
-        Self { dex: false, predictions: false }
+        Self { dex: false, predictions: false, launchpads: false }
     }
 
     pub fn any(&self) -> bool {
-        self.dex || self.predictions // MODULE: || self.launchpads
+        self.dex || self.predictions || self.launchpads
+        // MODULE: || self.<module>
     }
 
     /// Static description of every enabled module.
@@ -78,7 +81,10 @@ impl EnabledModules {
         if self.predictions {
             specs.push(&PREDICTIONS);
         }
-        // MODULE: if self.launchpads { specs.push(&LAUNCHPADS); }
+        if self.launchpads {
+            specs.push(&LAUNCHPADS);
+        }
+        // MODULE: if self.<module> { specs.push(&<MODULE>); }
         specs
     }
 }
@@ -88,12 +94,14 @@ impl EnabledModules {
 pub struct ModuleRows {
     pub dex: DexRows,
     pub predictions: PredictionRows,
-    // MODULE: pub launchpads: LaunchpadRows,
+    pub launchpads: LaunchpadRows,
+    // MODULE: pub <module>: <Module>Rows,
 }
 
 impl ModuleRows {
     pub fn rows(&self) -> usize {
-        self.dex.rows() + self.predictions.rows() // MODULE: + ...
+        self.dex.rows() + self.predictions.rows() + self.launchpads.rows()
+        // MODULE: + self.<module>.rows()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -103,19 +111,22 @@ impl ModuleRows {
     pub fn append(&mut self, other: &mut ModuleRows) {
         self.dex.append(&mut other.dex);
         self.predictions.append(&mut other.predictions);
-        // MODULE: self.launchpads.append(&mut other.launchpads);
+        self.launchpads.append(&mut other.launchpads);
+        // MODULE: self.<module>.append(&mut other.<module>);
     }
 
     pub fn set_version(&mut self, version: u64) {
         self.dex.set_version(version);
         self.predictions.set_version(version);
-        // MODULE: self.launchpads.set_version(version);
+        self.launchpads.set_version(version);
+        // MODULE: self.<module>.set_version(version);
     }
 
     pub fn set_epoch(&mut self, epoch: u32) {
         self.dex.set_epoch(epoch);
         self.predictions.set_epoch(epoch);
-        // MODULE: self.launchpads.set_epoch(epoch);
+        self.launchpads.set_epoch(epoch);
+        // MODULE: self.<module>.set_epoch(epoch);
     }
 
     /// Token contracts the modules learned about (tokens of pools created
@@ -126,7 +137,9 @@ impl ModuleRows {
             .into_iter()
             // Collateral tokens: the views need their decimals.
             .chain(self.predictions.token_addresses())
-            // MODULE: .chain(self.launchpads.token_addresses())
+            // Launch / quote tokens: the curve views need their decimals.
+            .chain(self.launchpads.token_addresses())
+            // MODULE: .chain(self.<module>.token_addresses())
             .map(|address| (address, TokenStandard::Erc20))
             .collect()
     }
@@ -148,6 +161,12 @@ impl ModuleRows {
                 self.predictions.resolutions,
                 self.predictions.questions,
                 self.predictions.markets
+            ),
+            "launchpads" => fingerprint!(
+                self.launchpads.creator_fees,
+                self.launchpads.graduations,
+                self.launchpads.trades,
+                self.launchpads.tokens
             ),
             // MODULE: one arm per module
             _ => Vec::new(),
@@ -175,6 +194,10 @@ impl ModuleRows {
             ),
             ("prediction_transfers", self.predictions.transfers.len()),
             ("prediction_trades", self.predictions.trades.len()),
+            ("launchpad_tokens", self.launchpads.tokens.len()),
+            ("launchpad_trades", self.launchpads.trades.len()),
+            ("launchpad_graduations", self.launchpads.graduations.len()),
+            ("launchpad_creator_fees", self.launchpads.creator_fees.len()),
             // MODULE: one entry per table
         ]
     }
@@ -236,7 +259,28 @@ impl ModuleRows {
             }
         }
 
-        // MODULE: the same loop over launchpads::INSERT_ORDER
+        let l = &self.launchpads;
+        for table in launchpads::INSERT_ORDER.iter().copied() {
+            match table {
+                "launchpad_tokens" => {
+                    db.insert_flush(table, &l.tokens, key).await?
+                }
+                "launchpad_trades" => {
+                    db.insert_flush(table, &l.trades, key).await?
+                }
+                "launchpad_graduations" => {
+                    db.insert_flush(table, &l.graduations, key).await?
+                }
+                "launchpad_creator_fees" => {
+                    db.insert_flush(table, &l.creator_fees, key).await?
+                }
+                other => {
+                    bail!("no insert path for launchpads table '{other}'")
+                }
+            }
+        }
+
+        // MODULE: the same loop over <module>::INSERT_ORDER
 
         Ok(())
     }
@@ -319,6 +363,19 @@ pub async fn stored_fingerprints(
             p.markets =
                 read_rows(db, spec, "prediction_markets", range).await?;
         }
+        "launchpads" => {
+            let l = &mut rows.launchpads;
+            l.creator_fees =
+                read_rows(db, spec, "launchpad_creator_fees", range)
+                    .await?;
+            l.graduations =
+                read_rows(db, spec, "launchpad_graduations", range)
+                    .await?;
+            l.trades =
+                read_rows(db, spec, "launchpad_trades", range).await?;
+            l.tokens =
+                read_rows(db, spec, "launchpad_tokens", range).await?;
+        }
         // MODULE: one arm per module
         other => bail!("module '{other}' has no read path"),
     }
@@ -375,14 +432,29 @@ pub fn decode(
     let origins: TxOrigins = rows
         .transactions
         .iter()
-        .map(|tx| (tx.hash, (tx.from, tx.to)))
+        .map(|tx| {
+            (
+                tx.hash,
+                TxOrigin { from: tx.from, to: tx.to, value: tx.value },
+            )
+        })
         .collect();
 
     decode_with_origins(enabled, chain, rows, &origins, state)
 }
 
-/// `from` / `to` by transaction hash.
-pub type TxOrigins = HashMap<B256, (Address, Option<Address>)>;
+/// `from`, `to` and the native `value` of a transaction: what the modules
+/// may attach to their rows. Never a substitute for what the event itself
+/// says (the sender of a swap is usually a router).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxOrigin {
+    pub from: Address,
+    pub to: Option<Address>,
+    pub value: U256,
+}
+
+/// [`TxOrigin`] by transaction hash.
+pub type TxOrigins = HashMap<B256, TxOrigin>;
 
 /// [`decode`] with the transaction origins given (the backfill reads them
 /// from the `transactions` table instead of the batch).
@@ -398,18 +470,19 @@ pub fn decode_with_origins(
     if enabled.dex {
         modules.dex = dex::decode(chain, &rows.logs);
         modules.dex.attach_transactions(|hash| {
-            origins
-                .get(hash)
-                .map(|(from, to)| dex::TxOrigin { from: *from, to: *to })
+            origins.get(hash).map(|origin| dex::TxOrigin {
+                from: origin.from,
+                to: origin.to,
+            })
         });
     }
 
     if enabled.predictions {
         let mut decoded = predictions::decode(chain, &rows.logs);
         decoded.attach_transactions(|hash| {
-            origins.get(hash).map(|(from, to)| predictions::TxOrigin {
-                from: *from,
-                to: *to,
+            origins.get(hash).map(|origin| predictions::TxOrigin {
+                from: origin.from,
+                to: origin.to,
             })
         });
         state.registries.observe(&decoded);
@@ -419,7 +492,19 @@ pub fn decode_with_origins(
         modules.predictions = decoded;
     }
 
-    // MODULE: if enabled.launchpads { ... }
+    if enabled.launchpads {
+        let mut decoded = launchpads::decode(chain, &rows.logs);
+        decoded.attach_transactions(|hash| {
+            origins.get(hash).map(|origin| launchpads::TxOrigin {
+                from: origin.from,
+                to: origin.to,
+                value: origin.value,
+            })
+        });
+        modules.launchpads = decoded;
+    }
+
+    // MODULE: if enabled.<module> { ... }
 
     modules
 }
@@ -522,11 +607,26 @@ pub const PREDICTIONS: ModuleSpec = ModuleSpec {
     rebuild_statements: plain_rebuild,
 };
 
-// MODULE: pub const LAUNCHPADS: ModuleSpec = ...
+pub const LAUNCHPADS: ModuleSpec = ModuleSpec {
+    name: "launchpads",
+    base_tables: launchpads::BASE_TABLES,
+    derived: launchpads::LAUNCHPADS_DERIVED,
+    block_column: launchpads::block_column,
+    purge_filter: no_filter,
+    // Plain `block_number` tables: the generic statement built from the
+    // embedded migration DDL.
+    tombstone_sql: db::tombstone_sql,
+    // Every aggregate reads a CHILD table, so its SQL needs no
+    // `{purge_from}`/`{purge_to}`; it carries `{to_ts}`, so it is sliced
+    // by month.
+    rebuild_statements: plain_rebuild,
+};
+
+// MODULE: pub const <MODULE>: ModuleSpec = ...
 
 /// Every module the binary knows, enabled or not (`indexer verify` looks
 /// at the data, not at the run flags).
-pub const ALL_MODULES: &[&ModuleSpec] = &[&DEX, &PREDICTIONS];
+pub const ALL_MODULES: &[&ModuleSpec] = &[&DEX, &PREDICTIONS, &LAUNCHPADS];
 
 /// Every table a process writes versioned rows of a chain into: what
 /// `Database::seed_version` looks at.
@@ -689,6 +789,10 @@ mod tests {
             assert!(listed.contains(table), "{table} has no row count");
         }
 
+        for table in launchpads::INSERT_ORDER {
+            assert!(listed.contains(table), "{table} has no row count");
+        }
+
         // `store` has an arm per table: keep these lists in sync with it.
         assert_eq!(
             dex::BASE_TABLES,
@@ -700,6 +804,12 @@ mod tests {
             predictions::INSERT_ORDER.len(),
             7,
             "a predictions table was added: add its arm to \
+             ModuleRows::store and ModuleRows::counts"
+        );
+        assert_eq!(
+            launchpads::INSERT_ORDER.len(),
+            4,
+            "a launchpads table was added: add its arm to \
              ModuleRows::store and ModuleRows::counts"
         );
     }
