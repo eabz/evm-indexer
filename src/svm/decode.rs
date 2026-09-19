@@ -324,6 +324,24 @@ pub struct Diagnostics {
     /// movement says otherwise, or the reverse. The two classifications are
     /// independent, so a divergence is worth counting on its own.
     pub kind_disagreed: u64,
+    /// Swaps of a LOG-sourced venue in a transaction whose logs the
+    /// validator truncated. Their event stream is incomplete by the
+    /// validator's own admission, so no log of theirs is read at all and
+    /// the row stays `movement` - counted here rather than silently
+    /// indistinguishable from "this venue emits no event".
+    pub dropped_logs: u64,
+    /// Swaps whose pool the venue could not be made to name, on a venue
+    /// whose vault authority is program-wide. They are stored with no pool
+    /// key and are excluded from the pool-keyed aggregates.
+    pub unnamed_pool: u64,
+    /// A swap the movement layer proved but whose instruction path could
+    /// not be packed into an ordinal. The row is DROPPED: a position key
+    /// that silently folded onto another row's would make the two
+    /// overwrite each other.
+    pub unpackable_ordinal: u64,
+    /// Fills of an instruction that executed more than one of them (Orca
+    /// `two_hop_swap`, Raydium CLMM `swap_router_base_in`), past the first.
+    pub extra_hops: u64,
 }
 
 impl Diagnostics {
@@ -335,6 +353,10 @@ impl Diagnostics {
         self.ambiguous_native += other.ambiguous_native;
         self.ambiguous_pool += other.ambiguous_pool;
         self.kind_disagreed += other.kind_disagreed;
+        self.dropped_logs += other.dropped_logs;
+        self.unnamed_pool += other.unnamed_pool;
+        self.unpackable_ordinal += other.unpackable_ordinal;
+        self.extra_hops += other.extra_hops;
         for index in 0..Venue::ALL.len() {
             self.swaps_by_venue[index] += other.swaps_by_venue[index];
             self.confirmed_by_venue[index] +=
@@ -507,20 +529,13 @@ impl<'a> Movements<'a> {
     /// Returns the amount sent when the vault's delta is not readable or
     /// not smaller, so a caller always gets a usable number and the gap it
     /// implies is never negative.
+    ///
+    /// The delta is read off the ONE account the principal input leg was
+    /// paid into, never off "the first account in the subtree with a
+    /// readable delta": see [`SvmSwap::with_received`] for what that cost
+    /// on the output leg.
     fn input_received(&self, swap: &MovementSwap) -> u64 {
-        let credited = self
-            .movements
-            .iter()
-            .filter(|movement| {
-                movement.destination_owner == Some(swap.authority)
-                    && movement.mint == swap.mint_in
-                    && swap.path.len() < movement.path.len()
-                    && movement.path.starts_with(&swap.path)
-            })
-            .filter_map(|movement| self.received_by(&movement.destination))
-            .next();
-
-        match credited {
+        match self.received_by(&swap.in_account) {
             Some(delta)
                 if delta > 0
                     && (delta as u128) <= u128::from(swap.amount_in) =>
@@ -662,13 +677,29 @@ pub struct MovementSwap {
     /// Out of the pool, as RECEIVED by the taker. Differs from the gross
     /// amount by a Token-2022 transfer fee, which no event mentions.
     pub amount_out: u64,
-    /// Transfers of a leg's mint that went somewhere other than the pool:
+    /// Transfers of ONE leg's mint that went somewhere other than the pool:
     /// protocol, creator and router fees.
     pub fee_amount: u64,
+    /// Which mint [`Self::fee_amount`] is in. Zero when there was no fee.
+    pub fee_mint: Pubkey,
     pub payer: Pubkey,
     pub recipient: Pubkey,
+    /// The token ACCOUNT that received the principal input leg, i.e. the
+    /// pool's vault. What it was really credited is what a Token-2022
+    /// transfer fee makes smaller than [`Self::amount_in`].
+    pub in_account: Pubkey,
+    /// The token ACCOUNT that received the principal output leg, i.e. the
+    /// taker's. Named explicitly because the subtree also contains fee
+    /// recipients, and reading "the first destination with a readable
+    /// balance delta" silently stored a FEE recipient's delta as the
+    /// taker's receipt (review round 4, M4).
+    pub out_account: Pubkey,
     /// The SOL leg came from a lamport delta rather than an instruction.
     pub native_leg: bool,
+    /// Which fill of the instruction this is: 0 for every venue
+    /// instruction that executes one swap, 1 and up for the later hops of
+    /// an Orca `two_hop_swap` or a Raydium CLMM `swap_router_base_in`.
+    pub hop: u32,
 }
 
 /// Decodes every swap in one transaction, using the shared registry.
@@ -752,15 +783,24 @@ pub fn decode_transaction_with(
                 // What the vault was CREDITED, which a Token-2022 transfer
                 // fee makes smaller than what the taker sent.
                 swap.amount_in_received = movements.input_received(&swap);
-                let mut row =
-                    build_row(chain, timestamp, tx, &movements, &swap);
+                let Some(mut row) = build_row(
+                    chain,
+                    timestamp,
+                    tx,
+                    instruction,
+                    &movements,
+                    &swap,
+                ) else {
+                    outcome.diagnostics.unpackable_ordinal += 1;
+                    continue;
+                };
                 let enriched = crate::svm::events::enrich(
                     tx,
                     instruction,
                     venue,
                     &swap,
                     &mut row,
-                    0,
+                    swap.hop as usize,
                 );
                 record(
                     &mut outcome.diagnostics,
@@ -768,14 +808,62 @@ pub fn decode_transaction_with(
                     enriched,
                     instruction,
                 );
+                finish_row(&mut outcome.diagnostics, venue, &mut row);
                 outcome.swaps.push(row);
+            }
+            // One instruction, several fills. Each keeps its own pair of
+            // transfers and its own position, so the later hops are
+            // stored instead of being dropped or overwriting the first.
+            Classified::Hops(hops) => {
+                outcome.diagnostics.extra_hops +=
+                    hops.len().saturating_sub(1) as u64;
+                for mut swap in hops {
+                    swap.amount_in_received =
+                        movements.input_received(&swap);
+                    let Some(mut row) = build_row(
+                        chain,
+                        timestamp,
+                        tx,
+                        instruction,
+                        &movements,
+                        &swap,
+                    ) else {
+                        outcome.diagnostics.unpackable_ordinal += 1;
+                        continue;
+                    };
+                    let enriched = crate::svm::events::enrich(
+                        tx,
+                        instruction,
+                        venue,
+                        &swap,
+                        &mut row,
+                        swap.hop as usize,
+                    );
+                    record(
+                        &mut outcome.diagnostics,
+                        venue,
+                        enriched,
+                        instruction,
+                    );
+                    finish_row(&mut outcome.diagnostics, venue, &mut row);
+                    outcome.swaps.push(row);
+                }
             }
             // The movement layer proposed both sides of a symmetric trade;
             // the venue's own event decides which is the pool. Exactly one
             // reading can validate, because the event names the user and
             // the direction.
             Classified::Candidates(proposals) => {
-                let only_one = proposals.len() == 1;
+                // A single unvalidated proposal is accepted on the
+                // movement layer alone, but only when the candidate really
+                // looks like a pool: `resolve_pool` refused to pick it,
+                // and a candidate that is ON the ed25519 curve has a
+                // private key, so it is somebody's wallet and not a
+                // program's vault owner.
+                let only_one = proposals.len() == 1
+                    && proposals.first().is_some_and(|swap| {
+                        !crate::svm::pda::is_on_curve(&swap.authority)
+                    });
                 let mut accepted = None;
                 let mut verdict = crate::svm::events::Enrichment::None;
                 for swap in &proposals {
@@ -783,15 +871,24 @@ pub fn decode_transaction_with(
                     swap.amount_in_received =
                         movements.input_received(&swap);
                     let swap = &swap;
-                    let mut row =
-                        build_row(chain, timestamp, tx, &movements, swap);
+                    let Some(mut row) = build_row(
+                        chain,
+                        timestamp,
+                        tx,
+                        instruction,
+                        &movements,
+                        swap,
+                    ) else {
+                        outcome.diagnostics.unpackable_ordinal += 1;
+                        continue;
+                    };
                     match crate::svm::events::enrich(
                         tx,
                         instruction,
                         venue,
                         swap,
                         &mut row,
-                        0,
+                        swap.hop as usize,
                     ) {
                         crate::svm::events::Enrichment::Applied => {
                             verdict =
@@ -810,12 +907,17 @@ pub fn decode_transaction_with(
                     }
                 }
                 match accepted {
-                    Some(row) => {
+                    Some(mut row) => {
                         record(
                             &mut outcome.diagnostics,
                             venue,
                             verdict,
                             instruction,
+                        );
+                        finish_row(
+                            &mut outcome.diagnostics,
+                            venue,
+                            &mut row,
                         );
                         outcome.swaps.push(row);
                     }
@@ -883,6 +985,11 @@ fn record(
             diagnostics.disagreed_by_venue[venue.index()] += 1;
             diagnostics.decoder_disagreed += 1;
         }
+        // Counted on its own, and deliberately NOT as an agreement or a
+        // disagreement: the venue said nothing here because the validator
+        // threw its words away, which is a different fact from "this venue
+        // emits no event" and must not move `agreement_rate`.
+        Enrichment::Incomplete => diagnostics.dropped_logs += 1,
         Enrichment::None => {}
     }
 
@@ -908,6 +1015,12 @@ enum Classified {
     /// derived address too, so the off-curve test cannot tell it from the
     /// pool, and before this the row was dropped as unclassified.
     Candidates(Vec<MovementSwap>),
+    /// SEVERAL fills executed by one instruction, in execution order. Orca
+    /// `two_hop_swap` and Raydium CLMM `swap_router_base_in` do this: two
+    /// pools, two trades, one `instruction_address`. Each entry keeps only
+    /// its own pair of transfers, so neither hop's amounts or fees leak
+    /// into the other's.
+    Hops(Vec<MovementSwap>),
     Liquidity,
     Unclassified,
     AmbiguousNative,
@@ -1067,6 +1180,105 @@ fn native_candidates(
     candidates
 }
 
+/// Splits ONE venue instruction into the several fills it executed, when
+/// that is what the movement really shows.
+///
+/// The test is DISJOINTNESS. Each candidate counterparty is a swap of its
+/// own only if the transfers it takes part in are its alone: a movement
+/// with two candidates as counterparties means the two are the pool and the
+/// taker of a single trade (which is [`resolve_pool`]'s ambiguity, not a
+/// second hop), and every candidate must also account for the movements it
+/// claims - so the hops together must cover every transfer of the subtree,
+/// or something is being dropped.
+///
+/// Returns `None` unless at least two disjoint candidates each classify to
+/// a genuine swap, which is the only shape that may become several rows.
+fn split_hops(
+    venue: Venue,
+    instruction: &SvmInstruction,
+    owned: &[&Movement],
+    pools: &[Pubkey],
+) -> Option<Vec<MovementSwap>> {
+    let touches = |authority: &Pubkey, movement: &Movement| {
+        movement.source_owner == Some(*authority)
+            || movement.destination_owner == Some(*authority)
+    };
+
+    // The TAKER is a counterparty of every hop, so it has to go first or
+    // nothing is ever disjoint. `resolve_pool`'s third test is what tells
+    // the two apart: `find_program_address` searches until it lands OFF
+    // the ed25519 curve, so no private key can exist for a pool, while a
+    // user's wallet is a real public key and is on the curve.
+    let pools: Vec<Pubkey> = pools
+        .iter()
+        .copied()
+        .filter(|candidate| !crate::svm::pda::is_on_curve(candidate))
+        .collect();
+    if pools.len() < 2 {
+        return None;
+    }
+
+    // No movement may be shared between two candidates. One that is means
+    // the two are the pool and the taker of a SINGLE trade - the ambiguity
+    // `resolve_pool` refused to resolve - and not two hops.
+    for movement in owned {
+        let sharing = pools
+            .iter()
+            .filter(|authority| touches(authority, movement))
+            .count();
+        if sharing > 1 {
+            return None;
+        }
+    }
+
+    // Group the transfers by the hop they belong to, in execution order.
+    let mut groups: Vec<(Pubkey, Vec<u32>, Vec<&Movement>)> = Vec::new();
+    for authority in &pools {
+        let mine: Vec<&Movement> = owned
+            .iter()
+            .copied()
+            .filter(|movement| touches(authority, movement))
+            .collect();
+        let Some(first) =
+            mine.iter().map(|movement| movement.path.clone()).min()
+        else {
+            continue;
+        };
+        groups.push((*authority, first, mine));
+    }
+    groups.sort_by(|left, right| left.1.cmp(&right.1));
+    if groups.len() < 2 {
+        return None;
+    }
+
+    // A transfer that crosses NO pool is a fee, and it belongs to the hop
+    // it was executed within: the last one that started before it.
+    for movement in owned {
+        if pools.iter().any(|authority| touches(authority, movement)) {
+            continue;
+        }
+        let hop = groups
+            .iter()
+            .rposition(|(_, first, _)| *first <= movement.path)
+            .unwrap_or(0);
+        groups[hop].2.push(movement);
+    }
+
+    let mut hops = Vec::with_capacity(groups.len());
+    for (index, (authority, _, mine)) in groups.into_iter().enumerate() {
+        let Classified::Swap(mut swap) =
+            classify_two_sided(venue, instruction, &mine, authority)
+        else {
+            // One group is not a trade, so this is not a multi-hop swap
+            // and nothing here may be guessed at.
+            return None;
+        };
+        swap.hop = index as u32;
+        hops.push(swap);
+    }
+    Some(hops)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn classify(
     movements: &Movements<'_>,
@@ -1088,12 +1300,26 @@ fn classify(
         return classify_two_sided(venue, instruction, owned, authority);
     }
 
-    // Two or more candidates survived every test, so the movement layer
-    // genuinely cannot tell the pool from the taker. Rather than drop the
-    // trade, propose each reading and let the venue's own event pick -
-    // exactly what the native-leg path below has always done. The readings
-    // differ in DIRECTION, which is precisely what an event states.
+    // Two or more candidates survived every test. There are two entirely
+    // different reasons for that and they need opposite treatment.
     if pools.len() > 1 {
+        // (a) The instruction executed SEVERAL fills. Orca's
+        //     `two_hop_swap` and Raydium CLMM's `swap_router_base_in` run
+        //     two pools from one instruction, and each pool is the
+        //     counterparty of its OWN pair of transfers. The candidates
+        //     are then disjoint: no movement has two of them as a
+        //     counterparty. That is what tells this case apart from (b),
+        //     where the two candidates - the pool and the taker - sit on
+        //     opposite ends of the very same two transfers.
+        if let Some(hops) = split_hops(venue, instruction, owned, pools) {
+            return Classified::Hops(hops);
+        }
+
+        // (b) The movement layer genuinely cannot tell the pool from the
+        //     taker. Rather than drop the trade, propose each reading and
+        //     let the venue's own event pick - exactly what the native-leg
+        //     path below has always done. The readings differ in
+        //     DIRECTION, which is precisely what an event states.
         let proposals: Vec<MovementSwap> = pools
             .iter()
             .filter_map(|authority| {
@@ -1237,9 +1463,15 @@ fn classify_native(
         amount_out_gross: amount_out,
         amount_out,
         fee_amount: 0,
+        fee_mint: ZERO_PUBKEY,
         payer,
         recipient: payer,
+        // A native leg moves no token account, so there is nothing whose
+        // balance delta could refine either figure.
+        in_account: ZERO_PUBKEY,
+        out_account: ZERO_PUBKEY,
         native_leg: true,
+        hop: 0,
     })
 }
 
@@ -1251,28 +1483,39 @@ fn classify_two_sided(
 ) -> Classified {
     let mut into_pool: HashMap<Pubkey, u64> = HashMap::new();
     let mut out_of_pool: HashMap<Pubkey, u64> = HashMap::new();
-    let mut fees: u64 = 0;
-    let mut payer = ZERO_PUBKEY;
-    let mut recipient = ZERO_PUBKEY;
+    // Fees PER MINT. A swap can pay one fee in lamports and another in the
+    // token, and adding those two numbers together produces a quantity in
+    // no unit at all (review round 4, M8), so they are kept apart until
+    // the legs are known and only one mint's total is ever stored.
+    let mut fees: HashMap<Pubkey, u64> = HashMap::new();
+    // The PRINCIPAL leg of each direction: the largest transfer of it. A
+    // direction can have several legs - the taker's and a fee recipient's
+    // share one mint - and "the last one wins" picked an arbitrary member
+    // of that set as the payer, the recipient and, through them, as the
+    // account whose balance delta became `amount_out`.
+    let mut principal_in: Option<&Movement> = None;
+    let mut principal_out: Option<&Movement> = None;
 
     for movement in owned {
         if movement.destination_owner == Some(authority) {
             *into_pool.entry(movement.mint).or_insert(0) +=
                 movement.amount;
-            if let Some(owner) = movement.source_owner {
-                payer = owner;
+            if principal_in
+                .is_none_or(|best| best.amount < movement.amount)
+            {
+                principal_in = Some(movement);
             }
         } else if movement.source_owner == Some(authority) {
             *out_of_pool.entry(movement.mint).or_insert(0) +=
                 movement.amount;
-            if let Some(owner) = movement.destination_owner {
-                recipient = owner;
-            } else {
-                recipient = movement.destination;
+            if principal_out
+                .is_none_or(|best| best.amount < movement.amount)
+            {
+                principal_out = Some(movement);
             }
         } else {
             // Neither side is the pool: a protocol / creator / router fee.
-            fees = fees.saturating_add(movement.amount);
+            *fees.entry(movement.mint).or_insert(0) += movement.amount;
         }
     }
 
@@ -1297,6 +1540,32 @@ fn classify_two_sided(
         return Classified::Unclassified;
     }
 
+    // Only a transfer of a LEG's mint can be this swap's fee, and only one
+    // mint's total is storable. Where both legs carry fees the larger is
+    // kept, with the mint that says what it is.
+    let (fee_mint, fee_amount) = [mint_in, mint_out]
+        .into_iter()
+        .filter_map(|mint| fees.get(&mint).map(|amount| (mint, *amount)))
+        .max_by_key(|(_, amount)| *amount)
+        .unwrap_or((ZERO_PUBKEY, 0));
+
+    let (payer, in_account) = principal_in
+        .map(|movement| {
+            (
+                movement.source_owner.unwrap_or(movement.source),
+                movement.destination,
+            )
+        })
+        .unwrap_or((ZERO_PUBKEY, ZERO_PUBKEY));
+    let (recipient, out_account) = principal_out
+        .map(|movement| {
+            (
+                movement.destination_owner.unwrap_or(movement.destination),
+                movement.destination,
+            )
+        })
+        .unwrap_or((ZERO_PUBKEY, ZERO_PUBKEY));
+
     Classified::Swap(MovementSwap {
         venue,
         path: instruction.path.clone(),
@@ -1310,23 +1579,52 @@ fn classify_two_sided(
         amount_in_received: amount_in,
         amount_out_gross,
         amount_out: amount_out_gross,
-        fee_amount: fees,
+        fee_amount,
+        fee_mint,
         payer,
         recipient,
+        in_account,
+        out_account,
         native_leg: false,
+        hop: 0,
     })
+}
+
+/// Booked once a row is final: the rules that must hold whatever the
+/// per-program layer did or did not manage to do.
+fn finish_row(
+    diagnostics: &mut Diagnostics,
+    venue: Venue,
+    row: &mut SvmSwap,
+) {
+    // A vault authority must never survive as the pool key. `build_row`
+    // never writes one, and a per-program decoder writes the pool the
+    // venue names, so this is the belt to that braces: an unnamed pool is
+    // 32 zero bytes, which the candle views exclude.
+    if row.pool_id == ZERO_PUBKEY && venue.vault_authority_is_global() {
+        diagnostics.unnamed_pool += 1;
+    }
 }
 
 /// Builds the storable row. `amount_out` is adjusted here, where the
 /// destination's real balance delta is reachable.
+///
+/// `None` when the instruction path cannot be packed into an ordinal.
+/// `pack_ordinal` fails loudly rather than truncating precisely so that two
+/// instructions never share a position key; swallowing that with
+/// `unwrap_or(0)` reintroduced the collision it exists to prevent, so the
+/// row is dropped and counted instead.
+#[allow(clippy::too_many_arguments)]
 fn build_row(
     chain: u64,
     timestamp: u32,
     tx: &SvmTransaction,
+    instruction: &SvmInstruction,
     movements: &Movements<'_>,
     swap: &MovementSwap,
-) -> SvmSwap {
-    let ordinal = pack_ordinal(&swap.path).unwrap_or(0);
+) -> Option<SvmSwap> {
+    let ordinal =
+        crate::svm::models::pack_ordinal_hop(&swap.path, swap.hop).ok()?;
     let (route_program, route_ordinal) = movements
         .nearest_router(&swap.path)
         .map(|(_, path, program)| {
@@ -1353,55 +1651,97 @@ fn build_row(
         (-amount_out_signed, amount_in_signed)
     };
 
-    SvmSwap {
-        chain,
-        block_number: tx.slot,
-        tx_index: tx.tx_index,
-        ordinal,
-        timestamp,
-        tx_id: tx.signature.to_vec(),
-        // From the movement layer alone the pool IS the authority; a
-        // per-program decoder replaces it with the account the venue names.
-        pool_id: swap.authority,
-        protocol: swap.venue.as_str().to_owned(),
-        venue_program: crate::svm::programs::pubkey(
-            swap.venue.program_b58(),
-        ),
-        // NEVER the instruction's signer: on Solana that is very often a
-        // router PDA or a bot.
-        trader: tx.fee_payer,
-        sender: swap.payer,
-        recipient: swap.recipient,
-        token0,
-        token1,
-        amount0,
-        amount1,
-        token_in: swap.mint_in,
-        token_out: swap.mint_out,
-        amount_in: U256::from(swap.amount_in),
-        amount_out: U256::from(swap.amount_out),
-        amount_out_gross: U256::from(swap.amount_out_gross),
-        // Always available on Solana: only the SPL Token program can move an
-        // SPL balance, so both mints are PROVEN, not claimed.
-        verified_in: swap.mint_in,
-        verified_out: swap.mint_out,
-        reserve0: U256::ZERO,
-        reserve1: U256::ZERO,
-        fee_amount: U256::from(swap.fee_amount),
-        confidence: Confidence::Movement.as_str().to_owned(),
-        route_ordinal,
-        route_program,
-        epoch: 0,
-        _version: 0,
-        is_deleted: 0,
-    }
-    .with_received(movements, swap)
+    // THE pool key. From the movement layer alone the "pool" is the common
+    // OWNER of the two vaults, and for five of the ten streamed venues
+    // that owner is one program-wide PDA shared by every pool the program
+    // runs - storing it would key the whole venue into a single candle
+    // series (review round 4, B3). For those venues the pool is taken from
+    // the instruction's own account metas instead, and when even that is
+    // not possible the row carries NO pool key rather than a wrong one: it
+    // still counts as venue volume and is excluded from the pool-keyed
+    // aggregates. A per-program decoder overwrites this with the account
+    // the venue itself names.
+    let pool_id = if swap.venue.vault_authority_is_global() {
+        swap.venue
+            .pool_account_index()
+            // Only for an instruction the registry already knows is a
+            // swap: a variant added after this was written has an account
+            // layout nobody has checked, and the wrong account is worse
+            // than none.
+            .filter(|_| {
+                swap.venue.instruction_kind(&instruction.data)
+                    == crate::svm::programs::IxKind::Swap
+            })
+            .and_then(|index| instruction.account(index))
+            .filter(|pool| *pool != swap.authority && *pool != ZERO_PUBKEY)
+            .unwrap_or(ZERO_PUBKEY)
+    } else {
+        swap.authority
+    };
+
+    Some(
+        SvmSwap {
+            chain,
+            block_number: tx.slot,
+            tx_index: tx.tx_index,
+            ordinal,
+            timestamp,
+            tx_id: tx.signature.to_vec(),
+            pool_id,
+            protocol: swap.venue.as_str().to_owned(),
+            venue_program: crate::svm::programs::pubkey(
+                swap.venue.program_b58(),
+            ),
+            // NEVER the instruction's signer: on Solana that is very often a
+            // router PDA or a bot.
+            trader: tx.fee_payer,
+            sender: swap.payer,
+            recipient: swap.recipient,
+            token0,
+            token1,
+            amount0,
+            amount1,
+            token_in: swap.mint_in,
+            token_out: swap.mint_out,
+            amount_in: U256::from(swap.amount_in),
+            amount_out: U256::from(swap.amount_out),
+            amount_out_gross: U256::from(swap.amount_out_gross),
+            // Always available on Solana: only the SPL Token program can move an
+            // SPL balance, so both mints are PROVEN, not claimed.
+            verified_in: swap.mint_in,
+            verified_out: swap.mint_out,
+            reserve0: U256::ZERO,
+            reserve1: U256::ZERO,
+            fee_amount: U256::from(swap.fee_amount),
+            fee_mint: swap.fee_mint,
+            confidence: Confidence::Movement.as_str().to_owned(),
+            route_ordinal,
+            route_program,
+            epoch: 0,
+            _version: 0,
+            is_deleted: 0,
+        }
+        .with_received(movements, swap),
+    )
 }
 
 impl SvmSwap {
     /// A Token-2022 transfer fee makes what the taker RECEIVED smaller than
     /// what the pool SENT. Storing one `amount_out` would silently be wrong
     /// for every Token-2022 pair, so both are kept.
+    ///
+    /// The delta is read off the ONE account the principal output leg was
+    /// paid into. The previous version matched every out-leg of `mint_out`
+    /// in the subtree and took the first whose destination had a readable
+    /// balance delta - which SKIPS the taker's own account when it is
+    /// opened and closed inside the transaction (it then appears in
+    /// neither the pre nor the post balances) and lands on the next
+    /// movement, a protocol or creator FEE recipient whose small positive
+    /// delta passes the `<= gross` guard. Measured on
+    /// `3ZZw4CfNzTMgPnnJRhKk28bteiip6zDimArpQSNURYfLn94J4UTPmYfBqTU2SfJ3pbwodZV3rGsUz7Qfyh8MVPJP`:
+    /// the taker received 127,409,301,712 and the row stored 32,922,301
+    /// (review round 4, M4). When the taker's account is unreadable the
+    /// answer is "what the pool sent", never another account's delta.
     fn with_received(
         mut self,
         movements: &Movements<'_>,
@@ -1410,21 +1750,7 @@ impl SvmSwap {
         if swap.native_leg {
             return self;
         }
-        let destination_delta = movements
-            .movements
-            .iter()
-            .filter(|movement| {
-                movement.source_owner == Some(swap.authority)
-                    && movement.mint == swap.mint_out
-                    && swap.path.len() < movement.path.len()
-                    && movement.path.starts_with(&swap.path)
-            })
-            .filter_map(|movement| {
-                movements.received_by(&movement.destination)
-            })
-            .next();
-
-        if let Some(delta) = destination_delta {
+        if let Some(delta) = movements.received_by(&swap.out_account) {
             if delta > 0
                 && (delta as u128) <= u128::from(swap.amount_out_gross)
             {
@@ -1439,5 +1765,32 @@ impl SvmSwap {
     pub(crate) fn mark_decoded(&mut self, pool: Pubkey) {
         self.pool_id = pool;
         self.confidence = Confidence::Decoded.as_str().to_owned();
+    }
+
+    /// The account the venue's own event names as the user of this trade.
+    ///
+    /// `trader` used to be the transaction's fee payer unconditionally,
+    /// which on Solana is very often a relayer or a bot: on the recorded
+    /// pump.fun curve sell the fee payer is a bot and the event's user is
+    /// the person who traded, and `sol_dex_candles_*.traders` is
+    /// `uniqState(trader)` - so the unique-trader count was a count of
+    /// bots. `launchpads.rs` already stored the event's user for the very
+    /// same trade, so the two tables disagreed about one trade (review
+    /// round 4, M6).
+    ///
+    /// The fee payer stays the fallback, and only the fallback: a venue
+    /// that names no user leaves it in place.
+    pub(crate) fn mark_trader(&mut self, user: Pubkey) {
+        if user != ZERO_PUBKEY {
+            self.trader = user;
+        }
+    }
+
+    /// The fee a venue's own event states, and the mint it is in. Storing
+    /// one without the other is what let fees of different mints be added
+    /// together (review round 4, M8).
+    pub(crate) fn set_fee(&mut self, amount: u64, mint: Pubkey) {
+        self.fee_amount = U256::from(amount);
+        self.fee_mint = if amount == 0 { ZERO_PUBKEY } else { mint };
     }
 }

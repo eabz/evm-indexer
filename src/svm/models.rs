@@ -67,6 +67,28 @@ pub const ORDINAL_MAX_INDEX: u32 = (1 << ORDINAL_BITS) - 2;
 /// Mask of one level.
 const ORDINAL_MASK: u64 = (1 << ORDINAL_BITS) - 1;
 
+/// Bits left over at the BOTTOM of the ordinal once all five levels are
+/// packed: `64 - 5 * 12 = 4`. They hold the HOP sub-index.
+///
+/// One instruction can execute more than one fill: Orca's `two_hop_swap`
+/// and Raydium CLMM's `swap_router_base_in` do, and each hop is a separate
+/// trade on a separate pool. They share one `instruction_address`, so
+/// without a sub-index the two rows collide on the position key and a
+/// `ReplacingMergeTree` keeps exactly one of them - the later hops were
+/// silently lost (review round 4, M5).
+///
+/// The sub-index goes in the low bits rather than in a new column because
+/// that preserves every property the sort key already has: a parent still
+/// sorts before its children, siblings still sort in execution order, and
+/// hop 0 still sorts before hop 1 of the same instruction.
+const ORDINAL_HOP_BITS: u32 = 64 - ORDINAL_BITS * ORDINAL_LEVELS as u32;
+
+/// Largest hop sub-index an ordinal can hold.
+pub const ORDINAL_MAX_HOP: u32 = (1 << ORDINAL_HOP_BITS) - 1;
+
+/// Mask of the hop sub-index.
+const ORDINAL_HOP_MASK: u64 = (1 << ORDINAL_HOP_BITS) - 1;
+
 /// Packs an `instruction_address` (the full CPI tree path HyperSync serves:
 /// `[2]` = third top level instruction, `[2, 0]` = its first child) into the
 /// single `UInt64` the chain-neutral position key uses.
@@ -106,6 +128,23 @@ pub fn pack_ordinal(path: &[u32]) -> Result<u64, OrdinalError> {
     Ok(packed)
 }
 
+/// [`pack_ordinal`] plus the HOP sub-index, for an instruction that
+/// executed more than one fill (Orca `two_hop_swap`, Raydium CLMM
+/// `swap_router_base_in`).
+///
+/// Hop 0 packs to exactly what [`pack_ordinal`] returns, so a one-fill
+/// instruction - every other venue instruction on the chain - keeps the
+/// ordinal it always had.
+pub fn pack_ordinal_hop(
+    path: &[u32],
+    hop: u32,
+) -> Result<u64, OrdinalError> {
+    if hop > ORDINAL_MAX_HOP {
+        return Err(OrdinalError::HopTooLarge(hop));
+    }
+    Ok(pack_ordinal(path)? | u64::from(hop))
+}
+
 /// Inverse of [`pack_ordinal`], for tests and for reading rows back.
 pub fn unpack_ordinal(ordinal: u64) -> Vec<u32> {
     let mut path = Vec::new();
@@ -120,6 +159,12 @@ pub fn unpack_ordinal(ordinal: u64) -> Vec<u32> {
     path
 }
 
+/// The HOP sub-index of an ordinal, i.e. which fill of a multi-hop
+/// instruction this row is. Zero for every ordinary swap.
+pub fn unpack_hop(ordinal: u64) -> u32 {
+    (ordinal & ORDINAL_HOP_MASK) as u32
+}
+
 /// Why an instruction path could not be packed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrdinalError {
@@ -129,6 +174,8 @@ pub enum OrdinalError {
     TooDeep(usize),
     /// A sibling index that does not fit in 12 bits.
     IndexTooLarge(u32),
+    /// More fills from one instruction than the sub-index can hold.
+    HopTooLarge(u32),
 }
 
 impl std::fmt::Display for OrdinalError {
@@ -144,6 +191,11 @@ impl std::fmt::Display for OrdinalError {
                 f,
                 "instruction index {index} does not fit in \
                  {ORDINAL_BITS} bits"
+            ),
+            OrdinalError::HopTooLarge(hop) => write!(
+                f,
+                "hop {hop} does not fit in the {ORDINAL_HOP_BITS} bits of \
+                 the ordinal's sub-index"
             ),
         }
     }
@@ -478,10 +530,18 @@ pub struct SvmSwap {
     pub reserve0: U256,
     #[serde_as(as = "SerU256")]
     pub reserve1: U256,
-    /// Total fee taken out of the quote leg, in quote units, when a
-    /// per-program decoder supplied it.
+    /// Total fee taken out of ONE leg, in that leg's raw units.
+    ///
+    /// It used to be a sum over every non-pool transfer in the subtree
+    /// whatever its mint, so a swap with a SOL fee and a token fee reported
+    /// lamports added to token base units - a meaningless number (review
+    /// round 4, M8). Only fees of [`Self::fee_mint`] are counted now.
     #[serde_as(as = "SerU256")]
     pub fee_amount: U256,
+    /// The mint [`Self::fee_amount`] is denominated in. Zero when no fee
+    /// was identified, which is the only case in which `fee_amount` is 0
+    /// and meaningful at the same time.
+    pub fee_mint: Pubkey,
     /// `'movement'` or `'decoded'`.
     pub confidence: String,
     /// Ordinal of the router instruction this fill sits under, 0 when the
@@ -528,6 +588,7 @@ impl SvmSwap {
         "reserve0",
         "reserve1",
         "fee_amount",
+        "fee_mint",
         "confidence",
         "route_ordinal",
         "route_program",

@@ -53,6 +53,18 @@ const PHASE2: &str = include_str!("fixtures/phase2.json");
 /// | `launchlab_launch` | a Raydium LaunchLab launch. `PoolCreateEvent` names NEITHER mint, so they come from account metas and are proved against the pool's PDA seeds |
 const LAUNCHPADS: &str = include_str!("fixtures/launchpads.json");
 
+/// The two transactions the ADDENDUM of docs/review-round-4.md names, in the
+/// same shape again. Recorded by SLOT and SIGNATURE (see
+/// `svm::live_tests::record_round4_fixtures`) rather than by scanning for a
+/// shape, so the findings are reproduced from the very bytes the reviewer
+/// read.
+///
+/// | Name | Why it is here |
+/// |---|---|
+/// | `raydium_v4_and_pumpswap` | Raydium AMM v4's two vaults are owned by ONE PROGRAM-WIDE authority, so storing that owner as `pool_id` collapses every Raydium v4 pair into a single candle series (B3). The same transaction's PumpSwap sell pays the taker into an account opened and closed inside it, so a decoder that skips an unreadable destination stores a FEE recipient's delta as `amount_out` (M4) |
+/// | `launchlab_sell` | the second M4 case, on a Raydium LaunchLab sell with a real 1% Token-2022 transfer fee - and LaunchLab's vault authority is program-wide too |
+const ROUND4: &str = include_str!("fixtures/round4.json");
+
 #[derive(Debug, Deserialize)]
 struct RawFixture {
     name: String,
@@ -184,6 +196,10 @@ fn parse() -> Vec<Fixture> {
     raw.extend(
         serde_json::from_str::<Vec<RawFixture>>(LAUNCHPADS)
             .expect("fixtures/launchpads.json parses"),
+    );
+    raw.extend(
+        serde_json::from_str::<Vec<RawFixture>>(ROUND4)
+            .expect("fixtures/round4.json parses"),
     );
 
     raw.into_iter()
@@ -334,8 +350,8 @@ mod tests {
     #[test]
     fn every_fixture_parses() {
         let fixtures = all();
-        // 5 phase 1 + 4 phase 2 + 6 launchpads.
-        assert_eq!(fixtures.len(), 15, "a fixture went missing");
+        // 5 phase 1 + 4 phase 2 + 6 launchpads + 2 round 4.
+        assert_eq!(fixtures.len(), 17, "a fixture went missing");
         for fixture in fixtures {
             assert!(
                 !fixture.transaction.instructions.is_empty(),

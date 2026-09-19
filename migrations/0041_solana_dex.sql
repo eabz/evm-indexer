@@ -23,10 +23,19 @@
 --     on EVM. No hex strings are stored, ever.
 --   * block_number holds the SLOT.
 --   * ordinal packs the instruction tree path, 12 bits per level, left
---     aligned. A parent sorts before its children, siblings sort in
---     execution order, and the value is unique inside a transaction. It is
---     computable from ONE row, which matters because a program-filtered
---     stream never sees the sibling instructions a flat rank would need.
+--     aligned, and the HOP sub-index of a multi-fill instruction in the
+--     four bits left over at the bottom. A parent sorts before its
+--     children, siblings sort in execution order, hop 0 sorts before hop 1
+--     of the same instruction, and the value is unique inside a
+--     transaction. It is computable from ONE row, which matters because a
+--     program-filtered stream never sees the sibling instructions a flat
+--     rank would need.
+--   * pool_id is the venue's own pool account, and NEVER a vault
+--     authority: five of the ten streamed venues own every pool's vaults
+--     with ONE program-wide PDA, so storing that owner would key the whole
+--     venue into a single candle series. A row whose pool could not be
+--     named carries 32 zero bytes here and is excluded from the
+--     pool-keyed aggregates of 0042 rather than mis-keyed into them.
 --   * amount0 / amount1 are POOL RELATIVE and signed: positive = into the
 --     pool. token0 / token1 are the two mints sorted by raw bytes.
 --   * amount_in / amount_out are the TAKER's view.
@@ -79,7 +88,13 @@ CREATE TABLE IF NOT EXISTS sol_dex_swaps (
   verified_out FixedString(32),
   reserve0 UInt256,
   reserve1 UInt256,
+  -- The fee taken out of ONE leg, and the mint it is denominated in. The
+  -- mint column is what makes the amount interpretable: a swap can pay a
+  -- fee in lamports and another in the token, and a single column summing
+  -- both would report base units added to lamports. fee_mint is 32 zero
+  -- bytes when no fee was identified.
   fee_amount UInt256,
+  fee_mint FixedString(32),
   confidence LowCardinality(String),
   route_ordinal UInt64 DEFAULT 0,
   route_program FixedString(32),
