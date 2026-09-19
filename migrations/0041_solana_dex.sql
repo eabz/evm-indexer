@@ -1,5 +1,5 @@
 -- Solana DEX swaps, in the CHAIN-NEUTRAL shape of docs/design.md §13 and
--- docs/solana-research.md §0.
+-- the Solana venue research §0.
 --
 -- TODO(merge): THIS TABLE IS TEMPORARY. The `dex-neutral` work converts
 -- `dex_swaps` to exactly the shape below - 32-byte identity columns,

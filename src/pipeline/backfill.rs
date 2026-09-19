@@ -129,7 +129,7 @@ type ChunkBlocks = Vec<(u32, u64)>;
 /// (or a very large value) one chunk can cover hundreds of UTC months,
 /// which ClickHouse refuses with code 252
 /// (`max_partitions_per_insert_block`). The backfill used to write every
-/// chunk as one insert and fail there (docs/review-round-4.md, MINOR 17).
+/// chunk as one insert and fail there (review round 4, MINOR 17).
 ///
 /// The block span is per part, so each part gets a deduplication token of
 /// its own: the same token for two parts would make the server drop the
@@ -237,7 +237,7 @@ pub async fn backfill(
     // rebuilds every aggregate. Two of them on the same chain and module
     // corrupt it exactly as two indexers would - both write a `reorgs`
     // row, and the lower-epoch rebuild ends up hidden by the higher floor
-    // (docs/review-round-4.md, MINOR 16). A role of its own, so the
+    // (review round 4, MINOR 16). A role of its own, so the
     // documented combination "a backfill next to a live `indexer run`"
     // keeps working.
     let (fatal, _taken_over) = watch::channel(None::<String>);
@@ -467,7 +467,7 @@ mod tests {
     /// A chunk of blocks is a block COUNT, so on a chain with a long block
     /// time it can span more monthly partitions than one insert may touch
     /// (ClickHouse code 252). It is written in parts, like a flush
-    /// (docs/review-round-4.md, MINOR 17).
+    /// (review round 4, MINOR 17).
     #[test]
     fn a_chunk_that_spans_too_many_months_is_written_in_parts() {
         // The ordinary case: one insert, and the whole block span.

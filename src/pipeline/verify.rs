@@ -167,7 +167,7 @@ impl VerifyReport {
     /// Nothing found that is wrong with what is stored.
     ///
     /// `heal_pending` belongs here and was missing
-    /// (docs/review-round-4.md, MINOR 14): the next `indexer run` will
+    /// (review round 4, MINOR 14): the next `indexer run` will
     /// purge something, which means rows are tombstoned that nothing has
     /// settled - and the aggregates of those days COUNT them right now.
     /// The data IS wrong until the heal runs, even though the operator
@@ -518,7 +518,7 @@ pub async fn verify(
     //    It used to be skipped outright as soon as the range had ANY gap,
     //    i.e. essentially always while a backfill is in progress - so the
     //    one check that finds a doubled aggregate was almost never on
-    //    (docs/review-round-4.md, MINOR 14). A complete day of a gap-free
+    //    (review round 4, MINOR 14). A complete day of a gap-free
     //    part holds only blocks of that part, so the comparison is exact.
     let (mut aggregates, mut aggregates_skipped) = (Vec::new(), None);
     let mut aggregate_parts_skipped = 0;
@@ -824,7 +824,7 @@ mod tests {
     }
 
     /// "Not checked" must not read as "consistent", and neither must "the
-    /// next start will purge something" (docs/review-round-4.md,
+    /// next start will purge something" (review round 4,
     /// MINOR 14): both used to leave the verdict at CONSISTENT.
     #[test]
     fn what_was_not_checked_is_not_reported_as_consistent() {

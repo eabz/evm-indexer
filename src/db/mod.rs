@@ -244,7 +244,7 @@ pub const MAX_MONTHS_PER_FLUSH: usize = 90;
 /// (`toYYYYMM(timestamp, 'UTC')` on the base tables, `DateTime('UTC')`
 /// bucket columns on the aggregates). Without that, the month of a plain
 /// `DateTime` would be taken in the SERVER's timezone and a 90-UTC-month
-/// slice could touch 91 local partitions (docs/review-round-4.md,
+/// slice could touch 91 local partitions (review round 4,
 /// MINOR 18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushWindow {
@@ -595,7 +595,7 @@ impl Database {
     /// re-reads the epoch after every flush and queues the span), but
     /// that queue lives in memory. This is the same question asked of the
     /// database, so a restart - or a crash while the queue was not empty
-    /// - does not lose the spans (docs/review-round-4.md, MAJOR 3).
+    /// - does not lose the spans (review round 4, MAJOR 3).
     ///
     /// The rule: a purge rebuilt every aggregate of `[from_ts, to_ts)`
     /// from what was live when it ran, and armed the validity rule so
@@ -715,7 +715,7 @@ impl Database {
     /// nothing to merge down there) the head's fast growing contiguous
     /// run was never reached, so the table grew without bound and
     /// `resume_point` got slower and slower
-    /// (docs/review-round-4.md, MINOR 15).
+    /// (review round 4, MINOR 15).
     ///
     /// The CALLER must hold the chain's lease: this rewrites rows a purge
     /// of another process could be splitting at the same moment.

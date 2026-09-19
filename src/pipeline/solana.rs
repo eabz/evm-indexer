@@ -77,7 +77,7 @@ pub const SOLANA_CHAIN_ID: u64 = 1_399_811_149;
 pub const SOLANA_CHAIN_NAME: &str = "solana";
 
 /// First slot Envio's Solana HyperSync serves (2026-01-03 07:37 UTC,
-/// docs/solana-research.md §4.4 / §11.3). A `--start-block` below it can
+/// the Solana venue research §4.4 / §11.3). A `--start-block` below it can
 /// never be satisfied: the server answers empty WITHOUT advancing
 /// `next_slot`, which is a stop condition and not a reason to spin, so the
 /// only honest thing to do is refuse at startup.
@@ -87,7 +87,7 @@ pub const FIRST_SERVED_SLOT: u64 = 391_000_000;
 ///
 /// Measured budget is 30 per 60 s per endpoint (`x-ratelimit-limit:
 /// 30000, 30000;w=60` with a flat `x-ratelimit-cost: 1000`,
-/// docs/solana-research.md §11.1). 25 leaves headroom for retries, gap
+/// the Solana venue research §11.1). 25 leaves headroom for retries, gap
 /// heals and the verify sweep, and following the head needs 7-15.
 ///
 /// It is a FLOOR on politeness, not a belief: every response's real
@@ -99,7 +99,7 @@ const HEAD_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Target cadence at the head: slots accumulate for this long before a
 /// metered query is spent on them. 4 s is the recommendation of
-/// docs/solana-research.md §11.2 - ~15 slots a query, 15 queries a minute,
+/// the Solana venue research §11.2 - ~15 slots a query, 15 queries a minute,
 /// and cheaper cadences buy nothing because Envio's own 10-13 s ingest lag
 /// dominates.
 const TIP_CADENCE: Duration = Duration::from_secs(4);
@@ -110,7 +110,7 @@ const TIP_PASS_SLOTS: u64 = 256;
 /// Being at most this far behind means "caught up", and only then is a
 /// cadence worth waiting out.
 ///
-/// Solana produces 3.76 slots/s (docs/solana-research.md §11.2), so one
+/// Solana produces 3.76 slots/s (the Solana venue research §11.2), so one
 /// [`TIP_CADENCE`] is ~15 new slots; 32 is that with room for a slow tick.
 /// Anything beyond it is real lag, and waiting only makes it worse.
 const TIP_PACE_SLOTS: u64 = 32;
@@ -389,7 +389,7 @@ impl Budget {
 
 // -------------------------------------------------------- the continuity
 
-/// The two witnesses of docs/solana-research.md §11.4.3, carried from slot
+/// The two witnesses of the Solana venue research §11.4.3, carried from slot
 /// to slot and across a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Continuity {
@@ -567,7 +567,7 @@ pub fn check_flags(config: &Config) -> Result<()> {
              cursor, which a resume loop can not tell from 'caught up', \
              so this is refused rather than left to spin. Anything older \
              exists only in the Old Faithful archive and needs a second \
-             ingest path (docs/solana-research.md §11.3.1). Use \
+             ingest path (the Solana venue research §11.3.1). Use \
              --start-block {FIRST_SERVED_SLOT} or higher, or \
              --new-blocks-only to start at the head.",
             config.start_block
@@ -916,7 +916,7 @@ pub async fn run_with<S: SlotSource>(
     // else would ever ask for those slots again (their rows ARE stored,
     // so no gap query reports them), so the same question is asked of the
     // database once per start - the EVM rule, over Solana's commit marker
-    // (docs/review-round-4.md, MAJOR 3).
+    // (review round 4, MAJOR 3).
     let stale = Arc::new(Mutex::new(
         db.stale_flush_ranges_in(COMMIT_MARKER, "block_number")
             .await
@@ -1771,7 +1771,7 @@ impl<S: SlotSource> SolanaIndexer<S> {
     /// again - their rows are stored, so no gap query reports them - so a
     /// span leaves it only after its purge succeeded. That rule, and the
     /// loop that applies it, are [`Purger::purge_queued`], shared with the
-    /// EVM pipeline (docs/review-round-4.md, MAJOR 3); this used to take
+    /// EVM pipeline (review round 4, MAJOR 3); this used to take
     /// the whole `Vec` and lose the failed span and every span after it
     /// on the first transient error.
     async fn purge_stale_flushes(&mut self) -> Result<Option<u64>> {

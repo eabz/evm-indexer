@@ -1372,7 +1372,7 @@ async fn a_parent_hash_break_trips_the_tripwire_too() {
 }
 
 /// The tripwire at a PASS BOUNDARY, with the database read that used to
-/// supply the predecessor answering stale (docs/review-round-4.md,
+/// supply the predecessor answering stale (review round 4,
 /// MAJOR 9).
 ///
 /// At the head every pass starts exactly where the previous one stopped,
@@ -2017,7 +2017,7 @@ async fn the_program_registry_is_read_again_not_only_at_startup() {
 /// hole appears in the tiling and no gap query reports them. The running
 /// indexer queues them in memory; a restart used to lose the queue, and
 /// the Solana loop never asked the database the same question the way the
-/// EVM one does (docs/review-round-4.md, MAJOR 3).
+/// EVM one does (review round 4, MAJOR 3).
 ///
 /// Here the queue is EMPTY at the start of the run and everything comes
 /// from what is stored: the loop finds the span by itself, purges it
@@ -2134,7 +2134,7 @@ async fn a_flush_that_raced_another_purge_is_found_again_after_a_restart()
 /// the validity rule from 1970 on: `epoch_floor_v` raises the floor on
 /// ~20,700 days at once and every aggregate of the chain reads as zero
 /// until a rebuild that slices fifty years into monthly INSERTs per
-/// aggregate finishes (docs/review-round-4.md, MAJOR 6).
+/// aggregate finishes (review round 4, MAJOR 6).
 ///
 /// The store therefore reports the oldest REAL timestamp of the range, as
 /// the EVM store now does. The shared clamp in `src/reorg` stays as the

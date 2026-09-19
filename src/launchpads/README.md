@@ -1,5 +1,11 @@
 # Token launchpads (docs/design.md §11)
 
+> **What this is** — bonding-curve token launches, the trading on those curves, the creator fees, and the graduation into a DEX pool. ON by default; `--no-launchpads` turns it off.
+> **What tables** — `launchpad_tokens`, `launchpad_trades`, `launchpad_graduations`, `launchpad_creator_fees`, their lookup tables and daily rollups, plus the operator-populated `launchpad_trusted_emitters` and `launchpad_frontends`.
+> **Where the queries are** — [the query cookbook](#4-the-query-cookbook), one cheap query per screen.
+> **Before you query** — the headline views count only emitters you have listed in `launchpad_trusted_emitters`; the migrations seed nothing, and the verified addresses are in this file as ready-to-run `INSERT`s. Front ends (GMGN, Axiom, fomo) are not venues and their volume is never added to a venue's.
+> **Binding design** — `docs/design.md` section 11; migrations `0030`-`0039`.
+
 Decode by event family from `logs`, never by address registry. `family` = which
 decoder, never a brand. Everything below marked **LIVE** was checked against real
 chain data on 2026-09-18/19 (public RPCs + Sourcify); **SRC** = read in

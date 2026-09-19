@@ -36,7 +36,7 @@
 -- WHY THIS IS A TABLE AND NOT A CONSTANT. The prop / "dark" AMMs -
 -- HumidiFi, Tessera, Scorch, QuantumAMM, GoonFi, AlphaQ, Deriverse, SolFi
 -- V2, BisonFi and the rest - are together about 32% of Solana DEX volume
--- (docs/solana-research.md section 1.3) and publish no IDL and, for most of
+-- (the Solana venue research section 1.3) and publish no IDL and, for most of
 -- them, no event at all. The movement layer already decodes them perfectly:
 -- it reads real SPL transfers, so amounts, mints, price and trader are
 -- exact for every one of them.
@@ -86,7 +86,7 @@ ORDER BY program_id;
 --
 -- bags.fm, StonkFun, BONK.fun / LetsBonk, Jupiter Studio and the rest are
 -- not programs. They are CONFIGURATIONS of one of the three launchpad
--- programs (docs/launchpads-research.md section 4.2), and the only thing on
+-- programs (the launchpad venue research section 4.2), and the only thing on
 -- chain that names them is the config account's fee claimer. A Meteora DBC
 -- launch names its `config` and a Raydium LaunchLab launch its
 -- `platform_config`; both are stored in launchpad_tokens.launch_config_id

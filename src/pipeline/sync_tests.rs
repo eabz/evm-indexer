@@ -772,7 +772,7 @@ async fn a_bounded_run_over_a_stored_range_still_drains_the_stale_queue() {
 /// The queue of flushes that raced another process's purge is the ONLY
 /// record that those blocks have to be indexed again - their rows are
 /// stored, so no gap query ever asks for them. A purge that fails must
-/// therefore leave the queue alone (docs/review-round-4.md, MAJOR 3): the
+/// therefore leave the queue alone (review round 4, MAJOR 3): the
 /// old code drained it into a local `Vec` and lost the failed span AND
 /// every span after it on the first transient error.
 #[tokio::test(start_paused = true)]

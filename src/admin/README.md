@@ -1,5 +1,11 @@
 # admin
 
+> **What this is** — the password-protected web page `indexer fleet` serves: start, stop and restart a chain, change how it behaves while it runs, add a new one.
+> **What tables** — none of its own. It reads live status out of memory and writes desired state to `fleet_chains`; it owns no chain data and can not delete, purge or re-index any.
+> **Where the queries are** — nowhere here. This is the control surface; the datasets and their query cookbooks are listed in the main [README](../../README.md#what-is-indexed).
+> **Read this first** — the panel is OFF and its port is not bound unless `ADMIN_PASSWORD` is set, and refused unless that password is at least 12 characters.
+> **Binding design** — `docs/design.md` section 15.
+
 The control panel of `indexer fleet` (docs/design.md section 15): one
 embedded HTML page and a small JSON API, served by `axum` on
 `--admin-addr` (default `127.0.0.1:8090`).

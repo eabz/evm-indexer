@@ -269,7 +269,7 @@ pub trait ReorgStore: Send + Sync {
     /// whose `blockTime` the node omitted), and one such row used to set
     /// the repair window to "every day since 1970", which hides a whole
     /// chain's aggregates until a rebuild of fifty years finishes
-    /// (docs/review-round-4.md, MAJOR 6). `Purger` clamps a 0 it still
+    /// (review round 4, MAJOR 6). `Purger` clamps a 0 it still
     /// gets, loudly, but a store that knows the real oldest timestamp of
     /// the range should report it - the clamp is coarser.
     fn timestamp_span(

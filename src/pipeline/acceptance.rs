@@ -1881,7 +1881,7 @@ async fn debris_of_a_finished_purge_is_not_healed_again() {
 /// its own tables, so its `reorgs` row must not tell the next start that
 /// somebody else's orphans are finished business.
 ///
-/// The damage it used to hide (docs/review-round-4.md, MAJOR 5): a flush
+/// The damage it used to hide (review round 4, MAJOR 5): a flush
 /// dies before its `blocks` insert, a gap heal tombstones the core
 /// children and dies before writing its `reorgs` row - and then a module
 /// backfill over the same block range writes a COMPLETED row with a higher
@@ -1971,7 +1971,7 @@ async fn a_module_purge_does_not_settle_somebody_elses_orphans() {
 /// genesis block, a Solana slot whose `blockTime` the node omitted) must
 /// not set a purge's repair window to "every day since 1970".
 ///
-/// Measured in the report (docs/review-round-4.md, MAJOR 6): `from_ts` 0
+/// Measured in the report (review round 4, MAJOR 6): `from_ts` 0
 /// makes `epoch_floor_v` expand ~20,700 day rows and raise the floor on
 /// every day since the epoch - the whole chain reads as zero - while the
 /// rebuild slices fifty years into ~678 monthly INSERTs per aggregate.
@@ -2750,7 +2750,7 @@ async fn a_second_process_on_the_same_chain_refuses_to_start() {
 /// epoch and rebuilds every aggregate. Two of them on one chain and module
 /// corrupt it exactly as two indexers would - both write a `reorgs` row,
 /// and the lower-epoch rebuild ends up hidden by the higher floor
-/// (docs/review-round-4.md, MINOR 16). It took no lease at all.
+/// (review round 4, MINOR 16). It took no lease at all.
 ///
 /// It must still be able to run NEXT TO a live `indexer run`, which is
 /// documented and handled (`pipeline::backfill`), so it holds a lease of
@@ -2819,7 +2819,7 @@ async fn two_backfills_of_one_module_refuse_to_run_together() {
 /// The aggregate cross-check is the only thing that finds a DOUBLED
 /// aggregate, and it used to be switched off by ANY gap in the range -
 /// i.e. essentially always while a backfill is in progress
-/// (docs/review-round-4.md, MINOR 14). It runs over the complete UTC days
+/// (review round 4, MINOR 14). It runs over the complete UTC days
 /// of the GAP-FREE parts now, which is exact: a complete day of a gap-free
 /// part holds only blocks of that part.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

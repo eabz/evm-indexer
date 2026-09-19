@@ -7,7 +7,7 @@
 //! endian bytes, `ReplacingMergeTree(_version, is_deleted)` with `epoch`.
 //!
 //! Solana specifics, all decided in docs/design.md section 13 and
-//! docs/solana-research.md section 0:
+//! the Solana venue research section 0:
 //!
 //! - a pubkey is 32 RAW bytes in a `FixedString(32)`. An EVM address in the
 //!   same column is 12 zero bytes + the 20 address bytes. Readers format
@@ -103,7 +103,7 @@ const ORDINAL_HOP_MASK: u64 = (1 << ORDINAL_HOP_BITS) - 1;
 ///
 /// Crucially it is computable from ONE row. That matters because a
 /// program-filtered stream never sees the sibling instructions a flat rank
-/// would need (docs/solana-research.md section 0).
+/// would need (the Solana venue research section 0).
 ///
 /// Fails loudly rather than truncating: a path deeper than
 /// [`ORDINAL_LEVELS`] or an index above [`ORDINAL_MAX_INDEX`] cannot happen
@@ -366,7 +366,7 @@ mod serde_bytes_compat {
 ///
 /// `block_number` holds the slot. Contiguity is the `parent_slot` chain and
 /// NEVER `slot + 1`: skipped slots are normal on Solana and a missing
-/// integer is not a gap (docs/solana-research.md section 6.3).
+/// integer is not a gap (the Solana venue research section 6.3).
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct SolSlot {
@@ -386,7 +386,7 @@ pub struct SolSlot {
 
 /// A transaction the program filter matched. Slim on purpose: this is an
 /// analytics-only pipeline and the table is NOT the chain's transactions
-/// (docs/solana-research.md section 5.5).
+/// (the Solana venue research section 5.5).
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct SolTransaction {
@@ -396,7 +396,7 @@ pub struct SolTransaction {
     #[serde_as(as = "SerSig64")]
     pub signature: SigBytes,
     /// The reliable trader on Solana: the signer of a swap is very often a
-    /// router's PDA or a bot (docs/solana-research.md section 1.2).
+    /// router's PDA or a bot (the Solana venue research section 1.2).
     pub fee_payer: Pubkey,
     pub success: bool,
     pub fee: u64,
@@ -456,7 +456,7 @@ impl std::fmt::Display for Confidence {
 }
 
 /// One swap leg on one venue, in the CHAIN-NEUTRAL shape of
-/// docs/design.md section 13 / docs/solana-research.md section 0.
+/// docs/design.md section 13 / the Solana venue research section 0.
 ///
 /// TODO(merge): when the `dex-neutral` work lands, this struct and its table
 /// disappear: the fields below are exactly the chain-neutral `dex_swaps`
@@ -472,7 +472,7 @@ impl std::fmt::Display for Confidence {
 /// - `amount_in` / `amount_out` are the TAKER's view.
 /// - `amount_out_gross` is what the pool SENT; `amount_out` is what the
 ///   taker RECEIVED. They differ by a Token-2022 transfer fee, which no
-///   event mentions (docs/solana-research.md section 2.3).
+///   event mentions (the Solana venue research section 2.3).
 /// - `verified_in` / `verified_out` are the mints PROVEN by real token
 ///   movement in this instruction's subtree. On EVM this is the
 ///   corroboration rule of `src/dex/corroborate.rs`; on Solana it is always

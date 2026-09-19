@@ -2,7 +2,7 @@
 //! routers, and which move tokens.
 //!
 //! Every id here is quoted in base58 exactly as
-//! docs/solana-research.md appendix B records it, and decoded to 32 bytes
+//! the Solana venue research appendix B records it, and decoded to 32 bytes
 //! by [`pubkey`]. A unit test round-trips every entry back to base58, so a
 //! typo is a test failure and not a filter that silently matches nothing.
 //!
@@ -10,7 +10,7 @@
 //! the pump.fun bonding curve). The generic movement decoder works on ANY
 //! program in [`VENUES`], so adding a venue is one line here plus a
 //! `protocol` name - that is the whole point of the two-layer design in
-//! docs/solana-research.md section 3.3.
+//! the Solana venue research section 3.3.
 
 use crate::svm::models::Pubkey;
 
@@ -324,7 +324,7 @@ impl std::fmt::Display for Venue {
 /// written to the swap table; the rest of [`Venue::ALL`] is only a name
 /// until its program id is added to this list.
 ///
-/// Ordered by 30-day volume share (docs/solana-research.md section 1.1), so
+/// Ordered by 30-day volume share (the Solana venue research section 1.1), so
 /// the list reads as the coverage it buys:
 /// PumpSwap 23.1 + Orca 10.0 + Raydium 9.5 + Meteora DLMM 8.0 +
 /// pump.fun 3.2 + Meteora DAMM v2 0.4 = **~54% of Solana DEX volume**.
@@ -345,7 +345,7 @@ pub const VENUES: [Venue; 10] = [
 
 /// Aggregators and routers. They are ATTRIBUTION ONLY and their volume is
 /// NEVER venue volume: 40% of Solana DEX volume is routed
-/// (docs/solana-research.md section 1.2), so counting a router's
+/// (the Solana venue research section 1.2), so counting a router's
 /// instruction as a trade would double count almost half the chain.
 ///
 /// A swap whose instruction sits under one of these gets `route_ordinal` and
@@ -360,10 +360,10 @@ pub const VENUES: [Venue; 10] = [
 ///
 /// Provenance: DefiLlama's aggregator table names the shares (Jupiter
 /// $16.6B, DFlow $9.3B, OKX $4.0B, Titan $0.7B over 30 days,
-/// docs/solana-research.md §1.2); every id below was taken from the
+/// the Solana venue research §1.2); every id below was taken from the
 /// operator's OWN repository or from Jupiter's official platform list and
 /// then checked on mainnet, where each is an executable program. The six
-/// ids docs/solana-research.md records only as a PREFIX are resolved here,
+/// ids the Solana venue research records only as a PREFIX are resolved here,
 /// and `routers_match_the_prefixes_the_research_recorded` asserts each full
 /// id against the recorded prefix so a wrong completion is a test failure.
 ///
@@ -408,7 +408,7 @@ pub const ROUTERS_B58: &[(&str, &str)] = &[
     ("gmgn", "GMGNreQcJFufBiCTLDBgKhYEfEe9B454UjpDr5CaSLA1"),
 ];
 
-/// The router prefixes docs/solana-research.md §1.2 recorded from real
+/// The router prefixes the Solana venue research §1.2 recorded from real
 /// mainnet transactions, and the full id each one resolves to. A completion
 /// that does not start with the observed prefix is a wrong program.
 pub const ROUTER_PREFIXES: &[(&str, &str)] = &[

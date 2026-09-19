@@ -47,8 +47,8 @@
 //! # Front ends are never venues
 //!
 //! bags.fm, StonkFun, BONK.fun and the rest are CONFIGURATIONS of one of
-//! these three programs, not programs of their own (docs/launchpads-research
-//! §4.2). A DBC launch names its `config` and a LaunchLab launch its
+//! these three programs, not programs of their own (the launchpad venue
+//! research, §4.2). A DBC launch names its `config` and a LaunchLab its
 //! `platform_config`; both are stored in `launchpad_tokens.launch_config_id`
 //! and joined to `launchpad_frontends` through `sol_launchpad_configs`,
 //! which this module fills from `EvtCreateConfig(V2)`. Their volume

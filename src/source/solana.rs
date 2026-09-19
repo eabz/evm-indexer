@@ -69,7 +69,7 @@ pub const DEFAULT_URL: &str = "https://solana.hypersync.xyz";
 /// nothing: the lowest UNSET cap simply binds first.
 ///
 /// That is not a theoretical point. Measured on the production query shape
-/// (docs/solana-research.md section 11.1.1): with only
+/// (the Solana venue research section 11.1.1): with only
 /// `max_num_instructions` raised, a request returned **one slot**. With all
 /// five raised, the same request returned **40 slots**. At 30 queries a
 /// minute, one slot per query is 0.5 slots/s against a chain that produces
@@ -444,7 +444,7 @@ impl SolanaSource {
     ///
     /// * **Arrow is 43% of JSON for the identical query and costs the same
     ///   1000 budget units** (measured: 19.9 MB against 46.2 MB,
-    ///   docs/solana-research.md §11.1). At 162 GB/day of head traffic
+    ///   the Solana venue research §11.1). At 162 GB/day of head traffic
     ///   that is not a micro-optimisation.
     /// * **It surfaces `x-ratelimit-*`.** The budget is 30 queries per
     ///   60 s per endpoint and `remaining` counts BUDGET UNITS, not
@@ -874,7 +874,7 @@ mod tests {
     /// no fix at all: the lowest unset cap binds and stops the response.
     /// Measured on the production query shape, that was the difference
     /// between **1 slot** and **40 slots** per request
-    /// (docs/solana-research.md section 11.1.1).
+    /// (the Solana venue research section 11.1.1).
     #[test]
     fn every_response_cap_is_raised() {
         for (name, query) in [

@@ -1233,7 +1233,7 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
     /// See [`ClickhouseSink::stale`]. Returns the lowest purged block.
     ///
     /// The non-destructive drain itself is [`Purger::purge_queued`], which
-    /// the Solana loop uses too (docs/review-round-4.md, MAJOR 3).
+    /// the Solana loop uses too (review round 4, MAJOR 3).
     async fn purge_stale_flushes(&mut self) -> Result<Option<u64>> {
         let purger = self.purger.clone();
         let stale = self.stale.clone();
