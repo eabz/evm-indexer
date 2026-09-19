@@ -27,6 +27,9 @@ pub mod status;
 pub mod supervisor;
 
 #[cfg(test)]
+pub(crate) mod fixtures;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
@@ -78,7 +81,16 @@ pub async fn run(config: FleetConfig) -> Result<()> {
         .await
         .context("connect to the database")?;
 
-    let runner = Arc::new(PipelineRunner::new(config.clone()));
+    // ONE set of provider budgets for the process: the supervisor splits
+    // the memory cap with it, the runner hands its Solana half to every
+    // Solana chain.
+    let budgets = Arc::new(Budgets::new(
+        config.max_inflight_mb,
+        config.solana_queries_per_minute,
+    ));
+
+    let runner =
+        Arc::new(PipelineRunner::new(config.clone(), budgets.clone()));
     let store = Arc::new(ClickhouseStore {
         db: db.clone(),
         lease_ttl_ms: u64::try_from(
@@ -87,7 +99,8 @@ pub async fn run(config: FleetConfig) -> Result<()> {
         .unwrap_or(35_000),
     });
 
-    let supervisor = Supervisor::new(config.clone(), runner, store);
+    let supervisor =
+        Supervisor::with_budgets(config.clone(), runner, store, budgets);
     supervisor.load_and_start().await?;
 
     tokio::spawn(supervisor.clone().sample_forever());
@@ -156,11 +169,7 @@ struct PipelineRunner {
 }
 
 impl PipelineRunner {
-    fn new(config: FleetConfig) -> Self {
-        let budgets = Arc::new(Budgets::new(
-            config.max_inflight_mb,
-            config.solana_queries_per_minute,
-        ));
+    fn new(config: FleetConfig, budgets: Arc<Budgets>) -> Self {
         Self { config, budgets }
     }
 }

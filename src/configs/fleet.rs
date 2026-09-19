@@ -19,7 +19,7 @@
 //! unknown option is judged by the code that judges the command line.
 
 use super::{parse_flag, Config, IndexerArgs};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr};
 
@@ -301,8 +301,7 @@ impl FleetConfig {
 
         apply_chain_settings(&mut argv, settings)?;
 
-        let args = IndexerArgs::try_parse_from(&argv)
-            .map_err(|e| SettingError::new(None, clean(&e.to_string())))?;
+        let args = parse_run_arguments(&argv)?;
 
         let mut config: Config =
             args.try_into().map_err(|e: clap::Error| {
@@ -317,6 +316,33 @@ impl FleetConfig {
 
         Ok(config)
     }
+}
+
+/// The `indexer run` parser with every ENVIRONMENT fallback removed.
+///
+/// A fleet process is configured once, at start. A chain's options then
+/// come from exactly two places - the fleet-wide values and that chain's
+/// own settings - and from nowhere else. Left as it is, clap would fill
+/// anything not named on this command line from the process environment, so
+/// a stray `START_BLOCK=77` in a compose file would silently apply to every
+/// chain in the fleet and to every chain added later in the panel. Resetting
+/// the fallbacks makes `chain_config` a pure function of its arguments.
+///
+/// `indexer run` itself is untouched: it keeps every environment fallback
+/// it has always had.
+fn parse_run_arguments(
+    argv: &[String],
+) -> Result<IndexerArgs, SettingError> {
+    let command = IndexerArgs::command()
+        .mut_args(|arg| arg.env(None::<&str>))
+        .no_binary_name(false);
+
+    let matches = command
+        .try_get_matches_from(argv)
+        .map_err(|e| SettingError::new(None, clean(&e.to_string())))?;
+
+    IndexerArgs::from_arg_matches(&matches)
+        .map_err(|e| SettingError::new(None, clean(&e.to_string())))
 }
 
 /// Appends the settings to a command line as `indexer run` flags.
@@ -559,6 +585,43 @@ mod tests {
             .unwrap_err();
 
         assert!(!error.message.contains("hunter2secret"), "{error}");
+    }
+
+    /// A fleet is configured once, at start. A `START_BLOCK` left in a
+    /// compose file must not silently apply to every chain the panel adds
+    /// later - which is what clap's environment fallbacks would do.
+    #[test]
+    fn the_process_environment_never_decides_a_chains_options() {
+        let _guard = super::super::tests::env_lock();
+
+        for (name, value) in [
+            ("START_BLOCK", "77"),
+            ("CONFIRMATIONS", "99"),
+            ("NO_DEX", "true"),
+            ("CHAIN_ID", "8453"),
+            ("RPC_URL", "https://leaked.example"),
+        ] {
+            std::env::set_var(name, value);
+        }
+
+        let config =
+            base().chain_config(1, &ChainSettings::new()).unwrap();
+
+        for name in [
+            "START_BLOCK",
+            "CONFIRMATIONS",
+            "NO_DEX",
+            "CHAIN_ID",
+            "RPC_URL",
+        ] {
+            std::env::remove_var(name);
+        }
+
+        assert_eq!(config.chain_id, 1);
+        assert_eq!(config.start_block, 0);
+        assert_eq!(config.confirmations, 0);
+        assert!(config.dex);
+        assert_eq!(config.rpc_url, None);
     }
 
     #[test]

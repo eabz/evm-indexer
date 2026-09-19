@@ -483,13 +483,37 @@ mod tests {
             .expect("locked out again");
         assert_eq!(second, FIRST_LOCKOUT * 2);
 
-        // ... and it never grows past the cap.
-        let mut at = now + FIRST_LOCKOUT;
+        // ... and it never grows past the cap, however long it goes on.
+        let mut last = second;
         for _ in 0..30 {
-            at += MAX_LOCKOUT;
-            let lockout = limiter.failed_at(who, at).expect("locked out");
-            assert!(lockout <= MAX_LOCKOUT, "{lockout:?}");
+            last = limiter
+                .failed_at(who, now + FIRST_LOCKOUT)
+                .expect("still locked out");
+            assert!(last <= MAX_LOCKOUT, "{last:?}");
         }
+        assert_eq!(last, MAX_LOCKOUT);
+    }
+
+    /// The lock-out is not a punishment for ever: an address that stops
+    /// guessing for longer than the window (and is no longer locked out) is
+    /// forgotten, so the owner who mistyped their password in the morning
+    /// is not locked out in the afternoon.
+    #[test]
+    fn an_address_that_gives_up_is_forgotten() {
+        let limiter = RateLimiter::default();
+        let now = Instant::now();
+        let who = address(1);
+
+        for _ in 0..(ATTEMPTS_PER_WINDOW + 1) {
+            limiter.failed_at(who, now);
+        }
+        assert!(matches!(limiter.check_at(who, now), Allowed::Wait(_)));
+
+        let much_later = now + MAX_LOCKOUT + ATTEMPT_WINDOW;
+        assert_eq!(limiter.check_at(who, much_later), Allowed::Yes);
+
+        // And the count starts again rather than locking out at once.
+        assert_eq!(limiter.failed_at(who, much_later), None);
     }
 
     #[test]

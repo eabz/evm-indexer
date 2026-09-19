@@ -879,6 +879,11 @@ mod tests {
     /// The environment is process global; tests touching it take this lock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// The same lock, for the tests of `configs::fleet`.
+    pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn parse_with_env(
         env: &[(&str, &str)],
         args: &[&str],
@@ -1552,6 +1557,128 @@ mod tests {
         assert_eq!(config.end_block, 0);
 
         assert!(parse_command(&[], &["verify"], false).is_err());
+    }
+
+    // ---- indexer fleet ----
+
+    fn fleet(
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> Result<FleetConfig, clap::Error> {
+        let mut argv = vec!["fleet"];
+        argv.extend_from_slice(args);
+
+        match parse_command(env, &argv, false)? {
+            Command::Fleet(config) => Ok(*config),
+            other => panic!("expected the fleet command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fleet_needs_a_database_and_a_token_and_nothing_else() {
+        // The chains come from the table, so none has to be named.
+        let config = fleet(
+            &[],
+            &[
+                "--database",
+                DATABASE,
+                "--hypersync-token",
+                "00000000-0000-0000-0000-000000000000",
+            ],
+        )
+        .unwrap();
+
+        assert!(config.chains.is_empty());
+        assert_eq!(
+            config.admin_addr,
+            fleet::DEFAULT_ADMIN_ADDR.parse().unwrap()
+        );
+        assert_eq!(config.metrics_addr, None);
+        assert!(!config.admin_allow_remote);
+        assert!(!config.admin_secure_cookie);
+        assert!(!config.admin_trust_forwarded_proto);
+        assert!(!config.no_migrate);
+        assert_eq!(config.max_inflight_mb, 2_048);
+        assert_eq!(config.solana_queries_per_minute, 25);
+
+        // Without them it is refused, like `run`.
+        assert!(fleet(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn fleet_takes_chains_by_id_and_by_name_repeatedly() {
+        let config = fleet(
+            &FULL_ENV,
+            &["--chain", "1", "--chain", "8453", "--chain", "solana"],
+        )
+        .unwrap();
+
+        assert_eq!(config.chains, [1, 8453, 1_399_811_149]);
+        assert!(fleet(&FULL_ENV, &["--chain", "mainnet"]).is_err());
+    }
+
+    /// The panel can start and stop indexing and speaks plain HTTP, so
+    /// putting it on the network has to be deliberate
+    /// (docs/design.md section 15).
+    #[test]
+    fn the_panel_refuses_a_public_address_without_the_flag() {
+        for address in ["0.0.0.0:8090", "192.168.1.10:8090", "[::]:8090"] {
+            let refused = fleet(&FULL_ENV, &["--admin-addr", address])
+                .unwrap_err()
+                .to_string();
+
+            assert!(refused.contains("loopback"), "{address}: {refused}");
+            assert!(
+                refused.contains("--admin-allow-remote"),
+                "{address}: {refused}"
+            );
+        }
+
+        // Loopback is always fine ...
+        for address in ["127.0.0.1:9000", "[::1]:9000"] {
+            let config =
+                fleet(&FULL_ENV, &["--admin-addr", address]).unwrap();
+            assert!(config.admin_addr.ip().is_loopback());
+        }
+
+        // ... and so is anything, once the operator says so.
+        let config = fleet(
+            &FULL_ENV,
+            &["--admin-addr", "0.0.0.0:8090", "--admin-allow-remote"],
+        )
+        .unwrap();
+        assert!(config.admin_allow_remote);
+        assert_eq!(config.admin_addr.port(), 8090);
+
+        // Nonsense is nonsense.
+        assert!(fleet(&FULL_ENV, &["--admin-addr", "nowhere"]).is_err());
+    }
+
+    /// `ADMIN_PASSWORD` must never be a flag (it would show up in `ps`) and
+    /// must never be parsed by clap (it would show up in `--help`).
+    #[test]
+    fn the_admin_password_is_not_a_command_line_option() {
+        use clap::CommandFactory;
+
+        let mut cli = Cli::command();
+        cli.build();
+
+        for subcommand in cli.get_subcommands() {
+            for arg in subcommand.get_arguments() {
+                assert_ne!(
+                    arg.get_long(),
+                    Some("admin-password"),
+                    "the password must not be a flag"
+                );
+                assert_ne!(
+                    arg.get_env().and_then(|e| e.to_str()),
+                    Some(ADMIN_PASSWORD_ENV),
+                    "the password must not be read by clap"
+                );
+            }
+        }
+
+        assert!(!ENV_VARS.contains(&ADMIN_PASSWORD_ENV));
     }
 
     #[test]

@@ -154,6 +154,18 @@ impl Supervisor {
             config.solana_queries_per_minute,
         ));
 
+        Self::with_budgets(config, runner, store, budgets)
+    }
+
+    /// [`Self::new`] over budgets the caller already owns, so the
+    /// supervisor and the thing that starts the chains share ONE Solana
+    /// query allowance instead of one each.
+    pub fn with_budgets(
+        config: FleetConfig,
+        runner: Arc<dyn ChainRunner>,
+        store: Arc<dyn DesiredStore>,
+        budgets: Arc<Budgets>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
             runner,
@@ -300,7 +312,7 @@ impl Supervisor {
         while keep_running.load(Ordering::SeqCst)
             && !*self.stopping.borrow()
         {
-            let Some((settings, shutdown, flush_rows)) =
+            let Some((settings, shutdown, flush_rows, generation)) =
                 self.attempt_inputs(chain)
             else {
                 break;
@@ -326,6 +338,16 @@ impl Supervisor {
                 || *self.stopping.borrow()
             {
                 break;
+            }
+
+            // The pipeline returns `Ok` both when it reached `--end-block`
+            // and when its shutdown future resolved, so the two are told
+            // apart by the cancellation counter: a Restart bumps it, and
+            // the chain starts again at once with no backoff, because
+            // nothing failed.
+            if self.cancel_generation(chain) != Some(generation) {
+                failures = 0;
+                continue;
             }
 
             let wait = match result {
@@ -375,11 +397,19 @@ impl Supervisor {
         status.set_state(ChainState::Stopped);
     }
 
+    /// The cancellation counter of a chain right now.
+    fn cancel_generation(&self, chain: u64) -> Option<u64> {
+        let chains = self.lock();
+        let generation = *chains.get(&chain)?.cancel.borrow();
+        Some(generation)
+    }
+
     /// Everything one attempt needs, read under the lock in one go.
+    #[allow(clippy::type_complexity)]
     fn attempt_inputs(
         &self,
         chain: u64,
-    ) -> Option<(ChainSettings, BoxFuture<'static, ()>, usize)> {
+    ) -> Option<(ChainSettings, BoxFuture<'static, ()>, usize, u64)> {
         let chains = self.lock();
         let entry = chains.get(&chain)?;
 
@@ -391,11 +421,16 @@ impl Supervisor {
             .filter(|entry| entry.desired == Desired::Running)
             .count();
 
-        Some((
+        let generation = *entry.cancel.borrow();
+
+        let inputs = (
             entry.settings.clone(),
             self.shutdown_future(entry),
             self.budgets.flush_rows(running),
-        ))
+            generation,
+        );
+
+        Some(inputs)
     }
 
     pub fn budgets(&self) -> Arc<Budgets> {
