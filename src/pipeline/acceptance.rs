@@ -903,8 +903,10 @@ async fn zero_flags_index_dex_and_resolve_tokens() {
         scenario
             .count(&format!(
                 "SELECT toUInt64(count()) FROM dex_swaps FINAL WHERE \
-                 tx_from = unhex('{}') AND tx_to = unhex('{}')",
+                 tx_from = unhex('{}{}') AND tx_to = unhex('{}{}')",
+                "00".repeat(12),
                 "d0".repeat(20),
+                "00".repeat(12),
                 "c0".repeat(20)
             ))
             .await,
@@ -914,7 +916,8 @@ async fn zero_flags_index_dex_and_resolve_tokens() {
         scenario
             .count(&format!(
                 "SELECT toUInt64(count()) FROM dex_liquidity FINAL WHERE \
-                 tx_from = unhex('{}')",
+                 tx_from = unhex('{}{}')",
+                "00".repeat(12),
                 "d0".repeat(20)
             ))
             .await,
@@ -1271,7 +1274,7 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     forged.dex.liquidity.clear();
     forged.dex.pools.clear();
     for swap in &mut forged.dex.swaps {
-        swap.log_index += 1_000;
+        swap.ordinal += 1_000;
     }
     forged.set_version(next_version());
     let key =

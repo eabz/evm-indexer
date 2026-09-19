@@ -24,11 +24,28 @@
 -- hourly native price) - and every rollup is a sum of those values.
 -- *_adj columns are decimals adjusted Float64 (~15.9 significant digits),
 -- raw columns stay exact UInt256 / Int256.
+--
+-- Chain neutral ids (docs/design.md §13): every id column these views carry
+-- through is FixedString(32) raw bytes, and NOTHING here assumes the top 12
+-- bytes are zero - an unknown token is the 32 zero bytes
+-- (toFixedString('', 32)), never a 20 byte value. The only place a 20 byte
+-- EVM address meets them is the `tokens` join of dex_token_info_v, which
+-- pads the address up. Format ids for display with the expression documented
+-- in migration 0006, where chains_v gives the family. dex_pools_v.pool
+-- prints all 32 bytes of a pool id on purpose, because a V4 / Balancer pool
+-- id is not an address.
 
 -- Symbol / decimals / quote kind of a token: tokens first, quote_tokens as
 -- the fallback for pseudo addresses that have no contract. A tokens row
 -- with no name, no symbol and 0 decimals is the "checked, nothing there"
 -- row of the token resolver: its decimals are UNKNOWN, not 0.
+--
+-- THE seam between the chain neutral analytics tables (token FixedString(32),
+-- docs/design.md §13) and the EVM-only core table `tokens` (address
+-- FixedString(20)): the address is left padded to 32 bytes here, so a Solana
+-- token simply finds no `tokens` row instead of matching a truncated one.
+-- Pad, never truncate the analytics side - substring(token, 13) would map
+-- every 32 byte pubkey onto some address.
 CREATE VIEW IF NOT EXISTS dex_token_info_v AS
 SELECT
   chain,
@@ -39,7 +56,7 @@ SELECT
   anyIf(info_kind, origin = 0) AS kind
 FROM
 (
-  SELECT chain, address AS token, symbol AS info_symbol, name AS info_name, if(name = '' AND symbol = '' AND decimals = 0, NULL, toNullable(decimals)) AS info_decimals, '' AS info_kind, 1 AS origin
+  SELECT chain, toFixedString(concat(unhex('000000000000000000000000'), address), 32) AS token, symbol AS info_symbol, name AS info_name, if(name = '' AND symbol = '' AND decimals = 0, NULL, toNullable(decimals)) AS info_decimals, '' AS info_kind, 1 AS origin
   FROM tokens FINAL
   UNION ALL
   SELECT chain, token, symbol AS info_symbol, '' AS info_name, decimals AS info_decimals, toString(kind) AS info_kind, 0 AS origin
@@ -118,7 +135,7 @@ FROM
   INNER JOIN dex_token_info_v AS qo ON qo.chain = v.chain AND qo.token = v.token_out
   LEFT JOIN (SELECT chain AS e_chain, emitter AS e_emitter, protocol AS e_protocol, price_source AS e_price_source FROM dex_trusted_emitters_v) AS e ON e.e_chain = v.chain AND e.e_emitter = v.emitter
   LEFT JOIN (SELECT chain, 1 AS restricted FROM dex_trusted_emitters_v WHERE price_source = 1 GROUP BY chain) AS r ON r.chain = v.chain
-  WHERE v.token_in != toFixedString('', 20) AND v.token_out != toFixedString('', 20)
+  WHERE v.token_in != toFixedString('', 32) AND v.token_out != toFixedString('', 32)
     AND ((qi.kind = 'native' AND qo.kind = 'stable') OR (qi.kind = 'stable' AND qo.kind = 'native'))
     AND qi.decimals IS NOT NULL AND qo.decimals IS NOT NULL
     AND (v.protocol NOT IN ('uniswap_v4', 'balancer_v2') OR ifNull(e.e_protocol, '') != '')
@@ -140,8 +157,9 @@ SELECT
   r.chain AS chain,
   r.block_number AS block_number,
   r.timestamp AS timestamp,
-  r.transaction_hash AS transaction_hash,
-  r.log_index AS log_index,
+  r.tx_id AS tx_id,
+  r.tx_index AS tx_index,
+  r.ordinal AS ordinal,
   r.pool_id AS pool_id,
   r.emitter AS emitter,
   r.protocol AS protocol,
@@ -178,7 +196,7 @@ FROM
 (
   SELECT
     s.*,
-    toFixedString('', 20) AS zero,
+    toFixedString('', 32) AS zero,
     ifNull(p.trusted, 0) = 1 AS pool_trusted,
     (s.protocol NOT IN ('uniswap_v4', 'balancer_v2') OR ifNull(e.e_protocol, '') != '') AS valued,
     s.verified_in != zero AS in_verified,
@@ -226,11 +244,11 @@ SELECT
   v.chain AS chain, v.pool_id AS pool_id, v.emitter AS emitter, v.protocol AS protocol, v.bucket AS bucket,
   v.token_in AS token_in, v.token_out AS token_out,
   v.volume_in AS volume_in, v.volume_out AS volume_out,
-  v.volume_in / pow(10, if(v.token_in != toFixedString('', 20), qi.decimals, NULL)) AS volume_in_adj,
-  v.volume_out / pow(10, if(v.token_out != toFixedString('', 20), qo.decimals, NULL)) AS volume_out_adj,
+  v.volume_in / pow(10, if(v.token_in != toFixedString('', 32), qi.decimals, NULL)) AS volume_in_adj,
+  v.volume_out / pow(10, if(v.token_out != toFixedString('', 32), qo.decimals, NULL)) AS volume_out_adj,
   (v.protocol NOT IN ('uniswap_v4', 'balancer_v2') OR ifNull(e.e_protocol, '') != '') AS valued,
-  if(valued AND v.token_in != toFixedString('', 20), qi.kind, '') AS quote_in,
-  if(valued AND v.token_out != toFixedString('', 20), qo.kind, '') AS quote_out,
+  if(valued AND v.token_in != toFixedString('', 32), qi.kind, '') AS quote_in,
+  if(valued AND v.token_out != toFixedString('', 32), qo.kind, '') AS quote_out,
   if(n.price > 0 AND v.bucket - n.valid_from <= 86400, n.price, NULL) AS native_price,
   coalesce(
     if(quote_in = 'stable', volume_in_adj, NULL),
@@ -327,7 +345,7 @@ FROM
 (
   SELECT
     u.chain AS chain, u.bucket AS bucket, u.pool_id AS pool_id, u.emitter AS emitter, u.volume_usd AS volume_usd, u.swaps AS swaps,
-    arrayJoin(arrayFilter(x -> tupleElement(x, 1) != toFixedString('', 20), [(u.token_in, qi.symbol, u.volume_in, u.volume_in_adj), (u.token_out, qo.symbol, u.volume_out, u.volume_out_adj)])) AS side
+    arrayJoin(arrayFilter(x -> tupleElement(x, 1) != toFixedString('', 32), [(u.token_in, qi.symbol, u.volume_in, u.volume_in_adj), (u.token_out, qo.symbol, u.volume_out, u.volume_out_adj)])) AS side
   FROM dex_pool_volume_usd_1h_v AS u
   LEFT JOIN dex_token_info_v AS qi ON qi.chain = u.chain AND qi.token = u.token_in
   LEFT JOIN dex_token_info_v AS qo ON qo.chain = u.chain AND qo.token = u.token_out
