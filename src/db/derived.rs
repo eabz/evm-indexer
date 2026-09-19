@@ -92,13 +92,119 @@ impl DerivedTable {
         purged_from: u64,
         purged_to: Option<u64>,
     ) -> String {
-        render(self.rebuild_sql, chain, repair_start(from_ts), epoch)
+        self.render_slice(
+            chain,
+            repair_start(from_ts),
+            u32::MAX,
+            epoch,
+            purged_from,
+            purged_to,
+        )
+    }
+
+    /// The rebuild as ONE INSERT PER UTC MONTH of `[from_ts, to_ts)`,
+    /// oldest first. The aggregates are `PARTITION BY toYYYYMM(bucket)` and
+    /// ClickHouse refuses an insert block that touches more than 100
+    /// partitions (code 252): a single open ended INSERT would make a purge
+    /// deep in history (a gap heal while backfilling old blocks) fail at
+    /// this step on every restart, for ever.
+    ///
+    /// `to_ts` is exclusive: the timestamp of the newest stored block + 1
+    /// (NOT `u32::MAX`: one statement is issued per month). A `rebuild_sql`
+    /// without a `{to_ts}` placeholder can not be sliced and is rendered as
+    /// the single statement [`Self::rebuild_sql`] gives.
+    pub fn rebuild_statements(
+        &self,
+        chain: u64,
+        from_ts: u32,
+        to_ts: u32,
+        epoch: u32,
+        purged_from: u64,
+        purged_to: Option<u64>,
+    ) -> Vec<String> {
+        if !self.rebuild_sql.contains("{to_ts}") {
+            return vec![self.rebuild_sql(
+                chain,
+                from_ts,
+                epoch,
+                purged_from,
+                purged_to,
+            )];
+        }
+
+        let mut statements = Vec::new();
+        let mut start = repair_start(from_ts);
+
+        while start < to_ts {
+            let end = next_month_start(start).min(u64::from(to_ts)) as u32;
+            statements.push(self.render_slice(
+                chain,
+                start,
+                end,
+                epoch,
+                purged_from,
+                purged_to,
+            ));
+            start = end;
+        }
+
+        statements
+    }
+
+    fn render_slice(
+        &self,
+        chain: u64,
+        from_ts: u32,
+        to_ts: u32,
+        epoch: u32,
+        purged_from: u64,
+        purged_to: Option<u64>,
+    ) -> String {
+        render(self.rebuild_sql, chain, from_ts, epoch)
+            .replace("{to_ts}", &to_ts.to_string())
             .replace("{purge_from}", &purged_from.to_string())
             .replace(
                 "{purge_to}",
                 &purged_to.unwrap_or(u64::MAX).to_string(),
             )
     }
+}
+
+/// Unix seconds of the first instant of the UTC month after the one
+/// `timestamp` falls into (civil-from-days, proleptic Gregorian).
+pub fn next_month_start(timestamp: u32) -> u64 {
+    let days = i64::from(timestamp / 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1_460
+        + day_of_era / 36_524
+        - day_of_era / 146_096)
+        / 365;
+    let day_of_year = day_of_era
+        - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+
+    let (next_year, next_month) =
+        if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+
+    // days-from-civil of the first of the next month
+    let y = if next_month <= 2 { next_year - 1 } else { next_year };
+    let era = y.div_euclid(400);
+    let year_of_era = y.rem_euclid(400);
+    let shifted = (next_month + 9) % 12;
+    let day_of_year = (153 * shifted + 2) / 5;
+    let day_of_era = year_of_era * 365 + year_of_era / 4
+        - year_of_era / 100
+        + day_of_year;
+
+    ((era * 146_097 + day_of_era - 719_468) * 86_400) as u64
 }
 
 /// Fills the `{chain}`, `{from_ts}` and `{epoch}` placeholders.
@@ -132,7 +238,7 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
             uniqState(miner) AS miners, \
             avgState(toFloat64(b.base_fee_per_gas)) AS base_fee_per_gas \
             FROM blocks AS b \
-            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} \
+            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} AND timestamp < {to_ts} \
             AND NOT (number >= {purge_from} AND number < {purge_to}) \
             GROUP BY chain, day, epoch",
     },
@@ -156,7 +262,7 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
             uniqState(t.`to`) AS recipients, \
             avgState(toFloat64(t.effective_gas_price)) AS effective_gas_price \
             FROM transactions AS t \
-            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} \
+            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} AND timestamp < {to_ts} \
             AND NOT (block_number >= {purge_from} AND block_number < {purge_to}) \
             GROUP BY chain, day, epoch",
     },
@@ -175,7 +281,7 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
             uniqState(e.`from`) AS senders, \
             uniqState(e.`to`) AS recipients \
             FROM erc20_transfers AS e \
-            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} \
+            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} AND timestamp < {to_ts} \
             AND NOT (block_number >= {purge_from} AND block_number < {purge_to}) \
             GROUP BY chain, token_address, day, epoch",
     },
@@ -185,7 +291,7 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
 /// reads deduplicated rows of one chain from `from_ts` on ...
 #[cfg(test)]
 const REBUILD_FILTER: &str =
-    " FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts}";
+    " FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} AND timestamp < {to_ts}";
 #[cfg(test)]
 const VIEW_FILTER: &str = " WHERE is_deleted = 0";
 /// ... without the range being purged (`number` when it reads `blocks`) ...
@@ -219,6 +325,74 @@ mod tests {
         let mut selects = view_selects(table);
         assert_eq!(selects.len(), 1, "{table}");
         selects.remove(0)
+    }
+
+    #[test]
+    fn rebuilds_are_sliced_by_utc_month() {
+        let table = DerivedTable {
+            name: "t",
+            bucket_seconds: 86_400,
+            bucket_column: "day",
+            rebuild_sql: "ts >= {from_ts} AND ts < {to_ts} e{epoch} \
+                          NOT [{purge_from}, {purge_to})",
+        };
+
+        // 2023-11-14 22:13:20 .. 2024-02-10: Nov (from the start of the
+        // day), Dec, Jan, Feb (up to `to_ts`).
+        let statements = table.rebuild_statements(
+            1,
+            1_700_000_000,
+            1_707_523_200,
+            3,
+            10,
+            Some(20),
+        );
+        assert_eq!(
+            statements,
+            vec![
+                "ts >= 1699920000 AND ts < 1701388800 e3 NOT [10, 20)",
+                "ts >= 1701388800 AND ts < 1704067200 e3 NOT [10, 20)",
+                "ts >= 1704067200 AND ts < 1706745600 e3 NOT [10, 20)",
+                "ts >= 1706745600 AND ts < 1707523200 e3 NOT [10, 20)",
+            ]
+        );
+
+        // 15 years: far more than the 100 partitions one INSERT may touch,
+        // and every slice stays inside one month.
+        let statements = table.rebuild_statements(
+            1,
+            1_438_269_973,
+            1_911_655_573,
+            1,
+            0,
+            None,
+        );
+        assert_eq!(statements.len(), 181);
+
+        // Nothing to rebuild.
+        assert!(table
+            .rebuild_statements(
+                1,
+                1_700_000_000,
+                1_600_000_000,
+                1,
+                0,
+                None
+            )
+            .is_empty());
+
+        // Every core aggregate can be sliced.
+        for table in CORE_DERIVED {
+            assert!(
+                table.rebuild_sql.contains("{to_ts}"),
+                "{}",
+                table.name
+            );
+        }
+
+        assert_eq!(next_month_start(0), 2_678_400);
+        assert_eq!(next_month_start(1_709_164_800), 1_709_251_200); // leap Feb 29
+        assert_eq!(next_month_start(1_703_980_800), 1_704_067_200); // Dec -> Jan
     }
 
     #[test]

@@ -265,9 +265,9 @@ impl ClickhouseReorgStore {
                 Scope::Module(scoped) => scoped.name == spec.name,
             };
             tables.extend(
-                spec.derived
-                    .iter()
-                    .map(|table| (table, spec.rebuild_sql, in_scope)),
+                spec.derived.iter().map(|table| {
+                    (table, spec.rebuild_statements, in_scope)
+                }),
             );
         }
 

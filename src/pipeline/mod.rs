@@ -398,6 +398,9 @@ pub async fn run_with<S: BlockSource>(
         );
     }
 
+    // `_version`s must never go back, whatever this host's clock says.
+    db.seed_version(&modules::versioned_tables()).await?;
+
     // The epoch of a chain survives restarts in `reorgs`.
     db.set_epoch(db.current_epoch().await?);
 

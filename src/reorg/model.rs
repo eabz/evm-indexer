@@ -254,6 +254,40 @@ impl CanonicalChain for FakeChain {
 /// partition.
 pub const PARTITION_SECONDS: u32 = 30 * 86_400;
 
+/// The `_version` clock of one process: `db::next_version()` with a wall
+/// clock that can be set BACK (NTP step, VM snapshot, skewed container
+/// host) and the seed a process reads from the database at startup.
+#[derive(Debug)]
+pub struct ModelClock {
+    /// How far behind the real clock this process' wall clock is.
+    behind: u64,
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl ModelClock {
+    pub fn new(behind: u64, seed: u64) -> Arc<Self> {
+        Arc::new(Self {
+            behind,
+            last: std::sync::atomic::AtomicU64::new(seed),
+        })
+    }
+
+    /// Strictly increasing within the process, never below the seed.
+    pub fn next(&self) -> u64 {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let wall = next_version().saturating_sub(self.behind);
+        let mut last = self.last.load(SeqCst);
+        loop {
+            let next = wall.max(last + 1);
+            match self.last.compare_exchange(last, next, SeqCst, SeqCst) {
+                Ok(_) => return next,
+                Err(current) => last = current,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row<T> {
     pub version: u64,
@@ -264,13 +298,15 @@ pub struct Row<T> {
 }
 
 /// `SELECT .. FINAL`: per partition the newest version, unless it is a
-/// tombstone.
+/// tombstone. With EQUAL versions ClickHouse keeps the row inserted LAST
+/// (measured on 25.12: tombstone last -> gone, canonical last -> alive,
+/// also after `OPTIMIZE FINAL`); `versions` is in insertion order.
 pub fn live<T>(versions: &[Row<T>]) -> Vec<&Row<T>> {
     let mut newest: BTreeMap<u32, &Row<T>> = BTreeMap::new();
     for row in versions {
         let partition = row.timestamp / PARTITION_SECONDS;
         match newest.get(&partition) {
-            Some(current) if current.version >= row.version => {}
+            Some(current) if current.version > row.version => {}
             _ => {
                 newest.insert(partition, row);
             }
@@ -323,6 +359,21 @@ pub struct ChainData {
 }
 
 impl ChainData {
+    /// `max(_version)` over every block scoped table and the checkpoints:
+    /// what a starting process seeds its version clock with.
+    pub fn max_version(&self) -> u64 {
+        let blocks = self.blocks.values().flatten().map(|r| r.version);
+        let children = self
+            .children
+            .iter()
+            .flat_map(|table| table.values().flatten())
+            .map(|r| r.version);
+        let checkpoints =
+            self.checkpoints.values().flatten().map(|r| r.version);
+
+        blocks.chain(children).chain(checkpoints).max().unwrap_or(0)
+    }
+
     fn add(&mut self, agg: Agg, ts: u32, epoch: u32, value: u64) {
         let entry =
             self.aggs.entry((agg, agg.bucket(ts), epoch)).or_default();
@@ -1227,6 +1278,7 @@ struct WriterState {
 pub struct FakeWriter {
     chain: u64,
     store: Arc<FakeStore>,
+    clock: Arc<ModelClock>,
     /// `quiesce` drops the buffer instead of flushing it.
     discard_on_quiesce: bool,
     /// `quiesce` returns without making sure its flush can be read back
@@ -1239,12 +1291,14 @@ impl FakeWriter {
     pub fn new(
         chain: u64,
         store: Arc<FakeStore>,
+        clock: Arc<ModelClock>,
         discard_on_quiesce: bool,
         sloppy: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             chain,
             store,
+            clock,
             discard_on_quiesce,
             sloppy,
             state: Mutex::new(WriterState {
@@ -1298,7 +1352,7 @@ impl FakeWriter {
 
         assert_ne!(epoch, u32::MAX, "the writer never adopted an epoch");
 
-        let version = next_version();
+        let version = self.clock.next();
         self.store.insert_children(self.chain, &blocks, epoch, version);
 
         let written: Vec<FakeBlock> = match fault {
@@ -1411,6 +1465,9 @@ pub struct NodeOptions {
     pub stream_guards: bool,
     pub check_tip: bool,
     pub sloppy_writer: bool,
+    /// A starting process seeds its `_version` clock from the store
+    /// (`false` = the bug of review round 2, for the negative control).
+    pub seed_versions: bool,
 }
 
 impl NodeOptions {
@@ -1427,6 +1484,7 @@ impl NodeOptions {
             stream_guards: true,
             check_tip: false,
             sloppy_writer: false,
+            seed_versions: true,
         }
     }
 }
@@ -1448,6 +1506,9 @@ pub struct Node {
     pub writer: Arc<FakeWriter>,
     pub recorder: Arc<Recorder>,
     pub guard: ReorgGuard,
+    /// How far behind the real clock the wall clock of the CURRENT process
+    /// is (grows with every `restart_with_clock_step_back`).
+    clock_behind: u64,
     cursor: u64,
     started: bool,
     pub rollbacks: Vec<super::Rollback>,
@@ -1461,7 +1522,7 @@ impl Node {
     ) -> Self {
         let recorder = Arc::new(Recorder::default());
         let (writer, guard) =
-            Self::boot(&options, &chain, &store, &recorder);
+            Self::boot(&options, &chain, &store, &recorder, 0);
         Self {
             options,
             chain,
@@ -1469,6 +1530,7 @@ impl Node {
             writer,
             recorder,
             guard,
+            clock_behind: 0,
             cursor: options.start_block,
             started: false,
             rollbacks: Vec::new(),
@@ -1480,10 +1542,20 @@ impl Node {
         chain: &Arc<FakeChain>,
         store: &Arc<FakeStore>,
         recorder: &Arc<Recorder>,
+        clock_behind: u64,
     ) -> (Arc<FakeWriter>, ReorgGuard) {
+        // What `Database::seed_version` does at startup.
+        let seed = if options.seed_versions {
+            store.snapshot(options.chain_id).max_version()
+        } else {
+            0
+        };
+        let clock = ModelClock::new(clock_behind, seed);
+
         let writer = FakeWriter::new(
             options.chain_id,
             store.clone(),
+            clock.clone(),
             options.discard_on_quiesce,
             options.sloppy_writer,
         );
@@ -1493,6 +1565,7 @@ impl Node {
             recorder.clone(),
             recorder.clone(),
         )
+        .with_version_source(Arc::new(move || clock.next()))
         .with_options(PurgeOptions {
             tombstone_attempts: 6,
             retry_delay: Duration::ZERO,
@@ -1506,6 +1579,13 @@ impl Node {
         (writer.clone(), ReorgGuard::new(config, chain.clone(), purger))
     }
 
+    /// The process died, and the wall clock of the host it comes back on
+    /// is `step_back` version units (ms) behind where it was.
+    pub fn restart_with_clock_step_back(&mut self, step_back: u64) {
+        self.clock_behind = self.clock_behind.saturating_add(step_back);
+        self.restart();
+    }
+
     /// The process died: buffered rows and every in-memory state are gone.
     pub fn restart(&mut self) {
         let (writer, guard) = Self::boot(
@@ -1513,6 +1593,7 @@ impl Node {
             &self.chain,
             &self.store,
             &self.recorder,
+            self.clock_behind,
         );
         self.writer = writer;
         self.guard = guard;
