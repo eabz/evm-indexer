@@ -1,5 +1,6 @@
 pub mod configs;
 pub mod db;
+pub mod dex;
 pub mod metrics;
 pub mod pipeline;
 pub mod source;

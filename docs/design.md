@@ -39,9 +39,14 @@ Deferred (NOT in scope): F1 Arrow passthrough.
 - Dead columns are removed: `log_type`, `removed`, the duplicated `address` on transfer
   tables (keep `token_address`), `is_uncle`, `blocks.logs_bloom`. `logs.transaction_log_index`
   becomes `transaction_index`. `contracts` and `traces` get `timestamp`.
-- Every table: `ENGINE = ReplacingMergeTree(_version)`, `_version UInt64` = unix ms taken
-  once per flush, `PARTITION BY (chain, toYYYYMM(timestamp))`,
-  `SETTINGS do_not_merge_across_partitions_select_final = 1`.
+- Every block-scoped table: `ENGINE = ReplacingMergeTree(_version, is_deleted)`,
+  `_version UInt64` (strictly increasing per process, unix-ms based), `is_deleted UInt8
+  DEFAULT 0`, plus `epoch UInt32` (§2). **Target scale is 50+ chains in one database**, so
+  base tables are `PARTITION BY toYYYYMM(timestamp)` — never by chain (50 chains x 120
+  months would be ~6,000 partitions per table); `chain` is the first sorting-key column,
+  which is what prunes reads. Lookup/side tables are `PARTITION BY chain` (hash/address
+  lookups must not fan out per month). `SETTINGS do_not_merge_across_partitions_select_final = 1`
+  everywhere (a tombstone copies its row's timestamp, so it always lands in the same partition).
 - Sorting keys are positional, never hash based, so a re-inserted block replaces itself:
 
 | Table | ORDER BY |
@@ -60,10 +65,10 @@ Deferred (NOT in scope): F1 Arrow passthrough.
 
 ### Read-path tables (S2)
 
-**No projections** (they complicate lightweight deletes on ReplacingMergeTree). No
+**No projections** (tombstones must propagate to every read path, and MVs do that for free). No
 bloom-filter zoo. Each access pattern gets an MV-fed side table, itself
-`ReplacingMergeTree(_version)`, carrying `(chain, block_number)` so it participates in
-rollback like any other table:
+`ReplacingMergeTree(_version, is_deleted)`; its MV passes `_version` and `is_deleted`
+through, so it follows rollbacks automatically:
 
 | Table | Fed from | ORDER BY |
 |---|---|---|
@@ -94,7 +99,7 @@ pub struct DerivedTable {
     ///  AND timestamp >= {from_ts} GROUP BY ...` — must produce exactly what the MV produces.
     pub rebuild_sql: &'static str,
 }
-pub const CORE_DERIVED: &[DerivedTable] = &[ /* daily block/tx/transfer/contract stats */ ];
+pub const CORE_DERIVED: &[DerivedTable] = &[ /* daily block / transaction / erc20-transfer stats */ ];
 ```
 
 Distinct counts use `uniqState`/`uniqMerge` (never `uniqExact` in a Summing table).
@@ -114,42 +119,63 @@ Layers, outermost first:
    deeper = fatal error with a clear message, never silent.
 4. **Rollback = `purge_range(chain, fork, ∞)`** then resume streaming from `fork`.
 
-`purge_range(chain, from, to)`:
-   1. `min_ts` = min `timestamp` of stored blocks in range (before deleting anything).
-   2. Lightweight `DELETE FROM t WHERE chain = ? AND block_number >= ? [AND < ?]` on every
-      **block-scoped table, children and side tables first, `blocks` LAST**, each
-      awaited synchronously (`lightweight_deletes_sync = 2`). Mirror image of the insert
-      order: while the old `blocks` row exists the reorg is re-detected after a crash and
-      the purge re-runs; it is idempotent. No intent log needed.
-   3. **Bucket repair** for every `DerivedTable`: delete buckets `>= bucket(min_ts)` for
-      the chain, run `rebuild_sql` from that bucket start over the surviving base rows.
-      Re-streamed blocks then flow through the MVs incrementally as usual.
-   4. Append a row to `reorgs` (chain, detected_at, fork_block, old_head, old_hash,
-      new_hash, depth, blocks_purged) — audit + metric.
-   5. Evict anything cached from the purged range (pending token / pool discoveries).
+### No DELETE, ever: tombstones + epochs
 
-**Deletes must be serialized and verified (ClickHouse 25.12 loses concurrent deletes).**
-Reproduced with plain `clickhouse-client`: two clients running `DELETE` (lightweight or
-`ALTER .. DELETE`, even with `mutations_sync` / `lightweight_deletes_sync = 2`) on the
-same table at the same time both return OK, every mutation reports `is_done = 1`, yet one
-of them leaves its rows behind. Therefore `purge_range` and bucket repair:
-   - never issue two deletes in parallel, not even on different tables of one purge;
-   - hold a **database-wide purge lock** shared by every indexer process on that database
-     (same atomic `CREATE TABLE` lock-table technique as the migration runner, with
-     heartbeat and stale takeover) for the whole purge;
-   - after every delete, **verify** `count() = 0` for the predicate (`FINAL` not needed:
-     lightweight-deleted rows are already masked) and re-issue up to N times; still
-     non-zero = fatal, never continue on a half-purged range;
-   - inserts are unaffected and stay concurrent.
-   Rejected alternative, kept for the record: insert-only tombstones via
-   `ReplacingMergeTree(_version, is_deleted)`; avoids mutations entirely but forces every
-   reader and every MV to handle tombstones. Revisit if purges ever become frequent.
+ClickHouse 25.12 silently loses one of two concurrent `DELETE`s on the same table (both
+return OK, `is_done = 1`, rows stay; reproduced with plain `clickhouse-client`). With 50+
+indexer processes sharing a database a lock-and-verify workaround is not acceptable, so
+**the indexer never issues `DELETE`, `ALTER .. DELETE/UPDATE` or `DROP PARTITION`.
+Everything is an `INSERT`**, which ClickHouse handles concurrently without coordination.
+No cross-process lock exists or is needed. (Verified end to end on 25.12: base table,
+MV-fed side table and aggregate all correct after a simulated reorg.)
+
+- **Rows are removed by tombstone.** `ReplacingMergeTree(_version, is_deleted)`:
+  `INSERT INTO t SELECT <all columns>, <new _version>, 1 AS is_deleted FROM t FINAL WHERE
+  chain = ? AND block_number >= ? [AND < ?]` — server side, tiny. `FINAL` hides the row.
+  A re-streamed canonical row with the same key simply carries a newer `_version` and
+  wins; orphan keys (the canonical block has fewer logs) stay dead.
+- **Side tables follow automatically:** every MV passes `_version` and `is_deleted`
+  through, so a tombstone inserted into a base table tombstones its side-table rows too.
+- **Aggregates use epochs instead of deleting buckets.** Every block-scoped row carries
+  `epoch UInt32`, the chain's purge generation, stamped by the writer. Aggregate tables
+  include `epoch` in their sorting key; their MVs select `WHERE is_deleted = 0` and group
+  by `epoch`. A purge bumps the chain's epoch and records `(chain, epoch, from_ts)` in
+  `reorgs`, where `from_ts` = start of the smallest bucket touched by the tombstoned rows
+  (use the largest bucket width in play, i.e. start of day UTC). Then bucket repair =
+  `INSERT INTO agg SELECT ..., <new epoch> FROM base FINAL WHERE chain = ? AND timestamp >= from_ts`.
+  **Validity rule used by every `*_v` view:** a contribution with epoch `e` in bucket `b`
+  counts iff `e >= max(r.epoch) over reorgs r where r.chain = chain and r.from_ts <= b`
+  (0 when none). So stale contributions in repaired buckets vanish, buckets older than
+  the fork are untouched, and a later gap-heal writing into an old bucket with a newer
+  epoch still adds to the old contributions instead of replacing them.
+  `DerivedTable::rebuild_sql` gains an `{epoch}` placeholder; `delete_sql` disappears.
+- Readers use `FINAL` on base/side tables and the `*_v` views on aggregates; both are
+  already the convention (C5). Nothing else is reorg-aware.
+
+`purge_range(chain, from, to)` — idempotent, crash-safe, lock-free:
+   1. `new_epoch` = chain's max epoch + 1. `from_ts` = start of day (UTC) of the minimum
+      `timestamp` among live rows in range across block-scoped tables (rows, not
+      `blocks`: a gap range may hold orphan children and no block).
+   2. Tombstone every block-scoped table in range, **children and side-less bases first,
+      `blocks` LAST** (mirror of the insert order: while the old `blocks` row is alive a
+      crash is followed by re-detection and a full re-run; re-running is harmless).
+      Side tables are NOT tombstoned directly — their MVs do it.
+   3. Insert the `reorgs` row (chain, epoch, from_ts, detected_at, fork_block, old_head,
+      old_hash, new_hash, depth, rows_tombstoned, reason `reorg` | `gap_heal`).
+   4. Bucket repair for every `DerivedTable` at `new_epoch`.
+   5. Tombstone `blocks`, then overlapping `checkpoints`; adopt `new_epoch` in the writer;
+      evict cached discoveries from the range.
+   A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
+   the abandoned partial epoch invisible.
+
+Gap queries, checkpoint reads and `block_hash` lookups use `FINAL` so tombstoned blocks
+count as missing.
 
 The list of block-scoped tables is code, not convention:
 `db::BLOCK_SCOPED_TABLES` + `dex::BLOCK_SCOPED_TABLES`, children before `blocks`. A unit
 test asserts every table in the migrations that has a `block_number` column is listed.
 
-**Gap healing uses the same primitive.** A gap range may hold orphan children from a
+**Gap healing uses the same primitive** (reason `gap_heal`). A gap range may hold orphan children from a
 flush that crashed before writing `blocks`. On the first pass after startup, for each gap
 range, if any child table has rows in it → `purge_range(chain, from, to)` before
 streaming it. This removes the last source of duplicate inserts, which is what makes
@@ -261,8 +287,7 @@ attribution).
 `contract_created` is set and the transaction succeeded (`contract_address`, `creator` =
 `from`, `transaction_hash`, `block_number`, `timestamp`). Nothing to insert, purge or keep
 consistent. It lists directly deployed contracts only; factory-created contracts are
-out of scope by design. The daily contract-deployment aggregate is fed from
-`transactions`, not from a contracts table.
+out of scope by design. There is NO contract-deployment aggregate (the data is partial by design, so a statistic over it would mislead).
 
 Everywhere else in this document, references to traces / `traces_by_tx` / a `contracts`
 table are superseded by this section.
