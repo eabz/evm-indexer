@@ -304,6 +304,151 @@ fn no_recorded_launchpad_transaction_trips_a_diagnostic() {
     }
 }
 
+// --- review round 4, the addendum's MINORs -------------------------------
+
+/// A leg counts as verified only when the movement layer proves that mint
+/// moved on THAT SIDE.
+///
+/// The check used to test membership alone - "is this mint one of the two
+/// the swap row proved?" - which marks an INVERTED trade, one whose side
+/// the event and the transfers disagree about, as verified on both legs.
+/// That is exactly the disagreement the corroboration exists to catch, so
+/// the check was blind to the only thing it could see.
+#[test]
+fn an_inverted_swap_row_does_not_verify_a_trades_legs() {
+    let fixture = fixtures::get("pumpfun_sell");
+    let swaps = decode_transaction(
+        CHAIN,
+        fixture.timestamp(),
+        &fixture.transaction,
+    )
+    .swaps;
+    assert_eq!(swaps.len(), 1);
+
+    // As it really is: both legs proven, on the right sides.
+    let honest = crate::svm::launchpads::decode_transaction(
+        CHAIN,
+        fixture.timestamp(),
+        &fixture.transaction,
+        &swaps,
+    );
+    let trade = &honest.trades[0];
+    assert_eq!(trade.side, "sell");
+    assert_eq!(trade.token_verified, 1);
+    assert_eq!(trade.quote_verified, 1);
+
+    // The same trade against a swap row whose two mints are the wrong way
+    // round. Nothing may be verified against that.
+    let mut inverted = swaps.clone();
+    let row = &mut inverted[0];
+    std::mem::swap(&mut row.verified_in, &mut row.verified_out);
+    let rows = crate::svm::launchpads::decode_transaction(
+        CHAIN,
+        fixture.timestamp(),
+        &fixture.transaction,
+        &inverted,
+    );
+    let trade = &rows.trades[0];
+    assert_eq!(
+        (trade.token_verified, trade.quote_verified),
+        (0, 0),
+        "an inverted swap row must verify neither leg"
+    );
+    assert_eq!(rows.diagnostics.trade_unverified, 1);
+}
+
+/// `sole_unverified_quote` is the flag that says `tx_value` may bound the
+/// quote leg. It was hard-coded to 1 on every Solana trade - including the
+/// trades whose quote leg is NOT verified, where `tx_value` is 0 and the
+/// bound it implies is "the buyer paid at most nothing".
+#[test]
+fn sole_unverified_quote_is_computed_and_not_asserted() {
+    // A trade the movement layer corroborated: the quote leg IS verified,
+    // so the flag is 0 and no bound is claimed.
+    let fixture = fixtures::get("pumpfun_sell");
+    let rows = launchpads("pumpfun_sell");
+    assert_eq!(rows.trades[0].quote_verified, 1);
+    assert_eq!(rows.trades[0].sole_unverified_quote, 0);
+
+    // The same trade with no swap row to corroborate it: one unverified
+    // quote leg in the transaction, so the flag is 1.
+    let alone = crate::svm::launchpads::decode_transaction(
+        CHAIN,
+        fixture.timestamp(),
+        &fixture.transaction,
+        &[],
+    );
+    assert_eq!(alone.trades.len(), 1);
+    assert_eq!(alone.trades[0].quote_verified, 0);
+    assert_eq!(alone.trades[0].sole_unverified_quote, 1);
+
+    // And the sniper's bundle - SEVERAL curve trades in one transaction,
+    // none corroborated - is the counter-example the flag exists for: one
+    // transaction value cannot bound any single one of them.
+    let bundle = fixtures::get("pumpfun_multi_buy");
+    let many = crate::svm::launchpads::decode_transaction(
+        CHAIN,
+        bundle.timestamp(),
+        &bundle.transaction,
+        &[],
+    );
+    assert!(
+        many.trades.len() > 1,
+        "the bundle fixture holds one trade, so it proves nothing"
+    );
+    for trade in &many.trades {
+        assert_eq!(trade.quote_verified, 0);
+        assert_eq!(trade.sole_unverified_quote, 0);
+    }
+}
+
+/// `launchpad_trades` and `sol_dex_swaps` must report the same amounts for
+/// the same trade. pump.fun's row took its amounts from the EVENT while
+/// the other two families take theirs from the swap row, so on a
+/// Token-2022 curve - where the event states what the curve was CREDITED
+/// and the transfer states what the trader SENT - the two tables disagreed
+/// about one trade.
+#[test]
+fn a_curve_trade_reports_the_same_amounts_as_its_swap_row() {
+    for name in ["pumpfun_sell", "pumpfun_multi_buy", "launchlab_sell"] {
+        let fixture = fixtures::get(name);
+        let swaps = decode_transaction(
+            CHAIN,
+            fixture.timestamp(),
+            &fixture.transaction,
+        )
+        .swaps;
+        let rows = crate::svm::launchpads::decode_transaction(
+            CHAIN,
+            fixture.timestamp(),
+            &fixture.transaction,
+            &swaps,
+        );
+
+        for trade in &rows.trades {
+            let Some(swap) =
+                swaps.iter().find(|swap| swap.ordinal == trade.ordinal)
+            else {
+                continue;
+            };
+            let (token_amount, quote_amount) = if trade.side == "buy" {
+                (swap.amount_out_gross, swap.amount_in)
+            } else {
+                (swap.amount_in, swap.amount_out_gross)
+            };
+            assert_eq!(
+                trade.token_amount, token_amount,
+                "{name}: the launchpad row and the swap row disagree \
+                 about the token leg"
+            );
+            assert_eq!(
+                trade.quote_amount, quote_amount,
+                "{name}: ... about the quote leg"
+            );
+        }
+    }
+}
+
 /// A failed transaction produces nothing at all: its state changes were
 /// rolled back, so a launch or a trade inside it never happened.
 #[test]

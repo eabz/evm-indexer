@@ -1021,6 +1021,24 @@ fn the_pool_account_index_is_the_account_the_venue_names() {
         checked >= 2,
         "no recording exercises a global-authority venue's pool index"
     );
+
+    // And the decoder checks the same thing on every row it writes, so a
+    // venue that changes an account layout shows up as a counter rather
+    // than as a wrong pool key. It must be zero over the whole corpus.
+    for fixture in fixtures::all() {
+        let outcome = decode_transaction_with(
+            CHAIN,
+            fixture.timestamp(),
+            &fixture.transaction,
+            &registry,
+        );
+        assert_eq!(
+            outcome.diagnostics.pool_index_disagreed, 0,
+            "{}: the account index and the venue's event name different \
+             pools",
+            fixture.name
+        );
+    }
 }
 
 /// M4. `amount_out` is what the TAKER received, and on a routed trade the

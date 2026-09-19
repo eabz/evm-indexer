@@ -683,6 +683,44 @@ mod tests {
         assert_eq!(seen.len(), paths.len());
     }
 
+    /// One instruction can execute several fills - Orca's `two_hop_swap`
+    /// and Raydium CLMM's `swap_router_base_in` do - and they share one
+    /// `instruction_address`. The hop sub-index is what keeps the rows
+    /// apart, and it must not disturb any property the path already has.
+    #[test]
+    fn a_hop_sub_index_orders_the_fills_of_one_instruction() {
+        let plain = pack_ordinal(&[6]).unwrap();
+        let first = pack_ordinal_hop(&[6], 0).unwrap();
+        let second = pack_ordinal_hop(&[6], 1).unwrap();
+        let last = pack_ordinal_hop(&[6], ORDINAL_MAX_HOP).unwrap();
+
+        // Hop 0 is exactly the ordinal a one-fill instruction has always
+        // had, so nothing that already worked moves.
+        assert_eq!(plain, first);
+        assert!(first < second && second < last);
+        assert_eq!(unpack_hop(first), 0);
+        assert_eq!(unpack_hop(second), 1);
+        assert_eq!(unpack_hop(last), ORDINAL_MAX_HOP);
+
+        // The path still reads back, at every depth, whatever the hop.
+        for path in [vec![6u32], vec![2, 0], vec![1, 2, 3, 4, 5]] {
+            for hop in [0, 1, ORDINAL_MAX_HOP] {
+                let packed = pack_ordinal_hop(&path, hop).unwrap();
+                assert_eq!(unpack_ordinal(packed), path, "{path:?}/{hop}");
+                assert_eq!(unpack_hop(packed), hop);
+            }
+        }
+
+        // And a hop never leaks into the next instruction's range: the
+        // whole subtree of [2], hops included, stays below [3].
+        let next = pack_ordinal(&[3]).unwrap();
+        assert!(
+            pack_ordinal_hop(&[2, ORDINAL_MAX_INDEX], ORDINAL_MAX_HOP)
+                .unwrap()
+                < next
+        );
+    }
+
     #[test]
     fn impossible_paths_fail_loudly_instead_of_truncating() {
         assert_eq!(pack_ordinal(&[]), Err(OrdinalError::Empty));
@@ -693,6 +731,10 @@ mod tests {
         assert_eq!(
             pack_ordinal(&[ORDINAL_MAX_INDEX + 1]),
             Err(OrdinalError::IndexTooLarge(ORDINAL_MAX_INDEX + 1))
+        );
+        assert_eq!(
+            pack_ordinal_hop(&[0], ORDINAL_MAX_HOP + 1),
+            Err(OrdinalError::HopTooLarge(ORDINAL_MAX_HOP + 1))
         );
     }
 

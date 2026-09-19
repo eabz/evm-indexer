@@ -334,6 +334,11 @@ pub struct Diagnostics {
     /// whose vault authority is program-wide. They are stored with no pool
     /// key and are excluded from the pool-keyed aggregates.
     pub unnamed_pool: u64,
+    /// Swaps where the account meta this module reads the pool from and
+    /// the pool the venue's own EVENT names are different accounts. Zero
+    /// on every recording; anything else means a venue has changed an
+    /// account layout and the index has gone stale.
+    pub pool_index_disagreed: u64,
     /// A swap the movement layer proved but whose instruction path could
     /// not be packed into an ordinal. The row is DROPPED: a position key
     /// that silently folded onto another row's would make the two
@@ -355,6 +360,7 @@ impl Diagnostics {
         self.kind_disagreed += other.kind_disagreed;
         self.dropped_logs += other.dropped_logs;
         self.unnamed_pool += other.unnamed_pool;
+        self.pool_index_disagreed += other.pool_index_disagreed;
         self.unpackable_ordinal += other.unpackable_ordinal;
         self.extra_hops += other.extra_hops;
         for index in 0..Venue::ALL.len() {
@@ -808,7 +814,12 @@ pub fn decode_transaction_with(
                     enriched,
                     instruction,
                 );
-                finish_row(&mut outcome.diagnostics, venue, &mut row);
+                finish_row(
+                    &mut outcome.diagnostics,
+                    venue,
+                    instruction,
+                    &mut row,
+                );
                 outcome.swaps.push(row);
             }
             // One instruction, several fills. Each keeps its own pair of
@@ -845,7 +856,12 @@ pub fn decode_transaction_with(
                         enriched,
                         instruction,
                     );
-                    finish_row(&mut outcome.diagnostics, venue, &mut row);
+                    finish_row(
+                        &mut outcome.diagnostics,
+                        venue,
+                        instruction,
+                        &mut row,
+                    );
                     outcome.swaps.push(row);
                 }
             }
@@ -917,6 +933,7 @@ pub fn decode_transaction_with(
                         finish_row(
                             &mut outcome.diagnostics,
                             venue,
+                            instruction,
                             &mut row,
                         );
                         outcome.swaps.push(row);
@@ -1595,14 +1612,38 @@ fn classify_two_sided(
 fn finish_row(
     diagnostics: &mut Diagnostics,
     venue: Venue,
+    instruction: &SvmInstruction,
     row: &mut SvmSwap,
 ) {
+    if !venue.vault_authority_is_global() {
+        return;
+    }
     // A vault authority must never survive as the pool key. `build_row`
     // never writes one, and a per-program decoder writes the pool the
     // venue names, so this is the belt to that braces: an unnamed pool is
     // 32 zero bytes, which the candle views exclude.
-    if row.pool_id == ZERO_PUBKEY && venue.vault_authority_is_global() {
+    if row.pool_id == ZERO_PUBKEY {
         diagnostics.unnamed_pool += 1;
+        return;
+    }
+
+    // The account index is checked against the fixtures, but a venue can
+    // add an instruction variant with a different account layout at any
+    // time. Where the venue's own event named the pool, the index is
+    // checked against it on EVERY row, live: a non-zero counter here means
+    // an index has gone stale and rows of that venue are being keyed on
+    // some other account.
+    let named = venue
+        .pool_account_index()
+        .filter(|_| {
+            venue.instruction_kind(&instruction.data)
+                == crate::svm::programs::IxKind::Swap
+        })
+        .and_then(|index| instruction.account(index));
+    if row.confidence == Confidence::Decoded.as_str()
+        && named.is_some_and(|pool| pool != row.pool_id)
+    {
+        diagnostics.pool_index_disagreed += 1;
     }
 }
 
