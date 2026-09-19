@@ -69,10 +69,19 @@
 -- Every parameterized view below therefore carries
 --
 --   AND length({<id>:String}) IN (40, 64)
+--   AND match({<id>:String}, '^[0-9a-fA-F]+$')
 --
--- exactly once, in the filter that gates its output. The conjunct names
--- no column, so ClickHouse folds it while it analyses the query: a valid
--- length leaves the primary key range read exactly as it was (verified
+-- exactly once, in the filter that gates its output. The second line is
+-- there because unhex does NOT raise on a non-hex character: measured on
+-- 25.12, every one of the 74 printable non-hex characters becomes the
+-- nibble 0xE or 0xF, so unhex('zz' x 20) is 20 bytes of 0xEF. That cannot
+-- reach the 32-zero-byte bucket (only '0' is a zero nibble, and '00' is
+-- valid hex), so the old guard was safe - but safe by accident of that
+-- mapping rather than by construction, which is the whole point of a
+-- guard. A malformed id now makes the WHERE constant false, exactly like
+-- a malformed length (review round 4, MINOR 23). Both conjuncts name
+-- no column, so ClickHouse folds them while it analyses the query: a
+-- valid id leaves the primary key range read exactly as it was (verified
 -- with EXPLAIN indexes = 1 - the key condition still names the id column
 -- and reads one granule), a wrong one makes the WHERE constant false and
 -- no part is read. An id longer than 64 characters still raises
@@ -167,6 +176,7 @@ CREATE VIEW IF NOT EXISTS launchpad_candles_1m_v AS
 SELECT * FROM launchpad_candles_1m_all_v
 WHERE chain = {chain:UInt64}
   AND length({token:String}) IN (40, 64)
+  AND match({token:String}, '^[0-9a-fA-F]+$')
   AND token = toFixedString(unhex(if(length({token:String}) = 40,
   concat('000000000000000000000000', {token:String}), {token:String})), 32)
   AND emitter IN (
@@ -177,6 +187,7 @@ CREATE VIEW IF NOT EXISTS launchpad_candles_1h_v AS
 SELECT * FROM launchpad_candles_1h_all_v
 WHERE chain = {chain:UInt64}
   AND length({token:String}) IN (40, 64)
+  AND match({token:String}, '^[0-9a-fA-F]+$')
   AND token = toFixedString(unhex(if(length({token:String}) = 40,
   concat('000000000000000000000000', {token:String}), {token:String})), 32)
   AND emitter IN (
@@ -342,6 +353,7 @@ FROM
   WHERE chain = {chain:UInt64} AND token = token_id
     AND is_deleted = 0
     AND length({token:String}) IN (40, 64)
+    AND match({token:String}, '^[0-9a-fA-F]+$')
   GROUP BY chain, token
 ) AS l
 CROSS JOIN
@@ -439,6 +451,7 @@ FROM
   WHERE chain = {chain:UInt64} AND token = token_id
     AND is_deleted = 0
     AND length({token:String}) IN (40, 64)
+    AND match({token:String}, '^[0-9a-fA-F]+$')
     AND emitter IN (
       SELECT curve FROM launchpad_trusted_curves_v
       WHERE chain = {chain:UInt64})
@@ -507,6 +520,7 @@ WHERE chain = {chain:UInt64} AND token = toFixedString(unhex(if(length({token:St
   concat('000000000000000000000000', {token:String}), {token:String})), 32)
   AND is_deleted = 0 AND block_number >= {from_block:UInt64}
   AND length({token:String}) IN (40, 64)
+  AND match({token:String}, '^[0-9a-fA-F]+$')
 ORDER BY block_number DESC, tx_index DESC, ordinal DESC;
 
 CREATE VIEW IF NOT EXISTS launchpad_token_trades_v AS
@@ -579,6 +593,7 @@ FROM
 )
 GROUP BY account
 HAVING balance_raw > 0 AND length({token:String}) IN (40, 64)
+AND match({token:String}, '^[0-9a-fA-F]+$')
 ORDER BY balance_raw DESC;
 
 CREATE VIEW IF NOT EXISTS launchpad_token_holders_v AS
@@ -628,6 +643,7 @@ FROM
 )
 GROUP BY account
 HAVING balance_raw > 0 AND length({token:String}) IN (40, 64)
+AND match({token:String}, '^[0-9a-fA-F]+$')
 ORDER BY balance_raw DESC;
 
 -- ------------------------------------------------ screen: graduations
@@ -750,6 +766,7 @@ LEFT JOIN
 WHERE l.chain = {chain:UInt64} AND l.creator = creator_id
   AND l.is_deleted = 0
   AND length({creator:String}) IN (40, 64)
+  AND match({creator:String}, '^[0-9a-fA-F]+$')
 ORDER BY l.timestamp DESC;
 
 -- THE screen. Same shape, every source restricted to the trusted curves,
@@ -802,6 +819,7 @@ LEFT JOIN
 WHERE l.chain = {chain:UInt64} AND l.creator = creator_id
   AND l.is_deleted = 0
   AND length({creator:String}) IN (40, 64)
+  AND match({creator:String}, '^[0-9a-fA-F]+$')
   AND l.emitter IN (
     SELECT curve FROM launchpad_trusted_curves_v
     WHERE chain = {chain:UInt64})
@@ -844,7 +862,8 @@ CROSS JOIN
   WHERE chain = {chain:UInt64} AND is_deleted = 0
     AND recipient = creator_id AND kind = 'creator'
 ) AS f
-WHERE length({creator:String}) IN (40, 64);
+WHERE length({creator:String}) IN (40, 64)
+  AND match({creator:String}, '^[0-9a-fA-F]+$');
 
 -- THE screen. Every launch counted, every graduation, every trade and
 -- every fee row comes from a trusted curve, so a forger can neither add
@@ -886,7 +905,8 @@ CROSS JOIN
       SELECT curve FROM launchpad_trusted_curves_v
       WHERE chain = {chain:UInt64})
 ) AS f
-WHERE length({creator:String}) IN (40, 64);
+WHERE length({creator:String}) IN (40, 64)
+  AND match({creator:String}, '^[0-9a-fA-F]+$');
 
 -- -------------------------------------------------- screen: sniper view
 --
@@ -934,6 +954,7 @@ FROM
     WHERE chain = {chain:UInt64} AND token = token_id
       AND is_deleted = 0 AND side = 'buy'
       AND length({token:String}) IN (40, 64)
+      AND match({token:String}, '^[0-9a-fA-F]+$')
       AND block_number <= (
         SELECT min(block_number) + {blocks:UInt64}
         FROM launchpad_tokens FINAL
@@ -987,6 +1008,7 @@ FROM
     WHERE chain = {chain:UInt64} AND token = token_id
       AND is_deleted = 0 AND side = 'buy'
       AND length({token:String}) IN (40, 64)
+      AND match({token:String}, '^[0-9a-fA-F]+$')
       AND emitter IN (
         SELECT curve FROM launchpad_trusted_curves_v
         WHERE chain = {chain:UInt64})

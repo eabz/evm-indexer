@@ -72,12 +72,21 @@ CI on PR #16 has been green on every completed run since the pipeline wiring lan
    whole Solana path (`src/svm/**`, `src/source/solana.rs`, `src/pipeline/solana*.rs`),
    the SQL fixes. Route findings to fresh Opus engineers.
 3. Known open items (tirith tasks exist):
-   - Solana flush latency went from ~50 ms to 0.6-5.9 s once launchpad tables + their ten
-     MVs joined the flush; `sol_token_balances` is `PARTITION BY chain` (one partition for
-     all of Solana, merged on every insert) - prime suspect. Fix BEFORE any history backfill.
-   - `sol_token_balances` uses the POSITION as `_version`: it is excluded from tombstoning
-     and from `Database::seed_version` (a clock version can never outrank it). Confirm the
-     design is sound in review round 4.
+   - ~~Solana flush latency~~ MEASURED (fix-c, round 4). `svm::profile::flush_cost_per_table`
+     is the benchmark: fresh ClickHouse, the real insert path, per-table timings, batch size
+     and flush count from `FLUSH_BENCH_COPIES` / `FLUSH_BENCH_FLUSHES`. At the DEFAULT
+     `--flush-rows 100000` a flush costs ~250 ms on an M-series laptop with a local server,
+     flat over 400 consecutive flushes and linear in rows (~2.5 us/row), so the 0.6-5.9 s
+     seen live is that same cost on a loaded host - not a pathology. WHERE it goes:
+     `sol_dex_swaps` 158 ms of the 250 (its three candle MVs are 105 ms of that, measured
+     against a view-free copy of the table), `launchpad_trades` 39 ms (its five views 26 ms),
+     everything else under 15 ms. The PRIME SUSPECT IS WRONG: `sol_token_balances`
+     partitioned by chain and partitioned by month cost the same 14 ms for the same rows.
+     The lever, if the flush ever has to be cheaper, is the candle MVs (chain 1h/1d off the
+     1m table instead of re-reading the swap block three times) or a smaller `--flush-rows`;
+     both are design decisions, neither was taken.
+   - ~~`sol_token_balances` uses the POSITION as `_version`~~ FIXED (round 4, MAJOR 12): it
+     is an append log of observations now, an ordinary purge child and seeded version table.
    - The sink's queue of flush spans that raced another process's purge is in memory only
      (task 5e52af12): persist it or verify the days of the newest `reorgs` rows at startup.
    - Solana history backfill driver (blocked on OWNER DECISION: Envio Starter $70 for one

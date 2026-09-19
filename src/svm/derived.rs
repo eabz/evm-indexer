@@ -35,7 +35,7 @@ macro_rules! sol_candles {
             rebuild_sql: concat!(
                 "INSERT INTO ",
                 $name,
-                " WITH (amount0 > 0) != (amount1 > 0) AND amount0 != 0 AND amount1 != 0 AS trade_ok,",
+                " WITH (amount0 > 0) != (amount1 > 0) AND amount0 != 0 AND amount1 != 0 AND abs(toFloat64(amount0)) >= 1000 AND abs(toFloat64(amount1)) >= 1000 AS trade_ok,",
                 " abs(toFloat64(amount1)) / abs(toFloat64(amount0)) AS trade_price,",
                 " reserve0 != 0 AND reserve1 != 0 AS pool_ok,",
                 " toFloat64(reserve1) / toFloat64(reserve0) AS pool_price",

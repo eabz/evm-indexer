@@ -40,9 +40,17 @@
 -- Every parameterized view below therefore carries
 --
 --   AND length({<id>:String}) IN (40, 64)
+--   AND match({<id>:String}, '^[0-9a-fA-F]+$')
 --
--- exactly once, in the filter that gates its output. The conjunct has no
--- column in it, so ClickHouse folds it to 0 or 1 while it analyses the
+-- exactly once, in the filter that gates its output. The second line is
+-- there because unhex does NOT raise on a non-hex character - it maps
+-- every one of them to the nibble 0xE or 0xF, so unhex('zz' x 20) is 20
+-- bytes of 0xEF. That can never reach the zero bucket (only '0' is a zero
+-- nibble), so the length guard alone was already safe. The match makes it
+-- safe BY CONSTRUCTION rather than by accident of that mapping, and a
+-- malformed id now folds the WHERE to false exactly like a malformed
+-- length (review round 4, MINOR 23). Neither conjunct has a
+-- column in it, so ClickHouse folds them to 0 or 1 while it analyses the
 -- query: a valid length keeps the primary key range read untouched
 -- (verified with EXPLAIN indexes = 1 - the key condition still names the
 -- id column and reads one granule), and a wrong one makes the whole WHERE
@@ -98,6 +106,7 @@ FROM prediction_candles_1m AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
   AND length({registry:String}) IN (40, 64)
+  AND match({registry:String}, '^[0-9a-fA-F]+$')
   AND a.epoch >= ifNull(f.epoch_floor, 0)
   AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
@@ -129,6 +138,7 @@ FROM prediction_candles_1h AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
   AND length({registry:String}) IN (40, 64)
+  AND match({registry:String}, '^[0-9a-fA-F]+$')
   AND a.epoch >= ifNull(f.epoch_floor, 0)
   AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
@@ -160,6 +170,7 @@ FROM prediction_candles_1d AS a
 ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
 WHERE a.chain = {chain:UInt64} AND a.registry = registry_id AND a.outcome_token_id = {outcome_token_id:UInt256}
   AND length({registry:String}) IN (40, 64)
+  AND match({registry:String}, '^[0-9a-fA-F]+$')
   AND a.epoch >= ifNull(f.epoch_floor, 0)
   AND registry_id IN (SELECT registry FROM prediction_trusted_registries_v WHERE chain = {chain:UInt64})
 GROUP BY chain, registry, outcome_token_id, bucket;
@@ -464,6 +475,7 @@ mapping AS (
   FROM prediction_outcome_tokens_by_market FINAL
   WHERE chain = {chain:UInt64} AND market_id = market_key
     AND length({market_id:String}) IN (40, 64)
+    AND match({market_id:String}, '^[0-9a-fA-F]+$')
     AND (registry, collateral_token) IN (
       SELECT registry, collateral_token FROM prediction_market_list
       WHERE chain = {chain:UInt64} AND market_id = market_key)
@@ -542,6 +554,7 @@ SELECT
 FROM prediction_trades_by_token AS s FINAL
 WHERE s.chain = {chain:UInt64}
   AND length({market_id:String}) IN (40, 64)
+  AND match({market_id:String}, '^[0-9a-fA-F]+$')
   AND (s.registry, s.outcome_token_id) IN (
     SELECT registry, outcome_token_id FROM prediction_outcome_tokens_by_market FINAL
     WHERE chain = {chain:UInt64} AND market_id = market_key)
@@ -559,6 +572,7 @@ mapping AS (
   FROM prediction_outcome_tokens_by_market FINAL
   WHERE chain = {chain:UInt64} AND market_id = market_key
     AND length({market_id:String}) IN (40, 64)
+    AND match({market_id:String}, '^[0-9a-fA-F]+$')
     AND (registry, collateral_token) IN (
       SELECT registry, collateral_token FROM prediction_market_list
       WHERE chain = {chain:UInt64} AND market_id = market_key)
@@ -637,6 +651,7 @@ ledger AS (
   FROM prediction_ledger_by_holder FINAL
   WHERE chain = {chain:UInt64} AND holder = holder_id
     AND length({holder:String}) IN (40, 64)
+    AND match({holder:String}, '^[0-9a-fA-F]+$')
     AND registry IN (
       SELECT registry FROM prediction_trusted_registries_v
       WHERE chain = {chain:UInt64})
@@ -702,6 +717,7 @@ ledger AS (
   FROM prediction_ledger_by_holder FINAL
   WHERE chain = {chain:UInt64} AND holder = holder_id
     AND length({holder:String}) IN (40, 64)
+    AND match({holder:String}, '^[0-9a-fA-F]+$')
     AND reason != 'trade'
     AND registry IN (
       SELECT registry FROM prediction_trusted_registries_v

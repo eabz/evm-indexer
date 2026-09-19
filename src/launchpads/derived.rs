@@ -49,7 +49,9 @@ pub const LAUNCHPAD_CANDLES_1M: DerivedTable = DerivedTable {
     bucket_column: "bucket",
     rebuild_sql: concat!(
         "INSERT INTO launchpad_candles_1m WITH token_amount != 0 AND ",
-        "quote_amount != 0 AS priced, toFloat64(quote_amount) / ",
+        "quote_amount != 0 AND abs(toFloat64(token_amount)) >= 1000 AND ",
+        "abs(toFloat64(quote_amount)) >= 1000 AS priced, ",
+        "toFloat64(quote_amount) / ",
         "toFloat64(token_amount) AS price, (block_number, tx_index, ",
         "ordinal) AS position SELECT chain, token, emitter, ",
         "toDateTime(intDiv(toUInt32(timestamp), 60) * 60, 'UTC') AS ",
@@ -78,7 +80,9 @@ pub const LAUNCHPAD_CANDLES_1H: DerivedTable = DerivedTable {
     bucket_column: "bucket",
     rebuild_sql: concat!(
         "INSERT INTO launchpad_candles_1h WITH token_amount != 0 AND ",
-        "quote_amount != 0 AS priced, toFloat64(quote_amount) / ",
+        "quote_amount != 0 AND abs(toFloat64(token_amount)) >= 1000 AND ",
+        "abs(toFloat64(quote_amount)) >= 1000 AS priced, ",
+        "toFloat64(quote_amount) / ",
         "toFloat64(token_amount) AS price, (block_number, tx_index, ",
         "ordinal) AS position SELECT chain, token, emitter, ",
         "toDateTime(intDiv(toUInt32(timestamp), 3600) * 3600, 'UTC') ",
