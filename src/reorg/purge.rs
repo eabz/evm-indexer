@@ -24,7 +24,11 @@
 //!                                 did not) is the one case nothing else
 //!                                 can ever fix, so it is verified and
 //!                                 repaired directly.
-//!  8 evict caches, metrics
+//!  8 mark the `reorgs` row completed
+//!                                everything is durable; the next start
+//!                                must not mistake the debris of THIS
+//!                                purge for an unfinished one
+//!  9 evict caches, metrics
 //! ```
 //!
 //! Why a crash anywhere is harmless:
@@ -366,7 +370,7 @@ impl Purger {
             }
         };
 
-        let record = ReorgRecord {
+        let mut record = ReorgRecord {
             chain,
             epoch,
             from_ts,
@@ -378,6 +382,8 @@ impl Purger {
             depth,
             rows_tombstoned: children_tombstoned,
             reason: reason.as_str(),
+            version,
+            completed: false,
         };
 
         // Remembered BEFORE the insert: if its acknowledgement is lost the
@@ -430,7 +436,18 @@ impl Purger {
             );
         }
 
-        // 8. In memory only: a restart starts with empty caches.
+        // 8. Every write of this purge is durable: mark it finished, so
+        //    the next start can tell its debris (tombstoned rows at block
+        //    numbers a chain that got SHORTER does not have any more) from
+        //    the leftovers of a purge that died half way. Same
+        //    `(chain, epoch)` row, replaced.
+        record.completed = true;
+        self.store
+            .insert_reorg(&record)
+            .await
+            .map_err(at(PurgeStep::InsertReorg))?;
+
+        // 9. In memory only: a restart starts with empty caches.
         self.cache.evict_range(from, to);
 
         let elapsed = started.elapsed();
