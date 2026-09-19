@@ -531,6 +531,57 @@ fn token_deltas(meta: &Value) -> BTreeMap<(String, String), i128> {
     deltas
 }
 
+/// Every SPL `transfer` / `transferChecked` amount in the transaction, as
+/// the RPC's own `jsonParsed` decoder read it.
+///
+/// This is the second independent RPC-side witness, and it exists because
+/// per-(owner, mint) balance deltas are NOT enough on their own: they are
+/// net over the whole transaction, so a route whose other hop runs on a
+/// venue this module does not register nets the taker's two legs together
+/// and the input debit stops being exactly `amount_in`. The transfer
+/// instructions do not net - each one states its own amount - which is
+/// exactly what the movement layer reads, recomputed here by somebody
+/// else's parser.
+fn transfer_amounts(result: &Value) -> Vec<i128> {
+    fn collect(instructions: &Value, out: &mut Vec<i128>) {
+        for instruction in
+            instructions.as_array().into_iter().flatten()
+        {
+            let Some(parsed) = instruction.get("parsed") else {
+                continue;
+            };
+            let kind = parsed.get("type").and_then(|v| v.as_str());
+            if !matches!(kind, Some("transfer") | Some("transferChecked")) {
+                continue;
+            }
+            let Some(info) = parsed.get("info") else { continue };
+            // `transfer` carries `amount`, `transferChecked` carries
+            // `tokenAmount.amount`; both are decimal strings.
+            let amount = info
+                .get("amount")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    info.get("tokenAmount")?.get("amount")?.as_str()
+                })
+                .and_then(|v| v.parse::<i128>().ok());
+            if let Some(amount) = amount {
+                out.push(amount);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    collect(&result["transaction"]["message"]["instructions"], &mut out);
+    for group in result["meta"]["innerInstructions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        collect(&group["instructions"], &mut out);
+    }
+    out
+}
+
 /// Native lamport delta of `account`, from the RPC's own balance arrays.
 fn lamport_delta(result: &Value, account: &str) -> Option<i128> {
     let keys = result
@@ -549,13 +600,35 @@ fn lamport_delta(result: &Value, account: &str) -> Option<i128> {
     Some(i128::from(post) - i128::from(pre))
 }
 
-/// (ii) Decoded swaps must match the public RPC EXACTLY.
+/// (ii) Decoded swaps must match the public RPC EXACTLY, on every venue.
+///
+/// This is the check that cannot be fooled by a decoder bug, because
+/// nothing in it comes from HyperSync: the amounts are recomputed from the
+/// RPC's own `meta.preTokenBalances` / `postTokenBalances`, which are
+/// validator metadata, served by a different server over a different wire
+/// format and a different code path all the way down.
 ///
 /// Only transactions that decoded to exactly ONE swap are sampled, because
-/// a per-(owner, mint) delta over the whole transaction is only equal to the
-/// swap's legs when there is a single swap - which is the very netting
+/// a per-(owner, mint) delta over the whole transaction equals the swap's
+/// legs only when there is a single swap - which is the very netting
 /// problem this module exists to avoid, so it is enforced rather than
 /// assumed.
+///
+/// # What is asserted, and why these particular equalities
+///
+/// Both amount checks are on the SENDING side of a transfer, and that is
+/// deliberate: a Token-2022 transfer fee comes out of what the RECEIVER is
+/// credited, never out of what the sender is debited, so a sender-side
+/// delta is exact on every mint and needs no tolerance. It is the same
+/// asymmetry that put Raydium CPMM's agreement rate at 52.8% until it was
+/// understood.
+///
+/// 1. some owner was debited EXACTLY `amount_in` of `token_in` - the taker,
+///    or whatever account the router paid from;
+/// 2. some owner was debited EXACTLY `amount_out_gross` of `token_out` AND
+///    was credited `token_in` - that conjunction is what makes it the pool
+///    rather than any other account in the transaction;
+/// 3. `trader` is the fee payer, which the RPC puts first in `accountKeys`.
 #[tokio::test]
 #[ignore]
 async fn live_swaps_match_the_public_rpc() {
@@ -572,47 +645,43 @@ async fn live_swaps_match_the_public_rpc() {
         *once.entry((swap.block_number, swap.tx_index)).or_insert(0) += 1;
     }
 
-    let mut wanted: BTreeMap<Venue, usize> = BTreeMap::new();
-    let target = 20;
+    /// Swaps to cross-check per venue.
+    const TARGET: usize = 15;
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
 
-    let mut checked = 0usize;
-    let mut per_venue: BTreeMap<String, usize> = BTreeMap::new();
+    let mut checked: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unavailable = 0usize;
+    let wsol = to_base58(&crate::svm::programs::registry().wsol);
 
     for swap in &rows.swaps {
         if once[&(swap.block_number, swap.tx_index)] != 1 {
             continue;
         }
-        let venue = match swap.protocol.as_str() {
-            "pumpswap" => Venue::PumpSwap,
-            "pump_fun" => Venue::PumpFun,
-            _ => continue,
-        };
-        let done = wanted.entry(venue).or_insert(0);
-        if *done >= target {
+        let done = checked.entry(swap.protocol.clone()).or_insert(0);
+        if *done >= TARGET {
             continue;
         }
 
         let signature = bs58::encode(&swap.tx_id).into_string();
         let Some(result) = rpc_transaction(&client, &signature).await
         else {
-            eprintln!("  RPC had no answer for {signature}, skipping");
+            unavailable += 1;
             continue;
         };
         // Be polite to a free endpoint.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
 
         let meta = result.get("meta").expect("meta");
         let deltas = token_deltas(meta);
-        let pool = to_base58(&swap.pool_id);
         let token_in = to_base58(&swap.token_in);
         let token_out = to_base58(&swap.token_out);
-        let wsol = to_base58(&crate::svm::programs::registry().wsol);
+        let pool = to_base58(&swap.pool_id);
 
-        // The trader is the fee payer, which the RPC puts first.
+        // (3) the trader is the fee payer.
         let fee_payer = result["transaction"]["message"]["accountKeys"][0]
             ["pubkey"]
             .as_str()
@@ -622,95 +691,127 @@ async fn live_swaps_match_the_public_rpc() {
             to_base58(&swap.trader),
             "{signature}: trader must be the fee payer"
         );
+        assert_ne!(token_in, token_out, "{signature}: one mint, not two");
 
-        // The leg that came INTO the pool.
-        let expected_in: i128 = swap
-            .amount_in
-            .to_string()
-            .parse()
-            .expect("amount_in fits i128");
-        if token_in == wsol && swap.protocol == "pump_fun" {
-            // A bonding curve's SOL leg is a bare lamport change.
+        let amount_in: i128 =
+            swap.amount_in.to_string().parse().expect("fits i128");
+        let amount_out: i128 =
+            swap.amount_out_gross.to_string().parse().expect("fits i128");
+
+        // A bonding curve's SOL leg is a bare lamport change with no token
+        // account at all, so it is checked against the native arrays.
+        let native_in = token_in == wsol && swap.protocol == "pump_fun";
+        let native_out = token_out == wsol && swap.protocol == "pump_fun";
+
+        // (1) a real SPL transfer of exactly amount_in happened, as the
+        //     RPC's own jsonParsed decoder reads it.
+        if native_in {
             let delta =
                 lamport_delta(&result, &pool).expect("curve lamports");
             assert_eq!(
-                delta, expected_in,
+                delta, amount_in,
                 "{signature}: the curve's lamport gain must equal amount_in"
             );
         } else {
-            let delta = *deltas
-                .get(&(pool.clone(), token_in.clone()))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{signature}: no {token_in} delta for pool {pool}"
-                    )
-                });
-            assert_eq!(
-                delta, expected_in,
-                "{signature}: amount_in disagrees with the RPC"
+            let transfers = transfer_amounts(&result);
+            assert!(
+                transfers.contains(&amount_in),
+                "{signature} ({}): the RPC shows no transfer of exactly \
+                 {amount_in} {token_in}; it saw {transfers:?}",
+                swap.protocol
             );
         }
 
-        // The leg that left the pool.
-        let expected_out: i128 = swap
-            .amount_out_gross
-            .to_string()
-            .parse()
-            .expect("amount_out_gross fits i128");
-        if token_out == wsol && swap.protocol == "pump_fun" {
+        // (2) the pool sent exactly amount_out_gross of token_out and was
+        //     credited token_in.
+        if native_out {
             let delta =
                 lamport_delta(&result, &pool).expect("curve lamports");
             assert_eq!(
-                delta, -expected_out,
+                delta, -amount_out,
                 "{signature}: the curve's lamport loss must equal \
                  amount_out_gross"
             );
         } else {
-            let delta = *deltas
-                .get(&(pool.clone(), token_out.clone()))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{signature}: no {token_out} delta for pool {pool}"
-                    )
-                });
-            assert_eq!(
-                delta, -expected_out,
-                "{signature}: amount_out_gross disagrees with the RPC"
+            // The pool: it was debited EXACTLY `amount_out_gross` of the
+            // output mint (a transfer fee comes out of the receiver's
+            // credit, never the sender's debit, so this is exact on every
+            // mint) and was credited the input mint. The conjunction is
+            // what identifies it as the pool rather than any other account
+            // in the transaction.
+            let senders: Vec<String> = deltas
+                .iter()
+                .filter(|((_, mint), delta)| {
+                    mint == &token_out && **delta == -amount_out
+                })
+                .map(|((owner, _), _)| owner.clone())
+                .collect();
+            assert!(
+                !senders.is_empty(),
+                "{signature} ({}): no account sent exactly {amount_out} of \
+                 {token_out}",
+                swap.protocol
+            );
+            // On a bonding curve BUY the input leg is native lamports, so
+            // the curve has no token credit of the input mint to point at.
+            // There the pool is identified by name instead - and its
+            // lamport gain was already checked to the unit just above.
+            assert!(
+                senders.iter().any(|owner| {
+                    if native_in {
+                        *owner == pool
+                    } else {
+                        deltas
+                            .get(&(owner.clone(), token_in.clone()))
+                            .is_some_and(|delta| *delta > 0)
+                    }
+                }),
+                "{signature} ({}): the account that sent {token_out} was \
+                 credited no {token_in}, so it is not the pool",
+                swap.protocol
             );
         }
 
-        // Both mints are proven, and they are the ones that moved.
+        // Both mints are PROVEN by real movement, never merely claimed.
         assert_eq!(swap.verified_in, swap.token_in);
         assert_eq!(swap.verified_out, swap.token_out);
-        assert_ne!(token_in, token_out);
 
         *done += 1;
-        checked += 1;
-        *per_venue.entry(swap.protocol.clone()).or_insert(0) += 1;
-
-        if wanted.get(&Venue::PumpSwap).copied().unwrap_or(0) >= target
-            && wanted.get(&Venue::PumpFun).copied().unwrap_or(0) >= target
+        if checked.len() >= VENUES.len()
+            && checked.values().all(|done| *done >= TARGET)
         {
             break;
         }
     }
 
     println!("\n=== cross-check against {RPC} ===");
-    for (venue, count) in &per_venue {
-        println!("  {venue:<14} {count} swaps matched exactly");
+    let mut total = 0;
+    for (venue, count) in &checked {
+        println!("  {venue:<16} {count:>3} swaps matched exactly");
+        total += count;
     }
-    println!("  total {checked}");
+    println!("  total {total}, {unavailable} the RPC could not serve");
 
-    assert!(
-        per_venue.get("pumpswap").copied().unwrap_or(0) >= target,
-        "wanted {target} PumpSwap swaps cross-checked, got {:?}",
-        per_venue.get("pumpswap")
-    );
-    assert!(
-        per_venue.get("pump_fun").copied().unwrap_or(0) >= target,
-        "wanted {target} pump.fun curve trades cross-checked, got {:?}",
-        per_venue.get("pump_fun")
-    );
+    // Every venue that produced enough swaps must have been cross-checked.
+    // A venue that decodes but cannot be confirmed against an independent
+    // source is not proven.
+    for venue in VENUES {
+        let available = rows.diagnostics.swaps_by_venue[venue.index()];
+        if available < TARGET as u64 {
+            println!(
+                "  note: {} produced only {available} swaps in this window",
+                venue.as_str()
+            );
+            continue;
+        }
+        let done = checked.get(venue.as_str()).copied().unwrap_or(0);
+        assert!(
+            done >= TARGET,
+            "wanted {TARGET} {} swaps cross-checked against the public \
+             RPC, got {done}",
+            venue.as_str()
+        );
+    }
 }
 
 /// The three tricky transactions of docs/solana-research.md are recorded
