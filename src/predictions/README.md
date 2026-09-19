@@ -360,11 +360,59 @@ same hex string.
 `outcome_prices[i]` = last print of outcome i (`argMax` by
 `(block_number, tx_index, ordinal)` through the daily candles); 24h volume from the
 hourly candles; `open_interest` = split - merged - redeemed collateral of
-the registry's own events (it only knows the indexed history: started mid
-chain it can be negative); `status` = `resolved` (a `ConditionResolution`
+the registry's own events (see "Markets older than the coverage floor"
+below: until that pass has run it only knows the indexed history, and can
+be negative); `status` = `resolved` (a `ConditionResolution`
 exists, with `payouts`, `winning_outcome`), `disputed` (UMA reset / flag),
 else `open`. For AMM markets the price is the last trade too (pool state is
 a known gap).
+
+### Markets older than the coverage floor
+
+This indexer covers a window - "gap-free from a known date to now"
+(`docs/design.md` section 16, `src/coverage/`) - and prediction markets are
+the one dataset that is WRONG without a little data from below it:
+
+* a market whose `ConditionPreparation` happened below the floor has no
+  question and no outcomes, so a screen shows a market with no name;
+* open interest is split minus merged minus redeemed, so a market that was
+  split into below the floor and redeemed above it reads as a **negative**
+  number.
+
+`src/predictions/history.rs` fixes both with one bounded pass, which
+`indexer run` starts by itself the first time a chain is indexed and which
+can be run on demand:
+
+```sh
+indexer backfill --module predictions --registry-only --chain 137 \
+  --database http://default@localhost:8123/indexer
+```
+
+It walks the blocks below the floor asking the source for the logs of the
+addresses in **your** `prediction_trusted` and of nothing else, and stores
+market metadata, questions, outcome-token mappings and the
+split / merge / redeem / convert / resolution events. It is resumable (one
+high-water mark per chain in `prediction_history`) and idempotent (the same
+dedup tokens as a live flush).
+
+**It stores no trade below the floor, on purpose.** A trade is volume.
+Keeping the trades of a few trusted exchanges below the floor - while every
+other dataset on the chain starts at the floor - would make volume, candles
+and leaderboards mean one thing below a date and another above it, with
+nothing on a screen to say which.
+
+Two things follow for the operator:
+
+* **A question you do not trust is a question you do not get.** The pass
+  reads trusted addresses only, so the NegRisk and UMA adapters above have
+  to be in `prediction_trusted` for a market's title to come back.
+* **No deployment blocks are needed, and none ship.** A log filter over a
+  handful of addresses costs the source nothing below the block where those
+  contracts were created - it skips those ranges and says how far it got -
+  so the pass starts at block 0 by default. If you would rather pin it, set
+  `prediction_trusted.from_block` (migration 0023) to the deployment block
+  you verified yourself. As with the addresses, this file does not tell you
+  what that number is.
 
 ## Query cookbook
 

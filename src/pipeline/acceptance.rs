@@ -741,6 +741,9 @@ impl Scenario {
             workers: fast_workers(),
             lease: fast_lease(),
             shutdown: Box::pin(shutdown),
+            // The in-memory chain of these tests serves no log filter; the
+            // registry-only history pass has its own tests.
+            history: None,
         };
 
         tokio::time::timeout(

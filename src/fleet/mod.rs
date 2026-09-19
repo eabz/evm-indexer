@@ -238,6 +238,8 @@ impl ChainRunner for PipelineRunner {
                 .await
                 .context("set up the RPC endpoints (--rpc)")?;
 
+                let history_source = source.clone();
+
                 let runtime = Runtime {
                     canonical: Arc::new(source.clone()),
                     source,
@@ -247,6 +249,7 @@ impl ChainRunner for PipelineRunner {
                     shutdown,
                     metrics: Some(metrics),
                     status,
+                    history: Some(Arc::new(history_source)),
                 };
 
                 pipeline::run_with(config, runtime).await

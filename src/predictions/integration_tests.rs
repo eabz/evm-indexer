@@ -106,6 +106,9 @@ struct TestDb {
     /// ClickHouse ignores a parameter a query does not use, so one set
     /// covers every screen.
     params: std::sync::Mutex<Vec<(String, String)>>,
+    /// The same database through the indexer's own handle, for the code
+    /// paths that take one (`predictions::history`).
+    indexer: crate::db::Database,
 }
 
 impl TestDb {
@@ -141,12 +144,22 @@ impl TestDb {
         migrate::run(target.as_str()).await.unwrap();
 
         let client = admin.clone().with_database(&name);
+        let indexer = crate::db::Database::new(target.as_str(), CHAIN)
+            .await
+            .unwrap();
+
         Self {
             admin,
             client,
             name,
             params: std::sync::Mutex::new(Vec::new()),
+            indexer,
         }
+    }
+
+    /// The indexer's own handle on this database.
+    fn db(&self) -> crate::db::Database {
+        self.indexer.clone()
     }
 
     /// Replaces the bound parameters used by every following query.
@@ -374,6 +387,29 @@ impl TestDb {
         .await;
 
         self.await_rows("prediction_trusted", before + 1).await;
+    }
+
+    /// One more contract the operator believes, by its address. The
+    /// adapters that carry a market's question are named in the module
+    /// README and an operator inserts them exactly like this.
+    async fn trust_emitters(&self, registry: &str, emitters: &[Address]) {
+        let trusted = "SELECT count() FROM prediction_trusted";
+        let before = self.count(trusted).await;
+
+        let mut added = 0;
+        for emitter in emitters {
+            self.execute(&format!(
+                "INSERT INTO prediction_trusted \
+                 (chain, kind, address, registry) \
+                 VALUES ({CHAIN}, 'adapter', unhex('{}'), unhex('{}'))",
+                id32_hex(&format!("{emitter:x}")),
+                id32_hex(registry)
+            ))
+            .await;
+            added += 1;
+        }
+
+        self.await_rows("prediction_trusted", before + added).await;
     }
 
     /// What the venue worker would have stored.
@@ -650,6 +686,293 @@ async fn latency(database: &TestDb, sql: &str, runs: usize) -> f64 {
     }
     samples.sort_by(f64::total_cmp);
     samples[samples.len() / 2]
+}
+
+// ---------------------------- the registry-only history pass (section 16)
+
+/// A [`LogSource`](crate::predictions::history::LogSource) over logs a test
+/// wrote by hand: the same seam the HyperSync source plugs into, so the
+/// pass is driven end to end without a network.
+struct FakeLogs {
+    logs: Vec<crate::core::models::log::DatabaseLog>,
+}
+
+impl crate::predictions::history::LogSource for FakeLogs {
+    fn logs(
+        &self,
+        _chain: u64,
+        range: crate::db::ranges::BlockRange,
+        addresses: &[Address],
+    ) -> futures::future::BoxFuture<
+        '_,
+        anyhow::Result<crate::predictions::history::LogPage>,
+    > {
+        let addresses = addresses.to_vec();
+        Box::pin(async move {
+            // Exactly what a log filter does: the range, and the addresses.
+            let logs = self
+                .logs
+                .iter()
+                .filter(|log| {
+                    log.block_number >= range.from
+                        && log.block_number < range.to
+                        && addresses.contains(&log.address)
+                })
+                .cloned()
+                .collect();
+
+            Ok(crate::predictions::history::LogPage {
+                logs,
+                next_block: range.to,
+            })
+        })
+    }
+}
+
+/// docs/design.md section 16. A market whose life started BELOW the
+/// coverage floor is the one thing a window of history gets wrong: it has
+/// no question and no outcomes, and its open interest - split minus merged
+/// minus redeemed - counts only the redemptions, so it goes NEGATIVE.
+///
+/// The test sets that situation up exactly, checks it really is broken,
+/// runs the registry-only pass, and checks all three promises: the
+/// description is there, the open interest is not negative any more, and
+/// NOT ONE TRADE below the floor was stored.
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL (a real ClickHouse)"]
+async fn a_market_older_than_the_floor_gets_its_history_but_none_of_its_trades(
+) {
+    use crate::predictions::history;
+
+    /// Everything below this block is outside the covered window.
+    const FLOOR: u64 = 2_000;
+
+    let database = TestDb::create().await;
+    let now = now();
+
+    database.token(WRAPPED_COLLATERAL, "WCOL", 6).await;
+    database.token(USDC_E, "USDC.e", 6).await;
+    database.venue(NEG_RISK_EXCHANGE, USDC_E).await;
+    database.trust(CTF, &[NEG_RISK_EXCHANGE]).await;
+
+    // ---- what the live indexer stored: ABOVE the floor only.
+    //
+    // A redemption of 500 collateral on a market this database never saw
+    // being split into.
+    let redeemed = U256::from(500_000_000u64);
+    let redemption = fixtures::constructed_redemption(
+        Place {
+            chain: CHAIN,
+            block_number: 3_100,
+            log_index: 0,
+            timestamp: now - 600,
+            transaction_hash: B256::repeat_byte(0x31),
+        },
+        address(CTF),
+        address(TAKER),
+        address(WRAPPED_COLLATERAL),
+        m1(),
+        redeemed,
+    );
+
+    let mut above = decode(CHAIN, &[redemption]);
+    above.set_version(crate::db::next_version());
+    database.insert(&above).await;
+
+    // ---- the broken state, proven rather than assumed.
+    let market = m1();
+    let market_hex = bare(&format!("{market:x}"));
+    database.set(&[("market", &market_hex)]);
+
+    let broken: f64 = settle(
+        || async {
+            database
+                .rows::<f64>(&format!(
+                    "SELECT ifNull(open_interest, 0.) FROM \
+                     prediction_markets_all_v WHERE chain = {CHAIN} AND \
+                     lower(hex(market_id)) = '{market_hex}'"
+                ))
+                .await
+                .first()
+                .copied()
+                .unwrap_or(0.)
+        },
+        |value| *value < 0.,
+    )
+    .await;
+
+    assert!(
+        broken < 0.,
+        "the situation this pass exists for did not happen: open interest \
+         is {broken}, expected a negative number"
+    );
+
+    // ---- what the source can still serve from BELOW the floor: the
+    // market's own history, from the trusted addresses and nowhere else.
+    let mut below = Vec::new();
+    below.extend(fixtures::V1_NEG_RISK_MATCH.placed(1_000, now - 86_400));
+    below.extend(
+        fixtures::NEG_RISK_MARKET_PREPARED.placed(1_001, now - 86_300),
+    );
+    below.extend(
+        fixtures::NEG_RISK_QUESTION_PREPARED.placed(1_002, now - 86_200),
+    );
+    below.extend(
+        fixtures::UMA_QUESTION_INITIALIZED.placed(1_003, now - 86_100),
+    );
+
+    let trades_below = decode(CHAIN, &below).trades.len();
+    assert!(
+        trades_below > 0,
+        "the fixture below the floor has no trades, so 'no trade is \
+         stored' would prove nothing"
+    );
+
+    // An operator who wants a market's QUESTION has to trust the contract
+    // that carries it - the NegRisk and UMA adapters, named in
+    // src/predictions/README.md. The pass reads the trusted addresses and
+    // nothing else, which is the whole point of it, so a description this
+    // database does not believe in stays out.
+    let emitters: Vec<Address> = {
+        let mut seen: Vec<Address> = Vec::new();
+        for log in &below {
+            if !seen.contains(&log.address) {
+                seen.push(log.address);
+            }
+        }
+        seen
+    };
+    database.trust_emitters(CTF, &emitters).await;
+
+    let source = FakeLogs { logs: below };
+
+    let report = history::run(
+        &database.db(),
+        &crate::pipeline::lease::Fence::open(),
+        &source,
+        FLOOR,
+        400,
+    )
+    .await
+    .expect("the history pass");
+
+    assert!(report.finished(), "{report:?}");
+    assert_eq!(report.done_to_block, FLOOR);
+    assert!(report.position_events > 0, "{report:?}");
+    assert_eq!(
+        report.trades_dropped, trades_below,
+        "the pass did not see the trades it is supposed to be dropping"
+    );
+
+    // ---- promise 1: the market can be described again.
+    let questions: u64 = settle(
+        || async {
+            database
+                .count(&format!(
+                    "SELECT toUInt64(count()) FROM prediction_questions \
+                     FINAL WHERE chain = {CHAIN} AND block_number < {FLOOR}"
+                ))
+                .await
+        },
+        |count| *count > 0,
+    )
+    .await;
+    assert!(
+        questions > 0,
+        "no question was recovered from below the floor"
+    );
+
+    let titled: u64 = database
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM prediction_questions FINAL \
+             WHERE chain = {CHAIN} AND block_number < {FLOOR} AND \
+             length(title) > 0"
+        ))
+        .await;
+    assert!(titled > 0, "the recovered questions carry no title");
+
+    let outcome_tokens: u64 = database
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM prediction_outcome_tokens FINAL \
+             WHERE chain = {CHAIN} AND market_id = \
+             toFixedString(unhex('{market_hex}'), 32)"
+        ))
+        .await;
+    assert!(
+        outcome_tokens > 0,
+        "the market's outcomes were not recovered"
+    );
+
+    // ---- promise 2: open interest is not negative any more.
+    let healed: f64 = settle(
+        || async {
+            database
+                .rows::<f64>(&format!(
+                    "SELECT ifNull(open_interest, -1.) FROM \
+                     prediction_markets_all_v WHERE chain = {CHAIN} AND \
+                     lower(hex(market_id)) = '{market_hex}'"
+                ))
+                .await
+                .first()
+                .copied()
+                .unwrap_or(-1.)
+        },
+        |value| *value >= 0.,
+    )
+    .await;
+
+    assert!(
+        healed >= 0.,
+        "open interest is still {healed} after the history pass"
+    );
+    // 891.52 was locked below the floor, 500 was redeemed above it.
+    assert!(close(healed, 891.52 - 500.0), "{healed}");
+
+    // ---- promise 3: NOT ONE trade below the floor.
+    let old_trades: u64 = database
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM prediction_trades FINAL WHERE \
+             chain = {CHAIN} AND block_number < {FLOOR}"
+        ))
+        .await;
+    assert_eq!(
+        old_trades, 0,
+        "the pass stored {old_trades} trade(s) from below the coverage \
+         floor; volume must mean the same thing on both sides of the floor"
+    );
+
+    // ---- and running it again is a no-op rather than a double count.
+    let again = history::run(
+        &database.db(),
+        &crate::pipeline::lease::Fence::open(),
+        &source,
+        FLOOR,
+        400,
+    )
+    .await
+    .expect("the history pass, again");
+    assert_eq!(again.scanned, 0, "{again:?}");
+    assert!(again.finished());
+
+    let after: f64 = settle(
+        || async {
+            database
+                .rows::<f64>(&format!(
+                    "SELECT ifNull(open_interest, -1.) FROM \
+                     prediction_markets_all_v WHERE chain = {CHAIN} AND \
+                     lower(hex(market_id)) = '{market_hex}'"
+                ))
+                .await
+                .first()
+                .copied()
+                .unwrap_or(-1.)
+        },
+        |value| close(*value, 891.52 - 500.0),
+    )
+    .await;
+    assert!(close(after, 891.52 - 500.0), "{after} after a second run");
+
+    database.drop().await;
 }
 
 #[tokio::test]

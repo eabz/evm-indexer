@@ -122,6 +122,42 @@ pub fn build_header_query(range: BlockRange) -> Query {
         .select_block_fields(HEADER_FIELDS)
 }
 
+/// Block fields the registry-only history pass needs: enough to place and
+/// to date a log, and nothing more. No transactions: the only row that
+/// reads `tx_from` is a trade, and that pass stores none.
+const HISTORY_BLOCK_FIELDS: [BlockField; 3] =
+    [BlockField::Number, BlockField::Hash, BlockField::Timestamp];
+
+/// The logs of `addresses` in `range`, and the blocks they are in
+/// (docs/design.md section 16, `predictions::history`).
+///
+/// An empty address list would mean "every log on the chain" to HyperSync,
+/// which is the opposite of what this query is for, so the caller must
+/// never pass one - `predictions::history::run` returns early instead.
+pub fn build_address_log_query(
+    range: BlockRange,
+    addresses: &[alloy::primitives::Address],
+) -> Query {
+    Query::new()
+        .from_block(range.from)
+        .to_block_excl(range.to)
+        // Only the blocks that carry a matching log, which on a filter this
+        // narrow is almost none of them.
+        .where_logs(LogFilter {
+            address: addresses
+                .iter()
+                .map(|address| {
+                    hypersync_client::format::Address::from(
+                        <[u8; 20]>::from(*address),
+                    )
+                })
+                .collect(),
+            ..LogFilter::default()
+        })
+        .select_block_fields(HISTORY_BLOCK_FIELDS)
+        .select_log_fields(LOG_FIELDS)
+}
+
 /// Requests per [`CanonicalChain::headers`] call. One is the norm (the
 /// ranges are a few hundred headers at most).
 const MAX_HEADER_REQUESTS: usize = 16;
@@ -241,6 +277,52 @@ impl CanonicalChain for Source {
             headers.dedup_by_key(|header| header.number);
 
             Ok(headers)
+        })
+    }
+}
+
+impl crate::predictions::history::LogSource for Source {
+    fn logs(
+        &self,
+        chain: u64,
+        range: BlockRange,
+        addresses: &[alloy::primitives::Address],
+    ) -> BoxFuture<'_, Result<crate::predictions::history::LogPage>> {
+        let addresses = addresses.to_vec();
+        Box::pin(async move {
+            if addresses.is_empty() {
+                // An empty filter means "everything" to HyperSync. Refuse
+                // rather than accidentally read a whole chain.
+                bail!("no trusted addresses to read the history of");
+            }
+
+            let response = self
+                .client
+                .get(&build_address_log_query(range, &addresses))
+                .await
+                .with_context(|| {
+                    format!("get HyperSync logs for {range}")
+                })?;
+
+            let data = ResponseRows {
+                blocks: response.data.blocks,
+                transactions: Vec::new(),
+                logs: response.data.logs,
+            };
+
+            // The same transform the live stream uses, so a log read here
+            // and a log read there are byte-identical rows.
+            let rows =
+                crate::pipeline::transform::transform(chain, &data, range)
+                    .context("turn the history logs into rows")?;
+
+            Ok(crate::predictions::history::LogPage {
+                logs: rows.rows.logs,
+                // A source that skips over the blocks before these
+                // contracts existed says so here, which is what makes a
+                // table of deployment blocks unnecessary.
+                next_block: response.next_block.max(range.from),
+            })
         })
     }
 }

@@ -359,6 +359,10 @@ pub struct Runtime<S: BlockSource> {
     pub metrics: Option<Metrics>,
     /// Where the chain reports what it is doing. Off for `indexer run`.
     pub status: StatusSink,
+    /// Where the registry-only prediction history pass reads its logs
+    /// (docs/design.md section 16). `None` switches the pass off, which is
+    /// what the acceptance tests that have no log source do.
+    pub history: Option<Arc<dyn crate::predictions::history::LogSource>>,
 }
 
 /// Runs the indexer. Returns `Ok` when `--end-block` was reached or a
@@ -387,6 +391,8 @@ pub async fn run(config: Config) -> Result<()> {
     .await
     .context("set up the RPC endpoints (--rpc)")?;
 
+    let history_source = source.clone();
+
     let runtime = Runtime {
         canonical: Arc::new(source.clone()),
         source,
@@ -396,6 +402,7 @@ pub async fn run(config: Config) -> Result<()> {
         shutdown: Box::pin(shutdown_signal()),
         metrics: None,
         status: StatusSink::off(),
+        history: Some(Arc::new(history_source)),
     };
 
     run_with(config, runtime).await
@@ -527,6 +534,22 @@ pub async fn run_with<S: BlockSource>(
 
     // The epoch of a chain survives restarts in `reorgs`.
     db.set_epoch(db.current_epoch().await?);
+
+    // Prediction markets are the one dataset that needs data from BELOW the
+    // floor to be right: a market created down there has no question and
+    // its open interest can go negative (docs/design.md section 16). The
+    // pass that fixes that runs in the background, once, and never delays
+    // the live window - a market's name arriving a minute later is not
+    // worth a minute of lag.
+    if let Some(history) = runtime.history.clone() {
+        crate::predictions::history::spawn(
+            db.clone(),
+            lease.fence(),
+            history,
+            enabled,
+            floor.block,
+        );
+    }
 
     let workers = Workers::spawn(
         &db,

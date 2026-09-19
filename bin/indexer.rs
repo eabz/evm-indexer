@@ -113,6 +113,64 @@ async fn run_fleet(config: FleetConfig) -> Result<()> {
     fleet::run(config).await
 }
 
+/// `indexer backfill --module predictions --registry-only`.
+///
+/// Reads the blocks below this chain's coverage floor, filtered to the
+/// operator's own trusted addresses, and stores what a market needs to be
+/// describable: its metadata, its question, its outcome tokens and the
+/// split / merge / redeem events open interest is made of. No trade below
+/// the floor is stored, on purpose (docs/design.md section 16).
+///
+/// The same pass `indexer run` starts by itself, run on demand and in the
+/// foreground so the operator watches it finish.
+async fn run_registry_history(
+    db: &Database,
+    config: &BackfillConfig,
+) -> Result<()> {
+    use evm_indexer::predictions::history;
+
+    if config.module != "predictions" {
+        anyhow::bail!(
+            "--registry-only is only for --module predictions. It reads \
+             the blocks below the coverage floor for the market metadata \
+             and the split/merge/redeem events open interest is made of, \
+             which no other module needs."
+        );
+    }
+
+    let Some(floor) = evm_indexer::coverage::store::stored(db).await?
+    else {
+        anyhow::bail!(
+            "chain {} has no coverage floor yet, so there is nothing \
+             below it to read. Run `indexer run` once first.",
+            config.chain_id
+        );
+    };
+
+    // `--from-block` / `--from-date` narrow the pass; by default it goes
+    // as far down as the source will serve these addresses.
+    let source = evm_indexer::source::evm::Source::new(
+        config.chain_id,
+        None,
+        std::env::var("ENVIO_API_TOKEN").unwrap_or_default().trim(),
+    )?;
+
+    let report = history::run(
+        db,
+        // No lease is taken: the pass writes only below the floor, where
+        // the live indexer never writes, and a second copy of it is
+        // idempotent rather than harmful.
+        &evm_indexer::pipeline::lease::Fence::open(),
+        &source,
+        floor.block,
+        config.chunk_blocks.max(history::CHUNK_BLOCKS),
+    )
+    .await?;
+
+    println!("{report}");
+    Ok(())
+}
+
 /// Read only. Exit code 0 = consistent, 1 = problems found.
 ///
 /// Solana gets its own checks: "every block number has a row" would report
@@ -167,6 +225,14 @@ async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
 
 async fn run_backfill(config: BackfillConfig) -> Result<()> {
     let db = Database::new(&config.database_url, config.chain_id).await?;
+
+    // `--registry-only` is a different job from every other backfill: the
+    // rest re-decode logs this database already has, and this one fetches
+    // logs from BELOW the coverage floor that it has never had
+    // (docs/design.md section 16).
+    if config.registry_only {
+        return run_registry_history(&db, &config).await;
+    }
 
     let report = pipeline::backfill::backfill(
         &db,
