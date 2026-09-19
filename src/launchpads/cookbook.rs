@@ -31,9 +31,19 @@
 //! `launchpad_trusted_emitters`. **Picking a token is not a trust
 //! decision**: a forged curve can name a real token, and a forged launch
 //! emitted earlier than the real one can claim it, so the token page, the
-//! chart, the tape, the snipers and the holders are filtered too. Each
-//! has an `*_all_v` twin that counts everything - that is the tool for
-//! deciding what to trust, never the screen.
+//! chart, the tape, the snipers and the holders are filtered too.
+//!
+//! **Picking a creator is not a trust decision either.** A launch names
+//! its creator in the event, so a forger can hang a launch that never
+//! graduates on any wallet it likes - inflating that wallet's launch
+//! count, tanking its graduation rate and manufacturing the very
+//! serial-rugger signal the creator page reports - and a forged fee sweep
+//! can name it as the recipient of fees it never earned. The creator
+//! screens therefore take their launches, graduations, trades and fees
+//! from trusted curves only.
+//!
+//! Each filtered screen has an `*_all_v` twin that counts everything -
+//! that is the tool for deciding what to trust, never the screen.
 //!
 //! # The text these queries return is HOSTILE
 //!

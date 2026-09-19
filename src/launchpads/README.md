@@ -315,6 +315,26 @@ every one of those screens is byte for byte identical before and after the
 forged rows exist, including the earlier-launch case, and that every
 `_all_v` twin does show them.
 
+**Picking a CREATOR is not a trust decision either**, and there the victim
+is a wallet that did nothing at all. A launch names its creator in the
+event, so a forger can emit a `TokenLaunched` naming any address as
+`creator`: unfiltered, that launch lands on the stranger's page, never
+graduates, and so raises `launches`, raises `died` and drags
+`graduation_rate` down - manufacturing precisely the serial-rugger signal
+the creator page exists to report. The other three sources are open the
+same way: a forged `CurveBuy` on one of those tokens moves `trades`,
+`volume_quote_raw` and `last_trade_time` (and through it `died`), a forged
+graduation flips `graduated`, and a forged fee sweep naming the wallet as
+`recipient` inflates `realised_creator_fees_raw`. So
+`launchpad_creator_tokens_v` and `launchpad_creator_v` restrict all four
+sources to `launchpad_trusted_curves_v`, and
+`launchpad_creator_tokens_all_v` / `launchpad_creator_all_v` are the
+exploration twins (the `_all_v` header also carries `trusted_launches`, how
+many of the counted launches came from a trusted curve).
+`integration_tests::a_forged_launch_moves_no_creator_page_number` asserts
+the two creator screens are byte identical before and after the forged
+rows and that both twins move.
+
 **Why trusted-by-default-off is the right default.** The alternative -
 counting everything and hoping the corroboration filters it - fails against
 the cheapest attack there is: deploy a token, deploy a fake curve, move
@@ -531,6 +551,13 @@ for `dead_after` seconds. `realised_creator_fees_raw` counts only fee rows
 whose recipient the fee ESCROW named (`kind = 'creator'`), so it is money
 that provably moved, not a fee policy read over RPC.
 
+All four sources are restricted to `launchpad_trusted_curves_v` (§3.2):
+without that, anyone could name this wallet as the `creator` of a launch
+that never graduates, or as the `recipient` of a fee sweep, and both
+numbers are exactly the ones a reader judges the wallet by. The
+exploration twin is `launchpad_creator_all_v`, which counts every emitter
+and adds `trusted_launches`.
+
 ### Creator launches
 
 ```sql
@@ -540,6 +567,10 @@ FROM launchpad_creator_tokens_v(chain = {chain:UInt64}, creator = {creator:Strin
                                 as_of = {now:UInt32}, dead_after = {dead_after:UInt32})
 LIMIT 200
 ```
+
+One row per launch of the wallet, newest first, launches / graduations /
+trades all taken from trusted curves. `launchpad_creator_tokens_all_v` is
+the unfiltered twin and carries `trusted` per row.
 
 ### Sniper view
 
