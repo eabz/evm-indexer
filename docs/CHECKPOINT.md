@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-18 23:35 (America/Mexico_City)
+**Last updated:** 2026-09-19 00:20 (America/Mexico_City)
 
 ## Where things are
 
@@ -35,7 +35,7 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 
 | Who | Model | Where | What | Saved how |
 |---|---|---|---|---|
-| pipeline | Fable | MAIN tree (uncommitted edits!) | wire tokens/DEX/predictions/metrics/reorg into the running binary, checkpoints, insert dedup (migration 0090), `indexer verify` / `backfill`, zero-flag acceptance tests | commits prefixed `pipeline:` when the tree compiles; WIP notes on tirith |
+| pipeline | DONE (HEAD 8d39855, pushed) | main tree, clean | wire tokens/DEX/predictions/metrics/reorg into the running binary, checkpoints, insert dedup (migration 0090), `indexer verify` / `backfill`, zero-flag acceptance tests | commits prefixed `pipeline:` when the tree compiles; WIP notes on tirith |
 | launchpads | Opus | worktree `.claude/worktrees/agent-ab96eb1af8d691753` | `src/launchpads/` (Pons V2, Flap Portal; design section 11) | commits in the worktree + tirith notes |
 | migrator | Opus | worktree `.claude/worktrees/agent-a81326682e269a32c` | review fixes 14-19 for the migration runner | commits in the worktree |
 | solana-research | done | `docs/solana-research.md` | finished and committed | - |
@@ -50,7 +50,7 @@ given the handoff file plus `git status`/`git log` of the worktree can continue.
 
 ## Still to do, in order
 
-1. Pipeline wiring lands (compiling, tests green) -> push -> PR CI green.
+1. DONE: pipeline wiring (zero-flag proof, 8/8 acceptance tests, review round 2 core fixes). DONE: migrator review fixes merged. DONE: review round 2 (findings routed; predictions fixes are with predictions-neutral). Open backlog: tirith tasks 'Pipeline hardening backlog' and 'Live validation'.
 2. Merge launchpads + migrator fixes (validate each in its worktree against the current
    branch first, then a real `git merge`, then remove the worktree).
 3. Review round 2 findings -> fixes. Then review the pipeline wiring itself.
