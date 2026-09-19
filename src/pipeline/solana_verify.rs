@@ -101,11 +101,32 @@ pub struct SolanaVerifyReport {
 }
 
 impl SolanaVerifyReport {
+    /// Nothing found that is wrong with what is stored.
+    ///
+    /// `heal_pending` counts, exactly as it does on the EVM side
+    /// (docs/review-round-4.md, MINOR 14): a repair that is armed and not
+    /// completed means rows are tombstoned that nothing has settled, and
+    /// the aggregates of those days still count them. The operator need
+    /// do nothing about it - the next `indexer run` purges and re-indexes
+    /// the range - but the numbers ARE wrong until it does, and a
+    /// verifier that says "consistent" about them is lying.
     pub fn is_consistent(&self) -> bool {
         self.unasked.is_empty()
             && self.breaks.is_empty()
             && self.orphans.is_empty()
             && self.candles.is_empty()
+            && !self.heal_pending
+    }
+
+    /// Did the candle cross-check - the only one that can find a DOUBLED
+    /// range - actually run?
+    ///
+    /// It is skipped where there is nothing it could compare (a tiling
+    /// with holes, a chain that does not close, a range shorter than one
+    /// complete UTC day). That is not a fault of the data, but it must
+    /// not read as "checked and fine" either, so the verdict line says so.
+    pub fn fully_checked(&self) -> bool {
+        self.candles_skipped.is_none()
     }
 }
 
@@ -247,10 +268,10 @@ impl fmt::Display for SolanaVerifyReport {
         write!(
             f,
             "Result: {}",
-            if self.is_consistent() {
-                "CONSISTENT"
-            } else {
-                "PROBLEMS FOUND"
+            match (self.is_consistent(), self.fully_checked()) {
+                (false, _) => "PROBLEMS FOUND",
+                (true, false) => "CONSISTENT, NOT FULLY CHECKED",
+                (true, true) => "CONSISTENT",
             }
         )
     }
@@ -696,12 +717,43 @@ mod tests {
         assert!(report.to_string().contains("20 swaps instead of 10"));
     }
 
-    /// A pending heal is information, not an inconsistency: the next start
-    /// repairs it by itself.
+    /// A pending repair IS a problem right now, exactly as it is on the
+    /// EVM side (docs/review-round-4.md, MINOR 14): rows are tombstoned
+    /// that no completed purge settled, and the aggregates of those days
+    /// still COUNT them. The operator need do nothing - the next
+    /// `indexer run` repairs it - but the numbers are wrong until it does,
+    /// so `verify` must not call the index consistent.
+    ///
+    /// This replaces `a_pending_heal_is_reported_without_failing_the_run`,
+    /// which asserted the opposite (lead decision, round 4 follow-ups).
     #[test]
-    fn a_pending_heal_is_reported_without_failing_the_run() {
+    fn a_pending_heal_is_a_problem_until_the_next_run_repairs_it() {
         let report = SolanaVerifyReport { heal_pending: true, ..report() };
-        assert!(report.is_consistent());
-        assert!(report.to_string().contains("a gap heal is pending"));
+        assert!(!report.is_consistent());
+        let text = report.to_string();
+        assert!(text.contains("a gap heal is pending"), "{text}");
+        assert!(text.contains("Result: PROBLEMS FOUND"), "{text}");
+    }
+
+    /// A check that could not run must not read as "checked and fine".
+    #[test]
+    fn a_skipped_candle_check_says_not_fully_checked() {
+        let skipped = SolanaVerifyReport {
+            candles_skipped: Some("the range holds less than one \
+                                   complete UTC day"),
+            ..report()
+        };
+
+        assert!(skipped.is_consistent());
+        assert!(!skipped.fully_checked());
+        let text = skipped.to_string();
+        assert!(
+            text.ends_with("Result: CONSISTENT, NOT FULLY CHECKED"),
+            "{text}"
+        );
+
+        // ... and a report that DID check its candles says so plainly.
+        assert!(report().fully_checked());
+        assert!(report().to_string().ends_with("Result: CONSISTENT"));
     }
 }
