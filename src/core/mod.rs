@@ -7,5 +7,8 @@
 //! `README.md` in this directory for the table catalogue.
 
 pub mod convert;
+pub mod decode;
 pub mod events;
 pub mod models;
+
+pub use self::decode::decode;

@@ -1,16 +1,9 @@
 use alloy::primitives::{Address, Bytes, B256};
-use anyhow::{Context, Result};
 use clickhouse::Row;
-use hypersync_client::simple_types::Log;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::{
-    core::convert::{
-        address_to_alloy, data_to_bytes, hash_to_b256, sat_u32,
-    },
-    db::format::{SerAddress, SerB256, SerBytes, SerTopic},
-};
+use crate::db::format::{SerAddress, SerB256, SerBytes, SerTopic};
 
 /// Row of `logs`. Field names are the column names.
 ///
@@ -108,71 +101,6 @@ impl From<StoredLog> for DatabaseLog {
     }
 }
 
-/// Topics are positional: they end at the first missing one.
-pub fn topic_count(topics: [&Option<B256>; 4]) -> u8 {
-    topics.iter().take_while(|topic| topic.is_some()).count() as u8
-}
-
-impl DatabaseLog {
-    pub fn from_hypersync(
-        log: &Log,
-        chain: u64,
-        timestamp: u32,
-    ) -> Result<Self> {
-        let block_number = log
-            .block_number
-            .map(u64::from)
-            .context("log without a block number in response")?;
-
-        let log_index =
-            log.log_index.map(u64::from).with_context(|| {
-                format!("log without a log index in block {block_number}")
-            })?;
-
-        let topic = |index: usize| {
-            log.topics
-                .get(index)
-                .and_then(|topic| topic.as_ref())
-                .map(hash_to_b256)
-        };
-
-        // A topic after a missing one can not exist on chain; dropping it
-        // keeps `topic_count` and the columns consistent.
-        let topic0 = topic(0);
-        let topic1 = topic0.and(topic(1));
-        let topic2 = topic1.and(topic(2));
-        let topic3 = topic2.and(topic(3));
-
-        Ok(Self {
-            chain,
-            block_number,
-            log_index: sat_u32(log_index),
-            transaction_index: sat_u32(
-                log.transaction_index.map(u64::from).unwrap_or_default(),
-            ),
-            transaction_hash: log
-                .transaction_hash
-                .as_ref()
-                .map(hash_to_b256)
-                .unwrap_or_default(),
-            timestamp,
-            address: log
-                .address
-                .as_ref()
-                .map(address_to_alloy)
-                .unwrap_or_default(),
-            topic_count: topic_count([&topic0, &topic1, &topic2, &topic3]),
-            topic0,
-            topic1,
-            topic2,
-            topic3,
-            data: log.data.as_ref().map(data_to_bytes).unwrap_or_default(),
-            epoch: 0,
-            _version: 0,
-        })
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -211,83 +139,6 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hypersync_client::format::{
-        Address as HsAddress, Data, Hash, LogArgument, UInt,
-    };
-
-    fn hypersync_log() -> Log {
-        let mut log = Log {
-            block_number: Some(UInt::from(55u64)),
-            log_index: Some(UInt::from(70_000u64)),
-            transaction_index: Some(UInt::from(4u64)),
-            transaction_hash: Some(Hash::from([3u8; 32])),
-            address: Some(HsAddress::from([5u8; 20])),
-            data: Some(Data::from(vec![1u8, 2, 3])),
-            ..Default::default()
-        };
-        log.topics.push(Some(LogArgument::from([9u8; 32])));
-        log.topics.push(None);
-        log.topics.push(None);
-        log.topics.push(None);
-        log
-    }
-
-    #[test]
-    fn converts_without_narrowing() {
-        let row =
-            DatabaseLog::from_hypersync(&hypersync_log(), 1, 42).unwrap();
-
-        assert_eq!(row.block_number, 55);
-        // Did not fit the old UInt16 column.
-        assert_eq!(row.log_index, 70_000);
-        assert_eq!(row.timestamp, 42);
-        assert_eq!(row.topic_count, 1);
-        assert_eq!(row.topic0, Some(B256::repeat_byte(9)));
-        assert_eq!(row.topic1, None);
-        assert_eq!(row.transaction_index, 4);
-        assert_eq!(row.data, Bytes::from(vec![1u8, 2, 3]));
-        assert_eq!(row._version, 0);
-    }
-
-    #[test]
-    fn a_zero_topic_is_still_a_topic() {
-        let mut log = hypersync_log();
-        log.topics[1] = Some(LogArgument::from([1u8; 32]));
-        log.topics[2] = Some(LogArgument::from([2u8; 32]));
-        log.topics[3] = Some(LogArgument::from([0u8; 32]));
-
-        let row = DatabaseLog::from_hypersync(&log, 1, 0).unwrap();
-
-        assert_eq!(row.topic_count, 4);
-        assert_eq!(row.topic3, Some(B256::ZERO));
-    }
-
-    #[test]
-    fn topics_end_at_the_first_missing_one() {
-        let mut log = hypersync_log();
-        log.topics[2] = Some(LogArgument::from([2u8; 32]));
-
-        let row = DatabaseLog::from_hypersync(&log, 1, 0).unwrap();
-
-        assert_eq!(row.topic_count, 1);
-        assert_eq!(row.topic2, None);
-    }
-
-    #[test]
-    fn log_without_topics_or_data_is_fine() {
-        let log = Log {
-            block_number: Some(UInt::from(1u64)),
-            log_index: Some(UInt::from(0u64)),
-            ..Default::default()
-        };
-
-        let row = DatabaseLog::from_hypersync(&log, 1, 0).unwrap();
-
-        assert_eq!(row.topic_count, 0);
-        assert_eq!(row.topic0, None);
-        assert!(row.data.is_empty());
-        assert_eq!(row.address, Address::ZERO);
-    }
 
     #[test]
     fn stored_rows_restore_the_options_from_topic_count() {
@@ -303,12 +154,5 @@ mod tests {
         assert_eq!(back, log);
         assert_eq!(back.topic1, Some(B256::ZERO));
         assert_eq!(back.topic3, None);
-    }
-
-    #[test]
-    fn missing_identity_is_an_error() {
-        assert!(
-            DatabaseLog::from_hypersync(&Log::default(), 1, 0).is_err()
-        );
     }
 }
