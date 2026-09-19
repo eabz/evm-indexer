@@ -1,27 +1,18 @@
-//! HyperSync response -> database rows. Pure, no I/O.
+//! HyperSync response -> database rows: ORCHESTRATION only.
+//!
+//! The conversions themselves belong to the datasets: `core::decode`
+//! turns a response into the core rows, every other module's `decode`
+//! reads the logs of that batch (`pipeline::modules`). This file joins
+//! the two and hands back one [`Transformed`]. Pure, no I/O.
 
 use crate::{
-    db::{
-        models::{
-            block::DatabaseBlock,
-            erc1155_transfer::DatabaseERC1155Transfer,
-            erc20_transfer::DatabaseERC20Transfer,
-            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            transaction::DatabaseTransaction,
-            withdrawal::DatabaseWithdrawal,
-        },
-        ranges::BlockRange,
-        RowBatch,
-    },
+    core::{self, RowBatch},
+    db::ranges::BlockRange,
     pipeline::modules::{self, DecodeState, EnabledModules},
     tokens::TokenStandard,
-    utils::events::{
-        ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
-        ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
-    },
 };
-use alloy::primitives::{Address, U256};
-use anyhow::{bail, Context, Result};
+use alloy::primitives::Address;
+use anyhow::Result;
 use hypersync_client::simple_types::{Block, Log, Transaction};
 use std::collections::HashMap;
 
@@ -40,12 +31,6 @@ pub struct ResponseRows {
     pub blocks: Vec<Vec<Block>>,
     pub transactions: Vec<Vec<Transaction>>,
     pub logs: Vec<Vec<Log>>,
-}
-
-/// Per block values joined into the rows of the block's children.
-struct BlockContext {
-    timestamp: u32,
-    base_fee_per_gas: Option<U256>,
 }
 
 /// [`transform_with`] without any decoder module: the core rows only.
@@ -77,104 +62,8 @@ pub fn transform_with(
     enabled: EnabledModules,
     state: &mut DecodeState,
 ) -> Result<Transformed> {
-    let mut rows = RowBatch::default();
-
-    // Transactions per block: HyperSync blocks carry no transaction list.
-    let mut transaction_counts: HashMap<u64, u64> = HashMap::new();
-    for transaction in data.transactions.iter().flatten() {
-        if let Some(number) = transaction.block_number {
-            *transaction_counts.entry(u64::from(number)).or_default() += 1;
-        }
-    }
-
-    let mut contexts: HashMap<u64, BlockContext> = HashMap::new();
-
-    for block in data.blocks.iter().flatten() {
-        let number = block.number.context("block without a number")?;
-
-        if !(covered.from..covered.to).contains(&number) {
-            bail!("block {number} is outside the covered range {covered}");
-        }
-
-        let row = DatabaseBlock::from_hypersync(
-            block,
-            chain,
-            transaction_counts.get(&number).copied().unwrap_or_default(),
-        )?;
-
-        let context = BlockContext {
-            timestamp: row.timestamp,
-            base_fee_per_gas: row.base_fee_per_gas,
-        };
-
-        // A duplicated block inside one response is dropped.
-        if contexts.insert(number, context).is_some() {
-            continue;
-        }
-
-        for withdrawal in block.withdrawals.iter().flatten() {
-            rows.withdrawals.push(DatabaseWithdrawal::from_hypersync(
-                withdrawal,
-                chain,
-                row.number,
-                row.timestamp,
-            ));
-        }
-
-        rows.blocks.push(row);
-    }
-
-    if contexts.len() as u64 != covered.len() {
-        bail!(
-            "response for {covered} contains {} of {} blocks",
-            contexts.len(),
-            covered.len()
-        );
-    }
-
-    rows.blocks.sort_unstable_by_key(|block| block.number);
-
-    let context_of = |number: u64, what: &str| {
-        contexts.get(&number).with_context(|| {
-            format!("{what} references block {number} missing in response")
-        })
-    };
-
-    // Deployed contracts are not rows: `contracts` is a view over these
-    // transactions (docs/design.md, section 9).
-    for transaction in data.transactions.iter().flatten() {
-        let number = transaction
-            .block_number
-            .map(u64::from)
-            .context("transaction without a block number")?;
-
-        let context = context_of(number, "transaction")?;
-
-        rows.transactions.push(DatabaseTransaction::from_hypersync(
-            transaction,
-            chain,
-            context.timestamp,
-            context.base_fee_per_gas,
-        )?);
-    }
-
-    let mut tokens_seen: HashMap<Address, TokenStandard> = HashMap::new();
-
-    for log in data.logs.iter().flatten() {
-        let number = log
-            .block_number
-            .map(u64::from)
-            .context("log without a block number")?;
-
-        let context = context_of(number, "log")?;
-
-        let row =
-            DatabaseLog::from_hypersync(log, chain, context.timestamp)?;
-
-        decode_transfers(&row, &mut rows, &mut tokens_seen);
-
-        rows.logs.push(row);
-    }
+    let Transformed { mut rows, mut tokens_seen } =
+        core::decode(chain, data, covered)?;
 
     // Every log of the response, never a filtered subset.
     rows.modules = modules::decode(enabled, chain, &rows, state);
@@ -186,46 +75,13 @@ pub fn transform_with(
     Ok(Transformed { rows, tokens_seen })
 }
 
-/// ERC20 / ERC721 / ERC1155 transfers are decoded from the generic logs.
-fn decode_transfers(
-    log: &DatabaseLog,
-    rows: &mut RowBatch,
-    tokens_seen: &mut HashMap<Address, TokenStandard>,
-) {
-    let Some(topic0) = log.topic0 else { return };
-
-    if topic0 == TRANSFER_EVENT_SIGNATURE {
-        // Same signature: ERC721 indexes the token id (4 topics), ERC20
-        // keeps the amount in the data (3 topics).
-        if log.topic3.is_some() {
-            if let Some(row) = DatabaseERC721Transfer::from_log(log) {
-                tokens_seen
-                    .entry(row.token_address)
-                    .or_insert(TokenStandard::Erc721);
-                rows.erc721_transfers.push(row);
-            }
-        } else if let Some(row) = DatabaseERC20Transfer::from_log(log) {
-            tokens_seen
-                .entry(row.token_address)
-                .or_insert(TokenStandard::Erc20);
-            rows.erc20_transfers.push(row);
-        }
-    } else if topic0 == ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE
-        || topic0 == ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE
-    {
-        if let Some(row) = DatabaseERC1155Transfer::from_log(log) {
-            tokens_seen
-                .entry(row.token_address)
-                .or_insert(TokenStandard::Erc1155);
-            rows.erc1155_transfers.push(row);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::word;
+    use crate::core::{
+        events::TRANSFER_EVENT_SIGNATURE, models::log::test_support::word,
+    };
+    use alloy::primitives::U256;
     use hypersync_client::format::{
         Address as HsAddress, Data, Hash, LogArgument, Quantity,
         TransactionStatus, UInt, Withdrawal,

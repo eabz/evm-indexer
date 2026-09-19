@@ -281,9 +281,10 @@ ambiguous after retries, the affected range is purged (`gap_heal`) rather than t
 Gap queries, checkpoint reads and `block_hash` lookups use `FINAL` so tombstoned blocks
 count as missing.
 
-The list of block-scoped tables is code, not convention:
-`db::BLOCK_SCOPED_TABLES` + `dex::BLOCK_SCOPED_TABLES`, children before `blocks`. A unit
-test asserts every table in the migrations that has a `block_number` column is listed.
+The list of block-scoped tables is code, not convention: each data module's own
+`BASE_TABLES` + `SIDE_TABLES` (`core::`, `dex::`, `predictions::`, `launchpads::`,
+`svm::`), children before the commit marker. A unit test per module asserts every table
+in its migrations that has a `block_number` column is listed.
 
 **Gap healing uses the same primitive** (reason `gap_heal`). A gap range may hold orphan children from a
 flush that crashed before writing `blocks`. On the first pass after startup, for each gap
@@ -471,38 +472,47 @@ The codebase must not mix "by layer" (`db/models`, `utils`) and "by feature" (`d
 `predictions/`). **Feature modules win.** Rule: *a dataset owns everything about itself;
 infrastructure owns nothing about any dataset.*
 
+This is the layout as it now is (the refactor landed 2026-09-19; `tests/layout.rs` keeps
+it from rotting back):
+
 ```
 src/
   configs/        CLI + env parsing
-  source/         HyperSync client wrapper (ingest only)
+  source/         the sources, ingest only: mod.rs (the seam), evm.rs, solana.rs
   pipeline/       orchestration: stream -> transform -> writer, module seam, workers
   db/             INFRASTRUCTURE ONLY: client + insert path, migrate, schema helpers
                   (tombstone_sql...), ranges/checkpoints, the DerivedTable TYPE, format.rs
                   (ClickHouse serializers). No row models, no dataset constants.
   reorg/          fork-point search + purge orchestration (traits, no ClickHouse)
-  tokens/         token metadata worker + RPC endpoints
+  tokens/         token metadata worker + RPC endpoints (models.rs = the `tokens` row)
   metrics/
-  core/           DATA MODULE: blocks, transactions, logs, withdrawals, ERC-20/721/1155 transfers
+  core/           DATA MODULE: blocks, transactions, logs, withdrawals, ERC-20/721/1155
+                  transfers; also RowBatch and `store`, the EVM flush
   dex/            DATA MODULE
   predictions/    DATA MODULE
   launchpads/     DATA MODULE
+  svm/            DATA MODULE of the second chain family (the `sol_*` tables)
 ```
 
 Every DATA MODULE has the same files and the same public surface, so the pipeline seam
 treats them uniformly: `mod.rs` (API + `BASE_TABLES`, `SIDE_TABLES`, `*_DERIVED`),
-`models.rs` (row structs), `events.rs` (keccak-checked signatures), `decode.rs` (pure, no
-I/O: source rows/logs -> module rows), `derived.rs`, optional `worker.rs`/`resolve.rs`,
-`integration_tests.rs`, `README.md`; and owns a migration range (`0001-0009` core,
-`0010-0019` dex, `0020-0029` predictions, `0030-0039` launchpads, `0090+` cross-module).
+`models.rs` or `models/` (row structs), `events.rs` (keccak-checked signatures),
+`decode.rs` (pure, no I/O: source rows/logs -> module rows), `derived.rs`, optional
+`worker.rs`/`resolve.rs`, `integration_tests.rs`, `README.md`; and owns a migration range
+(`0001-0009` core, `0010-0019` dex, `0020-0029` predictions, `0030-0039` launchpads,
+`0040-0049` svm, `0090+` cross-module).
 
-Moves this implies (mechanical, `git mv`, no behaviour change): `src/db/models/*` ->
-`src/core/models.rs` (or `core/models/`); HyperSync -> row conversions and transfer
-decoding out of `src/pipeline/transform.rs` -> `src/core/decode.rs` (transform keeps only
-orchestration); `src/utils/events.rs`, `convert.rs` -> `src/core/`; `src/utils/format.rs`
--> `src/db/format.rs`; `CORE_DERIVED` + core table constants -> `src/core/`; `src/utils/`
-disappears. **Timing:** one dedicated refactor right after the pipeline wiring lands and
-before the final gate and review round 2 - never while another engineer has those files
-open. Until then: new code follows this layout; nobody moves existing files.
+Two things the tree above does not show, and why:
+
+- **`core` has no `integration_tests.rs`.** Its server-backed coverage is
+  `db::integration_tests`, which drives the INFRASTRUCTURE - insert path, tombstones,
+  the validity rule, epochs, missing ranges - and core is the only dataset that write
+  path has rows for. The two share one fixture; splitting them would duplicate it, not
+  separate two suites.
+- **`db` still names one table, `blocks`**, in `ranges` (resume cursor, gap scan) and in
+  `Database::{block_hash, stored_head}`: it is the EVM chain's commit marker and this
+  section assigns ranges and checkpoints to `db`. The `blocks` ROW type and everything
+  written into it are `core`'s.
 
 ## 13. Chain-neutral analytics tables (owner decision 2026-09-18: YES, now)
 

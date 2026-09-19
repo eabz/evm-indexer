@@ -20,9 +20,10 @@
 //!   statements and derived tables of [`ModuleSpec`].
 
 use crate::{
+    core::RowBatch,
     db::{
         self, derived::DerivedTable, select, Database, FlushKey,
-        FlushWindow, RowBatch, Timestamped,
+        FlushWindow, Timestamped,
     },
     dex::{self, DexRows},
     launchpads::{self, LaunchpadRows},
@@ -516,7 +517,7 @@ pub async fn known_registries(
     #[derive(clickhouse::Row, serde::Deserialize)]
     struct RegistryRow {
         // `prediction_*.registry` is FixedString(32) (design section 13).
-        #[serde_as(as = "crate::utils::format::SerId32")]
+        #[serde_as(as = "crate::db::format::SerId32")]
         registry: Address,
     }
 
@@ -790,7 +791,7 @@ pub const ALL_MODULES: &[&ModuleSpec] = &[&DEX, &PREDICTIONS, &LAUNCHPADS];
 /// Every table a process writes versioned rows of a chain into: what
 /// `Database::seed_version` looks at.
 pub fn versioned_tables() -> Vec<&'static str> {
-    let mut tables: Vec<&'static str> = db::BASE_TABLES.to_vec();
+    let mut tables: Vec<&'static str> = crate::core::BASE_TABLES.to_vec();
     tables.push("checkpoints");
     for spec in ALL_MODULES {
         tables.extend_from_slice(spec.base_tables);
@@ -824,7 +825,7 @@ pub fn range_predicate(
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use crate::db::models::log::{test_support::log_with, DatabaseLog};
+    use crate::core::models::log::{test_support::log_with, DatabaseLog};
     use alloy::primitives::U256;
 
     /// topic0 of the Uniswap V2 `Sync(uint112,uint112)` event.
@@ -890,7 +891,7 @@ mod tests {
 
     #[test]
     fn transactions_are_attached_to_liquidity_rows() {
-        use crate::db::models::transaction::DatabaseTransaction;
+        use crate::core::models::transaction::DatabaseTransaction;
         use hypersync_client::{
             format::{Address as HsAddress, Hash},
             simple_types::Transaction,
@@ -983,7 +984,7 @@ mod tests {
     fn every_aggregate_of_every_module_can_be_bounded() {
         let mut checked = 0;
 
-        for table in db::derived::CORE_DERIVED {
+        for table in crate::core::CORE_DERIVED {
             assert!(
                 table.rebuild_sql.contains("{to_ts}"),
                 "{}",

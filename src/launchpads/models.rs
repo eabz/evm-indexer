@@ -3,7 +3,7 @@
 //!
 //! Field order is irrelevant (the clickhouse crate inserts by name), field
 //! NAMES must match the columns. Hashes / ids / amounts go through the
-//! `crate::utils::format` serializers, which write the binary column types
+//! `crate::db::format` serializers, which write the binary column types
 //! of docs/design.md §1 and §13. `is_deleted` is never written by the
 //! decoder (it defaults to 0; tombstones are server side
 //! `INSERT ... SELECT`s).
@@ -33,10 +33,10 @@
 //! `ordinal` is the log index on EVM and the packed instruction path on a
 //! chain that has no block-global log index.
 //!
-//! [`SerId32`]: crate::utils::format::SerId32
-//! [`SerTxId`]: crate::utils::format::SerTxId
-//! [`tx_id`]: crate::utils::format::tx_id
-//! [`tx_hash_of`]: crate::utils::format::tx_hash_of
+//! [`SerId32`]: crate::db::format::SerId32
+//! [`SerTxId`]: crate::db::format::SerTxId
+//! [`tx_id`]: crate::db::format::tx_id
+//! [`tx_hash_of`]: crate::db::format::tx_hash_of
 
 use std::{fmt, str::FromStr};
 
@@ -45,7 +45,7 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
-use crate::utils::format::{SerB256, SerId32, SerTxId, SerU256};
+use crate::db::format::{SerB256, SerId32, SerTxId, SerU256};
 
 macro_rules! string_enum {
     ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident => $text:literal),+ $(,)? }) => {
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn evm_ids_round_trip_and_keep_the_dex_pool_id_convention() {
-        use crate::utils::format::{address_of_id32, id32};
+        use crate::db::format::{address_of_id32, id32};
 
         let address = Address::repeat_byte(0x5a);
         let id = id32(address);

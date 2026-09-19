@@ -26,7 +26,8 @@ use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use clickhouse::Client;
 
 use crate::{
-    db::{models::log::DatabaseLog, next_version, DatabaseParams},
+    core::models::log::DatabaseLog,
+    db::{next_version, DatabaseParams},
     dex::{
         block_column, decode,
         derived::{rebuild_statements, render_rebuild},
@@ -237,7 +238,7 @@ fn addr(value: &Address) -> String {
 /// An identity column: the address left padded to 32 bytes
 /// (docs/design.md §13).
 fn id(value: &Address) -> String {
-    bytes(crate::utils::format::id32(*value).as_slice())
+    bytes(crate::db::format::id32(*value).as_slice())
 }
 
 fn word(value: &B256) -> String {

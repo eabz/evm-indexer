@@ -15,6 +15,7 @@
 //! (on-curve test), `fixtures.rs`, `integration_tests.rs`.
 
 pub mod decode;
+pub mod derived;
 pub mod events;
 pub mod fixtures;
 pub mod launchpads;
@@ -42,6 +43,8 @@ mod profile;
 #[cfg(test)]
 mod live_tests;
 
+pub use self::derived::SOL_DERIVED;
+
 use decode::{Diagnostics, SvmTransaction};
 use launchpads::SolLaunchpadRows;
 use models::{SolSlot, SolToken, SolTransaction, SvmSwap};
@@ -49,7 +52,7 @@ use registry::ProgramNames;
 
 /// Block scoped `sol_*` tables, in the order a purge must tombstone them:
 /// children first, the commit marker LAST. Same rule as
-/// `db::BASE_TABLES` - while the old `sol_slots` row is alive a crashed
+/// `core::BASE_TABLES` - while the old `sol_slots` row is alive a crashed
 /// purge is re-detected and re-run, which is harmless.
 ///
 /// `sol_tokens` is NOT here: a mint's decimals are chain state, not part of

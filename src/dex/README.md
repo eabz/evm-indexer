@@ -217,7 +217,7 @@ address UP to 32 bytes; it never truncates the analytics side, so a Solana token
 finds no `tokens` row instead of matching one that happens to share its last 20
 bytes.
 
-In Rust nobody hand rolls the padding: `crate::utils::format` has `id32` /
+In Rust nobody hand rolls the padding: `crate::db::format` has `id32` /
 `address_of_id32`, the `SerId32` / `SerVecId32` serializers, and `tx_id` /
 `tx_hash_of` / `SerTxId`. Reading an id whose 12 leading bytes are not zero is
 an error, never a truncation.

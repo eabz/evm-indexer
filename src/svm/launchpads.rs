@@ -60,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use crate::{
+    db::format::SerU256,
     svm::{
         decode::{SvmInstruction, SvmTransaction},
         models::{
@@ -78,7 +79,6 @@ use crate::{
         },
         venues::{DbcSwap2, LaunchlabTrade},
     },
-    utils::format::SerU256,
 };
 
 // --- the families --------------------------------------------------------

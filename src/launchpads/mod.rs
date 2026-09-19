@@ -66,7 +66,7 @@ use std::collections::HashSet;
 
 use alloy::primitives::{Address, B256, U256};
 
-use crate::utils::format::tx_hash_of;
+use crate::db::format::tx_hash_of;
 
 pub use self::{
     decode::decode,
@@ -97,8 +97,10 @@ pub const SIDE_TABLES: &[&str] = &[
     "launchpad_launches_by_creator",
 ];
 
-/// Everything with a `block_number` column, side tables first (the list
-/// `db::BLOCK_SCOPED_TABLES` is extended with).
+/// Everything of this module with a `block_number` column, side tables
+/// first: [`SIDE_TABLES`] followed by [`BASE_TABLES`]. What a purge
+/// extends the core list (`core::BASE_TABLES` / `core::SIDE_TABLES`)
+/// with.
 pub const BLOCK_SCOPED_TABLES: &[&str] = &[
     "launchpad_trades_by_token",
     "launchpad_trades_by_trader",

@@ -517,7 +517,7 @@ fn bare(hex: &str) -> String {
 /// (docs/design.md §13). Never hand rolled: `format::id32` is the one
 /// padding helper.
 fn id32_hex(address: &str) -> String {
-    hex::encode(crate::utils::format::id32(fixtures::address(address)))
+    hex::encode(crate::db::format::id32(fixtures::address(address)))
 }
 
 /// `tx` decoded as if it had been mined in `block` at `timestamp`.
@@ -1458,8 +1458,8 @@ async fn hostile_amounts_do_not_wrap_aggregates() {
             "INSERT INTO prediction_trusted (chain, kind, address, registry) \
              VALUES ({CHAIN}, 'registry', unhex('{0}'), unhex('{0}')), \
              ({CHAIN}, 'exchange', unhex('{1}'), unhex('{0}'))",
-            hex::encode(crate::utils::format::id32(registry)),
-            hex::encode(crate::utils::format::id32(exchange))
+            hex::encode(crate::db::format::id32(registry)),
+            hex::encode(crate::db::format::id32(exchange))
         ))
         .await;
 

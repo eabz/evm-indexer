@@ -1,33 +1,45 @@
+//! INFRASTRUCTURE ONLY (docs/design.md section 12): the ClickHouse
+//! client, the generic insert path, the migrator, the DDL helpers, the
+//! ranges / checkpoints, the [`derived::DerivedTable`] TYPE and the
+//! column serializers. It owns nothing about any dataset: no row struct,
+//! no table list, no aggregate instance. `insert_flush` / `insert_rows`
+//! take any `Row`, and a module hands its own tables to the purge through
+//! `pipeline::modules`.
+//!
+//! The one dataset name left in here is the TABLE `blocks`: it is the
+//! EVM chain's commit marker, so the resume cursor and the gap scan of
+//! `ranges` and `Database::{block_hash, stored_head}` key on it. Section
+//! 12 assigns ranges and checkpoints to this module, so they stay; the
+//! `blocks` ROW type and everything written into it are `core`'s.
+//!
+//! `integration_tests` is this module's ClickHouse suite. It drives the
+//! infrastructure - tombstones, the validity rule, epochs, missing
+//! ranges - through the core dataset, because core is the only dataset
+//! this write path has rows for; it is not a core-dataset suite and is
+//! not separable from one.
+
 pub mod derived;
+pub mod format;
 #[cfg(test)]
 mod integration_tests;
 pub mod migrate;
-pub mod models;
 pub mod ranges;
 pub mod schema;
 
 pub use schema::{
     block_number_column, tables_with_block_number, tombstone_sql,
-    BASE_TABLES, SIDE_TABLES,
 };
 
-use crate::{metrics::Metrics, pipeline::modules::ModuleRows};
+use crate::metrics::Metrics;
 use alloy::primitives::B256;
 use anyhow::{anyhow, bail, Context, Result};
 use clickhouse::{Client, Row};
 use log::{info, warn};
-use models::{
-    block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
-    erc20_transfer::DatabaseERC20Transfer,
-    erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
-};
 use ranges::{
-    assemble_missing_ranges, compaction_writes, contiguous_ranges,
-    gaps_sql, is_dense, stats_sql, BlockRange, CheckpointWrite,
-    DatabaseCheckpoint, GapRow, MissingRanges, RangeStats,
-    COMPACT_CHECKPOINTS_ABOVE, MAX_CHECKPOINTS_PER_COMPACTION,
-    MAX_GAPS_PER_PASS,
+    assemble_missing_ranges, compaction_writes, gaps_sql, is_dense,
+    stats_sql, BlockRange, CheckpointWrite, DatabaseCheckpoint, GapRow,
+    MissingRanges, RangeStats, COMPACT_CHECKPOINTS_ABOVE,
+    MAX_CHECKPOINTS_PER_COMPACTION, MAX_GAPS_PER_PASS,
 };
 use serde::Serialize;
 use std::{
@@ -102,104 +114,11 @@ const INSERT_END_TIMEOUT: Duration = Duration::from_secs(180);
 /// Fetching the table schema for the insert (cached after the first time).
 const INSERT_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Sets `$field` on every block scoped row of a [`RowBatch`].
-macro_rules! stamp {
-    ($batch:expr, $field:ident = $value:expr) => {{
-        stamp!(@rows $batch, $field = $value;
-            blocks, logs, transactions, withdrawals,
-            erc20_transfers, erc721_transfers, erc1155_transfers);
-    }};
-    (@rows $batch:expr, $field:ident = $value:expr; $($rows:ident),*) => {$(
-        for row in &mut $batch.$rows {
-            row.$field = $value;
-        }
-    )*};
-}
-
-/// Rows produced from one or more HyperSync responses. Always holds WHOLE
-/// blocks: every row that belongs to a block in `blocks` is in here too.
-#[derive(Debug, Default)]
-pub struct RowBatch {
-    pub blocks: Vec<DatabaseBlock>,
-    pub logs: Vec<DatabaseLog>,
-    pub transactions: Vec<DatabaseTransaction>,
-    pub withdrawals: Vec<DatabaseWithdrawal>,
-    pub erc20_transfers: Vec<DatabaseERC20Transfer>,
-    pub erc721_transfers: Vec<DatabaseERC721Transfer>,
-    pub erc1155_transfers: Vec<DatabaseERC1155Transfer>,
-    /// Rows of the decoder modules (DEX, ...), decoded from `logs` in
-    /// transform. Stored BEFORE `blocks`, like every other child.
-    pub modules: ModuleRows,
-}
-
-impl RowBatch {
-    /// Total rows over all tables.
-    pub fn rows(&self) -> usize {
-        self.blocks.len()
-            + self.logs.len()
-            + self.transactions.len()
-            + self.withdrawals.len()
-            + self.erc20_transfers.len()
-            + self.erc721_transfers.len()
-            + self.erc1155_transfers.len()
-            + self.modules.rows()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rows() == 0
-    }
-
-    /// Moves every row of `other` into `self`.
-    pub fn append(&mut self, other: &mut RowBatch) {
-        self.blocks.append(&mut other.blocks);
-        self.logs.append(&mut other.logs);
-        self.transactions.append(&mut other.transactions);
-        self.withdrawals.append(&mut other.withdrawals);
-        self.erc20_transfers.append(&mut other.erc20_transfers);
-        self.erc721_transfers.append(&mut other.erc721_transfers);
-        self.erc1155_transfers.append(&mut other.erc1155_transfers);
-        self.modules.append(&mut other.modules);
-    }
-
-    /// Stamps `_version` on every block scoped row of the batch (module
-    /// rows included). Called once per flush with [`next_version`].
-    pub fn set_version(&mut self, version: u64) {
-        stamp!(self, _version = version);
-        self.modules.set_version(version);
-    }
-
-    /// Stamps the chain's current purge generation on every block scoped
-    /// row of the batch (docs/design.md, section 2). Called once per flush,
-    /// like [`Self::set_version`]: the aggregates file every contribution
-    /// under the epoch of the rows it came from.
-    pub fn set_epoch(&mut self, epoch: u32) {
-        stamp!(self, epoch = epoch);
-        self.modules.set_epoch(epoch);
-    }
-
-    /// `_version` of the batch (0 before [`Self::set_version`]).
-    pub fn version(&self) -> u64 {
-        self.blocks.first().map(|block| block._version).unwrap_or(0)
-    }
-
-    /// `epoch` of the batch (0 before [`Self::set_epoch`]).
-    pub fn epoch(&self) -> u32 {
-        self.blocks.first().map(|block| block.epoch).unwrap_or(0)
-    }
-
-    /// Lowest and highest block number in the batch.
-    pub fn block_span(&self) -> Option<(u64, u64)> {
-        let min = self.blocks.iter().map(|b| b.number).min()?;
-        let max = self.blocks.iter().map(|b| b.number).max()?;
-        Some((min, max))
-    }
-}
-
 /// A single `FixedString(32)` column.
 #[serde_with::serde_as]
 #[derive(Debug, Row, serde::Deserialize)]
 struct HashRow {
-    #[serde_as(as = "crate::utils::format::SerB256")]
+    #[serde_as(as = "crate::db::format::SerB256")]
     hash: B256,
 }
 
@@ -384,26 +303,6 @@ pub trait Timestamped {
     /// Unix seconds deciding the row's partition.
     fn timestamp(&self) -> u32;
 }
-
-macro_rules! timestamped {
-    ($($row:ty),+ $(,)?) => {$(
-        impl Timestamped for $row {
-            fn timestamp(&self) -> u32 {
-                self.timestamp
-            }
-        }
-    )+};
-}
-
-timestamped!(
-    DatabaseBlock,
-    DatabaseTransaction,
-    DatabaseLog,
-    DatabaseWithdrawal,
-    DatabaseERC20Transfer,
-    DatabaseERC721Transfer,
-    DatabaseERC1155Transfer,
-);
 
 /// The rows of `window`, borrowed.
 pub fn select<T: Timestamped>(rows: &[T], window: FlushWindow) -> Vec<&T> {
@@ -777,126 +676,6 @@ impl Database {
         Ok((count > 0).then_some(max))
     }
 
-    /// Stores a batch. Every non-block table (module tables included) is
-    /// written concurrently, then `blocks` LAST: a block row only exists
-    /// once all of its data is durable, which is what resume / gap
-    /// detection relies on. The checkpoint rows follow `blocks`.
-    ///
-    /// Returns an error only after every retry is exhausted, in which case
-    /// NO block row of this batch was written (or, for a failed checkpoint
-    /// insert, everything was: checkpoints are an index, `blocks` decides).
-    pub async fn store(&self, batch: &RowBatch) -> Result<()> {
-        if batch.block_span().is_none() {
-            if batch.is_empty() {
-                return Ok(());
-            }
-            // Rows can not be committed without their block.
-            bail!("refusing to store a batch of rows without block rows");
-        }
-
-        let windows = flush_windows(
-            batch.blocks.iter().map(|block| block.timestamp),
-        );
-
-        if windows.len() > 1 {
-            info!(
-                "Chain {}: this flush spans {} UTC months, more than one \
-                 insert may touch; storing it in {} parts, oldest first.",
-                self.chain_id,
-                windows.len() * MAX_MONTHS_PER_FLUSH,
-                windows.len()
-            );
-        }
-
-        // Oldest first, each part complete in itself (children, then
-        // `blocks`, then its checkpoints): a crash between two parts leaves
-        // the later months as ordinary gaps.
-        for window in windows {
-            self.store_window(batch, window).await?;
-        }
-
-        Ok(())
-    }
-
-    /// One part of a flush: every row whose `timestamp` falls into
-    /// `window`. With the single [`FlushWindow::ALL`] this is the whole
-    /// flush and behaves exactly as an unsplit one - the deduplication
-    /// token included, because the key's block span is computed from the
-    /// window's own blocks.
-    async fn store_window(
-        &self,
-        batch: &RowBatch,
-        window: FlushWindow,
-    ) -> Result<()> {
-        let blocks: Vec<&DatabaseBlock> = batch
-            .blocks
-            .iter()
-            .filter(|block| window.holds(block.timestamp))
-            .collect();
-
-        let Some(span) = blocks
-            .iter()
-            .map(|block| block.number)
-            .min()
-            .zip(blocks.iter().map(|block| block.number).max())
-        else {
-            return Ok(());
-        };
-
-        let key = FlushKey {
-            chain: self.chain_id,
-            span,
-            version: batch.version(),
-        };
-
-        let logs = select(&batch.logs, window);
-        let transactions = select(&batch.transactions, window);
-        let withdrawals = select(&batch.withdrawals, window);
-        let erc20 = select(&batch.erc20_transfers, window);
-        let erc721 = select(&batch.erc721_transfers, window);
-        let erc1155 = select(&batch.erc1155_transfers, window);
-
-        let results = tokio::join!(
-            self.insert_flush_refs("logs", &logs, &key),
-            self.insert_flush_refs("transactions", &transactions, &key),
-            self.insert_flush_refs("withdrawals", &withdrawals, &key),
-            self.insert_flush_refs("erc20_transfers", &erc20, &key),
-            self.insert_flush_refs("erc721_transfers", &erc721, &key),
-            self.insert_flush_refs("erc1155_transfers", &erc1155, &key),
-            batch.modules.store(self, &key, window),
-        );
-
-        let (r0, r1, r2, r3, r4, r5, r6) = results;
-        let failures: Vec<String> = [r0, r1, r2, r3, r4, r5, r6]
-            .into_iter()
-            .filter_map(|r| r.err())
-            .map(|e| format!("{e:#}"))
-            .collect();
-
-        if !failures.is_empty() {
-            bail!("failed to store batch: {}", failures.join("; "));
-        }
-
-        self.insert_flush_refs("blocks", &blocks, &key).await?;
-
-        let checkpoints: Vec<DatabaseCheckpoint> =
-            contiguous_ranges(blocks.iter().map(|b| b.number))
-                .into_iter()
-                .map(|range| DatabaseCheckpoint {
-                    chain: self.chain_id,
-                    from_block: range.from,
-                    to_block: range.to,
-                    epoch: batch.epoch(),
-                    _version: key.version,
-                })
-                .collect();
-
-        let checkpoints: Vec<&DatabaseCheckpoint> =
-            checkpoints.iter().collect();
-
-        self.insert_flush_refs("checkpoints", &checkpoints, &key).await
-    }
-
     /// Inserts rows of a flush into a block scoped `table`: synchronous,
     /// with the flush's deduplication token, so a retry of an insert that
     /// was applied but not acknowledged is dropped by the server - in the
@@ -1020,7 +799,7 @@ impl Database {
     {
         // Validation is OFF for inserts: the crate's schema validation
         // has no mapping for (U)Int256 and panics on those columns (see
-        // `utils::format`). The rows go out as plain `RowBinary` with an
+        // `db::format`). The rows go out as plain `RowBinary` with an
         // explicit column list taken from the struct, so the column ORDER
         // of the table does not matter and columns that are not part of
         // the struct get their DEFAULT. The integration tests are the
@@ -1189,23 +968,6 @@ mod tests {
         assert_eq!(insert_backoff(u32::MAX), Duration::from_secs(30));
     }
 
-    #[test]
-    fn row_batch_append_moves_rows() {
-        use crate::db::models::log::test_support::log_with;
-
-        let mut a = RowBatch::default();
-        let mut b = RowBatch::default();
-        b.logs.push(log_with(&[], vec![]));
-        b.modules = crate::pipeline::modules::test_support::dex_rows(1, 5);
-        assert_eq!(b.modules.rows(), 1);
-
-        assert!(a.is_empty());
-        a.append(&mut b);
-        assert_eq!(a.rows(), 2);
-        assert!(b.is_empty());
-        assert_eq!(a.block_span(), None);
-    }
-
     /// 2015-08-01, 2015-09-01, ... : the first instant of `count` UTC
     /// months in a row.
     fn monthly(count: usize) -> Vec<u32> {
@@ -1325,38 +1087,5 @@ mod tests {
         assert!(second > first && third > second);
         // 2020-01-01 in ms: it is a wall clock, not a counter.
         assert!(first > 1_577_836_800_000);
-    }
-
-    #[test]
-    fn set_version_stamps_every_block_scoped_row() {
-        use crate::db::models::{
-            block::test_support::block_row, log::test_support::log_with,
-        };
-
-        let mut batch = RowBatch::default();
-        batch.blocks.push(block_row(5, 5, 4));
-        batch.blocks.push(block_row(6, 6, 5));
-        batch.logs.push(log_with(&[], vec![]));
-
-        batch.modules =
-            crate::pipeline::modules::test_support::dex_rows(1, 5);
-
-        batch.set_version(1_234);
-        batch.set_epoch(7);
-
-        assert_eq!((batch.version(), batch.epoch()), (1_234, 7));
-        assert!(!batch.modules.dex.liquidity.is_empty());
-        assert!(batch
-            .modules
-            .dex
-            .liquidity
-            .iter()
-            .all(|row| row._version == 1_234 && row.epoch == 7));
-
-        assert!(batch.blocks.iter().all(|row| row._version == 1_234));
-        assert!(batch.logs.iter().all(|row| row._version == 1_234));
-        assert!(batch.blocks.iter().all(|row| row.epoch == 7));
-        assert!(batch.logs.iter().all(|row| row.epoch == 7));
-        assert_eq!(batch.block_span(), Some((5, 6)));
     }
 }

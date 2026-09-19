@@ -2,7 +2,7 @@
 //!
 //! Field order is irrelevant (the clickhouse crate inserts by name), field
 //! NAMES must match the columns. Hashes / ids / amounts go through
-//! the `crate::utils::format` serializers, which write the binary
+//! the `crate::db::format` serializers, which write the binary
 //! column types of docs/design.md §1 and §13.
 //!
 //! The tables are CHAIN NEUTRAL (docs/design.md §13): every identity column
@@ -26,7 +26,7 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
-use crate::utils::format::{
+use crate::db::format::{
     address_of_id32, id32, SerB256, SerI256, SerId32, SerTxId, SerU256,
     SerVecId32,
 };
@@ -482,7 +482,7 @@ mod tests {
             chain: 1,
             block_number: 7,
             timestamp: 1,
-            tx_id: crate::utils::format::tx_id(B256::repeat_byte(0xcd)),
+            tx_id: crate::db::format::tx_id(B256::repeat_byte(0xcd)),
             tx_index: 4,
             ordinal: 9,
             pool_id: pool_id_of(Address::repeat_byte(0xab)),

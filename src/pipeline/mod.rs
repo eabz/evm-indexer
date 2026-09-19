@@ -47,9 +47,10 @@ mod solana_acceptance;
 
 use crate::{
     configs::Config,
+    core::{self, convert::hash_to_b256, RowBatch},
     db::{
         ranges::{subtract_ranges, BlockRange, MissingRanges},
-        Database, RowBatch,
+        Database,
     },
     metrics::{self, Metrics},
     reorg::{
@@ -57,9 +58,8 @@ use crate::{
         ReorgConfig, ReorgError, ReorgGuard, StreamGuard, Verdict,
         WriterControl,
     },
-    source::Source,
+    source::evm::Source,
     tokens::{self, multicall::EthCaller},
-    utils::convert::hash_to_b256,
 };
 use anyhow::{bail, Context, Result};
 use futures::future::BoxFuture;
@@ -183,7 +183,7 @@ impl Sink for ClickhouseSink {
         // owns the chain? A failure here is final, like any failed flush.
         self.fence.check()?;
 
-        self.db.store(batch).await?;
+        core::store(&self.db, batch).await?;
 
         if let Some((from, to)) = batch.block_span() {
             *self.last_flush.lock().unwrap() = Some((to, batch.version()));

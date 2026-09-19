@@ -27,17 +27,15 @@ use clickhouse::{Client, Row};
 use serde::Serialize;
 
 use crate::{
-    db::{
-        migrate, models::erc20_transfer::DatabaseERC20Transfer,
-        tombstone_sql, DatabaseParams,
-    },
+    core::models::erc20_transfer::DatabaseERC20Transfer,
+    db::format::id32,
+    db::{migrate, tombstone_sql, DatabaseParams},
     launchpads::{
         cookbook, decode,
         derived::rebuild_statements,
         fixtures::{self, address, Place, RawTx},
         LaunchpadRows, BASE_TABLES, LAUNCHPADS_DERIVED, SIDE_TABLES,
     },
-    utils::format::id32,
 };
 
 const CHAIN: u64 = 4663;

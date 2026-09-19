@@ -48,8 +48,8 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, Bytes, B256, U256};
 
 use crate::{
-    db::models::log::DatabaseLog,
-    utils::format::{address_of_id32, id32, tx_id},
+    core::models::log::DatabaseLog,
+    db::format::{address_of_id32, id32, tx_id},
 };
 
 use super::{
@@ -228,8 +228,8 @@ const MAX_CHARS: usize = 128;
 /// TEXT and **the UI escapes them** for whatever it renders into (the
 /// README says so next to the cookbook). A `<script>` in a symbol is data
 /// here and must stay data there. Same rule, and very nearly the same
-/// code, as `crate::predictions::text::sanitize`; the shared home is
-/// `src/utils` once a change may touch it.
+/// code, as `crate::predictions::text::sanitize`; if a change ever has to
+/// touch both, one of the two modules owns it and the other calls it.
 ///
 /// Public so the Solana launchpad decoder (`svm::launchpads`) applies the
 /// SAME rule to the same columns: a pump.fun symbol carrying a bidi
@@ -1067,7 +1067,7 @@ fn mark_sole_unverified_quotes(rows: &mut LaunchpadRows) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::log_with;
+    use crate::core::models::log::test_support::log_with;
 
     #[test]
     fn words_and_text_are_bounds_checked() {

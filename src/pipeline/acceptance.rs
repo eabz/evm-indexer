@@ -17,7 +17,8 @@
 use super::*;
 use crate::{
     configs::Command,
-    db::{self, migrate, next_version, DatabaseParams, FlushKey},
+    core::events::TRANSFER_EVENT_SIGNATURE,
+    db::{migrate, next_version, DatabaseParams, FlushKey},
     dex, launchpads,
     pipeline::{backfill, modules::ALL_MODULES, verify},
     reorg::ReorgStore,
@@ -27,7 +28,6 @@ use crate::{
         },
         multicall::testing::{FakeChain, FakeToken},
     },
-    utils::events::TRANSFER_EVENT_SIGNATURE,
 };
 use alloy::primitives::{Address, B256, I256, U256};
 use clickhouse::Client;
@@ -287,13 +287,13 @@ fn decoded_launchpads() -> launchpads::LaunchpadRows {
 
     for number in 1..=LAUNCHPAD_FIXTURES.len() as u64 {
         for tx in launchpad_block(number) {
-            let logs: Vec<crate::db::models::log::DatabaseLog> = tx
+            let logs: Vec<crate::core::models::log::DatabaseLog> = tx
                 .logs
                 .iter()
                 .enumerate()
                 .map(|(index, log)| {
                     let mut row =
-                        crate::db::models::log::test_support::log_with(
+                        crate::core::models::log::test_support::log_with(
                             &log.topics,
                             log.data.clone(),
                         );
@@ -770,8 +770,8 @@ impl Scenario {
     /// Everything a reader can see, as strings: every base and side table
     /// (FINAL, without the per-flush stamps) and every aggregate view.
     async fn snapshot(&self) -> BTreeMap<String, Vec<String>> {
-        let mut tables: Vec<&str> = db::BASE_TABLES.to_vec();
-        tables.extend_from_slice(db::SIDE_TABLES);
+        let mut tables: Vec<&str> = crate::core::BASE_TABLES.to_vec();
+        tables.extend_from_slice(crate::core::SIDE_TABLES);
         tables.push("seen_tokens");
         for spec in ALL_MODULES {
             tables.extend_from_slice(spec.base_tables);
@@ -1140,8 +1140,8 @@ async fn a_retried_insert_does_not_double_count() {
     // The flush is applied, the answer is lost, the flush is retried -
     // as a whole and table by table.
     let db = &scenario.db;
-    db.store(&batch).await.unwrap();
-    db.store(&batch).await.unwrap();
+    crate::core::store(db, &batch).await.unwrap();
+    crate::core::store(db, &batch).await.unwrap();
 
     let key =
         FlushKey { chain: CHAIN, span: (0, 11), version: batch.version() };
@@ -1174,7 +1174,7 @@ async fn a_retried_insert_does_not_double_count() {
     // A LATER flush of the same blocks (another `_version`) is not a
     // retry: it is written - that is what re-streaming after a purge does.
     batch.set_version(next_version());
-    db.store(&batch).await.unwrap();
+    crate::core::store(db, &batch).await.unwrap();
     assert_eq!(
         scenario.count("SELECT toUInt64(count()) FROM dex_swaps").await,
         30
@@ -1580,7 +1580,7 @@ async fn verify_catches_a_doubled_aggregate() {
     .rows;
     batch.set_version(next_version());
     batch.set_epoch(0);
-    scenario.db.store(&batch).await.unwrap();
+    crate::core::store(&scenario.db, &batch).await.unwrap();
 
     // The base tables are untouched ...
     assert_eq!(scenario.rows("blocks").await, 10);
@@ -1649,9 +1649,8 @@ async fn the_worker_queries_run_against_a_real_database() {
     let chain = TestChain::new(12);
     scenario.index_until(&chain, 12, &[]).await;
 
-    let id = |address: Address| {
-        hex::encode(crate::utils::format::id32(address).0)
-    };
+    let id =
+        |address: Address| hex::encode(crate::db::format::id32(address).0);
     let exec = |sql: String| {
         let db = scenario.db.clone();
         async move {
@@ -1875,7 +1874,8 @@ async fn debris_of_a_finished_purge_is_not_healed_again() {
 async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
     /// Every read-path side table the core and the modules declare.
     fn side_tables() -> Vec<&'static str> {
-        let mut tables: Vec<&'static str> = db::SIDE_TABLES.to_vec();
+        let mut tables: Vec<&'static str> =
+            crate::core::SIDE_TABLES.to_vec();
         for spec in ALL_MODULES {
             tables.extend_from_slice(spec.side_tables);
         }
@@ -1948,7 +1948,9 @@ async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
 
     assert!(injected > 0, "nothing was resurrected");
     // No base row explains a single one of them.
-    for table in db::BASE_TABLES.iter().filter(|t| **t != "blocks") {
+    for table in
+        crate::core::BASE_TABLES.iter().filter(|t| **t != "blocks")
+    {
         assert_eq!(
             scenario
                 .count(&format!(
@@ -2409,7 +2411,7 @@ async fn aggregate_views_do_not_depend_on_join_use_nulls() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs TEST_DATABASE_URL"]
 async fn contracts_view_lists_pre_byzantium_creations() {
-    use crate::db::models::transaction::DatabaseTransaction;
+    use crate::core::models::transaction::DatabaseTransaction;
 
     let scenario = Scenario::new("contracts").await;
 

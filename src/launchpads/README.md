@@ -162,9 +162,9 @@ The tables follow docs/design.md §13, exactly like `dex_*` and
 
 | | launchpad_* |
 |---|---|
-| identity columns (token, emitter, curve, creator, trader, caller, recipient, quote_token, tx_from, tx_to) | `FixedString(32)`: on EVM the 20 address bytes left-padded with 12 zero bytes, on Solana the 32 raw pubkey bytes. Rust side: `Address` through `crate::utils::format::SerId32` - nothing here hand rolls the padding, and reading a row whose padding is not zero fails loudly instead of truncating a pubkey |
+| identity columns (token, emitter, curve, creator, trader, caller, recipient, quote_token, tx_from, tx_to) | `FixedString(32)`: on EVM the 20 address bytes left-padded with 12 zero bytes, on Solana the 32 raw pubkey bytes. Rust side: `Address` through `crate::db::format::SerId32` - nothing here hand rolls the padding, and reading a row whose padding is not zero fails loudly instead of truncating a pubkey |
 | pool ids | `FixedString(32)`, natively 32 bytes for Uniswap V4, left-padded for a pool contract; `pool_kind` says which. Rust side: `B256` with `SerB256`, because a pool id is NOT an address even on EVM |
-| transaction id | `tx_id String`, the RAW bytes (32 on EVM, 64 for a Solana signature, which a `FixedString(32)` could not hold). Never a sorting-key column. Rust side: `Bytes` through `SerTxId`, built with `utils::format::tx_id()`, read back with `tx_hash_of()` |
+| transaction id | `tx_id String`, the RAW bytes (32 on EVM, 64 for a Solana signature, which a `FixedString(32)` could not hold). Never a sorting-key column. Rust side: `Bytes` through `SerTxId`, built with `db::format::tx_id()`, read back with `tx_hash_of()` |
 | position of a row | `(chain, block_number, tx_index, ordinal)`. `ordinal` IS the log index on EVM; there is no `log_index` column |
 | amounts | `UInt256` exact in the base tables, `Float64` in every aggregate (the 256-bit rule) |
 

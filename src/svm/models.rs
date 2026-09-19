@@ -27,13 +27,13 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
 
-use crate::utils::format::{SerI256, SerU256};
+use crate::db::format::{SerI256, SerU256};
 
 /// A Solana account address. 32 raw bytes; base58 is presentation only.
 ///
 /// `[u8; 32]` serializes as a serde tuple, which is exactly the RowBinary
 /// shape of `FixedString(32)` (no length prefix) - the same thing
-/// `utils::format::SerB256` produces for an EVM hash.
+/// `db::format::SerB256` produces for an EVM hash.
 pub type Pubkey = [u8; 32];
 
 /// A Solana transaction signature: 64 raw bytes.

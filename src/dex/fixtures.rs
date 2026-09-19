@@ -12,7 +12,7 @@
 
 use alloy::primitives::{Address, Bytes, B256, I256, U256};
 
-use crate::db::models::log::{test_support::log_with, DatabaseLog};
+use crate::core::models::log::{test_support::log_with, DatabaseLog};
 
 pub struct RawLog {
     pub address: &'static str,
@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(swap.ordinal, 0xf9);
         assert_eq!(
             swap.tx_id,
-            crate::utils::format::tx_id(hash(V2_SWAP.transaction_hash))
+            crate::db::format::tx_id(hash(V2_SWAP.transaction_hash))
         );
         assert_eq!(
             swap.sender,

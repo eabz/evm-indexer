@@ -49,6 +49,7 @@ pub mod decode;
 pub mod discovery;
 pub mod endpoints;
 pub mod http;
+pub mod models;
 pub mod multicall;
 pub mod redact;
 pub mod worker;
@@ -76,7 +77,7 @@ use alloy::primitives::Address;
 use anyhow::bail;
 use log::{debug, info, warn};
 
-use crate::db::models::token::DatabaseToken;
+use self::models::DatabaseToken;
 
 use self::{
     cache::{KnownTokens, RedisTokenCache, TokenCache},

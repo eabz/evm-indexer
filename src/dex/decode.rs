@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::OnceLock};
 
 use alloy::primitives::{keccak256, Address, B256, I256, U256};
 
-use crate::{db::models::log::DatabaseLog, utils::format::tx_id};
+use crate::{core::models::log::DatabaseLog, db::format::tx_id};
 
 use super::{
     corroborate::Evidence,
@@ -858,7 +858,7 @@ pub fn decode(chain: u64, logs: &[DatabaseLog]) -> DexRows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::{
+    use crate::core::models::log::test_support::{
         address_topic, log_with, word as word_of,
     };
 

@@ -31,7 +31,7 @@
 //! * **Every identity column is 32 bytes** (docs/design.md §13): an EVM
 //!   address left padded with 12 zero bytes, or a Solana pubkey. The rows
 //!   here keep their fields typed [`Address`] and let
-//!   [`crate::utils::format::SerId32`] pad; `pool_id` is a [`B256`] because
+//!   [`crate::db::format::SerId32`] pad; `pool_id` is a [`B256`] because
 //!   a V4 / Balancer id is not an address at all. Position is `(chain,
 //!   block_number, tx_index, ordinal)` - `tx_index` is the transaction's
 //!   index in the block, `ordinal` the log index - and `tx_id` holds the
@@ -96,7 +96,7 @@ use std::collections::HashSet;
 
 use alloy::primitives::{Address, B256};
 
-use crate::utils::format::tx_hash_of;
+use crate::db::format::tx_hash_of;
 
 pub use self::{
     decode::decode,
@@ -379,7 +379,7 @@ mod tests {
             chain: 1,
             block_number: 1,
             timestamp: 1,
-            tx_id: crate::utils::format::tx_id(B256::repeat_byte(9)),
+            tx_id: crate::db::format::tx_id(B256::repeat_byte(9)),
             tx_index: 0,
             ordinal: 0,
             pool_id: pool_id_of(pool),

@@ -6,9 +6,11 @@
 //! PARTITION` (docs/design.md, section 2): rows are removed by tombstone.
 
 use crate::{
+    core::CORE_DERIVED,
+    db::format::SerB256,
     db::{
         self,
-        derived::{DerivedTable, CORE_DERIVED},
+        derived::DerivedTable,
         ranges::DatabaseCheckpoint,
         schema::{
             live_rows_sql, min_timestamp_sql, tombstone_sql_where,
@@ -20,7 +22,6 @@ use crate::{
         plain_rebuild, range_predicate, ModuleSpec, Rebuild, ALL_MODULES,
     },
     reorg::{ReorgRecord, ReorgStore},
-    utils::format::SerB256,
 };
 use alloy::primitives::B256;
 use anyhow::{Context, Result};
@@ -247,7 +248,7 @@ impl ClickhouseReorgStore {
                 .iter()
                 .flat_map(|spec| of_module(spec))
                 .chain(
-                    db::BASE_TABLES
+                    crate::core::BASE_TABLES
                         .iter()
                         .filter(|table| **table != "blocks")
                         .map(|table| Child { table, spec: None }),
@@ -276,7 +277,7 @@ impl ClickhouseReorgStore {
             |base: &'static str, spec: Option<&'static ModuleSpec>| {
                 let declared: &[&'static str] = match spec {
                     Some(spec) => spec.side_tables,
-                    None => db::SIDE_TABLES,
+                    None => crate::core::SIDE_TABLES,
                 };
                 let filter =
                     spec.and_then(|spec| (spec.purge_filter)(base));
@@ -935,7 +936,7 @@ mod tests {
             chain.side_tables().iter().map(|side| side.table).collect();
         found.sort_unstable();
 
-        let mut declared: Vec<&str> = db::SIDE_TABLES.to_vec();
+        let mut declared: Vec<&str> = crate::core::SIDE_TABLES.to_vec();
         for spec in ALL_MODULES {
             declared.extend_from_slice(spec.side_tables);
         }

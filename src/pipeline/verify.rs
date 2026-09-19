@@ -12,7 +12,6 @@
 
 use crate::{
     db::{
-        self,
         ranges::{checkpoints_sql, contiguous_until, BlockRange},
         Database,
     },
@@ -267,7 +266,9 @@ fn child_tables(
 ) -> Vec<(&'static str, &'static str, String)> {
     let mut tables = Vec::new();
 
-    for table in db::BASE_TABLES.iter().filter(|t| **t != "blocks") {
+    for table in
+        crate::core::BASE_TABLES.iter().filter(|t| **t != "blocks")
+    {
         tables.push((
             *table,
             "block_number",
@@ -656,7 +657,7 @@ mod tests {
     fn every_aggregate_check_names_a_daily_view_of_a_known_base_table() {
         use crate::pipeline::modules::ALL_MODULES;
 
-        let bases: Vec<&str> = db::BASE_TABLES
+        let bases: Vec<&str> = crate::core::BASE_TABLES
             .iter()
             .copied()
             .chain(

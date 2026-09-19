@@ -6,10 +6,7 @@
 //! bounded, so a slow database slows the HyperSync stream down instead of
 //! growing memory.
 
-use crate::{
-    db::{next_version, RowBatch},
-    metrics::Metrics,
-};
+use crate::{core::RowBatch, db::next_version, metrics::Metrics};
 use anyhow::{Context, Result};
 use log::{error, info};
 use std::{future::Future, time::Duration};
@@ -301,7 +298,7 @@ async fn flush<S: Sink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::log_with;
+    use crate::core::models::log::test_support::log_with;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,

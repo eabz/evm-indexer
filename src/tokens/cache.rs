@@ -21,7 +21,7 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use serde::{Deserialize, Serialize};
 
 use super::redact::Redactor;
-use crate::db::models::token::DatabaseToken;
+use crate::tokens::models::DatabaseToken;
 
 /// Namespace prefix of every key written by the indexer.
 pub const REDIS_KEY_PREFIX: &str = "evm-indexer:token";

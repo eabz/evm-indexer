@@ -64,7 +64,9 @@ mod tests {
         let protected = with_window(&statements);
 
         let mut required: BTreeSet<String> = view_targets(&statements);
-        required.extend(db::BASE_TABLES.iter().map(|t| t.to_string()));
+        required.extend(
+            crate::core::BASE_TABLES.iter().map(|t| t.to_string()),
+        );
         required.insert("checkpoints".to_string());
         // Every table a flush writes, of every module: its block scoped
         // tables AND its insert order, which may hold more (a module can

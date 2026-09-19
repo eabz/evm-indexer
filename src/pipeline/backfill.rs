@@ -33,9 +33,10 @@
 //! readers see the module's rows of that range missing, never doubled.
 
 use crate::{
+    core::{models::log::DatabaseLog, RowBatch},
+    db::format::{SerAddress, SerB256, SerU256},
     db::{
-        models::log::DatabaseLog, next_version, ranges::BlockRange,
-        Database, FlushKey, FlushWindow, RowBatch,
+        next_version, ranges::BlockRange, Database, FlushKey, FlushWindow,
     },
     pipeline::{
         modules::{
@@ -44,7 +45,6 @@ use crate::{
         store::{ClickhouseReorgStore, Scope},
     },
     reorg::{NoHooks, PurgeReason, Purger, WriterControl},
-    utils::format::{SerAddress, SerB256, SerU256},
 };
 use alloy::primitives::{Address, B256, U256};
 use anyhow::{bail, Context, Result};
