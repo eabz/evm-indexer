@@ -37,7 +37,7 @@ fn to_text(data: &[u8]) -> String {
     let trimmed = text.trim_matches(char::from(0)).trim();
 
     let looks_hex = trimmed.len() >= 8
-        && trimmed.len() % 2 == 0
+        && trimmed.len().is_multiple_of(2)
         && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit());
 
     if looks_hex {
@@ -73,11 +73,7 @@ fn outcome_labels(text: &str) -> Vec<String> {
         return Vec::new();
     };
 
-    let second = rest
-        .split([',', '.'])
-        .next()
-        .unwrap_or_default()
-        .trim();
+    let second = rest.split([',', '.']).next().unwrap_or_default().trim();
     let first = first.trim();
 
     if first.is_empty()
@@ -144,7 +140,8 @@ mod tests {
         assert_eq!(parsed.description, "About A.");
         assert!(parsed.outcomes.is_empty());
 
-        let hexed = hex::encode("title: Winner 2026, description: x, id: 1");
+        let hexed =
+            hex::encode("title: Winner 2026, description: x, id: 1");
         assert_eq!(parse(hexed.as_bytes()).title, "Winner 2026");
     }
 

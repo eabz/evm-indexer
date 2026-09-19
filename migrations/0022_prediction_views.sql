@@ -96,8 +96,8 @@ GROUP BY chain, registry, outcome_token_id, bucket;
 -- definition of every column of prediction_markets_v, but it reads every
 -- market: consumers use prediction_markets_v.
 --
--- A market exists as soon as its ConditionPreparation OR one of its
--- outcome tokens was seen (indexing from the middle of the chain: the
+-- A market exists as soon as its ConditionPreparation OR a split / merge
+-- / redemption of it was seen (indexing from the middle of the chain: the
 -- preparation is older than the first indexed block, oracle / question /
 -- title are then unknown).
 CREATE VIEW IF NOT EXISTS prediction_markets_live_v AS
@@ -167,10 +167,22 @@ prepared AS (
   FROM prediction_markets FINAL
   GROUP BY chain, registry, market_id
 ),
+flows AS (
+  SELECT
+    a.chain AS chain, a.registry AS registry, a.market_id AS market_id, a.collateral_token AS collateral_token,
+    toFloat64(sum(a.split)) - toFloat64(sum(a.merged)) - toFloat64(sum(a.redeemed)) AS open_interest_raw
+  FROM prediction_market_flows_1d AS a
+  ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
+  WHERE a.epoch >= f.epoch_floor
+  GROUP BY chain, registry, market_id, collateral_token
+),
+-- The token map is arithmetic and survives a reorg, so it proves nothing:
+-- a market exists when a live ConditionPreparation or live collateral
+-- flows (every outcome token is born in a split) say so.
 market_keys AS (
   SELECT chain, registry, market_id FROM prepared
   UNION DISTINCT
-  SELECT chain, registry, market_id FROM primary_collateral
+  SELECT chain, registry, market_id FROM flows
 ),
 questions AS (
   SELECT
@@ -206,15 +218,6 @@ resolved AS (
     count() AS resolutions
   FROM prediction_resolutions FINAL
   GROUP BY chain, registry, market_id
-),
-flows AS (
-  SELECT
-    a.chain AS chain, a.registry AS registry, a.market_id AS market_id, a.collateral_token AS collateral_token,
-    toFloat64(sum(a.split)) - toFloat64(sum(a.merged)) - toFloat64(sum(a.redeemed)) AS open_interest_raw
-  FROM prediction_market_flows_1d AS a
-  ASOF LEFT JOIN epoch_floor_v AS f ON f.chain = a.chain AND f.from_ts <= a.bucket
-  WHERE a.epoch >= f.epoch_floor
-  GROUP BY chain, registry, market_id, collateral_token
 ),
 collaterals AS (
   SELECT chain, address, symbol, decimals, toUInt8(1) AS known

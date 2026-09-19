@@ -261,7 +261,8 @@ mod tests {
             assert_eq!(expected.matches(own_epoch[0]).count(), 1);
             let expected = expected.replace(
                 own_epoch[0],
-                &own_epoch[0].replace(" epoch,", &format!(" {REBUILD_EPOCH},")),
+                &own_epoch[0]
+                    .replace(" epoch,", &format!(" {REBUILD_EPOCH},")),
             );
 
             assert_eq!(

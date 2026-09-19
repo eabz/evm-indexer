@@ -159,11 +159,15 @@ fn topic_address(topic: &B256) -> Option<Address> {
 /// Word index the dynamic value of head slot `slot` starts at.
 fn tail(data: &[u8], slot: usize) -> Option<usize> {
     let offset = small(data, slot, data.len())?;
-    (offset % 32 == 0).then_some(offset / 32)
+    offset.is_multiple_of(32).then_some(offset / 32)
 }
 
 /// `uint256[]` whose offset sits in head slot `slot`.
-fn uint_array(data: &[u8], slot: usize, limit: usize) -> Option<Vec<U256>> {
+fn uint_array(
+    data: &[u8],
+    slot: usize,
+    limit: usize,
+) -> Option<Vec<U256>> {
     let start = tail(data, slot)?;
     let len = small(data, start, limit)?;
 
@@ -267,7 +271,11 @@ struct QuestionDraft {
 }
 
 impl QuestionDraft {
-    fn new(kind: QuestionKind, protocol: Protocol, question_id: B256) -> Self {
+    fn new(
+        kind: QuestionKind,
+        protocol: Protocol,
+        question_id: B256,
+    ) -> Self {
         Self {
             kind,
             protocol,
@@ -296,7 +304,7 @@ fn parse(log: &DatabaseLog) -> Option<Parsed> {
 
     if count != usize::from(def.topics)
         || def.data_len.is_some_and(|len| len != data.len())
-        || data.len() % 32 != 0
+        || !data.len().is_multiple_of(32)
     {
         return None;
     }
@@ -310,7 +318,8 @@ fn parse(log: &DatabaseLog) -> Option<Parsed> {
             // The CTF accepts 2..=256 slots and derives the id itself: an
             // event whose id does not match is not a CTF preparation.
             ((2..=MAX_OUTCOMES).contains(&usize::from(outcomes))
-                && ids::condition_id(oracle, topics[3], slots) == topics[1])
+                && ids::condition_id(oracle, topics[3], slots)
+                    == topics[1])
                 .then_some(Parsed::Preparation {
                     condition: topics[1],
                     oracle,
@@ -346,7 +355,8 @@ fn parse(log: &DatabaseLog) -> Option<Parsed> {
                 PositionEventKind::Merge
             };
 
-            (flow.index_sets.len() >= 2).then_some(Parsed::CtfFlow(kind, flow))
+            (flow.index_sets.len() >= 2)
+                .then_some(Parsed::CtfFlow(kind, flow))
         }
         Kind::CtfRedemption => Some(Parsed::CtfFlow(
             PositionEventKind::Redeem,
@@ -386,9 +396,13 @@ fn parse(log: &DatabaseLog) -> Option<Parsed> {
             // charged on what the order RECEIVES: shares for a buy.
             let (side, token, shares, collateral, fee_unit) =
                 match (maker_asset.is_zero(), taker_asset.is_zero()) {
-                    (true, false) => {
-                        (Side::Buy, taker_asset, taking, making, FeeUnit::Shares)
-                    }
+                    (true, false) => (
+                        Side::Buy,
+                        taker_asset,
+                        taking,
+                        making,
+                        FeeUnit::Shares,
+                    ),
                     (false, true) => (
                         Side::Sell,
                         maker_asset,
@@ -456,17 +470,19 @@ fn parse(log: &DatabaseLog) -> Option<Parsed> {
                 shares: uint(data, 2)?,
             })
         }
-        Kind::AdapterSplit | Kind::AdapterMerge => Some(Parsed::AdapterFlow {
-            kind: if *kind == Kind::AdapterSplit {
-                PositionEventKind::Split
-            } else {
-                PositionEventKind::Merge
-            },
-            stakeholder: topic_address(&topics[1])?,
-            condition: topics[2],
-            index_sets: Vec::new(),
-            amount: uint(data, 0)?,
-        }),
+        Kind::AdapterSplit | Kind::AdapterMerge => {
+            Some(Parsed::AdapterFlow {
+                kind: if *kind == Kind::AdapterSplit {
+                    PositionEventKind::Split
+                } else {
+                    PositionEventKind::Merge
+                },
+                stakeholder: topic_address(&topics[1])?,
+                condition: topics[2],
+                index_sets: Vec::new(),
+                amount: uint(data, 0)?,
+            })
+        }
         Kind::AdapterRedemption => Some(Parsed::AdapterFlow {
             kind: PositionEventKind::Redeem,
             stakeholder: topic_address(&topics[1])?,
@@ -602,9 +618,11 @@ fn decode_transaction(
         }
 
         for index_set in &flow.index_sets {
-            let Some(token) =
-                context.ids.token(flow.collateral, flow.condition, *index_set)
-            else {
+            let Some(token) = context.ids.token(
+                flow.collateral,
+                flow.condition,
+                *index_set,
+            ) else {
                 continue;
             };
 
@@ -623,20 +641,22 @@ fn decode_transaction(
 
             if let Some(outcome_index) = ids::single_outcome(*index_set) {
                 if context.mapped.insert((log.address, token)) {
-                    context.rows.outcome_tokens.push(PredictionOutcomeToken {
-                        chain: context.chain,
-                        registry: log.address,
-                        outcome_token_id: token,
-                        market_id: flow.condition,
-                        outcome_index,
-                        collateral_token: flow.collateral,
-                        first_seen_block: log.block_number,
-                        first_seen_timestamp: log.timestamp,
-                        _version: first_seen_version(
-                            log.block_number,
-                            log.log_index,
-                        ),
-                    });
+                    context.rows.outcome_tokens.push(
+                        PredictionOutcomeToken {
+                            chain: context.chain,
+                            registry: log.address,
+                            outcome_token_id: token,
+                            market_id: flow.condition,
+                            outcome_index,
+                            collateral_token: flow.collateral,
+                            first_seen_block: log.block_number,
+                            first_seen_timestamp: log.timestamp,
+                            _version: first_seen_version(
+                                log.block_number,
+                                log.log_index,
+                            ),
+                        },
+                    );
                 }
             }
         }
@@ -659,7 +679,12 @@ fn decode_transaction(
 
     for (index, (log, parsed)) in logs.iter().enumerate() {
         match parsed {
-            Parsed::Preparation { condition, oracle, question, outcomes } => {
+            Parsed::Preparation {
+                condition,
+                oracle,
+                question,
+                outcomes,
+            } => {
                 context.rows.markets.push(PredictionMarket {
                     chain: context.chain,
                     market_id: *condition,
@@ -678,10 +703,16 @@ fn decode_transaction(
                     _version: 0,
                 });
             }
-            Parsed::Resolution { condition, oracle, question, payouts } => {
-                let denominator = payouts
-                    .iter()
-                    .fold(U256::ZERO, |sum, payout| sum.saturating_add(*payout));
+            Parsed::Resolution {
+                condition,
+                oracle,
+                question,
+                payouts,
+            } => {
+                let denominator =
+                    payouts.iter().fold(U256::ZERO, |sum, payout| {
+                        sum.saturating_add(*payout)
+                    });
 
                 context.rows.resolutions.push(PredictionResolution {
                     chain: context.chain,
@@ -734,17 +765,26 @@ fn decode_transaction(
                     *kind,
                     *stakeholder,
                     *condition,
-                    collaterals.get(condition).copied().unwrap_or_default(),
+                    collaterals
+                        .get(condition)
+                        .copied()
+                        .unwrap_or_default(),
                     B256::ZERO,
                     index_sets.clone(),
                     *amount,
                 ));
             }
             Parsed::Question(draft) => {
-                context.rows.questions.push(question(context.chain, log, draft));
+                context.rows.questions.push(question(
+                    context.chain,
+                    log,
+                    draft,
+                ));
             }
             Parsed::Transfer { operator, from, to, legs } => {
-                for (batch_index, (token, amount)) in legs.iter().enumerate() {
+                for (batch_index, (token, amount)) in
+                    legs.iter().enumerate()
+                {
                     context.rows.transfers.push(transfer(
                         context.chain,
                         log,
@@ -770,19 +810,23 @@ fn decode_transaction(
             Parsed::Fpmm { side, trader, collateral, fee, shares } => {
                 // The pool moves the shares right before it reports the
                 // trade: that transfer names the token (and the registry).
-                let token = logs[..index].iter().rev().find_map(|(_, other)| {
-                    let Parsed::Transfer { from, to, legs, .. } = other else {
-                        return None;
-                    };
-                    let expected = match side {
-                        Side::Buy => (log.address, *trader),
-                        Side::Sell => (*trader, log.address),
-                    };
+                let token =
+                    logs[..index].iter().rev().find_map(|(_, other)| {
+                        let Parsed::Transfer { from, to, legs, .. } =
+                            other
+                        else {
+                            return None;
+                        };
+                        let expected = match side {
+                            Side::Buy => (log.address, *trader),
+                            Side::Sell => (*trader, log.address),
+                        };
 
-                    ((*from, *to) == expected && legs.len() == 1
-                        && legs[0].1 == *shares)
-                        .then_some(legs[0].0)
-                });
+                        ((*from, *to) == expected
+                            && legs.len() == 1
+                            && legs[0].1 == *shares)
+                            .then_some(legs[0].0)
+                    });
 
                 let Some(token) = token else { continue };
 
@@ -795,7 +839,10 @@ fn decode_transaction(
                     log_index: log.log_index,
                     protocol: Protocol::Fpmm,
                     exchange: log.address,
-                    registry: movers.get(&token).copied().unwrap_or_default(),
+                    registry: movers
+                        .get(&token)
+                        .copied()
+                        .unwrap_or_default(),
                     order_hash: B256::ZERO,
                     maker: log.address,
                     taker: *trader,
@@ -822,7 +869,8 @@ fn decode_transaction(
 
     // Orders filled directly by the operator: no taker order exists.
     let mut leftovers: Vec<_> = open.into_values().collect();
-    leftovers.sort_by_key(|fills| fills.first().map(|(log, _)| log.log_index));
+    leftovers
+        .sort_by_key(|fills| fills.first().map(|(log, _)| log.log_index));
     for makers in leftovers {
         close_match(context, &movers, &makers, None);
     }
@@ -836,14 +884,16 @@ fn close_match(
     makers: &[(&DatabaseLog, &Fill)],
     taker: Option<&Fill>,
 ) {
-    let total_shares = makers
-        .iter()
-        .fold(U256::ZERO, |sum, (_, fill)| sum.saturating_add(fill.shares));
+    let total_shares = makers.iter().fold(U256::ZERO, |sum, (_, fill)| {
+        sum.saturating_add(fill.shares)
+    });
     let mut fee_left = taker.map_or(U256::ZERO, |taker| taker.fee);
 
     for (position, (log, maker)) in makers.iter().enumerate() {
         let (match_type, token, side) = match taker {
-            None => (MatchType::Direct, maker.token, maker.side.opposite()),
+            None => {
+                (MatchType::Direct, maker.token, maker.side.opposite())
+            }
             Some(taker) if taker.token == maker.token => {
                 (MatchType::Complementary, taker.token, taker.side)
             }
@@ -995,7 +1045,8 @@ fn transfer(
 ) -> PredictionTransfer {
     let traded = exchanges.contains(&from) || exchanges.contains(&to);
     let involves = |who: &[Address], counterparty: Address| {
-        !who.is_empty() && (counterparty.is_zero() || who.contains(&counterparty))
+        !who.is_empty()
+            && (counterparty.is_zero() || who.contains(&counterparty))
     };
 
     let to_reason = match facts {
@@ -1008,7 +1059,9 @@ fn transfer(
 
     let from_reason = match facts {
         _ if traded => TransferReason::Trade,
-        Some(facts) if involves(&facts.mergers, to) => TransferReason::Merge,
+        Some(facts) if involves(&facts.mergers, to) => {
+            TransferReason::Merge
+        }
         Some(facts) if involves(&facts.redeemers, to) => {
             TransferReason::Redeem
         }
@@ -1141,7 +1194,10 @@ mod tests {
         let second = &rows.trades[1];
         assert_eq!(second.match_type, MatchType::Mint);
         assert_eq!(second.maker_side, Side::Buy);
-        assert_eq!(second.maker_outcome_token_id, U256::from_be_bytes(no.0));
+        assert_eq!(
+            second.maker_outcome_token_id,
+            U256::from_be_bytes(no.0)
+        );
         assert_eq!(second.share_amount, million(500));
         assert_eq!(second.maker_collateral_amount, unsigned("29500000"));
         assert_eq!(second.collateral_amount, unsigned("470500000"));
@@ -1273,7 +1329,8 @@ mod tests {
         // Shares moving through an exchange that traded are trades.
         let rows = decode(137, &fixtures::V2_MINT_MATCH.logs());
         let buyer = address("0xdc41c39b95453c943174f369926018f6963bdd7e");
-        let leg = rows.transfers.iter().find(|leg| leg.to == buyer).unwrap();
+        let leg =
+            rows.transfers.iter().find(|leg| leg.to == buyer).unwrap();
         assert_eq!(leg.to_reason, TransferReason::Trade);
         assert_eq!(leg.priced_collateral, U256::ZERO);
 
@@ -1292,7 +1349,8 @@ mod tests {
 
     #[test]
     fn markets_questions_and_resolutions() {
-        let rows = decode(137, &fixtures::NEG_RISK_QUESTION_PREPARED.logs());
+        let rows =
+            decode(137, &fixtures::NEG_RISK_QUESTION_PREPARED.logs());
         assert_eq!(rows.markets.len(), 1);
         assert_eq!(rows.questions.len(), 1);
 
@@ -1308,7 +1366,10 @@ mod tests {
             "Will the Golden State Warriors win the 2025–2026 NBA Pacific Division?"
         );
         // questionId = event id + index.
-        assert_eq!(question.event_id.0[..31], question.question_id.0[..31]);
+        assert_eq!(
+            question.event_id.0[..31],
+            question.question_id.0[..31]
+        );
         assert_eq!(question.event_id.0[31], 0);
 
         let rows = decode(137, &fixtures::NEG_RISK_MARKET_PREPARED.logs());
@@ -1479,12 +1540,9 @@ mod tests {
 
         let rows = decode(1, &logs);
         assert_eq!(rows.trades.len(), 2);
-        let fees = rows
-            .trades
-            .iter()
-            .fold(U256::ZERO, |sum, trade| {
-                sum.saturating_add(trade.taker_fee_amount)
-            });
+        let fees = rows.trades.iter().fold(U256::ZERO, |sum, trade| {
+            sum.saturating_add(trade.taker_fee_amount)
+        });
         assert_eq!(fees, U256::MAX);
     }
 }

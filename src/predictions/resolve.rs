@@ -18,7 +18,8 @@ use crate::tokens::multicall::{CallError, EmptyCheck, EthCaller};
 
 use super::{
     models::{
-        PredictionVenue, Protocol, RowSource, VERSION_RPC, VERSION_UNRESOLVED,
+        PredictionVenue, Protocol, RowSource, VERSION_RPC,
+        VERSION_UNRESOLVED,
     },
     VenueCandidate,
 };
@@ -37,7 +38,8 @@ impl Getter {
 
 pub const GET_COLLATERAL: Getter = Getter { signature: "getCollateral()" };
 pub const GET_CTF: Getter = Getter { signature: "getCtf()" };
-pub const COLLATERAL_TOKEN: Getter = Getter { signature: "collateralToken()" };
+pub const COLLATERAL_TOKEN: Getter =
+    Getter { signature: "collateralToken()" };
 pub const CONDITIONAL_TOKENS: Getter =
     Getter { signature: "conditionalTokens()" };
 
@@ -71,18 +73,27 @@ enum Answer {
     Retry,
 }
 
-async fn ask(caller: &dyn EthCaller, to: Address, getter: Getter) -> Answer {
+async fn ask(
+    caller: &dyn EthCaller,
+    to: Address,
+    getter: Getter,
+) -> Answer {
     let data = getter.calldata();
 
     match caller.call(to, data.clone()).await {
-        Ok(bytes) if bytes.len() == 32 && bytes[..12].iter().all(|b| *b == 0) => {
+        Ok(bytes)
+            if bytes.len() == 32
+                && bytes[..12].iter().all(|b| *b == 0) =>
+        {
             Answer::Address(Address::from_slice(&bytes[12..]))
         }
         Ok(bytes) if bytes.is_empty() => {
             match caller.confirm_empty(to, data).await {
                 EmptyCheck::Confirmed => Answer::Nothing,
                 // A lagging node: whatever the other one said, ask again.
-                EmptyCheck::Refuted(_) | EmptyCheck::Undecided => Answer::Retry,
+                EmptyCheck::Refuted(_) | EmptyCheck::Undecided => {
+                    Answer::Retry
+                }
             }
         }
         Ok(_) | Err(CallError::Execution(_)) => Answer::Nothing,
@@ -113,8 +124,17 @@ fn row(
 }
 
 /// The row that says "asked, not a venue".
-pub fn unresolved_venue(chain: u64, candidate: &VenueCandidate) -> PredictionVenue {
-    row(chain, candidate, Address::ZERO, Address::ZERO, RowSource::Unresolved)
+pub fn unresolved_venue(
+    chain: u64,
+    candidate: &VenueCandidate,
+) -> PredictionVenue {
+    row(
+        chain,
+        candidate,
+        Address::ZERO,
+        Address::ZERO,
+        RowSource::Unresolved,
+    )
 }
 
 pub async fn resolve_venue(
@@ -122,9 +142,11 @@ pub async fn resolve_venue(
     chain: u64,
     candidate: &VenueCandidate,
 ) -> Resolution {
-    for (collateral_getter, registry_getter) in getters(candidate.protocol) {
+    for (collateral_getter, registry_getter) in getters(candidate.protocol)
+    {
         let collateral =
-            match ask(caller, candidate.exchange, collateral_getter).await {
+            match ask(caller, candidate.exchange, collateral_getter).await
+            {
                 Answer::Address(address) if !address.is_zero() => address,
                 Answer::Retry => return Resolution::Retry,
                 _ => continue,
@@ -181,7 +203,12 @@ pub mod test_support {
             );
         }
 
-        pub fn exchange(&self, to: Address, collateral: Address, ctf: Address) {
+        pub fn exchange(
+            &self,
+            to: Address,
+            collateral: Address,
+            ctf: Address,
+        ) {
             self.set(to, GET_COLLATERAL, collateral);
             self.set(to, GET_CTF, ctf);
         }
@@ -259,7 +286,8 @@ mod tests {
 
         // A pool without conditionalTokens(): collateral is enough.
         let pool = candidate(2, Protocol::Fpmm);
-        let Resolution::Resolved(venue) = resolve_venue(&node, 137, &pool).await
+        let Resolution::Resolved(venue) =
+            resolve_venue(&node, 137, &pool).await
         else {
             panic!("not resolved");
         };

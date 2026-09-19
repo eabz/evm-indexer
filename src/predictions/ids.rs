@@ -101,7 +101,10 @@ pub fn collection_id(
 }
 
 /// `uint256(keccak256(abi.encodePacked(collateralToken, collectionId)))`.
-pub fn position_id(collateral_token: Address, collection_id: B256) -> U256 {
+pub fn position_id(
+    collateral_token: Address,
+    collection_id: B256,
+) -> U256 {
     let mut packed = [0u8; 52];
     packed[..20].copy_from_slice(collateral_token.as_slice());
     packed[20..].copy_from_slice(collection_id.as_slice());
@@ -134,10 +137,7 @@ mod tests {
 
     #[test]
     fn the_square_root_exponent_is_p_plus_one_over_four() {
-        assert_eq!(
-            (P + U256::from(1u8)) / U256::from(4u8),
-            SQRT_EXPONENT
-        );
+        assert_eq!((P + U256::from(1u8)) / U256::from(4u8), SQRT_EXPONENT);
         assert_eq!(P % U256::from(4u8), U256::from(3u8));
     }
 
@@ -170,7 +170,11 @@ mod tests {
                     tx.hash
                 );
                 assert_ne!(
-                    condition_id(oracle, question, slots + U256::from(1u8)),
+                    condition_id(
+                        oracle,
+                        question,
+                        slots + U256::from(1u8)
+                    ),
                     log.topic1.unwrap()
                 );
                 checked += 1;

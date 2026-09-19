@@ -64,6 +64,7 @@
 //! correct; on chains with a lot of unrelated ERC-1155 traffic the
 //! pipeline should keep a [`RegistrySet`] and drop the rest.
 
+pub mod cookbook;
 pub mod decode;
 pub mod derived;
 pub mod events;
@@ -91,10 +92,10 @@ pub use self::{
     derived::PREDICTIONS_DERIVED,
     models::{
         FeeUnit, MatchType, PositionEventKind, PredictionMarket,
-        PredictionOutcomeToken, PredictionPositionEvent, PredictionQuestion,
-        PredictionResolution, PredictionTrade, PredictionTransfer,
-        PredictionVenue, Protocol, QuestionKind, RowSource, Side,
-        TransferReason,
+        PredictionOutcomeToken, PredictionPositionEvent,
+        PredictionQuestion, PredictionResolution, PredictionTrade,
+        PredictionTransfer, PredictionVenue, Protocol, QuestionKind,
+        RowSource, Side, TransferReason,
     },
     worker::{
         MissingVenueSource, VenueSink, VenueWorker, VenueWorkerOptions,
@@ -364,7 +365,9 @@ impl PredictionRows {
             .iter()
             .map(|token| token.collateral_token)
             .chain(
-                self.position_events.iter().map(|row| row.collateral_token),
+                self.position_events
+                    .iter()
+                    .map(|row| row.collateral_token),
             )
             .filter(|token| !token.is_zero() && seen.insert(*token))
             .collect()
@@ -461,8 +464,10 @@ mod tests {
         let rows = all_rows();
 
         let candidates = rows.venue_candidates();
-        let unique: HashSet<Address> =
-            candidates.iter().map(|candidate| candidate.exchange).collect();
+        let unique: HashSet<Address> = candidates
+            .iter()
+            .map(|candidate| candidate.exchange)
+            .collect();
         assert_eq!(unique.len(), candidates.len());
         assert!(candidates.len() >= 5);
 
@@ -479,8 +484,8 @@ mod tests {
             .flat_map(|(_, sql)| statements(sql))
             .map(|statement| normalize(&statement))
             .filter_map(|statement| {
-                let rest =
-                    statement.strip_prefix("CREATE TABLE IF NOT EXISTS ")?;
+                let rest = statement
+                    .strip_prefix("CREATE TABLE IF NOT EXISTS ")?;
                 let (name, body) = rest.split_once(' ')?;
                 Some((name.to_owned(), body.to_owned()))
             })
@@ -496,8 +501,10 @@ mod tests {
             .collect();
         expected.sort();
 
-        let mut listed: Vec<String> =
-            BLOCK_SCOPED_TABLES.iter().map(|name| name.to_string()).collect();
+        let mut listed: Vec<String> = BLOCK_SCOPED_TABLES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
         listed.sort();
         assert_eq!(listed, expected);
 
@@ -538,7 +545,8 @@ mod tests {
                 let statement = normalize(&statement);
                 assert!(
                     statement.starts_with("CREATE TABLE IF NOT EXISTS ")
-                        || statement.starts_with("CREATE VIEW IF NOT EXISTS ")
+                        || statement
+                            .starts_with("CREATE VIEW IF NOT EXISTS ")
                         || statement.starts_with(
                             "CREATE MATERIALIZED VIEW IF NOT EXISTS "
                         ),

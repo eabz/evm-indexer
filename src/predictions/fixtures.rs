@@ -100,7 +100,11 @@ impl RawTx {
     }
 
     /// The same transaction in another block / at another time.
-    pub fn placed(&self, block_number: u64, timestamp: u32) -> Vec<DatabaseLog> {
+    pub fn placed(
+        &self,
+        block_number: u64,
+        timestamp: u32,
+    ) -> Vec<DatabaseLog> {
         self.logs
             .iter()
             .map(|raw| {
@@ -142,7 +146,12 @@ pub struct Place {
 }
 
 impl Place {
-    fn log(&self, emitter: Address, topics: &[B256], data: Vec<u8>) -> DatabaseLog {
+    fn log(
+        &self,
+        emitter: Address,
+        topics: &[B256],
+        data: Vec<u8>,
+    ) -> DatabaseLog {
         build(
             self.chain,
             emitter,

@@ -285,7 +285,10 @@ impl VenueWorker {
     }
 
     /// Venues known to be stored: they will never be asked over RPC.
-    pub fn mark_known<I: IntoIterator<Item = Address>>(&self, exchanges: I) {
+    pub fn mark_known<I: IntoIterator<Item = Address>>(
+        &self,
+        exchanges: I,
+    ) {
         let mut memory = self.shared.memory();
         for exchange in exchanges {
             memory.known.put(exchange, ());
@@ -298,7 +301,10 @@ impl VenueWorker {
 
         let (queue_depth, queue_capacity) =
             self.queue.as_ref().map_or((0, 0), |queue| {
-                (queue.max_capacity() - queue.capacity(), queue.max_capacity())
+                (
+                    queue.max_capacity() - queue.capacity(),
+                    queue.max_capacity(),
+                )
             });
 
         VenueWorkerStats {
@@ -368,13 +374,17 @@ impl Task {
     }
 
     /// `first` plus whatever arrives within `batch_linger`.
-    async fn collect(&mut self, first: VenueCandidate) -> Vec<VenueCandidate> {
+    async fn collect(
+        &mut self,
+        first: VenueCandidate,
+    ) -> Vec<VenueCandidate> {
         let options = &self.shared.options;
         let mut batch = vec![first];
         let deadline = Instant::now() + options.batch_linger;
 
         while batch.len() < options.batch_size {
-            match tokio::time::timeout_at(deadline, self.receiver.recv()).await
+            match tokio::time::timeout_at(deadline, self.receiver.recv())
+                .await
             {
                 Ok(Some(candidate)) => batch.push(candidate),
                 _ => break,
@@ -385,7 +395,11 @@ impl Task {
     }
 
     /// Runs a batch, but gives up at shutdown (bounded by the grace).
-    async fn guarded(&mut self, batch: Vec<VenueCandidate>, check_store: bool) {
+    async fn guarded(
+        &mut self,
+        batch: Vec<VenueCandidate>,
+        check_store: bool,
+    ) {
         let grace = self.shared.options.shutdown_grace;
         let mut stopped = self.stopped.clone();
         let exchanges: Vec<Address> =
@@ -406,7 +420,11 @@ impl Task {
         }
     }
 
-    async fn process(&mut self, batch: Vec<VenueCandidate>, check_store: bool) {
+    async fn process(
+        &mut self,
+        batch: Vec<VenueCandidate>,
+        check_store: bool,
+    ) {
         let shared = self.shared.clone();
         let counters = &shared.counters;
 
@@ -424,7 +442,9 @@ impl Task {
             match self.sink.known_venues(&exchanges).await {
                 Ok(known) => {
                     bump(&counters.already_known, known.len() as u64);
-                    batch.retain(|candidate| !known.contains(&candidate.exchange));
+                    batch.retain(|candidate| {
+                        !known.contains(&candidate.exchange)
+                    });
                     shared.memory().known.extend_known(known);
                 }
                 Err(error) => {
@@ -441,8 +461,12 @@ impl Task {
         let mut retries = Vec::new();
 
         for candidate in &batch {
-            match resolve_venue(self.caller.as_ref(), shared.chain_id, candidate)
-                .await
+            match resolve_venue(
+                self.caller.as_ref(),
+                shared.chain_id,
+                candidate,
+            )
+            .await
             {
                 Resolution::Resolved(row) => {
                     bump(&counters.resolved, 1);
@@ -462,7 +486,9 @@ impl Task {
         // Breaker bookkeeping: a batch where nothing got through.
         if rows.is_empty() && !retries.is_empty() {
             self.consecutive_failures += 1;
-            if self.consecutive_failures >= shared.options.breaker_threshold {
+            if self.consecutive_failures
+                >= shared.options.breaker_threshold
+            {
                 if shared.breaker_open.swap(true, Ordering::Relaxed) {
                     self.cooldown = (self.cooldown * 2)
                         .min(shared.options.breaker_max_cooldown);
@@ -516,14 +542,17 @@ impl Task {
         let options = &shared.options;
         bump(&shared.counters.backfill_runs, 1);
 
-        let missing = match source.missing_venues(options.backfill_limit).await {
-            Ok(missing) => missing,
-            Err(error) => {
-                bump(&shared.counters.backfill_failures, 1);
-                warn!("prediction venues: backfill query failed: {error:#}");
-                return self.backfill_wait;
-            }
-        };
+        let missing =
+            match source.missing_venues(options.backfill_limit).await {
+                Ok(missing) => missing,
+                Err(error) => {
+                    bump(&shared.counters.backfill_failures, 1);
+                    warn!(
+                    "prediction venues: backfill query failed: {error:#}"
+                );
+                    return self.backfill_wait;
+                }
+            };
 
         let now = Instant::now();
         let todo: Vec<VenueCandidate> = {
@@ -542,8 +571,8 @@ impl Task {
 
         if todo.is_empty() {
             // Nothing missing: look less often.
-            self.backfill_wait =
-                (self.backfill_wait * 2).min(options.backfill_max_interval);
+            self.backfill_wait = (self.backfill_wait * 2)
+                .min(options.backfill_max_interval);
             return self.backfill_wait;
         }
 
@@ -686,10 +715,13 @@ mod tests {
         settle(|| sink.rows().len() == 2).await;
 
         let rows = sink.rows();
-        let venue = rows.iter().find(|row| row.exchange == Address::repeat_byte(1));
+        let venue = rows
+            .iter()
+            .find(|row| row.exchange == Address::repeat_byte(1));
         assert_eq!(venue.unwrap().source, RowSource::Rpc);
-        let stranger =
-            rows.iter().find(|row| row.exchange == Address::repeat_byte(2));
+        let stranger = rows
+            .iter()
+            .find(|row| row.exchange == Address::repeat_byte(2));
         assert_eq!(stranger.unwrap().source, RowSource::Unresolved);
 
         // Known now: nothing is queued or asked again.

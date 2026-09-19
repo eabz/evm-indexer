@@ -538,7 +538,10 @@ mod tests {
     #[test]
     fn enums_round_trip_through_their_column_value() {
         for protocol in Protocol::ALL {
-            assert_eq!(protocol.as_str().parse::<Protocol>(), Ok(*protocol));
+            assert_eq!(
+                protocol.as_str().parse::<Protocol>(),
+                Ok(*protocol)
+            );
         }
         for reason in TransferReason::ALL {
             assert_eq!(
