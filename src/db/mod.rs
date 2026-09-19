@@ -7,7 +7,8 @@ pub mod ranges;
 pub mod schema;
 
 pub use schema::{
-    block_number_column, tables_with_block_number, BLOCK_SCOPED_TABLES,
+    block_number_column, tables_with_block_number, tombstone_sql,
+    BASE_TABLES, SIDE_TABLES,
 };
 
 use alloy::primitives::B256;
@@ -15,12 +16,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use clickhouse::{Client, Row};
 use log::{info, warn};
 use models::{
-    block::DatabaseBlock, contract::DatabaseContract,
-    erc1155_transfer::DatabaseERC1155Transfer,
+    block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
     erc20_transfer::DatabaseERC20Transfer,
     erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-    token::DatabaseToken, trace::DatabaseTrace,
-    transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
+    token::DatabaseToken, transaction::DatabaseTransaction,
+    withdrawal::DatabaseWithdrawal,
 };
 use ranges::{
     assemble_missing_ranges, gaps_sql, is_dense, stats_sql, BlockRange,
@@ -82,14 +82,26 @@ const INSERT_END_TIMEOUT: Duration = Duration::from_secs(180);
 /// Fetching the table schema for the insert (cached after the first time).
 const INSERT_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Sets `$field` on every block scoped row of a [`RowBatch`].
+macro_rules! stamp {
+    ($batch:expr, $field:ident = $value:expr) => {{
+        stamp!(@rows $batch, $field = $value;
+            blocks, logs, transactions, withdrawals,
+            erc20_transfers, erc721_transfers, erc1155_transfers);
+    }};
+    (@rows $batch:expr, $field:ident = $value:expr; $($rows:ident),*) => {$(
+        for row in &mut $batch.$rows {
+            row.$field = $value;
+        }
+    )*};
+}
+
 /// Rows produced from one or more HyperSync responses. Always holds WHOLE
 /// blocks: every row that belongs to a block in `blocks` is in here too.
 #[derive(Debug, Default)]
 pub struct RowBatch {
     pub blocks: Vec<DatabaseBlock>,
-    pub contracts: Vec<DatabaseContract>,
     pub logs: Vec<DatabaseLog>,
-    pub traces: Vec<DatabaseTrace>,
     pub transactions: Vec<DatabaseTransaction>,
     pub withdrawals: Vec<DatabaseWithdrawal>,
     pub erc20_transfers: Vec<DatabaseERC20Transfer>,
@@ -102,9 +114,7 @@ impl RowBatch {
     /// Total rows over all tables.
     pub fn rows(&self) -> usize {
         self.blocks.len()
-            + self.contracts.len()
             + self.logs.len()
-            + self.traces.len()
             + self.transactions.len()
             + self.withdrawals.len()
             + self.erc20_transfers.len()
@@ -120,9 +130,7 @@ impl RowBatch {
     /// Moves every row of `other` into `self`.
     pub fn append(&mut self, other: &mut RowBatch) {
         self.blocks.append(&mut other.blocks);
-        self.contracts.append(&mut other.contracts);
         self.logs.append(&mut other.logs);
-        self.traces.append(&mut other.traces);
         self.transactions.append(&mut other.transactions);
         self.withdrawals.append(&mut other.withdrawals);
         self.erc20_transfers.append(&mut other.erc20_transfers);
@@ -135,25 +143,15 @@ impl RowBatch {
     /// once per flush with [`next_version`]. (`tokens` rows get their
     /// version from the server, they are not part of a block.)
     pub fn set_version(&mut self, version: u64) {
-        macro_rules! stamp {
-            ($($rows:ident),*) => {$(
-                for row in &mut self.$rows {
-                    row._version = version;
-                }
-            )*};
-        }
+        stamp!(self, _version = version);
+    }
 
-        stamp!(
-            blocks,
-            contracts,
-            logs,
-            traces,
-            transactions,
-            withdrawals,
-            erc20_transfers,
-            erc721_transfers,
-            erc1155_transfers
-        );
+    /// Stamps the chain's current purge generation on every block scoped
+    /// row of the batch (docs/design.md, section 2). Called once per flush,
+    /// like [`Self::set_version`]: the aggregates file every contribution
+    /// under the epoch of the rows it came from.
+    pub fn set_epoch(&mut self, epoch: u32) {
+        stamp!(self, epoch = epoch);
     }
 
     /// Lowest and highest block number in the batch.
@@ -401,9 +399,7 @@ impl Database {
     /// NO block row of this batch was written.
     pub async fn store(&self, batch: &RowBatch) -> Result<()> {
         let results = tokio::join!(
-            self.insert_rows("contracts", &batch.contracts),
             self.insert_rows("logs", &batch.logs),
-            self.insert_rows("traces", &batch.traces),
             self.insert_rows("transactions", &batch.transactions),
             self.insert_rows("withdrawals", &batch.withdrawals),
             self.insert_rows("erc20_transfers", &batch.erc20_transfers),
@@ -415,8 +411,8 @@ impl Database {
             self.insert_rows("tokens", &batch.tokens),
         );
 
-        let (r0, r1, r2, r3, r4, r5, r6, r7, r8) = results;
-        let failures: Vec<String> = [r0, r1, r2, r3, r4, r5, r6, r7, r8]
+        let (r0, r1, r2, r3, r4, r5, r6) = results;
+        let failures: Vec<String> = [r0, r1, r2, r3, r4, r5, r6]
             .into_iter()
             .filter_map(|r| r.err())
             .map(|e| format!("{e:#}"))
@@ -690,9 +686,12 @@ mod tests {
         batch.logs.push(log_with(&[], vec![]));
 
         batch.set_version(1_234);
+        batch.set_epoch(7);
 
         assert!(batch.blocks.iter().all(|row| row._version == 1_234));
         assert!(batch.logs.iter().all(|row| row._version == 1_234));
+        assert!(batch.blocks.iter().all(|row| row.epoch == 7));
+        assert!(batch.logs.iter().all(|row| row.epoch == 7));
         assert_eq!(batch.block_span(), Some((5, 6)));
     }
 }

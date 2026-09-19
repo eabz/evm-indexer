@@ -58,6 +58,9 @@ pub struct DatabaseBlock {
     /// Zero bytes before Shanghai.
     #[serde_as(as = "SerB256")]
     pub withdrawals_root: B256,
+    /// The chain's purge generation, stamped once per flush, see
+    /// `RowBatch::set_epoch`.
+    pub epoch: u32,
     /// Stamped once per flush, see `RowBatch::set_version`.
     pub _version: u64,
 }
@@ -140,6 +143,7 @@ impl DatabaseBlock {
                 .map(|uncles| uncles.iter().map(hash_to_b256).collect())
                 .unwrap_or_default(),
             withdrawals_root: opt_hash(&block.withdrawals_root),
+            epoch: 0,
             _version: 0,
         })
     }
@@ -174,6 +178,7 @@ pub(crate) mod test_support {
             transactions_root: B256::ZERO,
             uncles: vec![],
             withdrawals_root: B256::ZERO,
+            epoch: 0,
             _version: 0,
         }
     }

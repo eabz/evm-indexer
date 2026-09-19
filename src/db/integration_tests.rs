@@ -5,26 +5,28 @@
 //!   cargo test -- --ignored
 //! ```
 //!
-//! The database is created and the embedded migrations are applied by the
-//! tests themselves, through the migrator. Every test uses its own chain
-//! id and only ever touches rows of that chain. (The migrator refuses a
-//! database whose applied migrations were edited since: drop the test
-//! database after changing a migration file.)
+//! The database named in the url BELONGS to these tests: it is dropped and
+//! recreated (through the migrator, the real startup path) once per test
+//! process, which is why its name has to end in `_test`. Every test uses
+//! its own chain ids, and, like the indexer itself, never deletes anything
+//! (docs/design.md, section 2): the tests run in parallel against shared
+//! tables with no lock of any kind.
 
 use super::{
     block_number_column,
-    derived::CORE_DERIVED,
+    derived::{repair_start, CORE_DERIVED},
     models::{
-        block::DatabaseBlock, contract::DatabaseContract,
-        erc1155_transfer::DatabaseERC1155Transfer,
+        block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
         erc20_transfer::DatabaseERC20Transfer,
         erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-        token::DatabaseToken, trace::DatabaseTrace,
-        transaction::DatabaseTransaction, withdrawal::DatabaseWithdrawal,
+        token::DatabaseToken, transaction::DatabaseTransaction,
+        withdrawal::DatabaseWithdrawal,
     },
     next_version,
     ranges::BlockRange,
-    Database, RowBatch, BLOCK_SCOPED_TABLES,
+    schema::{live_rows_sql, min_timestamp_sql},
+    tombstone_sql, Database, DatabaseParams, RowBatch, BASE_TABLES,
+    SIDE_TABLES,
 };
 use crate::{
     pipeline::transform::{transform, ResponseRows},
@@ -33,18 +35,18 @@ use crate::{
     },
 };
 use alloy::primitives::{Address, U256};
-use clickhouse::Row;
+use clickhouse::{Client, Row};
 use hypersync_client::{
     format::{
         AccessList, Address as HsAddress, Data, Hash, LogArgument,
         Quantity, TransactionStatus, TransactionType, UInt, Withdrawal,
     },
-    simple_types::{Block, Log, Trace, Transaction},
+    simple_types::{Block, Log, Transaction},
 };
 use serde::Deserialize;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
-/// Migrations are applied once per test process.
+/// The database is recreated once per test process.
 static MIGRATED: OnceCell<()> = OnceCell::const_new();
 
 fn test_url() -> String {
@@ -52,85 +54,44 @@ fn test_url() -> String {
         .expect("TEST_DATABASE_URL must be set for the ignored tests")
 }
 
-/// The real startup path: creates the database and applies every embedded
-/// migration through the migrator.
+/// Fresh database, then the real startup path: every embedded migration
+/// through the migrator.
 async fn migrate() {
+    let params = DatabaseParams::parse(&test_url()).unwrap();
+
+    assert!(
+        params.database.ends_with("_test"),
+        "TEST_DATABASE_URL names database '{}': these tests DROP their \
+         database, so its name must end in '_test'",
+        params.database
+    );
+
+    Client::default()
+        .with_url(&params.endpoint)
+        .with_user(&params.user)
+        .with_password(&params.password)
+        .query(&format!("DROP DATABASE IF EXISTS `{}`", params.database))
+        .execute()
+        .await
+        .unwrap();
+
     super::migrate::run(&test_url()).await.unwrap();
 }
 
-/// Every table a test can leave rows in.
-fn all_tables() -> Vec<&'static str> {
-    BLOCK_SCOPED_TABLES
-        .iter()
-        .copied()
-        .chain(["tokens"])
-        .chain(CORE_DERIVED.iter().map(|table| table.name))
-        .collect()
-}
-
-/// ClickHouse (seen on 25.12) can silently LOSE a delete when two clients
-/// run mutations (`DELETE FROM` / `ALTER ... DELETE`) on the same table at
-/// the same time, even synchronous ones with different predicates: both
-/// return, every mutation reports `is_done`, one of them was never applied.
-/// The tests run in parallel against shared tables, so every mutation they
-/// issue goes through this lock. (Production has one writer per chain and
-/// purges sequentially; see the report to the pipeline engineer.)
-static MUTATIONS: Mutex<()> = Mutex::const_new(());
-
 async fn database(chain: u64) -> Database {
     MIGRATED.get_or_init(migrate).await;
-
-    let database = Database::new(&test_url(), chain).await.unwrap();
-
-    // Leftovers of an earlier run. Every partition key starts with the
-    // chain, so this is a metadata operation, not a mutation per table.
-    for table in all_tables() {
-        if table == "tokens" {
-            execute(
-                &database,
-                &format!(
-                    "ALTER TABLE tokens DELETE WHERE chain = {chain} \
-                     SETTINGS mutations_sync = 2"
-                ),
-            )
-            .await;
-            continue;
-        }
-
-        let partitions = strings(
-            &database,
-            &format!(
-                "SELECT DISTINCT partition_id FROM system.parts \
-                 WHERE database = currentDatabase() AND table = '{table}' \
-                   AND active AND (partition = '{chain}' \
-                     OR startsWith(partition, '({chain},'))"
-            ),
-        )
-        .await;
-
-        for partition in partitions {
-            execute(
-                &database,
-                &format!(
-                    "ALTER TABLE {table} DROP PARTITION ID '{partition}'"
-                ),
-            )
-            .await;
-        }
-    }
-
-    database
+    Database::new(&test_url(), chain).await.unwrap()
 }
 
 async fn execute(database: &Database, sql: &str) {
-    // DROP PARTITION too: it cancels a mutation that is rewriting a part
-    // of that partition, and the cancellation fails the (table wide)
-    // DELETE of whoever is waiting for it.
-    let exclusive =
-        sql.starts_with("DELETE FROM") || sql.starts_with("ALTER TABLE");
-
-    let _serialized =
-        if exclusive { Some(MUTATIONS.lock().await) } else { None };
+    // The rule the whole design rests on.
+    let upper = sql.to_uppercase();
+    assert!(
+        !upper.contains("DELETE ")
+            && !upper.contains("DROP PARTITION")
+            && !upper.contains(" UPDATE "),
+        "the indexer never deletes: {sql}"
+    );
 
     database
         .db
@@ -164,7 +125,6 @@ fn quantity(value: U256) -> Quantity {
 
 const SENDER: [u8; 20] = [0x01; 20];
 const RECIPIENT: [u8; 20] = [0x02; 20];
-const FACTORY: [u8; 20] = [0xfa; 20];
 const ERC20: [u8; 20] = [0x20; 20];
 const ERC721: [u8; 20] = [0x21; 20];
 const ERC1155: [u8; 20] = [0x22; 20];
@@ -177,18 +137,34 @@ fn call_hash(number: u64) -> [u8; 32] {
     [number as u8 ^ 0x70; 32]
 }
 
+/// What a block looks like. `salt` changes the block hash and the gas
+/// used (a competing block at the same height). A `slim` block only has the
+/// failed call (now at index 0) and the ERC20 transfer: what a canonical
+/// replacement with FEWER transactions and logs looks like.
+#[derive(Debug, Clone, Copy, Default)]
+struct Shape {
+    salt: u8,
+    slim: bool,
+}
+
+const FULL: Shape = Shape { salt: 0, slim: false };
+/// The canonical replacement of a reorged `FULL` block.
+const CANONICAL: Shape = Shape { salt: 0x55, slim: true };
+
 /// A response with one fully populated block per number (< 128):
 /// 2 transactions (a deployment and a failed call), 5 logs (ERC20, ERC721
-/// of token id 0, ERC1155 batch, anonymous, ERC721 of a huge id), 3 traces (call, create,
-/// block reward) and a withdrawal. `salt` changes the block hash and the
-/// gas used, to tell a re-inserted block from the original.
-fn response(numbers: &[u64], salt: u8) -> ResponseRows {
+/// of token id 0, ERC1155 batch, anonymous, ERC721 of a huge id) and a
+/// withdrawal.
+fn response(numbers: &[u64], shape: Shape) -> ResponseRows {
+    let salt = shape.salt;
     let mut data = ResponseRows::default();
 
     for &number in numbers {
         assert!(number < 128);
         let id = number as u8;
-        let block_hash = [id ^ salt; 32];
+        // Unique per (number, salt): `block_lookup` is keyed by hash.
+        let mut block_hash = [id; 32];
+        block_hash[31] = id ^ salt;
 
         data.blocks.push(vec![Block {
             number: Some(number),
@@ -354,71 +330,50 @@ fn response(numbers: &[u64], salt: u8) -> ResponseRows {
                 vec![],
             ),
         ]);
+    }
 
-        let trace = |type_: &str, path: Vec<u64>| Trace {
-            block_number: Some(number),
-            block_hash: Some(Hash::from(block_hash)),
-            type_: Some(type_.to_string()),
-            subtraces: Some(0),
-            trace_address: Some(path),
-            transaction_hash: Some(Hash::from(deployment_hash(number))),
-            transaction_position: Some(0),
-            ..Default::default()
-        };
-
-        data.traces.push(vec![
-            Trace {
-                call_type: Some("call".to_string()),
-                from: Some(HsAddress::from(SENDER)),
-                to: Some(HsAddress::from(FACTORY)),
-                gas: Some(Quantity::from(u64::MAX)),
-                gas_used: Some(Quantity::from(1u64)),
-                value: Some(quantity(big_value(number))),
-                input: Some(Data::from(vec![0x00, 0x01])),
-                output: Some(Data::from(vec![])),
-                subtraces: Some(1),
-                ..trace("call", vec![])
-            },
-            Trace {
-                from: Some(HsAddress::from(FACTORY)),
-                address: Some(HsAddress::from([id | 0x40; 20])),
-                init: Some(Data::from(vec![0x60])),
-                code: Some(Data::from(vec![0xfe])),
-                value: Some(Quantity::from(0u64)),
-                gas: Some(Quantity::from(50_000u64)),
-                gas_used: Some(Quantity::from(32_000u64)),
-                ..trace("create", vec![0])
-            },
-            Trace {
-                author: Some(HsAddress::from([0x99; 20])),
-                reward_type: Some("block".to_string()),
-                value: Some(Quantity::from(2_000_000_000u64)),
-                transaction_hash: None,
-                transaction_position: None,
-                ..trace("reward", vec![])
-            },
-        ]);
+    if shape.slim {
+        for transactions in &mut data.transactions {
+            transactions.retain(|t| t.to.is_some());
+            for transaction in transactions {
+                transaction.transaction_index = Some(UInt::from(0u64));
+            }
+        }
+        for (logs, number) in data.logs.iter_mut().zip(numbers) {
+            logs.retain(|log| log.log_index == Some(UInt::from(0u64)));
+            for log in logs {
+                log.transaction_hash =
+                    Some(Hash::from(call_hash(*number)));
+            }
+        }
     }
 
     data
 }
 
 /// Rows of blocks `[from, to)`, stamped like a flush would.
-fn rows_with(chain: u64, from: u64, to: u64, salt: u8) -> RowBatch {
+fn rows_at(
+    chain: u64,
+    from: u64,
+    to: u64,
+    shape: Shape,
+    epoch: u32,
+) -> RowBatch {
     let numbers: Vec<u64> = (from..to).collect();
     let mut rows = transform(
         chain,
-        &response(&numbers, salt),
+        &response(&numbers, shape),
         BlockRange::new(from, to),
     )
     .unwrap()
     .rows;
     rows.set_version(next_version());
+    rows.set_epoch(epoch);
     rows
 }
 
 fn rows(chain: u64, from: u64, to: u64) -> RowBatch {
-    rows_with(chain, from, to, 0)
+    rows_at(chain, from, to, FULL, 0)
 }
 
 async fn count_where(
@@ -488,63 +443,55 @@ where
         .unwrap_or_else(|e| panic!("{table}: {e}"))
 }
 
-/// Rows per block produced by [`response`], base and side tables.
-const ROWS_PER_BLOCK: [(&str, u64); 16] = [
-    ("blocks", 1),
-    ("transactions", 2),
-    ("logs", 5),
-    ("traces", 3),
-    ("withdrawals", 1),
-    ("erc20_transfers", 1),
-    ("erc721_transfers", 2),
-    ("erc1155_transfers", 1),
-    // Deployment transaction + create trace.
-    ("contracts", 2),
-    ("tx_lookup", 2),
-    ("block_lookup", 1),
+/// Rows per `FULL` / `CANONICAL` block produced by [`response`], for
+/// every base and side table.
+const ROWS_PER_BLOCK: [(&str, u64, u64); 13] = [
+    ("blocks", 1, 1),
+    ("transactions", 2, 1),
+    ("logs", 5, 1),
+    ("withdrawals", 1, 1),
+    ("erc20_transfers", 1, 1),
+    ("erc721_transfers", 2, 0),
+    ("erc1155_transfers", 1, 0),
+    ("tx_lookup", 2, 1),
+    ("block_lookup", 1, 1),
     // Sender + (created contract | recipient), per transaction.
-    ("transactions_by_address", 4),
-    ("logs_by_address", 5),
-    ("erc20_transfers_by_account", 2),
+    ("transactions_by_address", 4, 2),
+    ("logs_by_address", 5, 1),
+    ("erc20_transfers_by_account", 2, 2),
     // ERC721: 2 x 2. ERC1155 batch of two ids: 4.
-    ("nft_transfers_by_account", 8),
-    // The reward trace has no transaction.
-    ("traces_by_tx", 2),
+    ("nft_transfers_by_account", 8, 0),
 ];
 
-async fn assert_blocks_stored(database: &Database, blocks: u64) {
-    for (table, per_block) in ROWS_PER_BLOCK {
-        let found = count(database, table).await;
-        if found != per_block * blocks {
+/// Live rows (`FINAL`) of `full` FULL blocks and `slim` CANONICAL blocks.
+async fn assert_blocks_stored(database: &Database, full: u64, slim: u64) {
+    for (table, per_full, per_slim) in ROWS_PER_BLOCK {
+        let expected = per_full * full + per_slim * slim;
+        let started = std::time::Instant::now();
+        let mut found = count(database, table).await;
+        while found != expected && started.elapsed() < SETTLE {
+            settle().await;
+            found = count(database, table).await;
+        }
+        if found != expected {
             let column = block_number_column(table);
             let dump = strings(
                 database,
                 &format!(
                     "SELECT concat(toString({column}), ' v', \
-                       toString(_version), ' ', _part, ' exists=', \
-                       toString(_row_exists)) FROM {table} \
-                     WHERE chain = {} ORDER BY {column}, _version \
-                     SETTINGS apply_deleted_mask = 0",
+                       toString(_version), ' deleted=', \
+                       toString(is_deleted), ' epoch=', toString(epoch), \
+                       ' ', _part) FROM {table} \
+                     WHERE chain = {} ORDER BY {column}, _version",
                     database.chain_id
                 ),
             )
             .await;
-            let mutations = strings(
-                database,
-                &format!(
-                    "SELECT concat(mutation_id, ' ', command, ' done=', \
-                       toString(is_done), ' ', toString(create_time)) \
-                     FROM system.mutations WHERE table = '{table}' \
-                       AND database = currentDatabase() \
-                     ORDER BY mutation_id DESC LIMIT 8"
-                ),
-            )
-            .await;
             panic!(
-                "{table}: {found} rows, expected {}\n{}\n--\n{}",
-                per_block * blocks,
+                "{table} of chain {}: {found} live rows, expected \
+                 {expected}\n{}",
+                database.chain_id,
                 dump.join("\n"),
-                mutations.join("\n")
             );
         }
     }
@@ -552,13 +499,16 @@ async fn assert_blocks_stored(database: &Database, blocks: u64) {
 
 #[test]
 fn the_fixture_covers_every_block_scoped_table() {
-    for table in BLOCK_SCOPED_TABLES {
+    for table in BASE_TABLES.iter().chain(SIDE_TABLES) {
         assert!(
-            ROWS_PER_BLOCK.iter().any(|(name, _)| name == table),
+            ROWS_PER_BLOCK.iter().any(|(name, _, _)| name == table),
             "{table}"
         );
     }
-    assert_eq!(ROWS_PER_BLOCK.len(), BLOCK_SCOPED_TABLES.len());
+    assert_eq!(
+        ROWS_PER_BLOCK.len(),
+        BASE_TABLES.len() + SIDE_TABLES.len()
+    );
 }
 
 #[tokio::test]
@@ -567,7 +517,7 @@ async fn stores_and_reads_back_every_table() {
     const CHAIN: u64 = 990_001;
     let database = database(CHAIN).await;
 
-    let mut batch = rows(CHAIN, 10, 13);
+    let mut batch = rows_at(CHAIN, 10, 13, FULL, 3);
     batch.tokens.push(DatabaseToken {
         address: Address::from(ERC20),
         name: "Token".into(),
@@ -581,7 +531,7 @@ async fn stores_and_reads_back_every_table() {
 
     // wait_for_async_insert=1: rows (and what the materialized views derive
     // from them) are visible as soon as store returns.
-    assert_blocks_stored(&database, 3).await;
+    assert_blocks_stored(&database, 3, 0).await;
     assert_eq!(count(&database, "tokens").await, 1);
 
     // Every table round trips through the models, bit for bit.
@@ -597,15 +547,6 @@ async fn stores_and_reads_back_every_table() {
         )
         .await,
         batch.transactions
-    );
-    assert_eq!(
-        read_back::<DatabaseTrace>(
-            &database,
-            "traces",
-            "block_number, transaction_position, trace_address"
-        )
-        .await,
-        batch.traces
     );
     assert_eq!(
         read_back::<DatabaseWithdrawal>(
@@ -644,16 +585,27 @@ async fn stores_and_reads_back_every_table() {
         batch.erc1155_transfers
     );
 
-    let mut contracts = batch.contracts.clone();
-    contracts.sort_by_key(|c| (c.block_number, c.contract_address));
+    // `contracts` is a view: the successful deployment of every block,
+    // nothing for the failed call.
     assert_eq!(
-        read_back::<DatabaseContract>(
+        strings(
             &database,
-            "contracts",
-            "block_number, contract_address"
+            "SELECT concat(toString(block_number), ' ', \
+               toString(toUnixTimestamp(timestamp)), ' ', \
+               lower(hex(contract_address)), ' ', lower(hex(creator)), ' ', \
+               lower(hex(transaction_hash))) \
+             FROM contracts WHERE chain = 990001 ORDER BY block_number",
         )
         .await,
-        contracts
+        (10..13u64)
+            .map(|number| format!(
+                "{number} {} {} {} {}",
+                timestamp_of(number),
+                hex::encode([number as u8 | 0x80; 20]),
+                hex::encode(SENDER),
+                hex::encode(deployment_hash(number)),
+            ))
+            .collect::<Vec<_>>()
     );
 
     // Logs: topics are not nullable in SQL, `topic_count` is what tells an
@@ -770,12 +722,6 @@ async fn stores_and_reads_back_every_table() {
             &value,
         ),
         (
-            "SELECT toString(assumeNotNull(value)) FROM traces FINAL \
-             WHERE chain = 990001 AND block_number = 10 \
-               AND action_type = 'call'",
-            &value,
-        ),
-        (
             "SELECT toString(amount) FROM withdrawals FINAL \
              WHERE chain = 990001 AND block_number = 10",
             &amount,
@@ -850,21 +796,22 @@ async fn stores_and_reads_back_every_table() {
     assert_eq!(validator_index, 1_100);
     assert_eq!(withdrawal_index, 110);
 
-    // Reward traces: sentinel position, NULL where nothing applies.
-    assert_eq!(
-        strings(
-            &database,
-            "SELECT ifNull(concat(toString(transaction_position), ' ', \
-               toString(gas IS NULL), ' ', toString(`from` IS NULL), ' ', \
-               toString(reward_type), ' ', lower(hex(transaction_hash))), \
-               'NULL') \
-             FROM traces FINAL \
-             WHERE chain = 990001 AND block_number = 10 \
-               AND action_type = 'reward'",
-        )
-        .await,
-        vec![format!("4294967295 1 1 block {}", "00".repeat(32))]
-    );
+    // Written as data: the epoch of the flush, never a tombstone.
+    for (table, _, _) in ROWS_PER_BLOCK {
+        assert_eq!(
+            strings(
+                &database,
+                &format!(
+                    "SELECT DISTINCT concat(toString(epoch), ' ', \
+                       toString(is_deleted)) FROM {table} \
+                     WHERE chain = 990001"
+                ),
+            )
+            .await,
+            vec!["3 0"],
+            "{table}"
+        );
+    }
 
     assert_eq!(
         database.block_hash(12).await.unwrap(),
@@ -1001,25 +948,6 @@ async fn materialized_views_feed_the_read_path_tables() {
             format!("ERC721 0 {} 1 1", big_value(20)),
         ]
     );
-
-    // Traces of a transaction (the reward trace is not listed).
-    assert_eq!(
-        strings(
-            &database,
-            &query(&format!(
-                "SELECT concat(toString(block_number), ' ', \
-                   toString(transaction_position), ' ', \
-                   toString(trace_address)) \
-                 FROM traces_by_tx FINAL \
-                 WHERE chain = {{chain}} AND transaction_hash = unhex('{}') \
-                 ORDER BY trace_address",
-                hex::encode(deployment_hash(20))
-            )),
-        )
-        .await,
-        vec!["20 0 []", "20 0 [0]"]
-    );
-    assert_eq!(count(&database, "traces_by_tx").await, 4);
 }
 
 /// Equal up to Float64 rounding.
@@ -1210,17 +1138,15 @@ async fn aggregate_views_return_correct_numbers() {
     let stats = erc20_stats().await;
     assert!(close(stats[1].volume.unwrap(), stats[1].volume_raw / 1e18));
 
-    // Real timestamps (2023, not 1970), two deployers: sender and factory.
+    // Real timestamps (2023, not 1970).
     assert_eq!(
         strings(
             &database,
-            "SELECT concat(toString(day), ' ', toString(contracts), ' ', \
-               toString(unique_deployers)) \
-             FROM daily_contract_deployments_v WHERE chain = 990004 \
-             ORDER BY day",
+            "SELECT toString(day) FROM daily_block_stats_v \
+             WHERE chain = 990004 ORDER BY day",
         )
         .await,
-        vec!["2023-11-14 00:00:00 6 2", "2023-11-15 00:00:00 4 2"]
+        vec!["2023-11-14 00:00:00", "2023-11-15 00:00:00"]
     );
 }
 
@@ -1281,10 +1207,20 @@ async fn aggregates_do_not_wrap_on_hostile_amounts() {
 
     check("materialized view").await;
 
-    // The rebuild path obeys the same rule.
+    // The rebuild path obeys the same rule: hide what the views wrote
+    // (epoch 0) behind a repair at epoch 1 and re-aggregate.
+    execute(
+        &database,
+        &format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, \
+               old_head, depth, rows_tombstoned, reason) \
+             VALUES ({CHAIN}, 1, {DAY_1}, 0, 0, 0, 0, 'gap_heal')"
+        ),
+    )
+    .await;
     for table in CORE_DERIVED {
-        execute(&database, &table.delete_sql(CHAIN, DAY_1)).await;
-        execute(&database, &table.rebuild_sql(CHAIN, DAY_1)).await;
+        let sql = table.rebuild_sql(CHAIN, DAY_1, 1, u64::MAX, None);
+        execute(&database, &sql).await;
     }
     check("rebuild_sql").await;
 }
@@ -1296,10 +1232,11 @@ async fn a_reinserted_block_replaces_itself_under_final() {
     let database = database(CHAIN).await;
 
     database.store(&rows(CHAIN, 30, 32)).await.unwrap();
-    assert_blocks_stored(&database, 2).await;
+    assert_blocks_stored(&database, 2, 0).await;
 
     // The same heights again, later (higher _version), different content.
-    let again = rows_with(CHAIN, 30, 32, 0x55);
+    let again =
+        rows_at(CHAIN, 30, 32, Shape { salt: 0x55, slim: false }, 0);
     assert_ne!(again.blocks[0].hash, rows(CHAIN, 30, 31).blocks[0].hash);
     database.store(&again).await.unwrap();
 
@@ -1309,9 +1246,9 @@ async fn a_reinserted_block_replaces_itself_under_final() {
 
     // ... but FINAL sees ONE row per key, in every base and side table,
     // and it is the later one.
-    for (table, per_block) in ROWS_PER_BLOCK {
+    for (table, per_block, _) in ROWS_PER_BLOCK {
         // block_lookup is keyed by hash, and the hash changed: the stale
-        // entry is what purge_range removes (by block_number).
+        // entry is what a purge tombstones (through the view of blocks).
         let expected =
             if table == "block_lookup" { 4 } else { per_block * 2 };
         assert_eq!(count(&database, table).await, expected, "{table}");
@@ -1336,77 +1273,452 @@ async fn a_reinserted_block_replaces_itself_under_final() {
     );
 
     // Same after the merge really happened.
-    for (table, _) in ROWS_PER_BLOCK {
+    for (table, _, _) in ROWS_PER_BLOCK {
         execute(&database, &format!("OPTIMIZE TABLE {table} FINAL")).await;
     }
     assert_eq!(raw_count(&database, "blocks").await, 2);
     assert_eq!(raw_count(&database, "logs").await, 10);
-    assert_eq!(raw_count(&database, "traces").await, 6);
     assert_eq!(raw_count(&database, "tx_lookup").await, 4);
+}
+
+/// ClickHouse gives no read-your-writes guarantee right after an INSERT
+/// returns: seen on 25.12 with concurrent writers, the part can stay
+/// invisible to the next query for a few ms (plain MergeTree, same
+/// connection, no async insert). So whatever is asserted right after a
+/// write is read until it holds, for at most [`SETTLE`].
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+}
+
+/// Tombstones `[from_block, to_block)` of `table` and verifies it, the way
+/// a purge has to: the statement is re-issued until no live row is left (a
+/// tombstone INSERT ... SELECT issued right after a flush may not see the
+/// flushed rows yet). Idempotent, no lock.
+async fn tombstone(
+    database: &Database,
+    table: &str,
+    from_block: u64,
+    to_block: Option<u64>,
+) {
+    let chain = database.chain_id;
+    let started = std::time::Instant::now();
+
+    loop {
+        let sql = tombstone_sql(
+            table,
+            chain,
+            from_block,
+            to_block,
+            next_version(),
+        )
+        .unwrap();
+        execute(database, &sql).await;
+
+        let alive: u64 = database
+            .db
+            .query(&live_rows_sql(table, chain, from_block, to_block))
+            .fetch_one()
+            .await
+            .unwrap();
+
+        if alive == 0 {
+            return;
+        }
+        assert!(
+            started.elapsed() < SETTLE,
+            "{table}: {alive} rows of chain {chain} survive their tombstones"
+        );
+        settle().await;
+    }
+}
+
+/// What `purge_range` does (docs/design.md, section 2), with nothing but
+/// INSERTs: tombstone the children, record the purge, repair the
+/// aggregates under the new epoch, tombstone `blocks` last.
+async fn purge(
+    database: &Database,
+    from_block: u64,
+    to_block: Option<u64>,
+    epoch: u32,
+    reason: &str,
+) {
+    let chain = database.chain_id;
+
+    // Dead rows count too: a re-run after a crash finds the same from_ts.
+    let mut min_timestamp = u32::MAX;
+    for table in BASE_TABLES {
+        let found: u32 = database
+            .db
+            .query(&min_timestamp_sql(table, chain, from_block, to_block))
+            .fetch_one()
+            .await
+            .unwrap();
+        if found > 0 {
+            min_timestamp = min_timestamp.min(found);
+        }
+    }
+    assert_ne!(min_timestamp, u32::MAX, "nothing to purge");
+    let from_ts = repair_start(min_timestamp);
+
+    let (blocks, children) = BASE_TABLES.split_last().unwrap();
+    assert_eq!(*blocks, "blocks");
+
+    for table in children {
+        tombstone(database, table, from_block, to_block).await;
+    }
+
+    execute(
+        database,
+        &format!(
+            "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, \
+               old_head, depth, rows_tombstoned, reason) \
+             VALUES ({chain}, {epoch}, {from_ts}, {from_block}, 0, 0, 0, \
+               '{reason}')"
+        ),
+    )
+    .await;
+
+    for table in CORE_DERIVED {
+        let sql =
+            table.rebuild_sql(chain, from_ts, epoch, from_block, to_block);
+        execute(database, &sql).await;
+    }
+
+    tombstone(database, blocks, from_block, to_block).await;
+}
+
+/// `(name, rows, content hash)` of everything a reader can see of a chain:
+/// every base and side table under `FINAL`, every `*_v` view. The
+/// bookkeeping columns (chain, epoch, _version) are not content.
+async fn snapshot(database: &Database) -> Vec<(String, u64, u64)> {
+    let chain = database.chain_id;
+    let mut snapshot = Vec::new();
+
+    let mut sources: Vec<(String, &str, &str)> = BASE_TABLES
+        .iter()
+        .chain(SIDE_TABLES)
+        .map(|table| {
+            (
+                table.to_string(),
+                " FINAL",
+                "tuple(* EXCEPT (chain, epoch, _version, is_deleted))",
+            )
+        })
+        .collect();
+    sources.push(("contracts".to_string(), "", "tuple(* EXCEPT (chain))"));
+    for table in CORE_DERIVED {
+        sources.push((
+            format!("{}_v", table.name),
+            "",
+            "tuple(* EXCEPT (chain))",
+        ));
+    }
+
+    for (name, modifier, columns) in sources {
+        let (rows, hash): (u64, u64) = database
+            .db
+            .query(&format!(
+                "SELECT count(), sum(cityHash64({columns})) \
+                 FROM {name}{modifier} WHERE chain = {chain}"
+            ))
+            .fetch_one()
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        snapshot.push((name, rows, hash));
+    }
+
+    snapshot
 }
 
 #[tokio::test]
 #[ignore = "needs TEST_DATABASE_URL"]
-async fn lightweight_deletes_work_on_every_block_scoped_table() {
+async fn tombstones_reach_every_side_table_with_exactly_the_same_keys() {
     const CHAIN: u64 = 990_006;
     let database = database(CHAIN).await;
 
     database.store(&rows(CHAIN, 40, 46)).await.unwrap();
-    assert_blocks_stored(&database, 6).await;
+    assert_blocks_stored(&database, 6, 0).await;
 
-    // The rollback statement of purge_range, children first, blocks last.
-    for table in BLOCK_SCOPED_TABLES {
-        execute(
-            &database,
-            &format!(
-                "DELETE FROM {table} WHERE chain = {CHAIN} AND {} >= 43 \
-                 SETTINGS lightweight_deletes_sync = 2",
-                block_number_column(table)
-            ),
-        )
-        .await;
+    // Tombstones go into the BASE tables only, children first.
+    for table in BASE_TABLES {
+        tombstone(&database, table, 43, None).await;
     }
 
-    // 40, 41, 42 survive everywhere, nothing at or above 43 does.
-    assert_blocks_stored(&database, 3).await;
-    for table in BLOCK_SCOPED_TABLES {
+    // 40, 41, 42 survive everywhere, nothing at or above 43 does - in the
+    // side tables too, which nobody wrote to: the views carried the
+    // tombstones over, for both rows of a transaction / transfer and for
+    // every id of an ERC1155 batch.
+    assert_blocks_stored(&database, 3, 0).await;
+
+    for (table, per_block, _) in ROWS_PER_BLOCK {
         let column = block_number_column(table);
+
         assert_eq!(
             count_where(&database, table, &format!("{column} >= 43"))
                 .await,
             0,
             "{table}"
         );
-        // Also without FINAL: deleted rows are gone, not just shadowed.
-        assert_eq!(
-            raw_count(&database, table).await,
-            count(&database, table).await,
-            "{table}"
-        );
+
+        // Exactly the same keys. A tombstone is the row it kills but for
+        // two columns, so by content: every row in range has its
+        // tombstone (a missed key would also still be alive above), and
+        // there are as many distinct tombstones as there were rows (one
+        // with another key would be an extra one). The data rows
+        // themselves may already have been merged away.
+        let (without_tombstone, tombstones): (u64, u64) = database
+            .db
+            .query(&format!(
+                "SELECT countIf(dead = 0), countIf(dead > 0) FROM ( \
+                   SELECT cityHash64(tuple(* EXCEPT (_version, \
+                     is_deleted))) AS h, sum(is_deleted) AS dead \
+                   FROM {table} WHERE chain = {CHAIN} AND {column} >= 43 \
+                   GROUP BY h)"
+            ))
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(without_tombstone, 0, "{table}");
+        assert_eq!(tombstones, per_block * 3, "{table}");
+    }
+    assert_eq!(count(&database, "contracts").await, 3);
+
+    // Idempotent: what is dead is not tombstoned again.
+    let tombstone_rows = |table: &'static str| {
+        let database = &database;
+        async move {
+            database
+                .db
+                .query(&format!(
+                    "SELECT countIf(is_deleted = 1) FROM {table} \
+                     WHERE chain = {CHAIN}"
+                ))
+                .fetch_one::<u64>()
+                .await
+                .unwrap()
+        }
+    };
+    let mut before = Vec::new();
+    for (table, _, _) in ROWS_PER_BLOCK {
+        before.push(tombstone_rows(table).await);
+    }
+    for table in BASE_TABLES {
+        let sql =
+            tombstone_sql(table, CHAIN, 43, None, next_version()).unwrap();
+        execute(&database, &sql).await;
+    }
+    for ((table, _, _), before) in ROWS_PER_BLOCK.iter().zip(before) {
+        // (A merge may have folded duplicates in the meantime.)
+        assert!(tombstone_rows(table).await <= before, "{table}");
     }
 
-    // Bounded variant (gap healing) and idempotency.
-    for _ in 0..2 {
-        for table in BLOCK_SCOPED_TABLES {
-            let column = block_number_column(table);
+    // Bounded variant (gap healing).
+    for table in BASE_TABLES {
+        tombstone(&database, table, 41, Some(42)).await;
+    }
+    assert_blocks_stored(&database, 2, 0).await;
+    assert_eq!(database.block_hash(41).await.unwrap(), None);
+    assert!(database.block_hash(42).await.unwrap().is_some());
+
+    // The purged range can be streamed again: same keys, newer version.
+    database.store(&rows(CHAIN, 41, 42)).await.unwrap();
+    database.store(&rows(CHAIN, 43, 46)).await.unwrap();
+    assert_blocks_stored(&database, 6, 0).await;
+
+    // And it all survives the merges.
+    for (table, _, _) in ROWS_PER_BLOCK {
+        execute(&database, &format!("OPTIMIZE TABLE {table} FINAL")).await;
+    }
+    assert_blocks_stored(&database, 6, 0).await;
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn tombstone_columns_are_the_columns_of_the_live_tables() {
+    let database = database(990_011).await;
+
+    for table in BASE_TABLES {
+        let sql = tombstone_sql(table, 1, 0, None, 1).unwrap();
+
+        let live = strings(
+            &database,
+            &format!(
+                "SELECT concat('`', name, '`') FROM system.columns \
+                 WHERE database = currentDatabase() AND table = '{table}' \
+                 ORDER BY position"
+            ),
+        )
+        .await;
+
+        assert!(
+            sql.starts_with(&format!(
+                "INSERT INTO `{table}` ({}) SELECT ",
+                live.join(", ")
+            )),
+            "{table}: {sql}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_validity_rule_decides_which_epochs_a_view_counts() {
+    let database = database(990_012).await;
+
+    const D1: u32 = DAY_1;
+    const D2: u32 = DAY_1 + 86_400;
+    const D3: u32 = DAY_1 + 2 * 86_400;
+
+    // (chain, contributions (day, epoch, blocks), reorgs (epoch, from_ts),
+    //  expected (day, blocks) of the view)
+    type Case = (
+        &'static str,
+        u64,
+        &'static [(u32, u32, u64)],
+        &'static [(u32, u32)],
+        &'static [(u32, u64)],
+    );
+
+    let cases: [Case; 9] = [
+        (
+            "no reorgs: every epoch counts",
+            990_101,
+            &[(D1, 0, 10), (D1, 5, 3), (D2, 0, 20)],
+            &[],
+            &[(D1, 13), (D2, 20)],
+        ),
+        (
+            "a bucket before from_ts keeps its old epochs, buckets at and \
+             after it ignore them",
+            990_102,
+            &[(D1, 0, 10), (D2, 0, 20), (D2, 1, 21), (D3, 0, 30), (D3, 1, 31)],
+            &[(1, D2)],
+            &[(D1, 10), (D2, 21), (D3, 31)],
+        ),
+        (
+            "a repaired bucket nobody rebuilt shows nothing, not stale data",
+            990_103,
+            &[(D1, 0, 10), (D2, 0, 20)],
+            &[(1, D2)],
+            &[(D1, 10)],
+        ),
+        (
+            "two successive repairs",
+            990_104,
+            &[
+                (D1, 0, 10),
+                (D2, 0, 20),
+                (D2, 1, 21),
+                (D3, 0, 30),
+                (D3, 1, 31),
+                (D3, 2, 32),
+            ],
+            &[(1, D2), (2, D3)],
+            &[(D1, 10), (D2, 21), (D3, 32)],
+        ),
+        (
+            "a later repair reaching further back raises the bar for every \
+             bucket after it",
+            990_105,
+            &[
+                (D1, 0, 10),
+                (D2, 0, 20),
+                (D2, 2, 22),
+                (D3, 0, 30),
+                (D3, 1, 31),
+                (D3, 2, 32),
+            ],
+            &[(1, D3), (2, D2)],
+            &[(D1, 10), (D2, 22), (D3, 32)],
+        ),
+        (
+            "an abandoned partial epoch (repair 1 crashed half way, repair \
+             2 completed) is invisible",
+            990_106,
+            &[(D2, 0, 20), (D2, 1, 7), (D2, 2, 21), (D3, 0, 30), (D3, 2, 31)],
+            &[(1, D2), (2, D2)],
+            &[(D2, 21), (D3, 31)],
+        ),
+        (
+            "a gap heal writing epoch 5 rows into an old bucket ADDS to its \
+             epoch 0 rows",
+            990_107,
+            &[(D1, 0, 10), (D1, 5, 3), (D3, 0, 30), (D3, 5, 35)],
+            &[(5, D3)],
+            &[(D1, 13), (D3, 35)],
+        ),
+        (
+            "rows streamed after a repair carry its epoch (or a later one) \
+             and add to it",
+            990_108,
+            &[(D2, 0, 20), (D2, 1, 21), (D2, 1, 4), (D2, 3, 5), (D3, 3, 9)],
+            &[(1, D2)],
+            &[(D2, 30), (D3, 9)],
+        ),
+        (
+            "the reorgs of another chain do not matter",
+            990_109,
+            &[(D1, 0, 10), (D2, 0, 20)],
+            // Recorded for chain 990_102 above, epoch 1 from D2.
+            &[],
+            &[(D1, 10), (D2, 20)],
+        ),
+    ];
+
+    for (_, chain, contributions, reorgs, _) in cases {
+        // One INSERT per contribution: separate parts, like the views and
+        // the rebuilds produce them.
+        for (day, epoch, blocks) in contributions {
             execute(
                 &database,
                 &format!(
-                    "DELETE FROM {table} WHERE chain = {CHAIN} \
-                     AND {column} >= 41 AND {column} < 42"
+                    "INSERT INTO daily_block_stats (chain, day, epoch, \
+                       blocks) VALUES ({chain}, {day}, {epoch}, {blocks})"
+                ),
+            )
+            .await;
+        }
+        for (epoch, from_ts) in reorgs {
+            execute(
+                &database,
+                &format!(
+                    "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, \
+                       old_head, depth, rows_tombstoned, reason) \
+                     VALUES ({chain}, {epoch}, {from_ts}, 0, 0, 0, 0, \
+                       'reorg')"
                 ),
             )
             .await;
         }
     }
-    assert_blocks_stored(&database, 2).await;
-    assert_eq!(database.block_hash(41).await.unwrap(), None);
-    assert!(database.block_hash(42).await.unwrap().is_some());
 
-    // The purged range can be streamed again.
-    database.store(&rows(CHAIN, 41, 42)).await.unwrap();
-    database.store(&rows(CHAIN, 43, 46)).await.unwrap();
-    assert_blocks_stored(&database, 6).await;
+    for (name, chain, _, _, expected) in cases {
+        let found: Vec<(u32, u64)> = database
+            .db
+            .query(&format!(
+                "SELECT toUnixTimestamp(day), blocks \
+                 FROM daily_block_stats_v WHERE chain = {chain} ORDER BY day"
+            ))
+            .fetch_all()
+            .await
+            .unwrap();
+
+        assert_eq!(found, expected, "{name}");
+    }
+
+    // Filtering the view by day (what a reader does) changes nothing.
+    let found: Vec<(u32, u64)> = database
+        .db
+        .query(&format!(
+            "SELECT toUnixTimestamp(day), blocks FROM daily_block_stats_v \
+             WHERE chain = 990104 AND day >= {D3}"
+        ))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(found, vec![(D3, 32)]);
 }
 
 #[tokio::test]
@@ -1420,129 +1732,241 @@ async fn rebuild_sql_reproduces_what_the_views_wrote() {
     database.store(&rows(CHAIN, 5, 8)).await.unwrap();
     database.store(&rows(CHAIN, 8, 10)).await.unwrap();
 
+    let mut written_by_the_views = Vec::new();
     for table in CORE_DERIVED {
-        let written_by_the_view = view_rows(&database, table.name).await;
-        assert!(written_by_the_view.len() >= 2, "{}", table.name);
+        let rows = view_rows(&database, table.name).await;
+        assert!(rows.len() >= 2, "{}", table.name);
+        written_by_the_views.push(rows);
+    }
 
-        // Any timestamp inside the first day repairs from its start.
-        let from_ts = DAY_1 + 80_000;
+    let repair = |epoch: u32, from_ts: u32| {
+        let database = &database;
+        async move {
+            execute(
+                database,
+                &format!(
+                    "INSERT INTO reorgs (chain, epoch, from_ts, fork_block, \
+                       old_head, depth, rows_tombstoned, reason) \
+                     VALUES ({CHAIN}, {epoch}, {}, 0, 0, 0, 0, 'gap_heal')",
+                    repair_start(from_ts)
+                ),
+            )
+            .await;
+        }
+    };
 
-        execute(&database, &table.delete_sql(CHAIN, from_ts)).await;
+    // Epoch 1 from any timestamp inside the first day: everything the
+    // views wrote (epoch 0) is hidden ...
+    repair(1, DAY_1 + 80_000).await;
+    for table in CORE_DERIVED {
         assert!(
             view_rows(&database, table.name).await.is_empty(),
             "{}",
             table.name
         );
+    }
 
-        execute(&database, &table.rebuild_sql(CHAIN, from_ts)).await;
+    // ... and the rebuild brings exactly the same numbers back. (Nothing
+    // was purged, so no block range is excluded.)
+    for (table, expected) in CORE_DERIVED.iter().zip(&written_by_the_views)
+    {
+        let sql =
+            table.rebuild_sql(CHAIN, DAY_1 + 80_000, 1, u64::MAX, None);
+        execute(&database, &sql).await;
         assert_eq!(
-            view_rows(&database, table.name).await,
-            written_by_the_view,
+            &view_rows(&database, table.name).await,
+            expected,
             "{}",
             table.name
         );
+    }
 
-        // Repairing only the second day leaves the first one alone.
-        execute(&database, &table.delete_sql(CHAIN, DAY_2)).await;
+    // Repairing only the second day leaves the first one alone.
+    repair(2, DAY_2 + 5).await;
+    for (table, expected) in CORE_DERIVED.iter().zip(&written_by_the_views)
+    {
         assert_eq!(
             view_rows(&database, table.name).await.len(),
-            written_by_the_view.len() / 2,
+            expected.len() / 2,
             "{}",
             table.name
         );
-        execute(&database, &table.rebuild_sql(CHAIN, DAY_2 + 5)).await;
+
+        let sql = table.rebuild_sql(CHAIN, DAY_2 + 5, 2, u64::MAX, None);
+        execute(&database, &sql).await;
         assert_eq!(
-            view_rows(&database, table.name).await,
-            written_by_the_view,
+            &view_rows(&database, table.name).await,
+            expected,
             "{}",
             table.name
         );
     }
 }
 
-#[tokio::test]
-#[ignore = "needs TEST_DATABASE_URL"]
-async fn bucket_repair_after_a_rollback_matches_a_clean_index() {
-    const CHAIN: u64 = 990_008;
-    const CLEAN: u64 = 990_009;
-    let database = database(CHAIN).await;
-    let clean = self::database(CLEAN).await;
+/// A reorg, end to end, through the real tables: index `[first, first +
+/// 8)`, find out that everything from `first + 5` on was not canonical
+/// (the canonical blocks have FEWER transactions and logs), purge, stream
+/// the canonical blocks under the new epoch. Afterwards everything a
+/// reader can see must equal `clean`, a chain that only ever saw the
+/// canonical blocks.
+async fn reorg_scenario(
+    database: &Database,
+    clean: &Database,
+    first: u64,
+    epoch: u32,
+) {
+    let chain = database.chain_id;
+    let fork = first + 5;
+    let end = first + 8;
 
-    // What the aggregates of blocks 3..8 look like without any rollback.
-    clean.store(&rows(CLEAN, 3, 8)).await.unwrap();
-
-    // Index 3..10, then roll back to 8 (second day) the way purge_range
-    // does: base rows first, then the affected buckets.
-    database.store(&rows(CHAIN, 3, 10)).await.unwrap();
-
-    let min_ts: u32 = database
-        .db
-        .query(
-            "SELECT toUnixTimestamp(min(timestamp)) FROM blocks FINAL \
-             WHERE chain = 990008 AND number >= 8",
-        )
-        .fetch_one()
+    clean.store(&rows(clean.chain_id, first, fork)).await.unwrap();
+    clean
+        .store(&rows_at(clean.chain_id, fork, end, CANONICAL, 0))
         .await
         .unwrap();
-    assert_eq!(u64::from(min_ts), timestamp_of(8));
 
-    for table in BLOCK_SCOPED_TABLES {
-        execute(
+    // Rows streamed before the purge carry the previous epoch.
+    database
+        .store(&rows_at(chain, first, first + 3, FULL, epoch - 1))
+        .await
+        .unwrap();
+    database
+        .store(&rows_at(chain, first + 3, end, FULL, epoch - 1))
+        .await
+        .unwrap();
+
+    // A purge reads what was flushed: wait until the last flush is
+    // visible (see [`SETTLE`]; the pipeline has to do the same).
+    let started = std::time::Instant::now();
+    for (table, per_block, _) in ROWS_PER_BLOCK {
+        if !BASE_TABLES.contains(&table) {
+            continue;
+        }
+        loop {
+            let visible: u64 = database
+                .db
+                .query(&live_rows_sql(table, chain, first, Some(end)))
+                .fetch_one()
+                .await
+                .unwrap();
+            if visible == per_block * 8 {
+                break;
+            }
+            assert!(started.elapsed() < SETTLE, "{table} of {chain}");
+            settle().await;
+        }
+    }
+
+    purge(database, fork, None, epoch, "reorg").await;
+
+    // Verified by the purge itself, table by table.
+    assert_eq!(database.block_hash(fork).await.unwrap(), None, "{chain}");
+    assert_eq!(
+        database
+            .missing_ranges(BlockRange::new(first, end))
+            .await
+            .unwrap()
+            .ranges,
+        vec![BlockRange::new(fork, end)],
+        "{chain}"
+    );
+
+    database
+        .store(&rows_at(chain, fork, fork + 1, CANONICAL, epoch))
+        .await
+        .unwrap();
+    database
+        .store(&rows_at(chain, fork + 1, end, CANONICAL, epoch))
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    loop {
+        let (found, expected) =
+            (snapshot(database).await, snapshot(clean).await);
+        if found == expected {
+            break;
+        }
+        if started.elapsed() > SETTLE {
+            assert_eq!(
+                found, expected,
+                "chain {chain}, blocks {first}..{end}, epoch {epoch}"
+            );
+        }
+        settle().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_reorg_is_repaired_with_inserts_only() {
+    let database = database(990_008).await;
+    let clean = self::database(990_009).await;
+
+    // Crosses the day boundary: blocks 2-6 are day 1, 7-9 day 2.
+    reorg_scenario(&database, &clean, 2, 1).await;
+
+    // What "equal to a clean index" means, spelled out once.
+    assert_blocks_stored(&database, 5, 3).await;
+    assert_eq!(count(&database, "contracts").await, 5);
+
+    let stats: Vec<(u32, u64, u64)> = database
+        .db
+        .query(
+            "SELECT toUnixTimestamp(day), blocks, transactions \
+             FROM daily_block_stats_v WHERE chain = 990008 ORDER BY day",
+        )
+        .fetch_all()
+        .await
+        .unwrap();
+    // The fork (block 7) is the first block of day 2: day 1 untouched.
+    assert_eq!(stats, vec![(DAY_1, 5, 10), (DAY_2, 3, 3)]);
+
+    // The reorged-out deployment is gone from the lookup, the call that
+    // made it into the canonical block points at its new position.
+    assert_eq!(
+        strings(
             &database,
             &format!(
-                "DELETE FROM {table} WHERE chain = {CHAIN} AND {} >= 8",
-                block_number_column(table)
+                "SELECT concat(toString(block_number), ':', \
+                   toString(transaction_index)) FROM tx_lookup FINAL \
+                 WHERE chain = 990008 AND hash IN (unhex('{}'), unhex('{}'))",
+                hex::encode(deployment_hash(8)),
+                hex::encode(call_hash(8))
             ),
         )
-        .await;
+        .await,
+        vec!["8:0"]
+    );
+
+    // A second, deeper reorg on top: epochs keep working.
+    reorg_scenario(&database, &clean, 20, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn eight_chains_reorg_concurrently_without_any_coordination() {
+    // The 50 chain scenario, and the reason nothing is ever deleted:
+    // ClickHouse loses concurrent DELETEs on one table, concurrent INSERTs
+    // it does not. No lock, no retry, no verification loop in here.
+    let mut chains = Vec::new();
+    for index in 0..8u64 {
+        chains.push((
+            database(990_200 + index).await,
+            database(990_300 + index).await,
+        ));
     }
 
-    for table in CORE_DERIVED {
-        // Deleting base rows does not touch the aggregate: still 3..10.
-        assert_ne!(
-            view_rows(&database, table.name).await,
-            view_rows(&clean, table.name)
-                .await
-                .iter()
-                .map(|row| row.replace("990009", "990008"))
-                .collect::<Vec<_>>(),
-            "{}",
-            table.name
-        );
+    for round in 0..10u64 {
+        let scenarios = chains.iter().map(|(database, clean)| {
+            reorg_scenario(database, clean, round * 12, round as u32 + 1)
+        });
 
-        execute(&database, &table.delete_sql(CHAIN, min_ts)).await;
-        execute(&database, &table.rebuild_sql(CHAIN, min_ts)).await;
-
-        assert_eq!(
-            view_rows(&database, table.name).await,
-            view_rows(&clean, table.name)
-                .await
-                .iter()
-                .map(|row| row.replace("990009", "990008"))
-                .collect::<Vec<_>>(),
-            "{}",
-            table.name
-        );
+        futures::future::join_all(scenarios).await;
     }
 
-    // Streaming the range again flows through the views incrementally and
-    // ends up where a clean index of 3..10 would.
-    database.store(&rows(CHAIN, 8, 10)).await.unwrap();
-    // (Wipes the reference chain first.)
-    let reference = self::database(CLEAN).await;
-    reference.store(&rows(CLEAN, 3, 10)).await.unwrap();
-
-    for table in CORE_DERIVED {
-        assert_eq!(
-            view_rows(&database, table.name).await,
-            view_rows(&reference, table.name)
-                .await
-                .iter()
-                .map(|row| row.replace("990009", "990008"))
-                .collect::<Vec<_>>(),
-            "{}",
-            table.name
-        );
+    for (database, _) in &chains {
+        assert_blocks_stored(database, 50, 30).await;
     }
 }
 
@@ -1590,4 +2014,26 @@ async fn missing_ranges_are_computed_in_clickhouse() {
     }
     let missing = database.missing_ranges(whole).await.unwrap();
     assert!(missing.ranges.is_empty());
+
+    // A tombstoned block is a missing block: it has to be streamed again.
+    let sql =
+        tombstone_sql("blocks", 990_002, 50, Some(60), next_version())
+            .unwrap();
+    execute(&database, &sql).await;
+
+    let missing = database.missing_ranges(whole).await.unwrap();
+    assert_eq!(missing.ranges, vec![BlockRange::new(50, 60)]);
+    assert_eq!(database.block_hash(55).await.unwrap(), None);
+    assert!(database.block_hash(49).await.unwrap().is_some());
+
+    // The whole tail gone: the highest LIVE block is what counts.
+    let sql = tombstone_sql("blocks", 990_002, 90, None, next_version())
+        .unwrap();
+    execute(&database, &sql).await;
+
+    let missing = database.missing_ranges(whole).await.unwrap();
+    assert_eq!(
+        missing.ranges,
+        vec![BlockRange::new(50, 60), BlockRange::new(90, 100)]
+    );
 }

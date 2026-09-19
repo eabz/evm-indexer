@@ -142,7 +142,6 @@ pub async fn run(config: Config) -> Result<()> {
         config.chain_id,
         config.hypersync_url.as_deref(),
         &config.hypersync_token,
-        config.traces,
     )?;
 
     // The default endpoint is derived from the chain id; only a custom url

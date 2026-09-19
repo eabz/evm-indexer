@@ -3,16 +3,26 @@
 //! Aggregates are `AggregatingMergeTree` tables fed by materialized views
 //! (`migrations/0003_core_aggregates.sql`, DEX: `0010+`). A view only ever
 //! ADDS what an insert brings, it can not take back the rows a rollback
-//! deletes. So after `purge_range` every affected time bucket is deleted
-//! and rebuilt from the surviving base rows ("bucket repair"):
+//! tombstones, and nothing is ever deleted (docs/design.md, section 2). So
+//! every contribution is filed under the `epoch` of the rows it came from,
+//! and a purge repairs the aggregates by epoch:
 //!
 //! ```text
-//! from = table.bucket_start(min timestamp of the purged blocks)
-//! 1. table.delete_sql(chain, from)      -- drop buckets >= from
-//! 2. table.rebuild_sql(chain, from)     -- re-aggregate base rows >= from
+//! epoch   = the chain's highest epoch + 1
+//! from_ts = start of day (UTC) of the earliest purged row
+//! 1. INSERT INTO reorgs (chain, epoch, from_ts, ...)
+//! 2. table.rebuild_sql(chain, from_ts, epoch)   -- for every DerivedTable
 //! ```
 //!
-//! Blocks streamed afterwards flow through the views as usual.
+//! The `*_v` views (`0004`, through `epoch_floor_v`) then apply the
+//! validity rule: a contribution with epoch
+//! `e` in bucket `b` counts iff `e >= max(r.epoch)` over the `reorgs` rows
+//! of the chain with `r.from_ts <= b`. Blocks streamed afterwards carry the
+//! new epoch and flow through the views as usual.
+//!
+//! `from_ts` must be a start of day for EVERY table, whatever its bucket
+//! width: the validity rule hides a whole bucket, so a rebuild has to cover
+//! every bucket it hides, from its first second on.
 //!
 //! Amounts are aggregated as `Float64`, never as raw `UInt256` sums (the
 //! "256-bit arithmetic rule" of docs/design.md: `sum(UInt256)` wraps
@@ -32,11 +42,20 @@ pub struct DerivedTable {
     pub bucket_seconds: u32,
     /// `DateTime` column holding the bucket start.
     pub bucket_column: &'static str,
-    /// `INSERT INTO <name> SELECT ... FROM <base> FINAL WHERE chain =
-    /// {chain} AND timestamp >= {from_ts} GROUP BY ...`. Must produce
-    /// exactly what the view produces. `{chain}` is rendered as an
-    /// integer, `{from_ts}` as unix seconds (always a bucket start).
+    /// `INSERT INTO <name> SELECT ..., toUInt32({epoch}) AS epoch, ... FROM
+    /// <base> FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp
+    /// >= {from_ts} GROUP BY ...`. Must produce exactly what the view
+    /// produces. `{chain}` and `{epoch}` are rendered as integers,
+    /// `{from_ts}` as unix seconds.
     pub rebuild_sql: &'static str,
+}
+
+/// The widest bucket in play: `reorgs.from_ts` is a start of day (UTC).
+pub const REPAIR_ALIGNMENT_SECONDS: u32 = 86_400;
+
+/// `reorgs.from_ts` for a purge whose earliest row is at `timestamp`.
+pub fn repair_start(timestamp: u32) -> u32 {
+    timestamp - timestamp % REPAIR_ALIGNMENT_SECONDS
 }
 
 impl DerivedTable {
@@ -45,29 +64,48 @@ impl DerivedTable {
         timestamp - timestamp % self.bucket_seconds.max(1)
     }
 
-    /// Lightweight delete of every bucket of `chain` starting at or after
-    /// the bucket of `from_ts`.
-    pub fn delete_sql(&self, chain: u64, from_ts: u32) -> String {
-        format!(
-            "DELETE FROM {} WHERE chain = {chain} AND {} >= {}",
-            self.name,
-            self.bucket_column,
-            self.bucket_start(from_ts)
-        )
-    }
-
-    /// `rebuild_sql` for `chain`, re-aggregating everything from the
-    /// bucket of `from_ts` on. `from_ts` is aligned down to its bucket
-    /// start: rebuilding half a bucket would lose the other half.
-    pub fn rebuild_sql(&self, chain: u64, from_ts: u32) -> String {
-        render(self.rebuild_sql, chain, self.bucket_start(from_ts))
+    /// `rebuild_sql` for `chain`: re-aggregates every live row from the
+    /// day of `from_ts` on, filed under `epoch`. `from_ts` is aligned down
+    /// with [`repair_start`], the same value `reorgs.from_ts` holds.
+    ///
+    /// `purged_from..purged_to` (open ended when `None`) is the block range
+    /// of the purge this repair belongs to, which the rebuild must NOT
+    /// count: the canonical blocks streamed afterwards add themselves
+    /// through the view. Relying on the tombstones for that is not enough:
+    ///
+    /// - `blocks` is tombstoned LAST, after the repair (that is what makes
+    ///   a crashed purge detectable), so its orphaned rows are still alive
+    ///   when the rebuild runs;
+    /// - ClickHouse gives no read-your-writes guarantee right after an
+    ///   INSERT returns (seen on 25.12: a part can stay invisible to the
+    ///   next query for a few ms), so a rebuild issued right after the
+    ///   tombstones may not see them yet.
+    ///
+    /// So every `rebuild_sql` excludes the range itself, with the
+    /// `{purge_from}` / `{purge_to}` placeholders. (A `rebuild_sql` without
+    /// them is rendered unchanged.)
+    pub fn rebuild_sql(
+        &self,
+        chain: u64,
+        from_ts: u32,
+        epoch: u32,
+        purged_from: u64,
+        purged_to: Option<u64>,
+    ) -> String {
+        render(self.rebuild_sql, chain, repair_start(from_ts), epoch)
+            .replace("{purge_from}", &purged_from.to_string())
+            .replace(
+                "{purge_to}",
+                &purged_to.unwrap_or(u64::MAX).to_string(),
+            )
     }
 }
 
-/// Fills the `{chain}` and `{from_ts}` placeholders.
-fn render(sql: &str, chain: u64, from_ts: u32) -> String {
+/// Fills the `{chain}`, `{from_ts}` and `{epoch}` placeholders.
+fn render(sql: &str, chain: u64, from_ts: u32, epoch: u32) -> String {
     sql.replace("{chain}", &chain.to_string())
         .replace("{from_ts}", &from_ts.to_string())
+        .replace("{epoch}", &epoch.to_string())
 }
 
 const DAY: u32 = 86_400;
@@ -83,6 +121,7 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
             SELECT \
             chain, \
             toDateTime(intDiv(toUnixTimestamp(timestamp), 86400) * 86400, 'UTC') AS day, \
+            toUInt32({epoch}) AS epoch, \
             count() AS blocks, \
             sum(toUInt64(b.transactions)) AS transactions, \
             sum(b.gas_used) AS gas_used, \
@@ -93,8 +132,9 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
             uniqState(miner) AS miners, \
             avgState(toFloat64(b.base_fee_per_gas)) AS base_fee_per_gas \
             FROM blocks AS b \
-            FINAL WHERE chain = {chain} AND timestamp >= {from_ts} \
-            GROUP BY chain, day",
+            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} \
+            AND NOT (number >= {purge_from} AND number < {purge_to}) \
+            GROUP BY chain, day, epoch",
     },
     DerivedTable {
         name: "daily_transaction_stats",
@@ -104,6 +144,7 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
             SELECT \
             chain, \
             toDateTime(intDiv(toUnixTimestamp(timestamp), 86400) * 86400, 'UTC') AS day, \
+            toUInt32({epoch}) AS epoch, \
             count() AS transactions, \
             countIf(t.status = 'success') AS successful, \
             countIf(t.status = 'failure') AS failed, \
@@ -115,8 +156,9 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
             uniqState(t.`to`) AS recipients, \
             avgState(toFloat64(t.effective_gas_price)) AS effective_gas_price \
             FROM transactions AS t \
-            FINAL WHERE chain = {chain} AND timestamp >= {from_ts} \
-            GROUP BY chain, day",
+            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} \
+            AND NOT (block_number >= {purge_from} AND block_number < {purge_to}) \
+            GROUP BY chain, day, epoch",
     },
     DerivedTable {
         name: "daily_erc20_transfer_stats",
@@ -127,34 +169,35 @@ pub const CORE_DERIVED: &[DerivedTable] = &[
             chain, \
             token_address, \
             toDateTime(intDiv(toUnixTimestamp(timestamp), 86400) * 86400, 'UTC') AS day, \
+            toUInt32({epoch}) AS epoch, \
             count() AS transfers, \
             sum(toFloat64(e.amount)) AS volume_raw, \
             uniqState(e.`from`) AS senders, \
             uniqState(e.`to`) AS recipients \
             FROM erc20_transfers AS e \
-            FINAL WHERE chain = {chain} AND timestamp >= {from_ts} \
-            GROUP BY chain, token_address, day",
-    },
-    DerivedTable {
-        name: "daily_contract_deployments",
-        bucket_seconds: DAY,
-        bucket_column: "day",
-        rebuild_sql: "INSERT INTO daily_contract_deployments \
-            SELECT \
-            chain, \
-            toDateTime(intDiv(toUnixTimestamp(timestamp), 86400) * 86400, 'UTC') AS day, \
-            count() AS contracts, \
-            uniqState(c.creator) AS deployers \
-            FROM contracts AS c \
-            FINAL WHERE chain = {chain} AND timestamp >= {from_ts} \
-            GROUP BY chain, day",
+            FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts} \
+            AND NOT (block_number >= {purge_from} AND block_number < {purge_to}) \
+            GROUP BY chain, token_address, day, epoch",
     },
 ];
 
-/// What a rebuild adds to the SELECT of the materialized view.
+/// How a rebuild differs from the SELECT of the materialized view: it
+/// reads deduplicated rows of one chain from `from_ts` on ...
 #[cfg(test)]
 const REBUILD_FILTER: &str =
-    " FINAL WHERE chain = {chain} AND timestamp >= {from_ts}";
+    " FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp >= {from_ts}";
+#[cfg(test)]
+const VIEW_FILTER: &str = " WHERE is_deleted = 0";
+/// ... without the range being purged (`number` when it reads `blocks`) ...
+#[cfg(test)]
+const REBUILD_EXCLUSION: &str =
+    " AND NOT (block_number >= {purge_from} AND \
+                                 block_number < {purge_to})";
+/// ... and files everything under the new epoch instead of the rows' own.
+#[cfg(test)]
+const REBUILD_EPOCH: &str = "toUInt32({epoch}) AS epoch,";
+#[cfg(test)]
+const VIEW_EPOCH: &str = "epoch,";
 
 #[cfg(test)]
 mod tests {
@@ -162,8 +205,8 @@ mod tests {
     use crate::db::{
         models::transaction::{STATUS_FAILURE, STATUS_SUCCESS},
         schema::{
-            split_sql_statements, tables_with_columns,
-            test_support::CORE_MIGRATIONS,
+            tables_with_columns,
+            test_support::{view_selects, CORE_MIGRATIONS},
         },
     };
 
@@ -171,31 +214,21 @@ mod tests {
         sql.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// SELECT of the materialized view writing `TO <table>`.
+    /// SELECT of the (one) materialized view writing `TO <table>`.
     fn view_select(table: &str) -> String {
-        let marker = format!(" TO {table} AS ");
-
-        CORE_MIGRATIONS
-            .iter()
-            .flat_map(|(_, sql)| split_sql_statements(sql))
-            .map(|statement| normalize(&statement))
-            .find_map(|statement| {
-                statement
-                    .starts_with("CREATE MATERIALIZED VIEW")
-                    .then(|| statement.split_once(&marker))
-                    .flatten()
-                    .map(|(_, select)| select.to_string())
-            })
-            .unwrap_or_else(|| panic!("no materialized view TO {table}"))
+        let mut selects = view_selects(table);
+        assert_eq!(selects.len(), 1, "{table}");
+        selects.remove(0)
     }
 
     #[test]
-    fn renders_placeholders_and_aligns_to_the_bucket() {
+    fn renders_placeholders_and_aligns_to_the_day() {
         let table = DerivedTable {
             name: "t",
             bucket_seconds: 3_600,
             bucket_column: "hour",
-            rebuild_sql: "INSERT INTO t SELECT 1 FROM b FINAL WHERE \
+            rebuild_sql:
+                "INSERT INTO t SELECT {epoch} FROM b FINAL WHERE \
                           chain = {chain} AND timestamp >= {from_ts}",
         };
 
@@ -208,14 +241,27 @@ mod tests {
             u32::MAX - u32::MAX % 3_600
         );
 
+        // Whatever the bucket width, a repair starts at a start of day:
+        // it is what `reorgs.from_ts` holds and what the views hide from.
+        assert_eq!(repair_start(86_400 + 7_201), 86_400);
+        assert_eq!(repair_start(86_399), 0);
         assert_eq!(
-            table.rebuild_sql(137, 7_201),
-            "INSERT INTO t SELECT 1 FROM b FINAL WHERE chain = 137 AND \
-             timestamp >= 7200"
+            table.rebuild_sql(137, 86_400 + 7_201, 4, 10, Some(20)),
+            "INSERT INTO t SELECT 4 FROM b FINAL WHERE chain = 137 AND \
+             timestamp >= 86400"
+        );
+
+        let blocks = DerivedTable {
+            rebuild_sql: "number >= {purge_from} AND number < {purge_to}",
+            ..table
+        };
+        assert_eq!(
+            blocks.rebuild_sql(1, 0, 1, 10, Some(20)),
+            "number >= 10 AND number < 20"
         );
         assert_eq!(
-            table.delete_sql(137, 7_201),
-            "DELETE FROM t WHERE chain = 137 AND hour >= 7200"
+            blocks.rebuild_sql(1, 0, 1, 10, None),
+            format!("number >= 10 AND number < {}", u64::MAX)
         );
     }
 
@@ -228,10 +274,12 @@ mod tests {
 
     #[test]
     fn every_core_aggregate_is_declared_once() {
+        // Every table of 0003 is an aggregate fed by a materialized view.
         let aggregates: Vec<String> =
             tables_with_columns(CORE_MIGRATIONS[2].1)
                 .into_iter()
                 .map(|(table, _)| table)
+                .filter(|table| !view_selects(table).is_empty())
                 .collect();
 
         let declared: Vec<&str> =
@@ -246,10 +294,16 @@ mod tests {
             let sql = normalize(table.rebuild_sql);
 
             // No placeholder left behind, none unknown.
-            let rendered = table.rebuild_sql(1, 0);
+            let rendered = table.rebuild_sql(1, 0, 3, 5, None);
             assert!(!rendered.contains('{'), "{rendered}");
             assert_eq!(
                 sql.matches("{chain}").count(),
+                1,
+                "{}",
+                table.name
+            );
+            assert_eq!(
+                sql.matches("{epoch}").count(),
                 1,
                 "{}",
                 table.name
@@ -273,12 +327,34 @@ mod tests {
                 table.name
             );
 
+            assert_eq!(select.matches(REBUILD_EPOCH).count(), 1);
+
+            // The purged range is left out by the statement itself, by
+            // the block number column of the table it reads.
+            let exclusion = if select.contains(" FROM blocks AS ") {
+                REBUILD_EXCLUSION.replace("block_number", "number")
+            } else {
+                REBUILD_EXCLUSION.to_string()
+            };
             assert_eq!(
-                select.replace(REBUILD_FILTER, ""),
+                select.matches(&exclusion).count(),
+                1,
+                "{}",
+                table.name
+            );
+
+            assert_eq!(
+                select
+                    .replace(&exclusion, "")
+                    .replace(REBUILD_FILTER, VIEW_FILTER)
+                    .replace(REBUILD_EPOCH, VIEW_EPOCH),
                 view_select(table.name),
                 "{}: rebuild_sql and the materialized view differ",
                 table.name
             );
+
+            // Filed under its epoch, which is part of the sorting key.
+            assert!(select.ends_with(", epoch"), "{}", table.name);
 
             // The bucket expression matches bucket_seconds / bucket_column.
             assert!(

@@ -2,16 +2,17 @@
 --
 -- One MV-fed side table per access pattern, no projections and no bloom
 -- filters. Every side table:
---   * is ReplacingMergeTree(_version) and copies _version from the base
---     row, so a re-inserted block replaces its own side rows too
---   * carries (chain, block_number), so a rollback purges it with the same
---     DELETE ... WHERE chain = ? AND block_number >= ? as the base tables
+--   * is a ReplacingMergeTree(_version, is_deleted) whose view copies
+--     _version, is_deleted and epoch from the base row. So a re-inserted
+--     block replaces its own side rows, and a tombstone inserted into a base
+--     table (the only way rows are ever removed, docs/design.md section 2)
+--     tombstones exactly the side rows of that base row. Side tables are
+--     NEVER written or tombstoned directly.
 --   * is partitioned by chain only: these tables exist to answer lookups
 --     that do NOT know the time range, a monthly partition would turn every
 --     lookup into one index probe per month
---   * has a minmax index on block_number, which is not a prefix of its
---     sorting key: it lets the rollback DELETE skip every part that only
---     holds older blocks instead of scanning the column
+--   * carries block_number for readers, with a minmax index because it is
+--     not a prefix of the sorting key ("what happened since block N")
 --
 -- direction is -1 for the sending side and 1 for the receiving side, so
 -- a balance is sum(toInt256(amount) * direction).
@@ -22,16 +23,18 @@ CREATE TABLE IF NOT EXISTS tx_lookup (
   hash FixedString(32),
   block_number UInt64,
   transaction_index UInt32,
+  epoch UInt32 DEFAULT 0,
   _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
   INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
 )
-ENGINE = ReplacingMergeTree(_version)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
 PARTITION BY chain
 ORDER BY (chain, hash)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS tx_lookup_mv TO tx_lookup AS
-SELECT chain, hash, block_number, transaction_index, _version
+SELECT chain, hash, block_number, transaction_index, epoch, _version, is_deleted
 FROM transactions;
 
 -- Block by hash.
@@ -39,16 +42,18 @@ CREATE TABLE IF NOT EXISTS block_lookup (
   chain UInt64,
   hash FixedString(32),
   block_number UInt64,
+  epoch UInt32 DEFAULT 0,
   _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
   INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
 )
-ENGINE = ReplacingMergeTree(_version)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
 PARTITION BY chain
 ORDER BY (chain, hash)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS block_lookup_mv TO block_lookup AS
-SELECT chain, hash, number AS block_number, _version
+SELECT chain, hash, number AS block_number, epoch, _version, is_deleted
 FROM blocks;
 
 -- Transactions of an address: one row for the sender and one for the
@@ -63,10 +68,12 @@ CREATE TABLE IF NOT EXISTS transactions_by_address (
   hash FixedString(32),
   value UInt256,
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  epoch UInt32 DEFAULT 0,
   _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
   INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
 )
-ENGINE = ReplacingMergeTree(_version)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
 PARTITION BY chain
 ORDER BY (chain, address, block_number, transaction_index, direction)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
@@ -82,7 +89,9 @@ SELECT
   hash,
   value,
   timestamp,
-  _version
+  epoch,
+  _version,
+  is_deleted
 FROM
 (
   SELECT
@@ -92,7 +101,9 @@ FROM
     hash,
     value,
     timestamp,
+    epoch,
     _version,
+    is_deleted,
     `from` AS sender,
     ifNull(`to`, contract_created) AS recipient,
     isNotNull(`to`) OR contract_created != toFixedString('', 20) AS has_recipient
@@ -111,16 +122,18 @@ CREATE TABLE IF NOT EXISTS logs_by_address (
   topic0 FixedString(32),
   block_number UInt64 CODEC(Delta, ZSTD),
   log_index UInt32,
+  epoch UInt32 DEFAULT 0,
   _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
   INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
 )
-ENGINE = ReplacingMergeTree(_version)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
 PARTITION BY chain
 ORDER BY (chain, address, topic0, block_number, log_index)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS logs_by_address_mv TO logs_by_address AS
-SELECT chain, address, topic0, block_number, log_index, _version
+SELECT chain, address, topic0, block_number, log_index, epoch, _version, is_deleted
 FROM logs;
 
 -- Wallet history / balances: two rows per transfer.
@@ -135,10 +148,12 @@ CREATE TABLE IF NOT EXISTS erc20_transfers_by_account (
   amount UInt256,
   transaction_hash FixedString(32),
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  epoch UInt32 DEFAULT 0,
   _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
   INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
 )
-ENGINE = ReplacingMergeTree(_version)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
 PARTITION BY chain
 ORDER BY (chain, account, token_address, block_number, log_index, direction)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
@@ -155,7 +170,9 @@ SELECT
   amount,
   transaction_hash,
   timestamp,
-  _version
+  epoch,
+  _version,
+  is_deleted
 FROM erc20_transfers
 ARRAY JOIN [(`from`, toInt8(-1), `to`), (`to`, toInt8(1), `from`)] AS side;
 
@@ -177,10 +194,12 @@ CREATE TABLE IF NOT EXISTS nft_transfers_by_account (
   standard LowCardinality(String),
   transaction_hash FixedString(32),
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
+  epoch UInt32 DEFAULT 0,
   _version UInt64,
+  is_deleted UInt8 DEFAULT 0,
   INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
 )
-ENGINE = ReplacingMergeTree(_version)
+ENGINE = ReplacingMergeTree(_version, is_deleted)
 PARTITION BY chain
 ORDER BY (chain, account, token_address, block_number, log_index, direction, batch_index)
 SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
@@ -200,7 +219,9 @@ SELECT
   'ERC721' AS standard,
   transaction_hash,
   timestamp,
-  _version
+  epoch,
+  _version,
+  is_deleted
 FROM erc721_transfers
 ARRAY JOIN [(`from`, toInt8(-1), `to`), (`to`, toInt8(1), `from`)] AS side;
 
@@ -219,29 +240,9 @@ SELECT
   'ERC1155' AS standard,
   transaction_hash,
   timestamp,
-  _version
+  epoch,
+  _version,
+  is_deleted
 FROM erc1155_transfers
 ARRAY JOIN arrayZip(ids, amounts, arrayEnumerate(ids)) AS item
 ARRAY JOIN [(`from`, toInt8(-1), `to`), (`to`, toInt8(1), `from`)] AS side;
-
--- Traces of a transaction. Slim: the trace itself is read from traces by
--- (chain, block_number, transaction_position, trace_address). Reward
--- traces have no transaction and are not listed.
-CREATE TABLE IF NOT EXISTS traces_by_tx (
-  chain UInt64,
-  transaction_hash FixedString(32),
-  trace_address Array(UInt32),
-  block_number UInt64,
-  transaction_position UInt32,
-  _version UInt64,
-  INDEX idx_block_number block_number TYPE minmax GRANULARITY 1
-)
-ENGINE = ReplacingMergeTree(_version)
-PARTITION BY chain
-ORDER BY (chain, transaction_hash, trace_address)
-SETTINGS index_granularity = 8192, do_not_merge_across_partitions_select_final = 1;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS traces_by_tx_mv TO traces_by_tx AS
-SELECT chain, transaction_hash, trace_address, block_number, transaction_position, _version
-FROM traces
-WHERE transaction_position != 4294967295;
