@@ -154,7 +154,8 @@ cargo build --release
 |---------|--------------|
 | `indexer run [OPTIONS]` | Index a chain. Applies pending schema migrations first (unless `--no-migrate`). `indexer [OPTIONS]` without a subcommand is the same thing |
 | `indexer migrate --database <url> [--dry-run]` | Create the database if it is missing, apply pending migrations and exit. `--dry-run` only lists what is pending and creates nothing |
-| `indexer verify` | Placeholder for a gap / consistency check of the indexed data. Not implemented yet: it prints a notice and exits with status `2` |
+| `indexer verify --database <url> [--chain N] [--start-block A] [--end-block B]` | Read-only consistency check of what is stored for a chain: missing blocks (gaps), rows without their block (left by an interrupted write; the next `indexer run` purges them), and checkpoints that claim missing blocks. Prints a report; exit status `0` = consistent, `1` = problems found |
+| `indexer backfill --module dex\|predictions --database <url> [--chain N] [--from-block A] [--to-block B]` | Decode a module's rows again **from the stored `logs`** (no re-sync, no HyperSync traffic), e.g. after a decoder fix or a new event family. Compares first and writes nothing when the stored rows already match; otherwise the module's rows of the affected block range are replaced and every aggregate of the chain is rebuilt under a new epoch, so nothing is counted twice. Safe to run while `indexer run` is live on the same chain |
 
 The schema lives in `migrations/NNNN_name.sql` and is **compiled into the binary**; the container image needs no SQL files and ClickHouse needs no init scripts.
 
@@ -168,13 +169,11 @@ The schema lives in `migrations/NNNN_name.sql` and is **compiled into the binary
 
 Every CLI flag can also be set through the environment variable listed next to it. CLI flags take precedence. A blank variable (`VAR=`) counts as unset; boolean variables accept `true` / `false`, `1` / `0`, `yes` / `no`, `on` / `off`.
 
-<!-- FLAG-CHECK: verify against src/configs/mod.rs after pipeline wiring -->
-
 Options of `indexer run`:
 
 | Flag | Environment variable | Default | Description |
 |------|----------------------|---------|-------------|
-| `--chain` | `CHAIN_ID` | `1` | Chain ID to index. One process per chain |
+| `--chain` | `CHAIN_ID` | `1` | Chain ID to index. One process per chain: a second `indexer run` on the same chain and database refuses to start (any number of chains can share a database) |
 | `--database` | `DATABASE_URL` | *required* | ClickHouse HTTP endpoint: `http://user:pass@host:port/db` (use `https://` for TLS). Always include the port (usually `8123`). The database is created when missing |
 | `--hypersync-url` | `HYPERSYNC_URL` | derived from the chain ID | HyperSync endpoint. Only needed to override the default endpoint for the chain |
 | `--hypersync-token` | `ENVIO_API_TOKEN` | *required* | [Envio API token](https://docs.envio.dev/docs/HyperSync/api-tokens) |
@@ -186,14 +185,14 @@ Options of `indexer run`:
 | `--confirmations` | `CONFIRMATIONS` | `0` | Stay this many blocks behind the chain head. Optional: reorgs are repaired either way, see [Reorgs](#reorgs) |
 | `--max-reorg-depth` | `MAX_REORG_DEPTH` | `512` | Deepest rollback the indexer performs on its own. A deeper fork stops the process with an error |
 | `--no-dex` | `NO_DEX` | `false` | Turn [DEX analytics](#dex-analytics) off |
-| `--no-predictions` | `NO_PREDICTIONS` | `false` | Turn prediction-market analytics off (upcoming module, see [below](#prediction-markets-and-perps)) |
+| `--no-predictions` | `NO_PREDICTIONS` | `false` | Turn prediction-market analytics off (see [below](#prediction-markets-and-perps)) |
 | `--no-migrate` | `NO_MIGRATE` | `false` | Do not apply pending schema migrations at startup (run `indexer migrate` yourself) |
 | `--metrics-addr` | `METRICS_ADDR` | *off* | `ip:port` to serve `/metrics`, `/healthz` and `/readyz` on. See [Metrics and health checks](#metrics-and-health-checks) |
 | `--flush-rows` | `FLUSH_ROWS` | `100000` | Flush to ClickHouse once this many rows are buffered |
-| `--flush-interval-ms` | `FLUSH_INTERVAL_MS` | `2000` | Maximum time in milliseconds between flushes |
+| `--flush-interval-ms` | `FLUSH_INTERVAL_MS` | `2000` | Maximum time in milliseconds between flushes during a historical sync. While following the chain head the indexer commits at most once every 2x this value (4 s by default): every commit is one synchronous ClickHouse insert per table, and fewer, larger inserts are what keeps a server shared by many chains healthy |
 | `--debug` | `DEBUG` | `false` | Enable debug logging |
 
-`indexer migrate` takes `--database`, `--dry-run` and `--debug`. See [`.env.example`](.env.example) for a commented template; for Docker Compose it additionally contains the ClickHouse container credentials (`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DB`) and `METRICS_PORT`.
+`indexer migrate` takes `--database`, `--dry-run` and `--debug`; `indexer verify` and `indexer backfill` take the options shown in the table above (plus `--debug`). See [`.env.example`](.env.example) for a commented template; for Docker Compose it additionally contains the ClickHouse container credentials (`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DB`) and `METRICS_PORT`.
 
 Any network available on HyperSync can be indexed: see the [list of supported networks](https://docs.envio.dev/docs/HyperSync/hypersync-supported-networks). The HyperSync endpoint is derived from `--chain`; use `--hypersync-url` to point to a different endpoint.
 
@@ -469,7 +468,7 @@ Conventions, precision, the pool resolver and the known gaps (forged events, agg
 
 ## Prediction markets and perps
 
-- **Prediction markets: upcoming.** A module with the same shape as DEX analytics (decoded by event family, candles of implied probability, trades, positions) is in progress. It will be on by default with `--no-predictions` to opt out. It is not part of the current schema.
+- **Prediction markets: on by default** (`--no-predictions` to opt out). Same shape as DEX analytics: decoded by event family, candles of implied probability, trades, positions. Tables, views and the query cookbook are in [`src/predictions/README.md`](src/predictions/README.md).
 - **Perpetual futures: deferred.** Only a few percent of perp volume is readable from EVM logs on HyperSync chains; the numbers are in [`docs/perps-research.md`](docs/perps-research.md).
 
 ## Metrics and health checks
@@ -480,7 +479,7 @@ Conventions, precision, the pool resolver and the known gaps (forged events, agg
 |----------|--------|
 | `GET /metrics` | Prometheus text format. Every series is prefixed `evm_indexer_` and labelled `chain="<chain id>"` |
 | `GET /healthz` | `200` while the process is alive (liveness) |
-| `GET /readyz` | `200` when the indexer is running and its last successful flush or head poll is recent; otherwise `503` with a one-line reason (readiness) |
+| `GET /readyz` | `200` when startup completed, the most recent flush did not fail, no flush has been retrying for more than 2 minutes, and the last successful flush or head poll is recent; otherwise `503` with a one-line reason. **Readiness, not liveness:** use it to take a lagging indexer out of a dashboard or load balancer, never to restart the process (a ClickHouse outage makes it not ready, and a restart loop would not help). Use `/healthz` for liveness |
 
 The most useful series: `evm_indexer_head_block`, `evm_indexer_indexed_block`, `evm_indexer_lag_blocks`, `evm_indexer_lag_seconds`, `evm_indexer_rows_inserted_total{table}`, `evm_indexer_flush_duration_seconds`, `evm_indexer_flushes_total{result}`, `evm_indexer_reorgs_total`, `evm_indexer_reorg_last_depth`, `evm_indexer_resolver_queue_depth{worker}` and `evm_indexer_resolver_endpoints_healthy{worker}`. The full reference and ready-made alert rules are in [`src/metrics/README.md`](src/metrics/README.md).
 

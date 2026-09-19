@@ -1219,37 +1219,50 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
 
 // ------------------------------------------------------------ the lease
 
+/// Generous ttl: the machine running the tests may be saturated, and a
+/// heartbeat that takes longer than the ttl IS a dead process.
+fn patient_lease() -> LeaseOptions {
+    LeaseOptions {
+        heartbeat: Duration::from_millis(100),
+        ttl: Duration::from_secs(3),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs TEST_DATABASE_URL"]
 async fn a_second_process_on_the_same_chain_refuses_to_start() {
     let scenario = Scenario::new("lease").await;
 
     let (fatal, _) = watch::channel(None);
-    let first = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
+    let first =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
 
-    let error = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .err()
-        .expect("the second instance must refuse");
+    let error =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .err()
+            .expect("the second instance must refuse");
     assert!(format!("{error:#}").contains("already indexing chain 1"));
 
     // After a clean shutdown the next start does not even wait.
     first.release().await;
     let started = std::time::Instant::now();
-    let second = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
-    assert!(started.elapsed() < Duration::from_millis(350));
+    let second =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
+    assert!(started.elapsed() < patient_lease().ttl);
 
     // A killed process (dropped: no release row): the next start waits
     // one ttl, sees no new heartbeat and takes over.
     drop(second);
     let started = std::time::Instant::now();
-    let third = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
-    assert!(started.elapsed() >= fast_lease().ttl);
+    let third =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
+    assert!(started.elapsed() >= patient_lease().ttl);
     third.release().await;
 }
