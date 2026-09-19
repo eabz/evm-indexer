@@ -70,6 +70,22 @@ const FIRST_SLOT: u64 = FIRST_SERVED_SLOT + 1_000;
 /// exercise the cursor-following loop rather than one big answer.
 const SERVED_PER_QUERY: u64 = 7;
 
+/// The launchpad aggregate views a heal has to reproduce exactly.
+///
+/// The CANDLES are compared through their `_all_v` form on purpose: the
+/// plain `_v` ones additionally restrict to emitters an operator listed in
+/// `launchpad_trusted_emitters`, and these scenarios seed none, so `_v`
+/// would be empty on both sides and prove nothing. `_all_v` still applies
+/// the reorg validity rule, which is the thing under test.
+const LAUNCHPAD_VIEWS: &[&str] = &[
+    "launchpad_candles_1m_all_v",
+    "launchpad_candles_1h_all_v",
+    "launchpad_venue_trades_1d_v",
+    "launchpad_launches_1d_v",
+    "launchpad_graduations_1d_v",
+    "launchpad_creator_fees_1d_v",
+];
+
 // ------------------------------------------------------------- the chain
 
 /// An in-memory Solana: a list of PRODUCED slots (the others are skipped)
@@ -350,7 +366,23 @@ impl Scenario {
     async fn snapshot(&self) -> BTreeMap<String, Vec<String>> {
         let mut names: Vec<(&str, bool)> =
             svm::BASE_TABLES.iter().map(|table| (*table, true)).collect();
+        // The SHARED launchpad tables the Solana decoder writes, their
+        // side tables, and the Solana-only holder table: all block scoped,
+        // so a heal has to bring them back identical too.
+        names.extend(
+            svm::SHARED_BASE_TABLES.iter().map(|table| (*table, true)),
+        );
+        names.extend(
+            crate::launchpads::SIDE_TABLES.iter().map(|t| (*t, true)),
+        );
+        // NOT `sol_token_balances`: it is a latest-value projection whose
+        // `_version` is the position, so a purge never touches it and a
+        // healed index legitimately holds observations a clean one made in
+        // a different order. `the_holder_projection_is_re_observed` checks
+        // the property it DOES have.
+
         names.extend(SOL_CANDLE_VIEWS.iter().map(|view| (*view, false)));
+        names.extend(LAUNCHPAD_VIEWS.iter().map(|view| (*view, false)));
 
         let mut snapshot = BTreeMap::new();
 
@@ -510,9 +542,46 @@ async fn a_canned_range_with_skipped_slots_is_indexed_end_to_end() {
     );
     assert!(scenario.rows("sol_tokens").await > 0, "sol_tokens");
 
-    // Every stored transaction and swap has its slot: the commit marker
-    // invariant, checked here and not only by `verify`.
-    for table in ["sol_transactions", "sol_dex_swaps"] {
+    // The LAUNCHPAD rows, in the SHARED chain-neutral tables, written by
+    // the same flush and under the same commit marker. The fake chain
+    // carries the recorded pump.fun / Meteora DBC / LaunchLab
+    // transactions, so these are real decoded launches and curve trades.
+    assert!(
+        scenario.rows("launchpad_tokens").await > 0,
+        "launchpad_tokens"
+    );
+    assert!(
+        scenario.rows("launchpad_trades").await > 0,
+        "launchpad_trades"
+    );
+    assert!(
+        scenario.rows("sol_token_balances").await > 0,
+        "sol_token_balances"
+    );
+    // ... and only Solana rows: the shared tables must not be claimed.
+    for table in svm::SHARED_BASE_TABLES {
+        let other = scenario
+            .count(&format!(
+                "SELECT toUInt64(count()) FROM `{table}` FINAL \
+                 WHERE chain != {CHAIN}"
+            ))
+            .await;
+        assert_eq!(other, 0, "{table} holds rows of another chain");
+    }
+    // Their side tables were fed by the materialized views.
+    assert!(
+        scenario.rows("launchpad_trades_by_token").await > 0,
+        "launchpad_trades_by_token"
+    );
+
+    // Every stored transaction, swap and launchpad row has its slot: the
+    // commit marker invariant, checked here and not only by `verify`.
+    for table in [
+        "sol_transactions",
+        "sol_dex_swaps",
+        "launchpad_tokens",
+        "launchpad_trades",
+    ] {
         let orphans = scenario
             .count(&format!(
                 "SELECT toUInt64(count()) FROM `{table}` FINAL \
@@ -559,6 +628,48 @@ async fn a_canned_range_with_skipped_slots_is_indexed_end_to_end() {
         ))
         .await;
     assert!(priced > 0, "no candle has an open and a close");
+
+    scenario.assert_consistent().await;
+}
+
+/// `--no-launchpads` on Solana: the DEX rows still land, the launchpad
+/// ones do not, and nothing else changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn no_launchpads_is_honoured_on_solana() {
+    let scenario = Scenario::new("a_no_launchpads").await;
+    let chain = chain(40);
+
+    let start = FIRST_SLOT.to_string();
+    let end = chain.head.to_string();
+    let config = scenario.config(&[
+        "--start-block",
+        &start,
+        "--end-block",
+        &end,
+        "--flush-interval-ms",
+        "200",
+        "--no-launchpads",
+    ]);
+
+    run_with(config, runtime(chain.clone())).await.unwrap();
+
+    // The DEX side is untouched: the flag must not cost a swap.
+    assert_eq!(
+        scenario.rows("sol_slots").await,
+        chain.produced_slots(),
+        "sol_slots"
+    );
+    assert!(scenario.rows("sol_dex_swaps").await > 0, "sol_dex_swaps");
+
+    // And not one launchpad row was stored, in any of their tables.
+    for table in svm::SHARED_BASE_TABLES {
+        assert_eq!(scenario.rows(table).await, 0, "{table}");
+    }
+    for table in crate::launchpads::SIDE_TABLES {
+        assert_eq!(scenario.rows(table).await, 0, "{table}");
+    }
+    assert_eq!(scenario.rows("sol_token_balances").await, 0);
 
     scenario.assert_consistent().await;
 }
@@ -700,6 +811,73 @@ async fn sol_tokens_program_is_best_effort_but_decimals_are_not() {
         systemic, 0,
         "a mint is recorded with a program that is neither SPL Token, \
          Token-2022, nor 'unknown'"
+    );
+}
+
+/// The holder projection is corrected by RE-OBSERVING, not by a purge.
+///
+/// `sol_token_balances` is keyed on `(chain, mint, owner, account)` with
+/// the POSITION as `_version`, so it is a latest-value table: a heal does
+/// not tombstone it, the re-stream simply writes the same observations
+/// again and the newest one wins. What must hold is that after a heal
+/// every balance is the one the highest position saw - never a stale one
+/// resurrected by a purge, and never a row the re-stream failed to bring
+/// back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_holder_projection_is_re_observed_after_a_heal() {
+    let chain = chain(40);
+    let clean = clean_index("b_bal_clean", &chain, chain.head).await;
+    let scenario = Scenario::new("b_bal_healed").await;
+
+    let middle = chain.slot_at(20);
+    scenario.index_until(&chain, middle).await.unwrap();
+
+    // The crash: children of the next windows, no commit marker.
+    let orphans: Vec<SvmSlotBatch> = chain
+        .slots
+        .iter()
+        .filter(|s| s.slot >= middle && s.slot < chain.slot_at(30))
+        .map(copy)
+        .collect();
+    let mut rows = svm::decode(CHAIN, &orphans);
+    rows.set_version(next_version());
+    rows.set_epoch(0);
+    store_children(
+        &scenario.db,
+        &SvmBatch {
+            rows,
+            windows: vec![BlockRange::new(middle, chain.slot_at(30))],
+        },
+    )
+    .await
+    .unwrap();
+
+    scenario.index_until(&chain, chain.head).await.unwrap();
+    scenario.assert_consistent().await;
+
+    // Every (mint, owner, account) the clean index knows, with the same
+    // balance: the heal lost none and resurrected none.
+    let balances = |s: &Scenario| {
+        let db = s.db.clone();
+        async move {
+            db.db
+                .query(&format!(
+                    "SELECT base58Encode(mint), base58Encode(owner), \
+                 base58Encode(account), toString(balance) \
+                 FROM sol_token_balances FINAL WHERE chain = {CHAIN} \
+                 ORDER BY mint, owner, account"
+                ))
+                .fetch_all::<(String, String, String, String)>()
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(
+        balances(&scenario).await,
+        balances(&clean).await,
+        "the healed index has different holder balances"
     );
 }
 

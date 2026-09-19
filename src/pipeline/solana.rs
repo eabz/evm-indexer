@@ -611,6 +611,25 @@ impl WriterControl for SvmWriterGate {
     }
 }
 
+/// The operator's `sol_dex_programs` overlay.
+///
+/// A missing or empty table is NOT an error: the registry is a judgement
+/// an operator makes over time (`src/svm/registry.rs`), and an unlisted
+/// program simply keeps its built-in venue name. What would be an error is
+/// a read that fails for another reason, so this does not swallow one.
+async fn load_program_names(
+    db: &Database,
+) -> Result<svm::registry::ProgramNames> {
+    let rows: Vec<svm::registry::SolDexProgram> = db
+        .db
+        .query(svm::registry::LOAD_SQL)
+        .fetch_all()
+        .await
+        .context("read the sol_dex_programs registry")?;
+
+    Ok(svm::registry::ProgramNames::new(rows))
+}
+
 /// Polls until the `sol_slots` row of the last flush is readable.
 async fn wait_until_visible(db: Database, last: LastFlush) -> Result<()> {
     let Some((slot, version)) = *last.lock().unwrap() else {
@@ -663,6 +682,8 @@ struct SolanaSettings {
     /// Exclusive, 0 = follow the head.
     end_slot: u64,
     new_slots_only: bool,
+    /// Decode and store the launchpad rows (on unless `--no-launchpads`).
+    launchpads: bool,
 }
 
 struct SolanaIndexer<S: SlotSource> {
@@ -679,8 +700,13 @@ struct SolanaIndexer<S: SlotSource> {
     stale: Arc<Mutex<Vec<BlockRange>>>,
     /// Gap heals are only looked for on the first inspection of a range.
     healed_until: u64,
+    /// The operator's `sol_dex_programs` overlay, read once at startup.
+    /// It can only ADD knowledge: an unlisted program keeps its built-in
+    /// venue name, so an empty table decodes exactly as before.
+    program_names: Arc<svm::registry::ProgramNames>,
     /// Counters for the Solana-only metric series.
     swaps_stored: Arc<AtomicU64>,
+    launchpad_rows: Arc<AtomicU64>,
     skipped_slots: Arc<AtomicU64>,
 }
 
@@ -768,6 +794,18 @@ pub async fn run_with<S: SlotSource>(
     // The epoch of a chain survives restarts in `reorgs`.
     db.set_epoch(db.current_epoch().await?);
 
+    // The operator's curated program registry, read once: it is a few
+    // dozen rows and it only ADDS knowledge, so an empty table (a fresh
+    // database) decodes exactly as the built-in venue list does.
+    let program_names = load_program_names(&db).await?;
+
+    info!(
+        "Modules on Solana: DEX on, launchpads {}. Program registry: {} \
+         operator row(s).",
+        if config.launchpads { "on" } else { "off (--no-launchpads)" },
+        program_names.len(),
+    );
+
     let store = SolanaReorgStore::new(db.clone());
     let last_flush = LastFlush::default();
     let stale = Arc::new(Mutex::new(Vec::new()));
@@ -824,6 +862,7 @@ pub async fn run_with<S: SlotSource>(
             start_slot,
             end_slot: config.end_block,
             new_slots_only: config.new_blocks_only,
+            launchpads: config.launchpads,
         },
         source: runtime.source,
         store,
@@ -834,7 +873,9 @@ pub async fn run_with<S: SlotSource>(
         committed: Vec::new(),
         stale,
         healed_until: 0,
+        program_names: Arc::new(program_names),
         swaps_stored: Arc::new(AtomicU64::new(0)),
+        launchpad_rows: Arc::new(AtomicU64::new(0)),
         skipped_slots: Arc::new(AtomicU64::new(0)),
     };
 
@@ -1256,16 +1297,30 @@ impl<S: SlotSource> SolanaIndexer<S> {
 
             let chain = self.settings.chain;
             let batches = page.batches;
+            let names = self.program_names.clone();
+            let launchpads = self.settings.launchpads;
 
             // CPU bound: keep the decode off the async workers.
-            let rows = tokio::task::spawn_blocking(move || {
-                svm::decode(chain, &batches)
+            let mut rows = tokio::task::spawn_blocking(move || {
+                svm::decode_with(chain, &batches, &names)
             })
             .await
             .context("Solana decode task panicked")?;
 
+            // `--no-launchpads`. The decode itself still ran: it is a pure
+            // function over rows that were fetched anyway, so skipping it
+            // would save nothing on the wire and only add a branch to the
+            // decoder. What the flag means is that none of it is STORED.
+            if !launchpads {
+                rows.launchpads = Default::default();
+            }
+
             self.swaps_stored
                 .fetch_add(rows.swaps.len() as u64, Ordering::Relaxed);
+            self.launchpad_rows.fetch_add(
+                rows.launchpads.rows() as u64,
+                Ordering::Relaxed,
+            );
             self.skipped_slots.fetch_add(
                 served.len().saturating_sub(rows.slots.len() as u64),
                 Ordering::Relaxed,

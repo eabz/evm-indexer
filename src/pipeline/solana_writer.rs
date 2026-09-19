@@ -25,7 +25,10 @@
 use crate::{
     db::{next_version, ranges::BlockRange, Database, FlushKey},
     metrics::Metrics,
-    pipeline::{lease::Fence, solana_store::COMMIT_MARKER},
+    pipeline::{
+        lease::Fence,
+        solana_store::{COMMIT_MARKER, SOL_TOKEN_BALANCES},
+    },
     svm::SvmRows,
 };
 use anyhow::{Context, Result};
@@ -342,13 +345,21 @@ async fn flush<S: SvmSink>(
     let requested: u64 = covered.iter().map(BlockRange::len).sum();
     let present = batch.rows.slots.len() as u64;
 
+    let pads = &batch.rows.launchpads;
+
     info!(
         "Stored slots {span}: {present} slot(s) of {requested} \
-         ({} skipped), transactions ({}) swaps ({}) mints ({}) in {:?}.",
+         ({} skipped), transactions ({}) swaps ({}) mints ({}) \
+         launches ({}) curve trades ({}) graduations ({}) \
+         balances ({}) in {:?}.",
         requested.saturating_sub(present),
         batch.rows.transactions.len(),
         batch.rows.swaps.len(),
         batch.rows.tokens.len(),
+        pads.tokens.len(),
+        pads.trades.len(),
+        pads.graduations.len(),
+        pads.balances.len(),
         started.elapsed(),
     );
 
@@ -429,9 +440,16 @@ fn flush_key(db: &Database, batch: &SvmBatch) -> Option<FlushKey> {
 
 /// Step 1: everything except the commit marker, concurrently.
 ///
-/// `sol_tokens` is in here although it is not block scoped: it is written
-/// by the same flush, and a mint row without its swap is harmless while a
-/// swap without its mint's decimals can not be valued.
+/// Three families, and they all go BEFORE `sol_slots`:
+///
+/// * the `sol_*` DEX rows;
+/// * the SHARED `launchpad_*` rows - the very same chain-neutral tables the
+///   EVM launchpad decoder writes, with 32-byte Solana ids - plus the
+///   Solana-only `sol_token_balances`;
+/// * `sol_tokens` and `sol_launchpad_configs`, which are NOT block scoped.
+///   They are in the flush anyway: a mint row without its swap is
+///   harmless, while a swap whose mint has no decimals cannot be valued,
+///   and a curve trade whose config is missing cannot be priced.
 pub async fn store_children(
     db: &Database,
     batch: &SvmBatch,
@@ -440,7 +458,11 @@ pub async fn store_children(
         return Ok(());
     };
 
-    let (swaps, transactions, tokens) = tokio::join!(
+    let pads = &batch.rows.launchpads;
+
+    // One `tokio::join!` so a flush is one round of concurrent inserts,
+    // exactly like the EVM `Database::store`.
+    let results = tokio::join!(
         db.insert_flush("sol_dex_swaps", &batch.rows.swaps, &key),
         db.insert_flush(
             "sol_transactions",
@@ -448,9 +470,20 @@ pub async fn store_children(
             &key
         ),
         db.insert_flush("sol_tokens", &batch.rows.tokens, &key),
+        db.insert_flush("launchpad_tokens", &pads.tokens, &key),
+        db.insert_flush("launchpad_trades", &pads.trades, &key),
+        db.insert_flush("launchpad_graduations", &pads.graduations, &key),
+        db.insert_flush(
+            "launchpad_creator_fees",
+            &pads.creator_fees,
+            &key
+        ),
+        db.insert_flush("sol_launchpad_configs", &pads.configs, &key),
+        db.insert_flush(SOL_TOKEN_BALANCES, &pads.balances, &key),
     );
 
-    let failures: Vec<String> = [swaps, transactions, tokens]
+    let (r0, r1, r2, r3, r4, r5, r6, r7, r8) = results;
+    let failures: Vec<String> = [r0, r1, r2, r3, r4, r5, r6, r7, r8]
         .into_iter()
         .filter_map(|r| r.err())
         .map(|e| format!("{e:#}"))
