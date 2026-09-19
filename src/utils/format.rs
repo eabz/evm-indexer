@@ -11,6 +11,17 @@
 //! | `I256`             | `Int256`          | 32 bytes LE, two's complement |
 //! | `Bytes`            | `String`          | LEB128 length + raw bytes     |
 //!
+//! The analytics data modules (`dex_*`, `launchpad_*`, `prediction_*`) are
+//! shared by every chain family and use two more (docs/design.md section
+//! 13). They are the ONLY way those modules encode an id: nobody hand rolls
+//! the padding.
+//!
+//! | Rust               | ClickHouse        | RowBinary                     |
+//! |--------------------|-------------------|-------------------------------|
+//! | `Address` [`SerId32`] | `FixedString(32)` | 12 zero bytes + 20 address bytes |
+//! | `Vec<Address>` [`SerVecId32`] | `Array(FixedString(32))` | the same, element wise |
+//! | `Bytes` / `Vec<u8>` [`SerTxId`] | `String` | LEB128 length + raw bytes |
+//!
 //! How this maps onto the `clickhouse` crate (checked against 0.14.0,
 //! `src/rowbinary/{ser,validation}.rs`):
 //!
@@ -880,6 +891,117 @@ mod tests {
         let json = serde_json::to_string(&with_values).unwrap();
         let back: Everything = serde_json::from_str(&json).unwrap();
         assert_eq!(back, with_values);
+    }
+
+    // ------------------------------------- chain neutral ids (section 13)
+
+    #[serde_as]
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Ids {
+        #[serde_as(as = "SerId32")]
+        emitter: Address,
+        #[serde_as(as = "SerVecId32")]
+        tokens: Vec<Address>,
+        #[serde_as(as = "SerTxId")]
+        tx_id: Bytes,
+        #[serde_as(as = "SerTxId")]
+        raw: Vec<u8>,
+    }
+
+    #[test]
+    fn an_id_is_twelve_zero_bytes_then_the_address() {
+        assert_eq!(
+            id32(Address::repeat_byte(0xab)),
+            "0x000000000000000000000000abababababababababababababababababababab"
+                .parse::<B256>()
+                .unwrap()
+        );
+        assert_eq!(id32(Address::ZERO), B256::ZERO);
+
+        let bytes = wire::to_bytes(&Ids {
+            emitter: Address::repeat_byte(0x11),
+            tokens: vec![Address::repeat_byte(0x22)],
+            tx_id: Bytes::from(vec![0xaa, 0xbb]),
+            raw: vec![0xcc],
+        });
+
+        let mut expected = vec![0u8; 12];
+        expected.extend([0x11; 20]);
+        // Array(FixedString(32)): one element, no per element length.
+        expected.push(1);
+        expected.extend(vec![0u8; 12]);
+        expected.extend([0x22; 20]);
+        // String columns: LEB128 length + raw bytes.
+        expected.extend([2, 0xaa, 0xbb]);
+        expected.extend([1, 0xcc]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn ids_and_tx_ids_round_trip() {
+        let sample = Ids {
+            emitter: Address::repeat_byte(0x11),
+            tokens: vec![Address::ZERO, Address::repeat_byte(0xff)],
+            tx_id: tx_id(B256::repeat_byte(0x7a)),
+            raw: vec![],
+        };
+
+        let json = serde_json::to_string(&sample).unwrap();
+        let back: Ids = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, sample);
+
+        for address in
+            [Address::ZERO, Address::repeat_byte(1), Address::repeat_byte(0xff)]
+        {
+            assert_eq!(address_of_id32(id32(address)), Some(address));
+        }
+
+        let hash = B256::repeat_byte(0x5e);
+        assert_eq!(tx_hash_of(&tx_id(hash)), Some(hash));
+        assert_eq!(tx_id(hash).len(), 32);
+    }
+
+    /// A 32 byte id that is NOT an EVM address - a Solana pubkey, a V4 pool
+    /// id - must never be truncated into one.
+    #[test]
+    fn a_non_evm_id_is_refused_never_truncated() {
+        // One non-zero byte anywhere in the padding is enough.
+        for position in 0..12 {
+            let mut id = B256::ZERO;
+            id.0[position] = 1;
+            assert_eq!(address_of_id32(id), None, "byte {position}");
+        }
+
+        let pubkey = B256::repeat_byte(0xc6);
+        assert_eq!(address_of_id32(pubkey), None);
+
+        // Through the serializers: an error, not a silently cut address.
+        let bad = serde_json::to_string(&pubkey.0.to_vec()).unwrap();
+        let error = serde_json::from_str::<Ids>(&format!(
+            "{{\"emitter\":{bad},\"tokens\":[],\"tx_id\":[],\"raw\":[]}}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not an EVM address"), "{error}");
+
+        let error = serde_json::from_str::<Ids>(&format!(
+            "{{\"emitter\":{},\"tokens\":[{bad}],\"tx_id\":[],\"raw\":[]}}",
+            serde_json::to_string(&id32(Address::ZERO).0.to_vec()).unwrap()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not an EVM address"), "{error}");
+    }
+
+    /// A Solana signature is 64 bytes: `tx_hash_of` says so instead of
+    /// handing back the first half.
+    #[test]
+    fn only_a_32_byte_tx_id_is_an_evm_hash() {
+        assert_eq!(tx_hash_of(&[]), None);
+        assert_eq!(tx_hash_of(&[0u8; 31]), None);
+        assert_eq!(tx_hash_of(&[0u8; 33]), None);
+        assert_eq!(tx_hash_of(&[0u8; 64]), None);
+        assert_eq!(tx_hash_of(&[7u8; 32]), Some(B256::repeat_byte(7)));
     }
 
     #[test]

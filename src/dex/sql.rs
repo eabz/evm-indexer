@@ -1,5 +1,11 @@
 //! Test helpers: the DEX migrations as text.
 
+/// The chain registry (docs/design.md §13). NOT a DEX table - it is shared
+/// by every analytics module - so it is not part of [`MIGRATIONS`], but the
+/// integration tests apply it, because the views format ids through it.
+pub const CHAINS_SQL: &str =
+    include_str!("../../migrations/0006_chains.sql");
+
 pub const TABLES_SQL: &str =
     include_str!("../../migrations/0010_dex_tables.sql");
 pub const AGGREGATES_SQL: &str =

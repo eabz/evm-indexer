@@ -36,7 +36,7 @@ use crate::{
             pool_id_of, DexLiquidity, DexPool, DexSwap, PoolSource,
             Protocol,
         },
-        sql::{statements, MIGRATIONS},
+        sql::{statements, CHAINS_SQL, MIGRATIONS},
         tombstone_sql, DexRows, BASE_TABLES, DEX_DERIVED, SIDE_TABLES,
     },
 };
@@ -108,6 +108,9 @@ impl TestDb {
 
         database.execute(TOKENS_DDL).await;
         database.execute(REORGS_DDL).await;
+        for statement in statements(CHAINS_SQL) {
+            database.execute(&statement).await;
+        }
         for (file, sql) in MIGRATIONS {
             for statement in statements(sql) {
                 database
@@ -213,6 +216,13 @@ fn tx(value: &Bytes) -> String {
     bytes(value.as_ref())
 }
 
+/// What `lower(hex(<an identity column>))` returns for an EVM address: 24
+/// zeros then the 40 hex digits of the address.
+fn id_hex(value: &str) -> String {
+    format!("{}{}", "0".repeat(24), value.trim_start_matches("0x"))
+        .to_lowercase()
+}
+
 fn int(value: &I256) -> String {
     format!("toInt256('{value}')")
 }
@@ -280,7 +290,7 @@ const LIQUIDITY_COLUMNS: &str = "chain, block_number, timestamp, \
 
 fn liquidity_sql(row: &DexLiquidity) -> String {
     format!(
-        "({}, {}, {}, {}, {}, {}, {}, '{}', '{}', {}, {}, {}, {}, {}, {}, \
+        "({}, {}, {}, {}, {}, {}, {}, {}, '{}', '{}', {}, {}, {}, {}, {}, \
          {}, {}, {}, {}, {}, {}, {}, {})",
         row.chain,
         row.block_number,
@@ -761,12 +771,12 @@ async fn seed_reference(database: &TestDb, chain: u64) {
             "INSERT INTO quote_tokens (chain, token, kind, _version) VALUES \
              ({chain}, {}, 'stable', 1), ({chain}, {}, 'stable', 1), \
              ({chain}, {}, 'native', 1), ({chain}, {}, 'stable', 1)",
-            addr(&address(fixtures::USDC)),
-            addr(&address(fixtures::USDT)),
-            addr(&address(fixtures::WETH)),
+            id(&address(fixtures::USDC)),
+            id(&address(fixtures::USDT)),
+            id(&address(fixtures::WETH)),
             // A "stable" nobody knows the decimals of (no tokens row, NULL
             // decimals): must stay unpriceable instead of assuming 18.
-            addr(&address(BALANCER_TOKEN_IN)),
+            id(&address(BALANCER_TOKEN_IN)),
         ))
         .await;
 
@@ -776,8 +786,8 @@ async fn seed_reference(database: &TestDb, chain: u64) {
             "INSERT INTO dex_trusted_emitters (chain, emitter, protocol, \
              _version) VALUES ({chain}, {}, 'uniswap_v4', 1), \
              ({chain}, {}, 'balancer_v2', 1)",
-            addr(&address(fixtures::V4_POOL_MANAGER)),
-            addr(&address(fixtures::BALANCER_VAULT)),
+            id(&address(fixtures::V4_POOL_MANAGER)),
+            id(&address(fixtures::BALANCER_VAULT)),
         ))
         .await;
 
@@ -977,13 +987,13 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
     let usd = database
         .client
         .query(&format!(
-            "SELECT toUInt64(block_number), log_index, protocol, symbol_in, \
+            "SELECT toUInt64(block_number), ordinal, protocol, symbol_in, \
              symbol_out, toUInt8(token_in_verified), \
              toUInt8(token_out_verified), ifNull(amount_in_adj, -1), \
              ifNull(amount_usd, -1) FROM dex_swaps_usd_v \
-             WHERE chain = {CHAIN} ORDER BY block_number, log_index"
+             WHERE chain = {CHAIN} ORDER BY block_number, ordinal"
         ))
-        .fetch_all::<(u64, u32, String, String, String, u8, u8, f64, f64)>()
+        .fetch_all::<(u64, u64, String, String, String, u8, u8, f64, f64)>()
         .await
         .unwrap();
 
@@ -1093,7 +1103,7 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
             "SELECT symbol, ifNull(volume_adj, -1), ifNull(volume_usd, -1), \
              swaps, pools FROM dex_token_volume_1d_v WHERE chain = {CHAIN} \
              AND token = {}",
-            addr(&address(fixtures::USDC))
+            id(&address(fixtures::USDC))
         ))
         .fetch_one::<(String, f64, f64, u64, u64)>()
         .await
@@ -1113,7 +1123,7 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
             .count(&format!(
                 "SELECT count() FROM dex_pools_by_token FINAL \
                  WHERE chain = {CHAIN} AND token = {}",
-                addr(&address(fixtures::USDC))
+                id(&address(fixtures::USDC))
             ))
             .await,
         6
@@ -1132,7 +1142,7 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
             .count(&format!(
                 "SELECT count() FROM dex_swaps_by_trader FINAL \
                  WHERE chain = {CHAIN} AND trader = {}",
-                addr(&TRADER_X)
+                id(&TRADER_X)
             ))
             .await,
         4
@@ -1153,10 +1163,9 @@ async fn candles_volumes_and_usd_match_hand_computed_numbers() {
     assert_eq!(
         missing,
         vec![
-            ("99".repeat(20), "uniswap_v2".to_string(), 0),
+            (id_hex(&"99".repeat(20)), "uniswap_v2".to_string(), 0),
             (
-                fixtures::CURVE_UNDERLYING_EXCHANGE.address[2..]
-                    .to_string(),
+                id_hex(fixtures::CURVE_UNDERLYING_EXCHANGE.address),
                 "curve".to_string(),
                 0
             ),
@@ -1177,7 +1186,7 @@ async fn headlines(database: &TestDb) -> Vec<(String, Vec<String>)> {
         ("token volumes", "SELECT * FROM dex_token_volume_1d_v".to_string()),
         (
             "valued swaps",
-            "SELECT chain, block_number, log_index, amount_usd \
+            "SELECT chain, block_number, ordinal, amount_usd \
              FROM dex_swaps_usd_v WHERE amount_usd IS NOT NULL"
                 .to_string(),
         ),
@@ -1304,8 +1313,8 @@ async fn forged_events_do_not_move_any_headline() {
              toUInt8(token_in_verified), ifNull(amount_usd, -1) \
              FROM dex_swaps_usd_v WHERE chain = {CHAIN} AND emitter IN \
              ({}, {}) ORDER BY emitter",
-            addr(&junk_vault),
-            addr(&junk_pair)
+            id(&junk_vault),
+            id(&junk_pair)
         ))
         .fetch_all::<(String, String, u8, f64)>()
         .await
@@ -1314,9 +1323,9 @@ async fn forged_events_do_not_move_any_headline() {
         seen,
         vec![
             // The event NAMES USDC: displayed as a claim, not verified.
-            ("b1".repeat(20), "USDC".to_string(), 0, NULL),
+            (id_hex(&"b1".repeat(20)), "USDC".to_string(), 0, NULL),
             // The junk pair is 'unverified': its tokens are not even shown.
-            ("b2".repeat(20), String::new(), 0, NULL),
+            (id_hex(&"b2".repeat(20)), String::new(), 0, NULL),
         ]
     );
 
@@ -1335,7 +1344,7 @@ async fn forged_events_do_not_move_any_headline() {
         .unwrap();
     assert_eq!(
         pair,
-        ("verified".to_string(), fixtures::USDC[2..].to_string(), 90, 3)
+        ("verified".to_string(), id_hex(fixtures::USDC), 90, 3)
     );
 
     // Even a real looking swap THROUGH the fake vault, with real transfers,
@@ -1426,7 +1435,7 @@ async fn pool_metadata_is_what_the_pool_answers() {
         }
     };
 
-    let usdc_hex = fixtures::USDC[2..].to_string();
+    let usdc_hex = id_hex(fixtures::USDC);
 
     // 1. A PRE-ANNOUNCED forgery: V2 pair addresses are predictable, so
     //    PairCreated(NEWTOKEN, USDC, pair) can be emitted before the pair
@@ -1443,7 +1452,7 @@ async fn pool_metadata_is_what_the_pool_answers() {
         vec![(
             "unverified".into(),
             0,
-            "01".repeat(20),
+            id_hex(&"01".repeat(20)),
             "event".into(),
             80,
             1
@@ -1484,7 +1493,7 @@ async fn pool_metadata_is_what_the_pool_answers() {
         vec![(
             "contested".into(),
             0,
-            "01".repeat(20),
+            id_hex(&"01".repeat(20)),
             "event".into(),
             80,
             2
@@ -1755,7 +1764,7 @@ async fn native_price_is_a_median_without_look_ahead_or_stale_prices() {
             "SELECT toUInt64(block_number), ifNull(native_price, -1), \
              ifNull(amount_usd, -1) FROM dex_swaps_usd_v WHERE chain = \
              {CHAIN} AND emitter = {} ORDER BY block_number",
-            addr(&Address::repeat_byte(0xd6))
+            id(&Address::repeat_byte(0xd6))
         ))
         .fetch_all::<(u64, f64, f64)>()
         .await
@@ -1775,7 +1784,7 @@ async fn native_price_is_a_median_without_look_ahead_or_stale_prices() {
             "SELECT ifNull(sum(volume_usd), -1), toUInt64(sum(priced_swaps)) \
              FROM dex_pool_volume_usd_1h_v WHERE chain = {CHAIN} \
              AND emitter = {}",
-            addr(&Address::repeat_byte(0xd6))
+            id(&Address::repeat_byte(0xd6))
         ))
         .fetch_one::<(f64, u64)>()
         .await
@@ -1823,7 +1832,7 @@ async fn native_price_is_a_median_without_look_ahead_or_stale_prices() {
             "SELECT toUInt8(token_in_verified), toUInt8(token_out_verified), \
              ifNull(amount_usd, -1) FROM dex_swaps_usd_v WHERE chain = \
              {CHAIN} AND emitter = {}",
-            addr(&fot_pair)
+            id(&fot_pair)
         ))
         .fetch_one::<(u8, u8, f64)>()
         .await
@@ -1837,9 +1846,9 @@ async fn native_price_is_a_median_without_look_ahead_or_stale_prices() {
             "INSERT INTO dex_trusted_emitters (chain, emitter, protocol, \
              price_source) VALUES ({CHAIN}, {}, 'uniswap_v2', 1), \
              ({CHAIN}, {}, 'uniswap_v2', 1), ({CHAIN}, {}, 'uniswap_v2', 1)",
-            addr(&Address::repeat_byte(0xd1)),
-            addr(&Address::repeat_byte(0xd2)),
-            addr(&Address::repeat_byte(0xd3)),
+            id(&Address::repeat_byte(0xd1)),
+            id(&Address::repeat_byte(0xd2)),
+            id(&Address::repeat_byte(0xd3)),
         ))
         .await;
     let listed = database
