@@ -232,12 +232,21 @@ fn quiet_block(number: u64) -> Vec<TestTx> {
 struct TestChain {
     blocks: Arc<Mutex<Vec<TestBlock>>>,
     blocks_per_response: u64,
+    block_seconds: u32,
 }
 
 impl TestChain {
+    /// 12 s blocks: the whole chain within one UTC day.
     fn new(length: u64) -> Self {
-        let chain =
-            Self { blocks: Arc::default(), blocks_per_response: 4 };
+        Self::with_block_time(length, 12)
+    }
+
+    fn with_block_time(length: u64, block_seconds: u32) -> Self {
+        let chain = Self {
+            blocks: Arc::default(),
+            blocks_per_response: 4,
+            block_seconds,
+        };
         chain.extend(length, 0, busy_block);
         chain
     }
@@ -268,8 +277,8 @@ impl TestChain {
                 number,
                 hash: B256::from(hash),
                 parent_hash,
-                // 12 s blocks, all within one UTC day.
-                timestamp: BASE_TIMESTAMP + number as u32 * 12,
+                timestamp: BASE_TIMESTAMP
+                    + number as u32 * self.block_seconds,
                 txs: content(number),
             });
         }
@@ -621,7 +630,7 @@ impl Scenario {
         };
 
         tokio::time::timeout(
-            Duration::from_secs(120),
+            Duration::from_secs(600),
             run_with(config, runtime),
         )
         .await
@@ -657,17 +666,7 @@ impl Scenario {
         }
         tables.extend_from_slice(dex::SIDE_TABLES);
 
-        let views = [
-            "daily_block_stats_v",
-            "daily_transaction_stats_v",
-            "daily_erc20_transfer_stats_v",
-            "dex_candles_1m_v",
-            "dex_candles_1h_v",
-            "dex_candles_1d_v",
-            "dex_pool_volume_1h_v",
-            "dex_pool_stats_1d_v",
-            "dex_protocol_stats_1d_v",
-        ];
+        let views = AGGREGATE_VIEWS;
 
         let mut snapshot = BTreeMap::new();
 
@@ -1217,7 +1216,175 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     );
 }
 
+// ------------------------------------------------------------ deep purge
+
+/// A purge deep in history repairs more than 100 monthly partitions of
+/// every aggregate. ClickHouse refuses ONE insert over that many (code
+/// 252), which would wedge the chain for ever (the purge fails at the
+/// rebuild on every restart): the rebuilds are one INSERT per month.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_purge_eleven_years_deep_can_finish() {
+    const MONTH: u32 = 30 * 86_400;
+
+    // Small flushes: ONE insert may not span more than 100 monthly
+    // partitions either (not a concern on a real chain, where a flush of
+    // 100k rows covers hours or days, never eight years).
+    const SMALL_FLUSHES: [&str; 2] = ["--flush-rows", "300"];
+
+    let scenario = Scenario::new("deep").await;
+    let chain = TestChain::with_block_time(135, MONTH);
+    scenario.index_until(&chain, 135, &SMALL_FLUSHES).await;
+
+    // Block 3 (11 years before the head) has to go: every aggregate is
+    // rebuilt from its day on, 132 months.
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(crate::pipeline::backfill::EpochOnly::new(
+            scenario.db.clone(),
+        )),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+    let report = purger
+        .purge_range(CHAIN, 3, Some(4), PurgeReason::GapHeal)
+        .await
+        .expect("the rebuild must be sliced by month");
+    assert_eq!(report.blocks_tombstoned, 1);
+    assert_eq!(report.epoch, 1);
+
+    // The hole is streamed again and everything equals a clean index.
+    scenario.index_until(&chain, 135, &SMALL_FLUSHES).await;
+
+    let clean = Scenario::new("deep_clean").await;
+    clean.index_until(&chain, 135, &SMALL_FLUSHES).await;
+    assert_same(
+        "after a deep purge",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+    scenario.assert_consistent().await;
+}
+
+// ------------------------------------------------------------ the views
+
+const AGGREGATE_VIEWS: [&str; 9] = [
+    "daily_block_stats_v",
+    "daily_transaction_stats_v",
+    "daily_erc20_transfer_stats_v",
+    "dex_candles_1m_v",
+    "dex_candles_1h_v",
+    "dex_candles_1d_v",
+    "dex_pool_volume_1h_v",
+    "dex_pool_stats_1d_v",
+    "dex_protocol_stats_1d_v",
+];
+
+/// `join_use_nulls = 1` is a per user / per profile setting a BI tool or an
+/// ORM may set. The validity rule joins `reorgs` with an ASOF LEFT JOIN: a
+/// chain without reorgs has no row there, and a bare `epoch >= epoch_floor`
+/// would then compare with NULL and silently drop every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn aggregate_views_do_not_depend_on_join_use_nulls() {
+    let scenario = Scenario::new("views").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    let nulls = scenario.db.db.clone().with_option("join_use_nulls", "1");
+
+    for view in AGGREGATE_VIEWS {
+        let sql = format!("SELECT toUInt64(count()) FROM {view}");
+        let default = scenario.count(&sql).await;
+        let with_nulls: u64 = nulls.query(&sql).fetch_one().await.unwrap();
+
+        assert!(default > 0, "{view} is empty");
+        assert_eq!(with_nulls, default, "{view} under join_use_nulls = 1");
+    }
+
+    // ... and after a purge (a `reorgs` row exists) just the same.
+    chain.reorg(2, 2);
+    scenario.index_until(&chain, 14, &[]).await;
+
+    for view in AGGREGATE_VIEWS {
+        let sql = format!("SELECT toUInt64(count()) FROM {view}");
+        let with_nulls: u64 = nulls.query(&sql).fetch_one().await.unwrap();
+        assert_eq!(with_nulls, scenario.count(&sql).await, "{view}");
+    }
+}
+
+/// Receipts had no status before Byzantium: `status` is NULL there, and a
+/// contract creation without a status succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn contracts_view_lists_pre_byzantium_creations() {
+    use crate::db::models::transaction::DatabaseTransaction;
+
+    let scenario = Scenario::new("contracts").await;
+
+    let creation = |index: u8, status: Option<TransactionStatus>| {
+        let mut row = DatabaseTransaction::from_hypersync(
+            &Transaction {
+                block_number: Some(UInt::from(100u64)),
+                transaction_index: Some(UInt::from(u64::from(index))),
+                hash: Some(Hash::from([index; 32])),
+                from: Some(HsAddress::from([0x01; 20])),
+                contract_address: Some(HsAddress::from(
+                    [0xc0 | index; 20],
+                )),
+                status,
+                ..Default::default()
+            },
+            CHAIN,
+            BASE_TIMESTAMP,
+            None,
+        )
+        .unwrap();
+        row._version = 1;
+        row
+    };
+
+    let rows = vec![
+        creation(1, None),
+        creation(2, Some(TransactionStatus::Success)),
+        creation(3, Some(TransactionStatus::Failure)),
+    ];
+    let key = FlushKey { chain: CHAIN, span: (100, 100), version: 1 };
+    scenario.db.insert_flush("transactions", &rows, &key).await.unwrap();
+
+    let listed: Vec<u32> = scenario
+        .db
+        .db
+        .query(
+            "SELECT toUInt32(transaction_index) FROM (SELECT c.*, \
+             t.transaction_index FROM contracts AS c INNER JOIN \
+             transactions AS t ON t.hash = c.transaction_hash) \
+             ORDER BY transaction_index",
+        )
+        .fetch_all()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        listed,
+        vec![1, 2],
+        "NULL status = success, failure is out"
+    );
+}
+
 // ------------------------------------------------------------ the lease
+
+/// Generous ttl: the machine running the tests may be saturated, and a
+/// heartbeat that takes longer than the ttl IS a dead process.
+fn patient_lease() -> LeaseOptions {
+    LeaseOptions {
+        heartbeat: Duration::from_millis(100),
+        ttl: Duration::from_secs(3),
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs TEST_DATABASE_URL"]
@@ -1225,31 +1392,35 @@ async fn a_second_process_on_the_same_chain_refuses_to_start() {
     let scenario = Scenario::new("lease").await;
 
     let (fatal, _) = watch::channel(None);
-    let first = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
+    let first =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
 
-    let error = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .err()
-        .expect("the second instance must refuse");
+    let error =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .err()
+            .expect("the second instance must refuse");
     assert!(format!("{error:#}").contains("already indexing chain 1"));
 
     // After a clean shutdown the next start does not even wait.
     first.release().await;
     let started = std::time::Instant::now();
-    let second = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
-    assert!(started.elapsed() < Duration::from_millis(350));
+    let second =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
+    assert!(started.elapsed() < patient_lease().ttl);
 
     // A killed process (dropped: no release row): the next start waits
     // one ttl, sees no new heartbeat and takes over.
     drop(second);
     let started = std::time::Instant::now();
-    let third = Lease::acquire(&scenario.db, fast_lease(), fatal.clone())
-        .await
-        .unwrap();
-    assert!(started.elapsed() >= fast_lease().ttl);
+    let third =
+        Lease::acquire(&scenario.db, patient_lease(), fatal.clone())
+            .await
+            .unwrap();
+    assert!(started.elapsed() >= patient_lease().ttl);
     third.release().await;
 }

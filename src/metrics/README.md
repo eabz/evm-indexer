@@ -6,13 +6,20 @@
 |---|---|
 | `GET /metrics` | Prometheus text format 0.0.4 |
 | `GET /healthz` | `200 ok` while the process is alive |
-| `GET /readyz` | `200 ready` when `set_ready(true)` was called **and** the last successful flush or head poll is younger than the staleness limit; otherwise `503` and a one-line reason |
+| `GET /readyz` | `200 ready` when ALL of: `set_ready(true)` was called; the most recent flush attempt did not fail; no flush has been running (retrying) for longer than the staleness limit; the last successful flush or head poll is younger than the staleness limit. Otherwise `503` and a one-line reason |
 
 Hand-rolled: atomics behind a clonable `Metrics` handle and a ~250 line
 HTTP/1.1 responder on a tokio `TcpListener`. No new dependencies, no
 metrics-crate types outside this module. One request per connection
 (`Connection: close`), request head limited to 8 KiB and 5 s, at most 64
 concurrent connections, bodies never read.
+
+**`/readyz` is a readiness probe, not a liveness probe.** It answers "is
+this indexer serving fresh data": take a not-ready indexer out of a
+dashboard or load balancer, do NOT restart the process on it. A ClickHouse
+outage makes every indexer not ready and a restart loop would only add
+load; a flush that fails for good already ends the process by itself. Use
+`/healthz` for liveness.
 
 ## Metric reference
 
@@ -44,13 +51,24 @@ first value is recorded.
 | `reorg_last_depth` | gauge | | Depth of the most recent reorganization |
 | `purge_duration_seconds` | histogram | `le` | `purge_range` latency (rollback, gap healing); 50 ms to 900 s |
 | `purged_blocks_total` | counter | | Blocks removed by `purge_range` |
-| `resolver_queue_depth` | gauge | `worker` = `tokens` \| `pools` | Addresses waiting for the background resolver |
-| `resolver_resolved_total` | counter | `worker` | Resolved with metadata |
+| `resolver_queue_depth` | gauge | `worker` = `tokens` \| `pools` \| `venues` | Addresses waiting for the background resolver |
+| `resolver_resolved_total` | counter | `worker` | Resolved WITH metadata. Negatives are NOT included (`resolved + negative` = addresses answered) |
 | `resolver_negative_total` | counter | `worker` | Resolved to nothing (reverts, garbage) |
+| `resolver_codeless_total` | counter | `worker` | No contract code at the address (asked again later, no row) |
 | `resolver_dropped_total` | counter | `worker` | Discoveries dropped on a full queue (healed by the backfill) |
-| `resolver_cache_hits_total`, `resolver_cache_misses_total` | counter | `worker` | Resolver cache |
+| `resolver_inserted_total` | counter | `worker` | Rows durably inserted by the worker |
+| `resolver_insert_failures_total` | counter | `worker` | Batches the worker could not store after its retries. **Growing = rows are being lost until the backfill finds them again** |
+| `resolver_rpc_failures_total` | counter | `worker` | Addresses the RPC could not be asked about (retried later) |
+| `resolver_backfill_found_total` | counter | `worker` | Addresses the database backfill reported missing: what the live path lost and the backfill healed |
+| `resolver_backfill_failures_total` | counter | `worker` | Backfill queries that failed. **Growing = nothing heals** |
+| `resolver_unconfirmed_total` | counter | `worker` | Answers of a public endpoint no second provider confirmed (nothing stored) |
+| `resolver_blank_rechecked_total`, `resolver_blank_healed_total` | counter | `worker` | Blank rows verified again / replaced by real metadata |
+| `resolver_cache_hits_total`, `resolver_cache_misses_total` | counter | `worker` | Resolver cache (pools / venues: already known vs queued) |
 | `resolver_breaker_open` | gauge | `worker` | 1 when every RPC endpoint's breaker is open |
-| `resolver_endpoints_healthy` | gauge | `worker` | Healthy RPC endpoints |
+| `resolver_endpoints_total`, `resolver_endpoints_healthy`, `resolver_endpoints_distrusted` | gauge | `worker` | RPC endpoints configured or discovered / healthy / caught contradicting the others (reported by `tokens`; the workers share one RPC backend) |
+
+A worker that is off (`--no-dex`, `--no-predictions`, `--rpc none`) has no
+series at all.
 
 Cache hit rate:
 
@@ -120,6 +138,10 @@ let metrics = match args.metrics_addr {
   (failures too), `rows_inserted` per table inside the sink,
   `flush_retry(table)` in the insert retry loop.
 - `table` labels are `&'static str`: pass table-name literals.
-- `set_token_stats` / `set_pool_stats` take `WorkerStatsSnapshot`
-  (aliased as `TokenStatsSnapshot` / `PoolStatsSnapshot`); map the
-  workers' own stats into it on a timer or after each flush.
+- `flush_started` right before a flush, `flush_observed` right after:
+  the pair is what lets `/readyz` see a flush that is stuck retrying.
+- `set_token_stats` / `set_pool_stats` / `set_venue_stats` take
+  `WorkerStatsSnapshot`; `pipeline::workers` maps the workers' own stats
+  into it every 5 s. `resolved` there EXCLUDES negatives:
+  `tokens::TokenWorkerStats::resolved` includes them, so the mapping
+  subtracts (`token_stats_snapshot`), otherwise they are counted twice.

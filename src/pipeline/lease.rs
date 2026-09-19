@@ -15,7 +15,9 @@
 //!   is dead and this one takes over;
 //! * while running, every heartbeat also looks for a live OLDER instance
 //!   (two processes started in the same instant, or a read that lagged at
-//!   startup): the younger process stops;
+//!   startup): the younger process stops. A process whose own heartbeats
+//!   stalled for longer than the ttl stops for ANY live instance: it may
+//!   have been taken over;
 //! * a clean shutdown writes `released = 1`, so a restart does not wait.
 //!
 //! Cost: one tiny insert and one tiny query per heartbeat.
@@ -239,9 +241,9 @@ impl Lease {
 
                     if !older.is_empty() {
                         let _ = fatal.send(Some(format!(
-                            "another, older indexer process is indexing \
-                             chain {} into this database ({}). Stopping \
-                             this one.",
+                            "another indexer process is indexing chain {} \
+                             into this database ({}) and has precedence. \
+                             Stopping this one.",
                             db.chain_id,
                             describe(&older)
                         )));

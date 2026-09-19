@@ -151,7 +151,7 @@ pub struct Purger {
     metrics: Arc<dyn ReorgMetrics>,
     options: PurgeOptions,
     /// `_version` of the tombstones of one purge.
-    next_version: fn() -> u64,
+    next_version: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// Highest epoch this process wrote per chain: the `reorgs` row of the
     /// previous purge may not be readable yet.
     epochs: Arc<Mutex<HashMap<u64, u32>>>,
@@ -178,9 +178,19 @@ impl Purger {
             cache,
             metrics,
             options: PurgeOptions::default(),
-            next_version: crate::db::next_version,
+            next_version: Arc::new(crate::db::next_version),
             epochs: Arc::default(),
         }
+    }
+
+    /// Another source of `_version`s (the in-memory model drives its own
+    /// clock to simulate a wall clock that stepped back).
+    pub fn with_version_source(
+        mut self,
+        next_version: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        self.next_version = next_version;
+        self
     }
 
     pub fn with_options(mut self, options: PurgeOptions) -> Self {

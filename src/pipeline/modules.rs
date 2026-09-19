@@ -441,8 +441,10 @@ pub struct ModuleSpec {
     /// The tombstone INSERT for `[from, to)` of a base table.
     pub tombstone_sql:
         fn(&str, u64, u64, Option<u64>, u64) -> Result<String>,
-    /// The statements that rebuild one of `derived`, see [`Rebuild`].
-    pub rebuild_sql: fn(&DerivedTable, &Rebuild) -> Vec<String>,
+    /// The module's `rebuild_statements`: the INSERTs that rebuild one of
+    /// `derived` for a [`Rebuild`], ONE PER UTC MONTH (ClickHouse refuses
+    /// an insert touching more than 100 partitions).
+    pub rebuild_statements: fn(&DerivedTable, &Rebuild) -> Vec<String>,
 }
 
 /// One bucket repair (docs/design.md, section 2).
@@ -460,15 +462,18 @@ pub struct Rebuild {
 }
 
 /// The rebuild of a table whose `rebuild_sql` follows the core convention
-/// (`{chain}`, `{from_ts}`, `{epoch}`, `{purge_from}`, `{purge_to}`).
+/// (`{chain}`, `{from_ts}`, `{to_ts}`, `{epoch}`, `{purge_from}`,
+/// `{purge_to}`): one INSERT per UTC month, see
+/// `DerivedTable::rebuild_statements`.
 pub fn plain_rebuild(table: &DerivedTable, r: &Rebuild) -> Vec<String> {
-    vec![table.rebuild_sql(
+    table.rebuild_statements(
         r.chain,
         r.from_ts,
+        r.to_ts,
         r.epoch,
         r.purged_from,
         r.purged_to,
-    )]
+    )
 }
 
 /// DEX: one statement per month, bounded by `to_ts`. Its SQL has no
@@ -501,7 +506,7 @@ pub const DEX: ModuleSpec = ModuleSpec {
     block_column: dex::block_column,
     purge_filter: dex::purge_filter,
     tombstone_sql: dex_tombstone_sql,
-    rebuild_sql: dex_rebuild,
+    rebuild_statements: dex_rebuild,
 };
 
 pub const PREDICTIONS: ModuleSpec = ModuleSpec {
@@ -513,7 +518,8 @@ pub const PREDICTIONS: ModuleSpec = ModuleSpec {
     // Plain `block_number` tables: the generic statement built from the
     // embedded migration DDL.
     tombstone_sql: db::tombstone_sql,
-    rebuild_sql: plain_rebuild,
+    // Sliced by month as soon as its SQL carries `{to_ts}`.
+    rebuild_statements: plain_rebuild,
 };
 
 // MODULE: pub const LAUNCHPADS: ModuleSpec = ...
@@ -521,6 +527,17 @@ pub const PREDICTIONS: ModuleSpec = ModuleSpec {
 /// Every module the binary knows, enabled or not (`indexer verify` looks
 /// at the data, not at the run flags).
 pub const ALL_MODULES: &[&ModuleSpec] = &[&DEX, &PREDICTIONS];
+
+/// Every table a process writes versioned rows of a chain into: what
+/// `Database::seed_version` looks at.
+pub fn versioned_tables() -> Vec<&'static str> {
+    let mut tables: Vec<&'static str> = db::BASE_TABLES.to_vec();
+    tables.push("checkpoints");
+    for spec in ALL_MODULES {
+        tables.extend_from_slice(spec.base_tables);
+    }
+    tables
+}
 
 /// `WHERE` clause selecting the block scoped rows of `[from, to)` in a
 /// module table.

@@ -8,9 +8,9 @@
 use super::{
     find_fork_point,
     model::{
-        assert_checkpoints_honest, assert_clean, check_clean, Agg,
+        assert_checkpoints_honest, assert_clean, check_clean, live, Agg,
         FakeChain, FakeStore, FlushFault, Node, NodeOptions, PassOutcome,
-        Rng,
+        Rng, Row,
     },
     BlockHeader, CanonicalChain, PurgeReason, PurgeStep, ReorgConfig,
     ReorgError, ReorgStore, StreamGuard, Verdict,
@@ -1268,6 +1268,73 @@ async fn orphans_above_a_chain_that_got_shorter_are_healed() {
     assert_clean(&node, "orphans above the head");
 }
 
+/// A host whose wall clock stepped back (NTP, VM snapshot): the process
+/// that starts on it must not hand out `_version`s below the stored ones,
+/// or the tombstones of its purge (version V) would beat the canonical
+/// rows streamed afterwards (version V' < V) and the range would stay
+/// invisible until the clock catches up.
+#[tokio::test]
+async fn a_clock_that_stepped_back_never_writes_below_the_stored_versions()
+{
+    let mut node = indexed(30, NodeOptions::new(CHAIN)).await;
+    let stored = node.data().max_version();
+
+    node.restart_with_clock_step_back(3_600_000);
+    node.chain.reorg(4, 6);
+    node.settle(false).await.unwrap();
+
+    assert_clean(&node, "after a rollback on a host with a late clock");
+    assert!(node.data().reorgs[0].epoch == 1);
+
+    // Every row written since is newer than everything stored before.
+    let data = node.data();
+    let newest_block = data.live_blocks().into_keys().max().unwrap();
+    assert!(data.blocks[&newest_block]
+        .iter()
+        .all(|row| row.version > stored));
+}
+
+/// Negative control: without the seed the same history ends with rows a
+/// reader can not see.
+#[tokio::test]
+async fn without_the_version_seed_a_late_clock_hides_the_new_fork() {
+    let options =
+        NodeOptions { seed_versions: false, ..NodeOptions::new(CHAIN) };
+    let mut node = indexed(30, options).await;
+
+    // First a rollback with the healthy clock: tombstones at "now".
+    node.chain.reorg(4, 6);
+    node.settle(false).await.unwrap();
+    assert_clean(&node, "healthy clock");
+
+    // Then the clock steps back and the same heights are rolled back
+    // again: the re-streamed rows are older than the first tombstones.
+    node.restart_with_clock_step_back(3_600_000);
+    node.chain.reorg(4, 6);
+    let _ = node.settle(false).await;
+
+    assert!(
+        check_clean(&node).is_err(),
+        "the model no longer reproduces the version regression"
+    );
+}
+
+/// Equal versions: ClickHouse keeps the row inserted LAST.
+#[test]
+fn final_keeps_the_last_inserted_row_of_equal_versions() {
+    let row = |deleted| Row {
+        version: 7,
+        deleted,
+        epoch: 0,
+        timestamp: 0,
+        data: 1u64,
+    };
+
+    // Tombstone last: gone. Canonical last: alive.
+    assert!(live(&[row(false), row(true)]).is_empty());
+    assert_eq!(live(&[row(true), row(false)]).len(), 1);
+}
+
 #[tokio::test]
 async fn the_epoch_survives_restarts_and_failed_purges() {
     let mut node = indexed(40, NodeOptions::new(CHAIN)).await;
@@ -1301,6 +1368,7 @@ struct Tally {
     gap_heals: u64,
     faults_hit: u64,
     lagged_reads: u64,
+    clock_regressions: u64,
 }
 
 fn random_options(rng: &mut Rng, chain_id: u64) -> NodeOptions {
@@ -1316,6 +1384,7 @@ fn random_options(rng: &mut Rng, chain_id: u64) -> NodeOptions {
         stream_guards: rng.chance(50),
         check_tip: rng.chance(50),
         sloppy_writer: rng.chance(50),
+        seed_versions: true,
     }
 }
 
@@ -1368,7 +1437,19 @@ async fn random_operation(
             node.chain
                 .reorg_after_calls(rng.between(1, 6), rng.between(1, 4));
         }
-        _ => node.restart(),
+        _ => {
+            // Half of the restarts come back on a host whose clock is
+            // behind (up to an hour): without the version seed the new
+            // process would write BELOW the stored versions.
+            if rng.chance(50) {
+                node.restart_with_clock_step_back(
+                    rng.between(1, 3_600_000),
+                );
+                tally.clock_regressions += 1;
+            } else {
+                node.restart();
+            }
+        }
     }
 
     let faulty = node.store.fault_pending(chain_id);
@@ -1434,6 +1515,7 @@ async fn random_histories_always_settle_to_a_clean_index() {
         gap_heals: 0,
         faults_hit: 0,
         lagged_reads: 0,
+        clock_regressions: 0,
     };
 
     for seed in 1..=400u64 {
@@ -1472,6 +1554,7 @@ async fn random_histories_always_settle_to_a_clean_index() {
 
     // The generator must actually exercise what it claims to.
     assert!(tally.lagged_reads > 1_000);
+    assert!(tally.clock_regressions > 100);
     assert!(tally.rollbacks > 400);
     assert!(tally.gap_heals > 100);
     assert!(tally.faults_hit > 100);
@@ -1487,6 +1570,7 @@ async fn chains_sharing_a_store_never_affect_each_other() {
         gap_heals: 0,
         faults_hit: 0,
         lagged_reads: 0,
+        clock_regressions: 0,
     };
 
     for seed in 1..=60u64 {

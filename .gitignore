@@ -14,3 +14,6 @@
 # Local agent tooling
 .tirith/
 .claude/
+
+# ClickHouse test servers started from the repo root
+preprocessed_configs/
