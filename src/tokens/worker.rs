@@ -16,9 +16,17 @@
 //! from there, however long the outage was.
 //!
 //! The backfill is also the authority over the caches: a token the
-//! database keeps reporting as missing although memory / Redis believe it
-//! is stored (a `tokens` table that was reset without flushing Redis, a
-//! lost insert) is fetched again the second time it is reported.
+//! database reports as missing is fetched again whatever memory / Redis
+//! believe (a `tokens` table that was reset without flushing Redis, a lost
+//! insert), unless it was stored so recently that the query could not see
+//! it yet. The listing is paged with a cursor, so tokens that cannot be
+//! resolved for now never keep the others from being reported.
+//!
+//! "Nothing there" is never final either: blank rows are what a stale or
+//! lying node makes of a good token, so the database is periodically asked
+//! for them ([`MissingTokenSource::blank_tokens`]) and the ones that are
+//! due are verified again; `tokens` is a `ReplacingMergeTree`, a row with
+//! metadata replaces the blank one.
 //!
 //! Reorgs need nothing: tokens are not block scoped. A token discovered in
 //! a block that is later purged is resolved like any other (its row is
@@ -62,18 +70,49 @@ pub trait TokenSink: Send + Sync + 'static {
 
 /// The database side of the backfill (an anti-join of the transfer tables
 /// and `dex_pools` against `tokens`).
+///
+/// **Ordering.** Every listing must be ordered by address, ascending, and
+/// `after` means `address > after`: the worker pages through the listing
+/// with that cursor and starts over when a page comes back short. A
+/// random or unstable order would make it skip tokens.
 pub trait MissingTokenSource: Send + Sync + 'static {
-    /// Up to `limit` token addresses referenced by stored data but absent
-    /// from `tokens`.
-    ///
-    /// Addresses that cannot be resolved right now are reported again on
-    /// the next call: prefer an order that does not always put the same
-    /// addresses first (the worker does give up on them eventually, see
-    /// [`TokenResolverOptions::empty_strikes`]).
+    /// The first `limit` token addresses (by address) referenced by
+    /// stored data but absent from `tokens`.
     fn missing_tokens<'a>(
         &'a self,
         limit: usize,
     ) -> BoxFuture<'a, anyhow::Result<Vec<(Address, TokenStandard)>>>;
+
+    /// [`missing_tokens`](Self::missing_tokens) continued after a cursor.
+    ///
+    /// Implement it: the default only knows the first page, so tokens
+    /// that cannot be resolved (and therefore stay in the listing) would
+    /// eventually fill that page and hide everything behind them.
+    fn missing_tokens_after<'a>(
+        &'a self,
+        after: Option<Address>,
+        limit: usize,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<(Address, TokenStandard)>>> {
+        match after {
+            None => self.missing_tokens(limit),
+            Some(_) => Box::pin(async { Ok(Vec::new()) }),
+        }
+    }
+
+    /// Up to `limit` tokens (by address, after the cursor) whose stored
+    /// row is blank (`name = '' AND symbol = '' AND decimals = 0`) and
+    /// was written more than `older_than` ago (`_version`, the insert
+    /// time). They are verified again: a stale node says "nothing there"
+    /// about perfectly good tokens. The default lists nothing.
+    fn blank_tokens<'a>(
+        &'a self,
+        after: Option<Address>,
+        limit: usize,
+        older_than: Duration,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<(Address, TokenStandard)>>> {
+        let _ = (after, limit, older_than);
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// Tunables of the [`TokenWorker`].
@@ -101,9 +140,16 @@ pub struct TokenWorkerOptions {
     /// The interval doubles up to this while the backfill finds nothing.
     pub backfill_max_interval: Duration,
     /// `limit` of a backfill query. A query that comes back full is
-    /// followed by the next one as soon as the queue is drained.
+    /// followed by the next page as soon as the queue has room.
     pub backfill_limit: usize,
     pub backfill_timeout: Duration,
+    /// Never two database listings closer than this, whatever the state
+    /// of the queue (they are heavy anti-joins).
+    pub backfill_min_interval: Duration,
+    /// Time between two passes over the blank rows of the database.
+    pub blank_recheck_interval: Duration,
+    /// Only blank rows written longer ago than this are listed.
+    pub blank_recheck_age: Duration,
     /// How long `shutdown` lets an insert that is already running finish.
     pub shutdown_grace: Duration,
     pub resolver: TokenResolverOptions,
@@ -124,6 +170,9 @@ impl Default for TokenWorkerOptions {
             backfill_max_interval: Duration::from_secs(600),
             backfill_limit: 5_000,
             backfill_timeout: Duration::from_secs(120),
+            backfill_min_interval: Duration::from_secs(5),
+            blank_recheck_interval: Duration::from_secs(3_600),
+            blank_recheck_age: Duration::from_secs(24 * 3_600),
             shutdown_grace: Duration::from_secs(5),
             resolver: TokenResolverOptions::default(),
         }
@@ -157,6 +206,12 @@ pub struct TokenWorkerStats {
     pub cache_misses: u64,
     /// Tokens the RPC could not be asked about (tried again later).
     pub rpc_failures: u64,
+    /// Tokens answered by one endpoint but not confirmed by a second,
+    /// independent one: nothing was stored (tried again later).
+    pub unconfirmed: u64,
+    /// Blank rows that were verified again / that got metadata then.
+    pub blank_rechecked: u64,
+    pub blank_healed: u64,
     pub backfill_runs: u64,
     /// Addresses the backfill reported as missing.
     pub backfill_found: u64,
@@ -166,14 +221,25 @@ pub struct TokenWorkerStats {
     pub breaker_open: bool,
     pub endpoints_total: usize,
     pub endpoints_healthy: usize,
+    /// Endpoints banned for contradicting the others.
+    pub endpoints_distrusted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Seen by the pipeline: the caches are trusted.
+    Seen,
+    /// Reported missing by the database: the caches are not asked.
+    Missing,
+    /// A blank row due to be verified again.
+    Recheck,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Queued {
     address: Address,
     standard: TokenStandard,
-    /// Reported missing by the database although the caches know it.
-    forced: bool,
+    kind: Kind,
 }
 
 #[derive(Default)]
@@ -193,6 +259,8 @@ struct Counters {
     backfill_runs: AtomicU64,
     backfill_found: AtomicU64,
     backfill_failures: AtomicU64,
+    blank_rechecked: AtomicU64,
+    blank_healed: AtomicU64,
 }
 
 struct Shared {
@@ -376,8 +444,16 @@ impl TokenWorker {
         }
 
         shared.enqueue(unknown.into_iter().map(|(address, standard)| {
-            Queued { address, standard, forced: false }
+            Queued { address, standard, kind: Kind::Seen }
         }));
+    }
+
+    /// Tells the worker how far the indexer has got (the highest block
+    /// handed to the writer is fine). NEVER blocks: one atomic store. The
+    /// RPC backend uses it to recognize stale nodes: a node behind the
+    /// indexer cannot know the contracts it is asked about.
+    pub fn set_head(&self, block: u64) {
+        self.shared.resolver.set_head(block);
     }
 
     pub fn stats(&self) -> TokenWorkerStats {
@@ -401,12 +477,16 @@ impl TokenWorker {
             cache_hits: resolver.cache_hits,
             cache_misses: resolver.cache_misses,
             rpc_failures: resolver.rpc_failures,
+            unconfirmed: resolver.unconfirmed,
+            blank_rechecked: load(&counters.blank_rechecked),
+            blank_healed: load(&counters.blank_healed),
             backfill_runs: load(&counters.backfill_runs),
             backfill_found: load(&counters.backfill_found),
             backfill_failures: load(&counters.backfill_failures),
             breaker_open: resolver.breaker_open,
             endpoints_total: health.endpoints_total,
             endpoints_healthy: health.endpoints_healthy,
+            endpoints_distrusted: health.endpoints_distrusted,
         }
     }
 
@@ -502,11 +582,18 @@ struct Backfill {
     source: Arc<dyn MissingTokenSource>,
     next_at: Instant,
     interval: Duration,
+    /// Where the next page of the missing tokens listing starts.
+    cursor: Option<Address>,
+    /// Anything was queued since the cursor last started over.
+    pass_found: bool,
     /// `dropped` counter when the last query ran.
     dropped_seen: u64,
-    /// Reported missing last time although the caches knew them.
-    suspects: HashSet<Address>,
     failing: bool,
+    /// The pass over the blank rows.
+    blank_next_at: Instant,
+    blank_cursor: Option<Address>,
+    /// Earliest time any database listing may run again.
+    floor_at: Instant,
 }
 
 /// Tokens the RPC repeatedly could not answer, kept away from everybody
@@ -586,6 +673,12 @@ impl Retries {
         let mut requeue = Vec::new();
 
         for token in &processed.unresolved {
+            // A blank row that could not be verified again stays what it
+            // is; the next pass over the blank rows lists it again.
+            if token.kind == Kind::Recheck {
+                continue;
+            }
+
             let failure = {
                 let failure =
                     self.failures.entry(token.address).or_default();
@@ -621,6 +714,10 @@ impl Retries {
         }
 
         requeue
+    }
+
+    fn is_proven(&self, address: &Address) -> bool {
+        self.failures.get(address).is_some_and(|failure| failure.proven)
     }
 
     /// Up to `limit` tokens whose delay is over, the most overdue first.
@@ -673,9 +770,14 @@ async fn run(
         // Right away: heal whatever previous runs left behind.
         next_at: Instant::now(),
         interval: options.backfill_interval,
+        cursor: None,
+        pass_found: false,
         dropped_seen: 0,
-        suspects: HashSet::new(),
         failing: false,
+        // Not at startup: the missing tokens go first.
+        blank_next_at: Instant::now() + options.backfill_interval,
+        blank_cursor: None,
+        floor_at: Instant::now(),
     });
 
     let mut retries = Retries::default();
@@ -692,15 +794,20 @@ async fn run(
         // RPC paused: keep everything queued (the queue is bounded and
         // what it drops is backfilled) and wait for the next probe.
         if !resolver.rpc_available() {
-            if resolver.wrong_chain() && !wrong_chain_logged {
+            if !resolver.wrong_chain() {
+                wrong_chain_logged = false;
+            } else if !wrong_chain_logged {
                 wrong_chain_logged = true;
                 error!(
-                    "Token metadata stays disabled for this run: the RPC \
-                     serves another chain"
+                    "Token metadata is disabled: the RPC serves another \
+                     chain (it is asked again periodically)"
                 );
             }
 
-            let wait = match resolver.rpc_retry_at() {
+            let wait = match resolver
+                .rpc_retry_at()
+                .or_else(|| resolver.chain_recheck_at())
+            {
                 Some(at) => at.saturating_duration_since(Instant::now()),
                 None => options.retry_delay,
             }
@@ -713,15 +820,23 @@ async fn run(
         }
 
         if let Some(backfill) = &mut backfill {
-            let due = Instant::now() >= backfill.next_at;
+            let now = Instant::now();
             let room = shared.queue_len() * 2
                 <= shared.options.queue_capacity.max(1);
 
-            if due && room {
-                tokio::select! {
-                    biased;
-                    _ = stopped(&mut stop) => return,
-                    _ = run_backfill(&shared, backfill) => {}
+            if room && now >= backfill.floor_at {
+                if now >= backfill.next_at {
+                    tokio::select! {
+                        biased;
+                        _ = stopped(&mut stop) => return,
+                        _ = run_backfill(&shared, backfill) => {}
+                    }
+                } else if now >= backfill.blank_next_at {
+                    tokio::select! {
+                        biased;
+                        _ = stopped(&mut stop) => return,
+                        _ = run_blank_recheck(&shared, backfill) => {}
+                    }
                 }
             }
         }
@@ -739,7 +854,7 @@ async fn run(
             }
 
             let batch = shared.take_batch();
-            let processed = process(&shared, &*sink, &batch).await;
+            let processed = process(&shared, &*sink, &batch, false).await;
             if processed.stop {
                 return;
             }
@@ -758,8 +873,11 @@ async fn run(
                 continue;
             }
 
+            // A token that fails while the RPC works for everybody else
+            // is the problem itself: its failures open no breaker.
+            let quiet = retries.is_proven(&token.address);
             let batch = [token];
-            let processed = process(&shared, &*sink, &batch).await;
+            let processed = process(&shared, &*sink, &batch, quiet).await;
             if processed.stop {
                 return;
             }
@@ -778,7 +896,12 @@ async fn run(
         } else if !worked {
             // Idle: wait for tokens, the next backfill / retry, shutdown.
             let next = [
-                backfill.as_ref().map(|backfill| backfill.next_at),
+                backfill.as_ref().map(|backfill| {
+                    backfill
+                        .next_at
+                        .min(backfill.blank_next_at)
+                        .max(backfill.floor_at)
+                }),
                 retries.next_due(),
             ]
             .into_iter()
@@ -822,18 +945,17 @@ async fn process(
     shared: &Shared,
     sink: &dyn TokenSink,
     batch: &[Queued],
+    quiet: bool,
 ) -> Processed {
     let resolver = &shared.resolver;
+    let counters = &shared.counters;
     let mut stop = shared.shutdown.subscribe();
-    let mut rows = Vec::new();
     let mut processed = Processed::default();
 
-    for (mode, forced) in
-        [(ResolveMode::Normal, false), (ResolveMode::Forced, true)]
-    {
+    for kind in [Kind::Seen, Kind::Missing, Kind::Recheck] {
         let tokens: HashMap<Address, TokenStandard> = batch
             .iter()
-            .filter(|token| token.forced == forced)
+            .filter(|token| token.kind == kind)
             .map(|token| (token.address, token.standard))
             .collect();
 
@@ -841,60 +963,102 @@ async fn process(
             continue;
         }
 
+        let mode = match kind {
+            Kind::Seen => ResolveMode::Normal,
+            Kind::Missing | Kind::Recheck => ResolveMode::Forced,
+        };
+
         let resolution = tokio::select! {
             biased;
-            // Abandoning the fetch releases the claims it holds; rows
-            // resolved so far are given back as well.
+            // Abandoning the fetch releases the claims it holds.
             _ = stopped(&mut stop) => {
-                resolver.release(&rows);
                 processed.stop = true;
                 return processed;
             }
-            resolution = resolver.resolve(&tokens, mode) => resolution,
+            resolution = resolver.resolve_with(&tokens, mode, quiet) => {
+                resolution
+            }
         };
-        rows.extend(resolution.rows);
+
         processed.unresolved.extend(
             resolution.unresolved.into_iter().map(
-                |(address, standard)| Queued { address, standard, forced },
+                |(address, standard)| Queued { address, standard, kind },
             ),
         );
-    }
 
-    if rows.is_empty() {
-        return processed;
-    }
-    processed.progress = true;
-
-    match insert(shared, sink, &rows).await {
-        Inserted::Yes => {
-            // Durable: only now may the caches know about them.
-            resolver.mark_stored(&rows).await;
-            shared
-                .counters
-                .inserted
-                .fetch_add(rows.len() as u64, Ordering::Relaxed);
+        let rows = resolution.rows;
+        if rows.is_empty() {
+            continue;
         }
-        failed => {
-            // Not stored: not marked, and free to be resolved again.
-            resolver.release(&rows);
-            shared
-                .counters
-                .insert_failures
-                .fetch_add(1, Ordering::Relaxed);
+        processed.progress = true;
 
-            if matches!(failed, Inserted::Stopped) {
-                processed.stop = true;
-                return processed;
+        match insert(shared, sink, &rows).await {
+            Inserted::Yes => {
+                // Durable: only now may the caches know about them. The
+                // cache write is not worth delaying a shutdown for (the
+                // rows are in the database, which is what counts).
+                let mark = async {
+                    if kind == Kind::Recheck {
+                        resolver.mark_rechecked(&rows).await
+                    } else {
+                        resolver.mark_stored(&rows).await
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = mark => {}
+                    _ = stopped(&mut stop) => processed.stop = true,
+                }
+
+                counters
+                    .inserted
+                    .fetch_add(rows.len() as u64, Ordering::Relaxed);
+
+                if kind == Kind::Recheck {
+                    let healed = rows
+                        .iter()
+                        .filter(|row| !super::cache::is_blank(row))
+                        .count();
+                    counters
+                        .blank_rechecked
+                        .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                    counters
+                        .blank_healed
+                        .fetch_add(healed as u64, Ordering::Relaxed);
+                    if healed > 0 {
+                        info!(
+                            "{healed} tokens that were stored without \
+                             metadata have some now"
+                        );
+                    }
+                }
+
+                if processed.stop {
+                    return processed;
+                }
             }
+            failed => {
+                // Not stored: not marked, and free to be resolved again.
+                resolver.release(&rows);
+                counters.insert_failures.fetch_add(1, Ordering::Relaxed);
 
-            let failed: HashSet<Address> =
-                rows.iter().map(|row| row.address).collect();
-            processed.not_stored.extend(
-                batch
-                    .iter()
-                    .filter(|token| failed.contains(&token.address))
-                    .copied(),
-            );
+                if matches!(failed, Inserted::Stopped) {
+                    processed.stop = true;
+                    return processed;
+                }
+
+                let failed: HashSet<Address> =
+                    rows.iter().map(|row| row.address).collect();
+                processed.not_stored.extend(
+                    batch
+                        .iter()
+                        .filter(|token| {
+                            token.kind != Kind::Recheck
+                                && failed.contains(&token.address)
+                        })
+                        .copied(),
+                );
+            }
         }
     }
 
@@ -977,6 +1141,54 @@ async fn insert(
     Inserted::No
 }
 
+/// Runs a database listing with the timeout and the failure bookkeeping
+/// both passes share. `None`: it failed (already reported).
+async fn listing(
+    shared: &Shared,
+    backfill: &mut Backfill,
+    what: &str,
+    query: BoxFuture<'_, anyhow::Result<Vec<(Address, TokenStandard)>>>,
+) -> Option<Vec<(Address, TokenStandard)>> {
+    let options = &shared.options;
+
+    let found = tokio::time::timeout(options.backfill_timeout, query)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "no answer within {:?}",
+                options.backfill_timeout
+            ))
+        });
+
+    // Heavy queries: never back to back, whatever they found.
+    backfill.floor_at = Instant::now() + options.backfill_min_interval;
+
+    match found {
+        Ok(found) => {
+            if std::mem::take(&mut backfill.failing) {
+                info!("Token backfill queries work again");
+            }
+            Some(found)
+        }
+        Err(error) => {
+            shared
+                .counters
+                .backfill_failures
+                .fetch_add(1, Ordering::Relaxed);
+            let error = redact_urls(&format!("{error:#}"));
+            if !std::mem::replace(&mut backfill.failing, true) {
+                warn!(
+                    "Unable to query the {what} of the database, trying \
+                     again later: {error}"
+                );
+            } else {
+                debug!("Token backfill query still failing: {error}");
+            }
+            None
+        }
+    }
+}
+
 async fn run_backfill(shared: &Shared, backfill: &mut Backfill) {
     let options = &shared.options;
     let counters = &shared.counters;
@@ -984,92 +1196,43 @@ async fn run_backfill(shared: &Shared, backfill: &mut Backfill) {
 
     counters.backfill_runs.fetch_add(1, Ordering::Relaxed);
 
-    let found = tokio::time::timeout(
-        options.backfill_timeout,
-        backfill.source.missing_tokens(limit),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(anyhow::anyhow!(
-            "no answer within {:?}",
-            options.backfill_timeout
-        ))
-    });
+    let started = Instant::now();
+    let source = backfill.source.clone();
+    let query = source.missing_tokens_after(backfill.cursor, limit);
 
-    let found = match found {
-        Ok(found) => {
-            if std::mem::take(&mut backfill.failing) {
-                info!("Token backfill query works again");
-            }
-            found
-        }
-        Err(error) => {
-            counters.backfill_failures.fetch_add(1, Ordering::Relaxed);
-            let error = redact_urls(&format!("{error:#}"));
-            if !std::mem::replace(&mut backfill.failing, true) {
-                warn!(
-                    "Unable to query the tokens missing from the \
-                     database, trying again later: {error}"
-                );
-            } else {
-                debug!("Token backfill query still failing: {error}");
-            }
-            backfill.next_at = Instant::now() + backfill.interval;
-            return;
-        }
+    let Some(found) =
+        listing(shared, backfill, "tokens missing from", query).await
+    else {
+        backfill.next_at = Instant::now() + backfill.interval;
+        return;
     };
 
     counters
         .backfill_found
         .fetch_add(found.len() as u64, Ordering::Relaxed);
 
-    // What memory thinks of them. Tokens it would resolve anyway go the
-    // normal way (Redis may still know them: then they come back as
-    // suspects next time). Tokens it believes stored are suspects: once
-    // is a race with an insert, twice is a cache that is wrong.
-    let reported: HashMap<Address, TokenStandard> =
-        found.iter().copied().collect();
-    let unknown: HashSet<Address> = shared
+    // The database is the authority: what it lacks is fetched whatever
+    // the caches believe, except what is being worked on, what has no
+    // code for now, and what was stored too recently for this very query
+    // to have seen it.
+    let tokens: Vec<Queued> = shared
         .resolver
-        .filter_unknown(&reported)
+        .missing_in_database(&found, started)
         .into_iter()
-        .map(|(address, _)| address)
+        .map(|(address, standard)| Queued {
+            address,
+            standard,
+            kind: Kind::Missing,
+        })
         .collect();
 
-    let mut suspects = HashSet::new();
-    let mut tokens = Vec::with_capacity(found.len());
-
-    for (address, standard) in &reported {
-        if unknown.contains(address) {
-            tokens.push(Queued {
-                address: *address,
-                standard: *standard,
-                forced: false,
-            });
-        } else if !shared.resolver.is_known(address) {
-            // In flight or recently seen without code: being handled.
-        } else if backfill.suspects.contains(address) {
-            tokens.push(Queued {
-                address: *address,
-                standard: *standard,
-                forced: true,
-            });
-        } else {
-            suspects.insert(*address);
-        }
-    }
-
-    let forced = tokens.iter().filter(|token| token.forced).count();
     let wanted = tokens.len();
-    backfill.suspects = suspects;
-
     let queued = shared.enqueue(tokens);
 
     if queued > 0 {
         info!(
             "Token backfill: {} tokens referenced by stored data have no \
-             metadata yet, {queued} queued ({forced} of them known to the \
-             cache but not to the database)",
+             metadata yet, {queued} queued",
             found.len()
         );
     }
@@ -1077,25 +1240,82 @@ async fn run_backfill(shared: &Shared, backfill: &mut Backfill) {
     let dropped = counters.dropped.load(Ordering::Relaxed);
     let dropped_since = dropped != backfill.dropped_seen;
     backfill.dropped_seen = dropped;
+    backfill.pass_found |= queued > 0;
+
+    let full_page = found.len() >= limit;
+    let now = Instant::now();
+
+    if queued < wanted {
+        // The queue is full: the same page again once there is room.
+        backfill.next_at = now;
+    } else if full_page {
+        // There is more: the next page as soon as there is room (and the
+        // floor between two queries allows).
+        backfill.cursor = found.last().map(|(address, _)| *address);
+        backfill.next_at = now;
+    } else {
+        // End of the listing: start over later, less and less often
+        // while there is nothing to do.
+        let idle =
+            !std::mem::take(&mut backfill.pass_found) && !dropped_since;
+        backfill.cursor = None;
+
+        if idle {
+            backfill.next_at = now + backfill.interval;
+            backfill.interval = backfill
+                .interval
+                .saturating_mul(2)
+                .min(options.backfill_max_interval)
+                .max(options.backfill_interval);
+        } else {
+            backfill.interval = options.backfill_interval;
+            backfill.next_at = now + backfill.interval;
+        }
+    }
+}
+
+/// One page of the pass over the blank rows of the database: the ones
+/// that are due (nobody vouches for them any more) are verified again.
+async fn run_blank_recheck(shared: &Shared, backfill: &mut Backfill) {
+    let options = &shared.options;
+    let limit = options.backfill_limit.max(1);
+
+    let source = backfill.source.clone();
+    let query = source.blank_tokens(
+        backfill.blank_cursor,
+        limit,
+        options.blank_recheck_age,
+    );
+
+    let Some(listed) =
+        listing(shared, backfill, "blank token rows", query).await
+    else {
+        backfill.blank_next_at =
+            Instant::now() + options.blank_recheck_interval;
+        return;
+    };
+
+    let due = shared.resolver.blank_recheck_due(&listed).await;
+    let wanted = due.len();
+
+    let queued =
+        shared.enqueue(due.into_iter().map(|(address, standard)| {
+            Queued { address, standard, kind: Kind::Recheck }
+        }));
+
+    if queued > 0 {
+        debug!("{queued} blank token rows are verified again");
+    }
 
     let now = Instant::now();
-    if queued > 0 && (found.len() >= limit || queued < wanted) {
-        // There is more (a full answer, or more than the queue takes):
-        // come back as soon as this is worked off. Never when nothing
-        // could be queued, that would be a busy loop on the database.
-        backfill.interval = options.backfill_interval;
-        backfill.next_at = now + options.batch_linger;
-    } else if !found.is_empty() || dropped_since {
-        backfill.interval = options.backfill_interval;
-        backfill.next_at = now + backfill.interval;
+    if queued < wanted {
+        backfill.blank_next_at = now;
+    } else if listed.len() >= limit {
+        backfill.blank_cursor = listed.last().map(|(address, _)| *address);
+        backfill.blank_next_at = now;
     } else {
-        // Nothing missing: look less often.
-        backfill.next_at = now + backfill.interval;
-        backfill.interval = backfill
-            .interval
-            .saturating_mul(2)
-            .min(options.backfill_max_interval)
-            .max(options.backfill_interval);
+        backfill.blank_cursor = None;
+        backfill.blank_next_at = now + options.blank_recheck_interval;
     }
 }
 
@@ -1131,6 +1351,11 @@ mod tests {
         hang: AtomicBool,
         insert_attempts: AtomicUsize,
         backfill_queries: AtomicUsize,
+        blank_queries: AtomicUsize,
+        /// When every database listing (of either kind) ran.
+        query_times: Mutex<Vec<Instant>>,
+        /// Insert time of the latest row of an address (`_version`).
+        written_at: Mutex<HashMap<Address, Instant>>,
         /// What the resolver knew at insert time: must be nothing.
         marked_before_insert: AtomicBool,
         resolver: Mutex<Option<TokenResolver>>,
@@ -1146,7 +1371,19 @@ mod tests {
                 .map(|row| row.address)
                 .collect();
             stored.sort();
+            stored.dedup();
             stored
+        }
+
+        /// The row a `FINAL` read returns.
+        fn latest(&self, address: Address) -> Option<DatabaseToken> {
+            self.tokens
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|row| row.address == address)
+                .cloned()
         }
 
         fn reference(&self, numbers: &[u64]) {
@@ -1193,6 +1430,11 @@ mod tests {
                     );
                 }
 
+                let now = Instant::now();
+                let mut written = self.written_at.lock().unwrap();
+                for row in rows {
+                    written.insert(row.address, now);
+                }
                 self.tokens.lock().unwrap().extend_from_slice(rows);
                 Ok(())
             })
@@ -1205,18 +1447,82 @@ mod tests {
             limit: usize,
         ) -> BoxFuture<'a, anyhow::Result<Vec<(Address, TokenStandard)>>>
         {
+            self.missing_tokens_after(None, limit)
+        }
+
+        fn missing_tokens_after<'a>(
+            &'a self,
+            after: Option<Address>,
+            limit: usize,
+        ) -> BoxFuture<'a, anyhow::Result<Vec<(Address, TokenStandard)>>>
+        {
             Box::pin(async move {
                 self.backfill_queries.fetch_add(1, Ordering::SeqCst);
-                let stored = self.stored();
-                Ok(self
+                self.query_times.lock().unwrap().push(Instant::now());
+
+                let stored: HashSet<Address> = self
+                    .tokens
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.address)
+                    .collect();
+
+                // ORDER BY address, address > after, LIMIT limit.
+                let mut missing: Vec<(Address, TokenStandard)> = self
                     .referenced
                     .lock()
                     .unwrap()
                     .iter()
-                    .filter(|(address, _)| !stored.contains(address))
-                    .take(limit)
+                    .filter(|(address, _)| {
+                        !stored.contains(address)
+                            && after.is_none_or(|after| *address > after)
+                    })
                     .copied()
-                    .collect())
+                    .collect();
+                missing.sort();
+                missing.dedup();
+                missing.truncate(limit);
+                Ok(missing)
+            })
+        }
+
+        fn blank_tokens<'a>(
+            &'a self,
+            after: Option<Address>,
+            limit: usize,
+            older_than: Duration,
+        ) -> BoxFuture<'a, anyhow::Result<Vec<(Address, TokenStandard)>>>
+        {
+            Box::pin(async move {
+                self.blank_queries.fetch_add(1, Ordering::SeqCst);
+                self.query_times.lock().unwrap().push(Instant::now());
+                let now = Instant::now();
+
+                // The latest row of every address (ReplacingMergeTree).
+                let mut latest: HashMap<Address, &DatabaseToken> =
+                    HashMap::new();
+                let tokens = self.tokens.lock().unwrap();
+                for row in tokens.iter() {
+                    latest.insert(row.address, row);
+                }
+                let written = self.written_at.lock().unwrap();
+
+                let mut blank: Vec<(Address, TokenStandard)> = latest
+                    .values()
+                    .filter(|row| {
+                        crate::tokens::cache::is_blank(row)
+                            && after
+                                .is_none_or(|after| row.address > after)
+                            && written.get(&row.address).is_some_and(
+                                |at| now.duration_since(*at) >= older_than,
+                            )
+                    })
+                    .map(|row| (row.address, TokenStandard::Erc20))
+                    .collect();
+                blank.sort();
+                blank.truncate(limit);
+                Ok(blank)
             })
         }
     }
@@ -1798,6 +2104,65 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_proven_troublemaker_opens_no_circuit_breaker() {
+        let chain = FakeChain::new();
+        for n in 1..=10u64 {
+            chain.add(addr(n), FakeToken::erc20("Token", "TKN", 18));
+        }
+        let node = Arc::new(Poisoned {
+            chain: chain.clone(),
+            poison: addr(66),
+            poisoned_requests: AtomicUsize::new(0),
+        });
+        let db = Arc::new(FakeDb::default());
+        let all: Vec<u64> = (1..=10).chain([66]).collect();
+        db.reference(&all);
+
+        // A real breaker this time: 30 seconds, doubling.
+        let fetch = crate::tokens::multicall::FetchOptions {
+            breaker_cooldown: Duration::from_secs(30),
+            breaker_max_cooldown: Duration::from_secs(300),
+            ..fast_options()
+        };
+        let resolver = TokenResolver::from_parts(
+            1,
+            Some(
+                MetadataFetcher::new(node.clone(), fetch)
+                    .expect_chain_id(1),
+            ),
+            None,
+            &options().resolver,
+        );
+        let (worker, handle) = TokenWorker::spawn_with_resolver(
+            resolver,
+            db.clone(),
+            Some(db.clone()),
+            options(),
+        );
+
+        // Telling the culprit from an outage does cost a few pauses...
+        settle(1_800).await;
+        assert_eq!(db.stored().len(), 10);
+
+        // ...but once it is known, its hourly retries never again make
+        // anybody else wait for a cool-down.
+        for round in 0..6u64 {
+            settle(3_000).await;
+            assert!(!worker.stats().breaker_open, "round {round}");
+
+            let fresh = 100 + round;
+            chain.add(addr(fresh), FakeToken::erc20("Token", "TKN", 18));
+            worker.discover(&batch(&[fresh]));
+            settle(2).await;
+            assert!(db.stored().contains(&addr(fresh)), "round {round}");
+        }
+        assert!(node.poisoned_requests.load(Ordering::SeqCst) > 8);
+
+        worker.shutdown().await;
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_handle_is_usable_from_spawned_tasks() {
         fn assert_send<T: Send>(value: T) -> T {
             value
@@ -1819,5 +2184,259 @@ mod tests {
             .await
             .unwrap();
         s.handle.await.unwrap();
+    }
+
+    // ---- hardening ----------------------------------------------------
+
+    /// Redis that vouches for every token ("the `tokens` table was
+    /// reset, Redis was not") and whose writes can be made to hang.
+    #[derive(Default)]
+    struct KnowsEverything {
+        lookups: AtomicUsize,
+        hang_writes: AtomicBool,
+    }
+
+    impl TokenCache for KnowsEverything {
+        fn contains_many<'a>(
+            &'a self,
+            addresses: &'a [Address],
+        ) -> BoxFuture<'a, anyhow::Result<Vec<bool>>> {
+            Box::pin(async move {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![true; addresses.len()])
+            })
+        }
+
+        fn store_many<'a>(
+            &'a self,
+            _tokens: &'a [DatabaseToken],
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                if self.hang_writes.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healing_a_reset_tokens_table_makes_steady_progress() {
+        const TOKENS: u64 = 20_000;
+
+        let chain = FakeChain::new();
+        let db = Arc::new(FakeDb::default());
+        let all: Vec<u64> = (1..=TOKENS).collect();
+        for n in &all {
+            chain.add(addr(*n), FakeToken::erc20("Token", "TKN", 18));
+        }
+        // Everything is referenced by stored transfers, nothing has a
+        // row, and Redis swears it is all stored.
+        db.reference(&all);
+        let cache = Arc::new(KnowsEverything::default());
+
+        let (worker, handle) = TokenWorker::spawn_with_resolver(
+            resolver(chain.clone(), Some(cache.clone())),
+            db.clone(),
+            Some(db.clone()),
+            options(),
+        );
+
+        // A page of 5000 every 5 seconds (the floor between listings).
+        settle(12).await;
+        let healed = db.stored().len();
+        assert!((10_000..=15_000).contains(&healed), "{healed}");
+
+        settle(30).await;
+        assert_eq!(db.stored().len(), TOKENS as usize);
+        assert_eq!(db.tokens.lock().unwrap().len(), TOKENS as usize);
+
+        // The database said "missing": Redis was not even asked.
+        assert_eq!(cache.lookups.load(Ordering::SeqCst), 0);
+        // No more listings than pages (+ the one that found the end),
+        // and never two closer than the floor.
+        let times = db.query_times.lock().unwrap().clone();
+        assert!(times.len() <= 6, "{}", times.len());
+        assert!(times
+            .windows(2)
+            .all(|w| w[1] - w[0] >= Duration::from_secs(5)));
+
+        worker.shutdown().await;
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_tokens_table_is_healed_without_a_restart_too() {
+        let s = setup(true, options());
+        let all: Vec<u64> = (1..=50).collect();
+        s.db.reference(&all);
+        s.worker.discover(&batch(&all));
+        settle(30).await;
+        assert_eq!(s.db.stored().len(), 50);
+
+        // TRUNCATE TABLE tokens. Memory knows all 50.
+        s.db.tokens.lock().unwrap().clear();
+        settle(300).await;
+        assert_eq!(s.db.stored().len(), 50);
+        assert_eq!(s.db.tokens.lock().unwrap().len(), 50, "healed once");
+
+        s.worker.shutdown().await;
+        s.handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unresolvable_tokens_do_not_hide_the_rest_of_the_listing() {
+        // The first page of the listing is nothing but addresses that
+        // cannot be resolved for now (no code yet).
+        let s = setup(
+            true,
+            TokenWorkerOptions { backfill_limit: 5, ..options() },
+        );
+        let codeless: Vec<u64> = (500..510).collect();
+        s.db.reference(&codeless);
+        s.db.reference(&[600_000, 600_001]);
+        s.chain.add(addr(600_000), FakeToken::erc20("Late", "LATE", 6));
+        s.chain.add(addr(600_001), FakeToken::erc20("Late", "LATE", 6));
+
+        settle(120).await;
+        assert_eq!(s.db.stored(), vec![addr(600_000), addr(600_001)]);
+
+        s.worker.shutdown().await;
+        s.handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blank_rows_are_verified_again_and_replaced() {
+        const DAY: u64 = 24 * 3_600;
+        let s = setup(true, options());
+
+        // Token 200 answers nothing when it is first seen (think of the
+        // node being wrong about it); token 201 never will.
+        s.chain.add(addr(200), FakeToken::reverting());
+        s.chain.add(addr(201), FakeToken::reverting());
+        s.db.reference(&[200, 201]);
+        s.worker.discover(&batch(&[200, 201]));
+        settle(30).await;
+        assert!(s
+            .db
+            .latest(addr(200))
+            .is_some_and(|row| row.name.is_empty()));
+        let first_calls = s.chain.token_calls(&addr(201));
+
+        // Nothing is rechecked while the blank is fresh.
+        s.chain.add(addr(200), FakeToken::erc20("Real Token", "REAL", 8));
+        settle(DAY / 2).await;
+        assert_eq!(s.chain.token_calls(&addr(201)), first_calls);
+        assert!(s
+            .db
+            .latest(addr(200))
+            .is_some_and(|row| row.name.is_empty()));
+
+        // A day later both are due: one now has metadata, and the
+        // ReplacingMergeTree row says so.
+        settle(DAY).await;
+        let row = s.db.latest(addr(200)).unwrap();
+        assert_eq!(
+            (row.name.as_str(), row.symbol.as_str(), row.decimals),
+            ("Real Token", "REAL", 8)
+        );
+        let stats = s.worker.stats();
+        assert_eq!((stats.blank_rechecked, stats.blank_healed), (2, 1));
+
+        // The other one is still blank: written again (the database
+        // lists it by age) and vouched for longer, 7 days.
+        let second_calls = s.chain.token_calls(&addr(201));
+        assert!(second_calls > first_calls);
+        assert!(s
+            .db
+            .latest(addr(201))
+            .is_some_and(|row| row.name.is_empty()));
+        settle(5 * DAY).await;
+        assert_eq!(s.chain.token_calls(&addr(201)), second_calls);
+        settle(3 * DAY).await;
+        assert!(s.chain.token_calls(&addr(201)) > second_calls);
+        assert_eq!(s.worker.stats().blank_rechecked, 3);
+
+        // The healed one is left alone for good.
+        let healed_calls = s.chain.token_calls(&addr(200));
+        settle(30 * DAY).await;
+        assert_eq!(s.chain.token_calls(&addr(200)), healed_calls);
+
+        s.worker.shutdown().await;
+        s.handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_head_reaches_the_rpc_backend_without_blocking() {
+        use crate::tokens::endpoints::{
+            EndpointOptions, EndpointSpec, MultiEndpointCaller,
+        };
+
+        let stale = FakeChain::new();
+        stale.height.store(100, Ordering::SeqCst);
+        let pool = Arc::new(MultiEndpointCaller::new(
+            1,
+            vec![EndpointSpec {
+                key: "node".into(),
+                label: "#1".into(),
+                provider: "node".into(),
+                caller: stale.clone(),
+                discovered: false,
+            }],
+            EndpointOptions::default(),
+        ));
+        stale.add(addr(1), FakeToken::erc20("Token", "TKN", 18));
+        let db = Arc::new(FakeDb::default());
+        let (worker, handle) = TokenWorker::spawn_with_resolver(
+            resolver(pool.clone(), None),
+            db.clone(),
+            None,
+            options(),
+        );
+
+        // The indexer is at block 9000, the only node at block 100: it
+        // cannot know the contracts it would be asked about.
+        let before = Instant::now();
+        worker.set_head(9_000);
+        worker.set_head(8_000);
+        assert_eq!(Instant::now(), before);
+
+        worker.discover(&batch(&[1]));
+        settle(30).await;
+        assert!(db.stored().is_empty());
+        assert!(stale.block_number_calls.load(Ordering::SeqCst) >= 1);
+
+        // It catches up.
+        stale.height.store(9_001, Ordering::SeqCst);
+        settle(600).await;
+        assert_eq!(db.stored(), vec![addr(1)]);
+
+        worker.shutdown().await;
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_cache_write_does_not_delay_shutdown() {
+        let chain = FakeChain::new();
+        chain.add(addr(1), FakeToken::erc20("Token", "TKN", 18));
+        let cache = Arc::new(KnowsEverything::default());
+        cache.hang_writes.store(true, Ordering::SeqCst);
+        let db = Arc::new(FakeDb::default());
+        db.reference(&[1]);
+
+        let (worker, handle) = TokenWorker::spawn_with_resolver(
+            resolver(chain.clone(), Some(cache.clone())),
+            db.clone(),
+            Some(db.clone()),
+            options(),
+        );
+        settle(30).await;
+        // In the database, stuck on telling Redis.
+        assert_eq!(db.stored(), vec![addr(1)]);
+
+        let started = Instant::now();
+        worker.shutdown().await;
+        handle.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

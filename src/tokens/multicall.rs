@@ -3,7 +3,6 @@
 
 use std::{
     collections::HashMap,
-    future::{Future, IntoFuture},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
@@ -12,20 +11,15 @@ use std::{
 };
 
 use alloy::{
-    eips::BlockId,
-    network::TransactionBuilder,
-    primitives::{address, Address, Bytes},
-    providers::{DynProvider, Provider, ProviderBuilder},
-    rpc::types::TransactionRequest,
+    primitives::{address, Address, Bytes, U256},
     sol,
-    sol_types::SolCall,
-    transports::{RpcError, TransportErrorKind},
+    sol_types::{SolCall, SolValue},
 };
-use anyhow::Context;
 use futures::{future::BoxFuture, stream, StreamExt};
 use log::{debug, error, info, warn};
 use tokio::time::Instant;
 
+pub use super::http::HttpCaller;
 use super::{
     breaker::CircuitBreaker, decode, redact::Redactor, TokenStandard,
 };
@@ -53,6 +47,8 @@ sol! {
         external
         payable
         returns (Call3Result[] memory returnData);
+
+    function getBlockNumber() external view returns (uint256 blockNumber);
 
     function name() external view returns (string);
     function symbol() external view returns (string);
@@ -90,11 +86,103 @@ pub struct CallerHealth {
     pub endpoints_total: usize,
     /// Endpoints on the right chain whose last request succeeded.
     pub endpoints_healthy: usize,
-    /// Endpoints disabled for good because they serve another chain.
+    /// Endpoints set aside because they serve another chain.
     pub endpoints_wrong_chain: usize,
+    /// Endpoints banned for contradicting the others.
+    pub endpoints_distrusted: usize,
+}
+
+/// Which node answered, and whether its word is enough.
+///
+/// Endpoints the operator configured are *trusted*: one answer is enough
+/// for anything positive. Endpoints discovered from a public list are
+/// not: whatever would be persisted from them needs a second, matching
+/// answer from another `group` (an independent host).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Source {
+    /// The endpoint (for pinning follow-up calls to the same node).
+    pub id: u64,
+    /// Endpoints of one provider share a group: they are one opinion.
+    pub group: u64,
+    pub trusted: bool,
+}
+
+impl Source {
+    /// The only source of a plain, single node [`EthCaller`].
+    pub const SINGLE: Source = Source { id: 0, group: 0, trusted: true };
+}
+
+/// Restricts which node may answer a [`EthCaller::call_routed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Route {
+    /// Only this endpoint ([`Source::id`]).
+    pub only: Option<u64>,
+    /// None of these groups ([`Source::group`]).
+    pub exclude_groups: Vec<u64>,
+    /// A failure says nothing about the node (the token is a known
+    /// troublemaker): do not open circuit breakers over it.
+    pub quiet: bool,
+}
+
+impl Route {
+    pub fn admits(&self, source: &Source) -> bool {
+        self.only.is_none_or(|id| id == source.id)
+            && !self.exclude_groups.contains(&source.group)
+    }
+}
+
+/// Answer of [`EthCaller::call_routed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Routed {
+    pub data: Bytes,
+    pub source: Source,
+}
+
+/// Failure of [`EthCaller::call_routed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedError {
+    pub error: CallError,
+    /// The node that failed (always set for `Execution`).
+    pub source: Option<Source>,
+    /// No node matches the route at all: retrying is pointless.
+    pub no_source: bool,
+}
+
+impl RoutedError {
+    pub fn no_source(what: &str) -> Self {
+        Self {
+            error: CallError::Transient(what.to_string()),
+            source: None,
+            no_source: true,
+        }
+    }
+}
+
+/// The two block heights a node can be asked for. They are compared
+/// within their kind only: on some L2s `block.number` inside the EVM is
+/// not the number `eth_blockNumber` reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeightKind {
+    /// `Multicall3.getBlockNumber()`: the state the answer was read from.
+    Evm,
+    /// `eth_blockNumber` (same numbering as the indexed blocks).
+    Rpc,
+}
+
+/// Outcome of comparing the answers of several sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vote {
+    /// Another source gave the same answer.
+    Won,
+    /// Two other sources agreed on a different answer.
+    Lost,
 }
 
 /// Minimal RPC backend so the fetcher can be tested without a node.
+///
+/// Only `call` and `chain_id` are required. The provided methods describe
+/// a backend made of several nodes; their defaults describe a single,
+/// trusted one.
 pub trait EthCaller: Send + Sync + 'static {
     /// `eth_call` at the latest block.
     fn call(
@@ -124,109 +212,215 @@ pub trait EthCaller: Send + Sync + 'static {
     fn health(&self) -> Option<CallerHealth> {
         None
     }
-}
 
-/// [`EthCaller`] over an alloy HTTP provider.
-pub struct AlloyCaller {
-    provider: DynProvider,
-    timeout: Duration,
-    redactor: Redactor,
-}
-
-impl AlloyCaller {
-    pub fn new(rpc_url: &str, timeout: Duration) -> anyhow::Result<Self> {
-        // `url::ParseError` does not echo the (possibly secret) input.
-        let url = rpc_url
-            .parse()
-            .with_context(|| "invalid rpc url for token metadata")?;
-
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(url)
-            .erased();
-
-        Ok(Self {
-            provider,
-            timeout,
-            redactor: Redactor::for_url(rpc_url),
-        })
-    }
-
-    /// Applies the timeout and turns the error into a redacted
-    /// [`CallError`].
-    async fn request<T, F>(
-        &self,
-        what: &str,
-        request: F,
-    ) -> Result<T, CallError>
-    where
-        F: Future<Output = Result<T, RpcError<TransportErrorKind>>>,
-    {
-        match tokio::time::timeout(self.timeout, request).await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => {
-                Err(classify_rpc_error(&error, &self.redactor))
-            }
-            Err(_) => Err(CallError::Transient(format!(
-                "{what} timed out after {:?}",
-                self.timeout
-            ))),
-        }
-    }
-}
-
-impl EthCaller for AlloyCaller {
-    fn call(
-        &self,
+    /// [`call`](Self::call) that tells who answered and can be told who
+    /// may answer.
+    fn call_routed<'a>(
+        &'a self,
         to: Address,
         data: Bytes,
-    ) -> BoxFuture<'_, Result<Bytes, CallError>> {
+        route: &'a Route,
+    ) -> BoxFuture<'a, Result<Routed, RoutedError>> {
         Box::pin(async move {
-            let request =
-                TransactionRequest::default().with_to(to).with_input(data);
+            if !route.admits(&Source::SINGLE) {
+                return Err(RoutedError::no_source(
+                    "there is no other RPC endpoint to ask",
+                ));
+            }
 
-            let call =
-                self.provider.call(request).block(BlockId::latest());
-
-            self.request("eth_call", call.into_future()).await
+            match self.call(to, data).await {
+                Ok(data) => Ok(Routed { data, source: Source::SINGLE }),
+                Err(error) => Err(RoutedError {
+                    error,
+                    source: Some(Source::SINGLE),
+                    no_source: false,
+                }),
+            }
         })
     }
 
-    fn chain_id(&self) -> BoxFuture<'_, Result<u64, CallError>> {
-        Box::pin(async move {
-            self.request(
-                "eth_chainId",
-                self.provider.get_chain_id().into_future(),
-            )
-            .await
-        })
+    /// Number of independent sources (groups) that could answer.
+    fn source_count(&self) -> usize {
+        1
+    }
+
+    /// Reports the block height a source answered at. `false`: the source
+    /// lags behind the others (it has been put in cool-down) and its
+    /// answer must not be used.
+    fn observe_height(
+        &self,
+        source: Source,
+        kind: HeightKind,
+        height: u64,
+    ) -> bool {
+        let _ = (source, kind, height);
+        true
+    }
+
+    /// The height the indexer has reached: a node behind it cannot know
+    /// the contracts being asked about.
+    fn head_hint(&self, block: u64) {
+        let _ = block;
+    }
+
+    /// Reports how a source fared against the others.
+    fn report_vote(&self, source: Source, vote: Vote) {
+        let _ = (source, vote);
+    }
+
+    /// `eth_blockNumber`, `None` when the backend cannot tell.
+    fn block_number(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<u64>, CallError>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
-/// Decides whether an RPC error says something about the contract
-/// (`Execution`) or only about the node / network (`Transient`).
+/// An `eth_call` whose answer is safe to store, for callers outside of
+/// the token fetcher (the DEX pool resolver's `token0()` / `token1()` /
+/// `fee()`): the same rules as for token metadata.
 ///
-/// Deliberately conservative: only JSON-RPC error *responses* that clearly
-/// describe an EVM failure are `Execution`; anything ambiguous is
-/// `Transient` so it can never poison the negative cache.
+/// * A trusted (configured) source is believed on a non-empty answer.
+/// * Anything from an untrusted (discovered) source, and any negative
+///   answer (no data, execution failure) whenever another source exists,
+///   needs the same raw answer from a source of another provider; when
+///   two disagree a third decides and the loser is reported.
+/// * Without agreement the result is `Transient`: ask again later and
+///   store nothing. `Execution` is only returned once it is agreed upon.
+pub async fn call_confirmed(
+    caller: &dyn EthCaller,
+    to: Address,
+    data: Bytes,
+) -> Result<Bytes, CallError> {
+    type Answer = Result<Bytes, String>;
+
+    async fn ask(
+        caller: &dyn EthCaller,
+        to: Address,
+        data: Bytes,
+        route: &Route,
+    ) -> Result<(Answer, Source), CallError> {
+        match caller.call_routed(to, data, route).await {
+            Ok(routed) => Ok((Ok(routed.data), routed.source)),
+            Err(RoutedError {
+                error: CallError::Execution(error),
+                source: Some(source),
+                ..
+            }) => Ok((Err(error), source)),
+            Err(failure) => Err(match failure.error {
+                CallError::Transient(error)
+                | CallError::Execution(error) => {
+                    CallError::Transient(error)
+                }
+            }),
+        }
+    }
+
+    // Two execution failures agree whatever their wording.
+    fn same(a: &Answer, b: &Answer) -> bool {
+        match (a, b) {
+            (Ok(a), Ok(b)) => a == b,
+            (Err(_), Err(_)) => true,
+            _ => false,
+        }
+    }
+
+    let finish = |answer: Answer| answer.map_err(CallError::Execution);
+    let unconfirmed = |why: &str| {
+        Err(CallError::Transient(format!(
+            "the answer could not be confirmed by a second, independent \
+             RPC endpoint ({why})"
+        )))
+    };
+
+    let (first, first_source) =
+        ask(caller, to, data.clone(), &Route::default()).await?;
+
+    let negative = first.as_ref().map_or(true, |data| data.is_empty());
+    if first_source.trusted && !(negative && caller.source_count() > 1) {
+        return finish(first);
+    }
+
+    let route = Route {
+        exclude_groups: vec![first_source.group],
+        ..Route::default()
+    };
+    let Ok((second, second_source)) =
+        ask(caller, to, data.clone(), &route).await
+    else {
+        return unconfirmed("none is reachable");
+    };
+
+    if same(&first, &second) {
+        caller.report_vote(first_source, Vote::Won);
+        caller.report_vote(second_source, Vote::Won);
+        return finish(first);
+    }
+
+    let route = Route {
+        exclude_groups: vec![first_source.group, second_source.group],
+        ..Route::default()
+    };
+    match ask(caller, to, data, &route).await {
+        Ok((third, _)) if same(&third, &first) => {
+            caller.report_vote(second_source, Vote::Lost);
+            finish(first)
+        }
+        Ok((third, _)) if same(&third, &second) => {
+            caller.report_vote(first_source, Vote::Lost);
+            finish(second)
+        }
+        _ => unconfirmed("the endpoints disagree"),
+    }
+}
+
+/// Decides whether a JSON-RPC error *response* says something about the
+/// contract (`Execution`) or only about the node / network (`Transient`).
 ///
-/// The error text goes through `redactor`: reqwest errors include the full
-/// request URL, which commonly embeds an API key.
-pub fn classify_rpc_error(
-    error: &RpcError<TransportErrorKind>,
+/// Deliberately conservative: only errors that clearly describe an EVM
+/// failure are `Execution`; anything ambiguous is `Transient` so it can
+/// never poison the negative cache.
+///
+/// The error text goes through `redactor`: nodes echo URLs and API keys.
+pub fn classify_error_response(
+    code: i64,
+    message: &str,
     redactor: &Redactor,
 ) -> CallError {
-    match error {
-        RpcError::ErrorResp(payload) if !payload.is_retry_err() => {
-            let message = redactor.redact(&payload.to_string());
-            if is_execution_error(payload.code, &payload.message) {
-                CallError::Execution(message)
-            } else {
-                CallError::Transient(message)
-            }
-        }
-        other => CallError::Transient(redactor.redact(&other.to_string())),
+    let text = redactor.redact(&format!("error code {code}: {message}"));
+
+    if !is_node_side_error(code, message)
+        && is_execution_error(code, message)
+    {
+        CallError::Execution(text)
+    } else {
+        CallError::Transient(text)
     }
+}
+
+/// Rate limits, timeouts and resource caps: conditions of the node, even
+/// when they are worded like an execution failure.
+fn is_node_side_error(code: i64, message: &str) -> bool {
+    if matches!(code, 429 | -32005 | -32007 | -32012 | -32016) {
+        return true;
+    }
+
+    let message = message.to_ascii_lowercase();
+
+    [
+        "rate limit",
+        "too many requests",
+        "timeout",
+        "timed out",
+        "capacity",
+        "limit exceeded",
+        // "execution aborted (timeout = 5s)", "gas required exceeds
+        // allowance": the node gave up, another node may not.
+        "execution aborted",
+        "gas required exceeds",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn is_execution_error(code: i64, message: &str) -> bool {
@@ -250,8 +444,6 @@ fn is_execution_error(code: i64, message: &str) -> bool {
         "vm execution error",
         "evm error",
         "execution error",
-        "execution aborted",
-        "gas required exceeds",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -278,12 +470,46 @@ pub struct FetchOutcome {
     /// (node lagging behind the indexed head, wrong network...), so these
     /// must never be persisted, only skipped for a short while.
     pub empty: Vec<Address>,
+    /// Tokens that were answered but not by enough independent sources
+    /// (no second endpoint reachable, or the endpoints disagree). Nothing
+    /// may be stored for them; they are worth trying again later.
+    pub unconfirmed: Vec<Address>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenResult {
     Resolved(TokenMetadata),
     Empty,
 }
+
+impl TokenResult {
+    /// "Nothing there": the kind of answer a stale or lying node gives,
+    /// and the kind that is stored for good.
+    fn is_negative(&self) -> bool {
+        match self {
+            TokenResult::Empty => true,
+            TokenResult::Resolved(metadata) => {
+                metadata.name.is_empty() && metadata.symbol.is_empty()
+            }
+        }
+    }
+}
+
+/// What one source says about a set of tokens.
+struct Opinion {
+    source: Source,
+    verdicts: HashMap<Address, TokenResult>,
+}
+
+#[derive(Default)]
+struct ChunkOutcome {
+    accepted: Vec<(Address, TokenResult)>,
+    unconfirmed: Vec<Address>,
+}
+
+/// An answer is thrown away and asked again elsewhere at most this often
+/// (stale node, node without Multicall3).
+const MAX_REROUTES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
@@ -357,6 +583,8 @@ pub struct FetchOptions {
     /// How long individual calls are used when the absence of Multicall3
     /// could not be cross-checked (see [`EthCaller::confirm_empty`]).
     pub multicall_undecided_ttl: Duration,
+    /// "The RPC serves another chain" is checked again after this long.
+    pub chain_recheck: Duration,
 }
 
 impl Default for FetchOptions {
@@ -372,6 +600,7 @@ impl Default for FetchOptions {
             breaker_max_cooldown: Duration::from_secs(300),
             multicall_recheck: Duration::from_secs(3_600),
             multicall_undecided_ttl: Duration::from_secs(60),
+            chain_recheck: Duration::from_secs(3_600),
         }
     }
 }
@@ -406,6 +635,8 @@ pub struct MetadataFetcher {
     expected_chain_id: Option<u64>,
     chain_state: AtomicU8,
     observed_chain_id: AtomicU64,
+    /// When the chain id mismatch was seen (it is not a life sentence).
+    mismatch_at: Mutex<Option<Instant>>,
     breaker: CircuitBreaker,
     rpc_down: AtomicBool,
 }
@@ -419,6 +650,10 @@ struct FetchRun {
     succeeded: AtomicBool,
     /// First fetch after an outage: no retries.
     probing: bool,
+    /// Failures are expected (troublemaker token): no breaker over them.
+    quiet: bool,
+    /// Answers could not be confirmed for want of a second source.
+    lacked_second: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
 
@@ -448,6 +683,7 @@ impl MetadataFetcher {
             expected_chain_id: None,
             chain_state: AtomicU8::new(CHAIN_UNCHECKED),
             observed_chain_id: AtomicU64::new(0),
+            mismatch_at: Mutex::new(None),
             breaker,
             rpc_down: AtomicBool::new(false),
         }
@@ -472,7 +708,7 @@ impl MetadataFetcher {
             return ChainCheck::Verified;
         };
 
-        match self.chain_state.load(Ordering::Relaxed) {
+        match self.chain_state() {
             CHAIN_VERIFIED => return ChainCheck::Verified,
             CHAIN_UNCHECKED => {}
             _ => {
@@ -489,13 +725,19 @@ impl MetadataFetcher {
             }
             Ok(actual) => {
                 self.observed_chain_id.store(actual, Ordering::Relaxed);
+                *self
+                    .mismatch_at
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) =
+                    Some(Instant::now());
                 if self.chain_state.swap(CHAIN_MISMATCH, Ordering::Relaxed)
                     != CHAIN_MISMATCH
                 {
                     error!(
                         "Token metadata RPC serves chain {actual} but \
                          chain {expected} is being indexed: token metadata \
-                         is disabled"
+                         is disabled (checked again in {:?})",
+                        self.options.chain_recheck
                     );
                 }
                 ChainCheck::Mismatch(actual)
@@ -509,8 +751,7 @@ impl MetadataFetcher {
     /// `false` while the circuit breaker is open or the node is known to
     /// serve another chain: `fetch` would return nothing without any I/O.
     pub fn is_available(&self) -> bool {
-        self.chain_state.load(Ordering::Relaxed) != CHAIN_MISMATCH
-            && !self.breaker_open()
+        self.chain_state() != CHAIN_MISMATCH && !self.breaker_open()
     }
 
     /// `true` while the RPC circuit breaker is open.
@@ -525,7 +766,40 @@ impl MetadataFetcher {
 
     /// `true` when the RPC is known to serve another chain (permanent).
     pub fn wrong_chain(&self) -> bool {
-        self.chain_state.load(Ordering::Relaxed) == CHAIN_MISMATCH
+        self.chain_state() == CHAIN_MISMATCH
+    }
+
+    /// The chain check verdict; a mismatch expires so that a load
+    /// balancer that briefly routed to the wrong network, or an operator
+    /// fixing the node, does not need an indexer restart.
+    fn chain_state(&self) -> u8 {
+        let state = self.chain_state.load(Ordering::Relaxed);
+        if state != CHAIN_MISMATCH {
+            return state;
+        }
+
+        let expired = self
+            .mismatch_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none_or(|at| at.elapsed() >= self.options.chain_recheck);
+
+        if expired {
+            self.chain_state.store(CHAIN_UNCHECKED, Ordering::Relaxed);
+            return CHAIN_UNCHECKED;
+        }
+        state
+    }
+
+    /// When the wrong-chain verdict is looked at again.
+    pub fn chain_recheck_at(&self) -> Option<Instant> {
+        if self.chain_state() != CHAIN_MISMATCH {
+            return None;
+        }
+        self.mismatch_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|at| at + self.options.chain_recheck)
     }
 
     /// Whether individual calls are currently used instead of Multicall3.
@@ -581,6 +855,16 @@ impl MetadataFetcher {
         &self,
         tokens: &[(Address, TokenStandard)],
     ) -> FetchOutcome {
+        self.fetch_with(tokens, false).await
+    }
+
+    /// [`fetch`](Self::fetch); with `quiet` a failure is blamed on the
+    /// tokens rather than on the RPC: no circuit breaker opens over it.
+    pub async fn fetch_with(
+        &self,
+        tokens: &[(Address, TokenStandard)],
+        quiet: bool,
+    ) -> FetchOutcome {
         let mut outcome = FetchOutcome::default();
 
         if tokens.is_empty() || !self.is_available() {
@@ -591,6 +875,8 @@ impl MetadataFetcher {
             gave_up: AtomicBool::new(false),
             succeeded: AtomicBool::new(false),
             probing: self.rpc_down.load(Ordering::Relaxed),
+            quiet,
+            lacked_second: AtomicBool::new(false),
             last_error: Mutex::new(None),
         };
         let run = &run;
@@ -599,7 +885,9 @@ impl MetadataFetcher {
             ChainCheck::Verified => {}
             ChainCheck::Mismatch(_) => return outcome,
             ChainCheck::Unavailable(error) => {
-                self.trip_breaker(&error);
+                if !quiet {
+                    self.trip_breaker(&error);
+                }
                 return outcome;
             }
         }
@@ -613,20 +901,24 @@ impl MetadataFetcher {
             .map(|chunk| self.fetch_chunk(chunk, run))
             .collect();
 
-        let results: Vec<Vec<(Address, TokenResult)>> =
-            stream::iter(chunks)
-                .buffer_unordered(self.options.chunk_concurrency.max(1))
-                .collect()
-                .await;
+        let results: Vec<ChunkOutcome> = stream::iter(chunks)
+            .buffer_unordered(self.options.chunk_concurrency.max(1))
+            .collect()
+            .await;
 
-        for (token, result) in results.into_iter().flatten() {
-            match result {
-                TokenResult::Resolved(metadata) => {
-                    outcome.resolved.insert(token, metadata);
+        for chunk in results {
+            outcome.unconfirmed.extend(chunk.unconfirmed);
+            for (token, result) in chunk.accepted {
+                match result {
+                    TokenResult::Resolved(metadata) => {
+                        outcome.resolved.insert(token, metadata);
+                    }
+                    TokenResult::Empty => outcome.empty.push(token),
                 }
-                TokenResult::Empty => outcome.empty.push(token),
             }
         }
+
+        let accepted = outcome.resolved.len() + outcome.empty.len();
 
         if run.gave_up.load(Ordering::Relaxed) {
             let error = run
@@ -636,6 +928,16 @@ impl MetadataFetcher {
                 .take()
                 .unwrap_or_else(|| "unknown error".to_string());
             self.trip_breaker(&error);
+        } else if accepted == 0
+            && !quiet
+            && run.lacked_second.load(Ordering::Relaxed)
+        {
+            // Asking again right away would only burn requests on the
+            // one endpoint that works.
+            self.trip_breaker(
+                "answers of a public RPC endpoint must be confirmed by a \
+                 second, independent endpoint and none is reachable",
+            );
         } else if run.succeeded.load(Ordering::Relaxed) {
             self.reset_breaker();
         }
@@ -643,182 +945,419 @@ impl MetadataFetcher {
         outcome
     }
 
+    /// Resolves one chunk, asking as many independent sources as the
+    /// answers need before they may be stored:
+    ///
+    /// * a trusted (configured) source is believed on anything positive;
+    /// * everything from an untrusted (discovered) source, and every
+    ///   negative answer whenever somebody else could be asked, needs the
+    ///   same decoded answer from a source of another group;
+    /// * when two sources disagree a third one decides, and the loser is
+    ///   reported;
+    /// * whatever is left without agreement is `unconfirmed`: no row.
     async fn fetch_chunk(
         &self,
         chunk: &[(Address, TokenStandard)],
         run: &FetchRun,
-    ) -> Vec<(Address, TokenResult)> {
-        if run.gave_up.load(Ordering::Relaxed) {
-            return Vec::new();
-        }
+    ) -> ChunkOutcome {
+        let mut outcome = ChunkOutcome::default();
 
-        if self.multicall_missing() {
-            return self.fetch_individually(chunk, run).await;
-        }
-
-        let mut calls = Vec::with_capacity(chunk.len() * 3);
-        for (token, standard) in chunk {
-            for field in fields_for(*standard) {
-                calls.push(Call3 {
-                    target: *token,
-                    allowFailure: true,
-                    callData: field.calldata(),
-                });
-            }
-        }
-        let expected = calls.len();
-        let calldata: Bytes = aggregate3Call { calls }.abi_encode().into();
-
-        let mut returned = match self
-            .call_with_retry(MULTICALL3_ADDRESS, calldata.clone(), run)
-            .await
-        {
-            Ok(returned) => returned,
-            Err(CallError::Transient(error)) => {
-                // The outage itself is reported once by the breaker.
-                debug!(
-                    "Token metadata multicall failed for {} tokens, they \
-                     will be retried when seen again: {error}",
-                    chunk.len()
-                );
-                return Vec::new();
-            }
-            Err(CallError::Execution(error)) => {
-                // allowFailure is set, so the aggregate itself failing
-                // means a sub-call blew the gas / response limits.
-                debug!(
-                    "Token metadata multicall execution failed, fetching \
-                     {} tokens individually: {error}",
-                    chunk.len()
-                );
-                return self.fetch_individually(chunk, run).await;
-            }
+        let route = Route { quiet: run.quiet, ..Route::default() };
+        let Some(first) = self.opinion(chunk, route, run, false).await
+        else {
+            return outcome;
         };
 
-        if returned.is_empty() {
-            // eth_call to an address without code succeeds with no data.
-            // Multicall3 presence is a property of the chain, not of the
-            // node that answered: a lagging / pruned / broken endpoint
-            // must not switch everybody to individual calls, so the
-            // backend is asked to cross-check before it is remembered.
-            match self
-                .caller
-                .confirm_empty(MULTICALL3_ADDRESS, calldata)
-                .await
-            {
-                EmptyCheck::Refuted(data) if !data.is_empty() => {
-                    debug!(
-                        "An RPC endpoint answered empty for Multicall3 \
-                         while another one has it, using the latter"
-                    );
-                    returned = data;
-                }
-                EmptyCheck::Confirmed => {
-                    self.set_multicall_missing(
-                        self.options.multicall_recheck,
-                    );
-                    if !self
-                        .multicall_missing_logged
-                        .swap(true, Ordering::Relaxed)
-                    {
-                        warn!(
-                            "Multicall3 is not deployed at \
-                             {MULTICALL3_ADDRESS} on this chain, falling \
-                             back to individual eth_calls for token \
-                             metadata"
-                        );
-                    }
-                    return self.fetch_individually(chunk, run).await;
-                }
-                EmptyCheck::Refuted(_) | EmptyCheck::Undecided => {
-                    debug!(
-                        "Unable to cross-check whether Multicall3 is \
-                         deployed, using individual eth_calls for a while"
-                    );
-                    self.set_multicall_missing(
-                        self.options.multicall_undecided_ttl,
-                    );
-                    return self.fetch_individually(chunk, run).await;
-                }
-            }
-        }
-
-        let results = match aggregate3Call::abi_decode_returns(&returned) {
-            Ok(results) if results.len() == expected => results,
-            Ok(results) => {
-                warn!(
-                    "Multicall3 returned {} results for {expected} calls, \
-                     fetching {} tokens individually",
-                    results.len(),
-                    chunk.len()
-                );
-                return self.fetch_individually(chunk, run).await;
-            }
-            Err(error) => {
-                warn!(
-                    "Unable to decode Multicall3 response, fetching {} \
-                     tokens individually: {error}",
-                    chunk.len()
-                );
-                return self.fetch_individually(chunk, run).await;
-            }
-        };
-
-        let mut resolved = Vec::with_capacity(chunk.len());
-        let mut suspicious = Vec::new();
-        let mut results = results.iter();
+        let others = self.caller.source_count() > 1;
+        let mut contested = Vec::new();
 
         for (token, standard) in chunk {
-            let mut metadata = TokenMetadata::default();
-            let mut any_success = false;
-            let mut all_empty = true;
+            let Some(verdict) = first.verdicts.get(token) else {
+                continue;
+            };
 
-            for (field, result) in
-                fields_for(*standard).iter().zip(results.by_ref())
-            {
-                all_empty &=
-                    result.success && result.returnData.is_empty();
-
-                if result.success {
-                    any_success = true;
-                    apply_field(&mut metadata, *field, &result.returnData);
-                }
-            }
-
-            if all_empty {
-                // No code at the address (yet): not a definitive answer.
-                resolved.push((*token, TokenResult::Empty));
-            } else if !any_success && *standard != TokenStandard::Erc1155 {
-                // Every call of an ERC20/ERC721 failing is unusual: it may
-                // be a victim of a gas-hungry neighbour in the same
-                // aggregate, so double check it alone before it gets
-                // negatively cached. (For ERC1155 it is the norm:
-                // name/symbol are not part of the standard.)
-                suspicious.push((*token, *standard));
+            if first.source.trusted && !(others && verdict.is_negative()) {
+                outcome.accepted.push((*token, verdict.clone()));
             } else {
-                resolved.push((*token, TokenResult::Resolved(metadata)));
+                contested.push((*token, *standard));
             }
         }
 
-        if !suspicious.is_empty() {
-            resolved
-                .extend(self.fetch_individually(&suspicious, run).await);
+        if contested.is_empty() {
+            return outcome;
         }
 
-        resolved
+        let route = Route {
+            only: None,
+            exclude_groups: vec![first.source.group],
+            quiet: run.quiet,
+        };
+        let Some(second) =
+            self.opinion(&contested, route, run, true).await
+        else {
+            run.lacked_second.store(true, Ordering::Relaxed);
+            debug!(
+                "No second RPC endpoint could confirm {} token answers, \
+                 nothing is stored for them",
+                contested.len()
+            );
+            outcome.unconfirmed.extend(contested.iter().map(|(t, _)| *t));
+            return outcome;
+        };
+
+        let mut disputed = Vec::new();
+        let mut agreed = false;
+
+        for (token, standard) in &contested {
+            match (first.verdicts.get(token), second.verdicts.get(token)) {
+                (Some(a), Some(b)) if a == b => {
+                    agreed = true;
+                    outcome.accepted.push((*token, a.clone()));
+                }
+                (Some(_), Some(_)) => disputed.push((*token, *standard)),
+                _ => outcome.unconfirmed.push(*token),
+            }
+        }
+
+        if agreed {
+            self.caller.report_vote(first.source, Vote::Won);
+            self.caller.report_vote(second.source, Vote::Won);
+        }
+
+        if disputed.is_empty() {
+            return outcome;
+        }
+
+        let route = Route {
+            only: None,
+            exclude_groups: vec![first.source.group, second.source.group],
+            quiet: run.quiet,
+        };
+        let third = self.opinion(&disputed, route, run, true).await;
+        let (mut first_lost, mut second_lost) = (false, false);
+
+        for (token, _) in &disputed {
+            let a = first.verdicts.get(token);
+            let b = second.verdicts.get(token);
+            let c = third.as_ref().and_then(|t| t.verdicts.get(token));
+
+            match c {
+                Some(c) if Some(c) == a => {
+                    second_lost = true;
+                    outcome.accepted.push((*token, c.clone()));
+                }
+                Some(c) if Some(c) == b => {
+                    first_lost = true;
+                    outcome.accepted.push((*token, c.clone()));
+                }
+                _ => outcome.unconfirmed.push(*token),
+            }
+        }
+
+        debug!(
+            "RPC endpoints disagree about {} tokens ({} left unconfirmed)",
+            disputed.len(),
+            outcome.unconfirmed.len()
+        );
+
+        if first_lost {
+            self.caller.report_vote(first.source, Vote::Lost);
+        }
+        if second_lost {
+            self.caller.report_vote(second.source, Vote::Lost);
+        }
+
+        outcome
     }
 
-    async fn fetch_individually(
+    /// What one source (the first the route admits that answers) says
+    /// about `tokens`. `None` when nobody could be asked. `auxiliary`
+    /// opinions (second, third) never abort the run: the RPC as a whole
+    /// is not down because a second endpoint is.
+    async fn opinion(
         &self,
         tokens: &[(Address, TokenStandard)],
+        mut route: Route,
         run: &FetchRun,
-    ) -> Vec<(Address, TokenResult)> {
-        let calls: Vec<_> = tokens
-            .iter()
-            .map(|(token, standard)| async move {
-                self.fetch_one(*token, *standard, run)
+        auxiliary: bool,
+    ) -> Option<Opinion> {
+        for _ in 0..MAX_REROUTES {
+            if run.gave_up.load(Ordering::Relaxed) {
+                return None;
+            }
+
+            if self.multicall_missing() {
+                return self
+                    .opinion_individually(tokens, route, run, auxiliary)
+                    .await;
+            }
+
+            // The height first: it tells whether the node answering has
+            // seen the blocks these tokens come from, in the very same
+            // state the metadata is read from and at no extra cost.
+            let mut calls = Vec::with_capacity(tokens.len() * 3 + 1);
+            calls.push(Call3 {
+                target: MULTICALL3_ADDRESS,
+                allowFailure: true,
+                callData: getBlockNumberCall {}.abi_encode().into(),
+            });
+            for (token, standard) in tokens {
+                for field in fields_for(*standard) {
+                    calls.push(Call3 {
+                        target: *token,
+                        allowFailure: true,
+                        callData: field.calldata(),
+                    });
+                }
+            }
+            let expected = calls.len();
+            let calldata: Bytes =
+                aggregate3Call { calls }.abi_encode().into();
+
+            let routed = match self
+                .call_with_retry(
+                    MULTICALL3_ADDRESS,
+                    calldata.clone(),
+                    &route,
+                    run,
+                    auxiliary,
+                )
+                .await
+            {
+                Ok(routed) => routed,
+                Err(RoutedError {
+                    error: CallError::Transient(error),
+                    ..
+                }) => {
+                    // The outage itself is reported once by the breaker.
+                    debug!(
+                        "Token metadata multicall failed for {} tokens, \
+                         they will be retried later: {error}",
+                        tokens.len()
+                    );
+                    return None;
+                }
+                Err(RoutedError {
+                    error: CallError::Execution(error),
+                    source,
+                    ..
+                }) => {
+                    // allowFailure is set, so the aggregate itself failing
+                    // means a sub-call blew the gas / response limits.
+                    debug!(
+                        "Token metadata multicall execution failed, \
+                         fetching {} tokens individually: {error}",
+                        tokens.len()
+                    );
+                    route.only = source.map(|source| source.id);
+                    return self
+                        .opinion_individually(
+                            tokens, route, run, auxiliary,
+                        )
+                        .await;
+                }
+            };
+
+            let source = routed.source;
+            let pinned = Route { only: Some(source.id), ..route.clone() };
+
+            if routed.data.is_empty() {
+                // eth_call to an address without code succeeds with no
+                // data. Multicall3 presence is a property of the chain,
+                // not of the node that answered: a lagging / pruned /
+                // broken endpoint must not switch everybody to individual
+                // calls, so the backend cross-checks before it is
+                // remembered.
+                match self
+                    .caller
+                    .confirm_empty(MULTICALL3_ADDRESS, calldata)
                     .await
-                    .map(|result| (*token, result))
+                {
+                    EmptyCheck::Refuted(_) => {
+                        debug!(
+                            "An RPC endpoint answered empty for \
+                             Multicall3 while another one has it, asking \
+                             somebody else"
+                        );
+                        route.exclude_groups.push(source.group);
+                        continue;
+                    }
+                    EmptyCheck::Confirmed => {
+                        self.set_multicall_missing(
+                            self.options.multicall_recheck,
+                        );
+                        if !self
+                            .multicall_missing_logged
+                            .swap(true, Ordering::Relaxed)
+                        {
+                            warn!(
+                                "Multicall3 is not deployed at \
+                                 {MULTICALL3_ADDRESS} on this chain, \
+                                 falling back to individual eth_calls \
+                                 for token metadata"
+                            );
+                        }
+                    }
+                    EmptyCheck::Undecided => {
+                        debug!(
+                            "Unable to cross-check whether Multicall3 is \
+                             deployed, using individual eth_calls for a \
+                             while"
+                        );
+                        self.set_multicall_missing(
+                            self.options.multicall_undecided_ttl,
+                        );
+                    }
+                }
+                return self
+                    .opinion_individually(tokens, pinned, run, auxiliary)
+                    .await;
+            }
+
+            let results =
+                match aggregate3Call::abi_decode_returns(&routed.data) {
+                    Ok(results) if results.len() == expected => results,
+                    other => {
+                        debug!(
+                            "Unusable Multicall3 response ({}), fetching \
+                             {} tokens individually",
+                            match other {
+                                Ok(results) => format!(
+                                    "{} results for {expected} calls",
+                                    results.len()
+                                ),
+                                Err(error) => error.to_string(),
+                            },
+                            tokens.len()
+                        );
+                        return self
+                            .opinion_individually(
+                                tokens, pinned, run, auxiliary,
+                            )
+                            .await;
+                    }
+                };
+
+            let mut results = results.iter();
+
+            if let Some(height) = results
+                .next()
+                .filter(|result| result.success)
+                .and_then(|result| {
+                    U256::abi_decode(&result.returnData).ok()
+                })
+                .and_then(|height| u64::try_from(height).ok())
+            {
+                if !self.caller.observe_height(
+                    source,
+                    HeightKind::Evm,
+                    height,
+                ) {
+                    debug!(
+                        "An RPC endpoint answered from block {height}, \
+                         behind the others: asking somebody else"
+                    );
+                    route.exclude_groups.push(source.group);
+                    continue;
+                }
+            }
+
+            let mut verdicts = HashMap::with_capacity(tokens.len());
+            let mut suspicious = Vec::new();
+
+            for (token, standard) in tokens {
+                let mut metadata = TokenMetadata::default();
+                let mut any_failed = false;
+                let mut all_empty = true;
+
+                for (field, result) in
+                    fields_for(*standard).iter().zip(results.by_ref())
+                {
+                    all_empty &=
+                        result.success && result.returnData.is_empty();
+                    any_failed |= !result.success;
+
+                    if result.success {
+                        apply_field(
+                            &mut metadata,
+                            *field,
+                            &result.returnData,
+                        );
+                    }
+                }
+
+                if all_empty {
+                    // No code at the address (yet): not definitive.
+                    verdicts.insert(*token, TokenResult::Empty);
+                } else if any_failed && *standard != TokenStandard::Erc1155
+                {
+                    // A failed call of an ERC20/ERC721 may be the doing
+                    // of a gas-hungry neighbour in the same aggregate
+                    // (`decimals()` failing next to a working `name()`
+                    // would be stored as 0 decimals): ask again, alone,
+                    // before anything is concluded. (For ERC1155 failing
+                    // is the norm: name/symbol are not in the standard.)
+                    suspicious.push((*token, *standard));
+                } else {
+                    verdicts
+                        .insert(*token, TokenResult::Resolved(metadata));
+                }
+            }
+
+            if !suspicious.is_empty() {
+                if let Some(alone) = self
+                    .opinion_individually(
+                        &suspicious,
+                        pinned,
+                        run,
+                        auxiliary,
+                    )
+                    .await
+                {
+                    verdicts.extend(alone.verdicts);
+                }
+            }
+
+            return Some(Opinion { source, verdicts });
+        }
+
+        None
+    }
+
+    /// [`opinion`](Self::opinion) with plain `eth_call`s, all answered by
+    /// the same endpoint: the first one that answers within the route.
+    async fn opinion_individually(
+        &self,
+        tokens: &[(Address, TokenStandard)],
+        mut route: Route,
+        run: &FetchRun,
+        auxiliary: bool,
+    ) -> Option<Opinion> {
+        let mut verdicts = HashMap::with_capacity(tokens.len());
+        let mut source = None;
+        let mut rest = tokens.iter();
+
+        // One at a time until somebody answers, then pin to that node.
+        for (token, standard) in rest.by_ref() {
+            if let Some((result, answered_by)) = self
+                .fetch_one(*token, *standard, &route, run, auxiliary)
+                .await
+            {
+                verdicts.insert(*token, result);
+                route.only = Some(answered_by.id);
+                source = Some(answered_by);
+                break;
+            }
+        }
+
+        let source = source?;
+        let route = &route;
+
+        let calls: Vec<_> = rest
+            .map(|(token, standard)| async move {
+                self.fetch_one(*token, *standard, route, run, auxiliary)
+                    .await
+                    .map(|(result, _)| (*token, result))
             })
             .collect();
 
@@ -830,7 +1369,9 @@ impl MetadataFetcher {
                 .collect()
                 .await;
 
-        resolved.into_iter().flatten().collect()
+        verdicts.extend(resolved.into_iter().flatten());
+
+        Some(Opinion { source, verdicts })
     }
 
     /// `None` when the node could not be reached for any of the calls.
@@ -838,59 +1379,115 @@ impl MetadataFetcher {
         &self,
         token: Address,
         standard: TokenStandard,
+        route: &Route,
         run: &FetchRun,
-    ) -> Option<TokenResult> {
+        auxiliary: bool,
+    ) -> Option<(TokenResult, Source)> {
         let mut metadata = TokenMetadata::default();
         let mut all_empty = true;
+        let mut route = route.clone();
+        let mut source = None;
 
         for field in fields_for(standard) {
-            match self.call_with_retry(token, field.calldata(), run).await
+            let answered_by = match self
+                .call_with_retry(
+                    token,
+                    field.calldata(),
+                    &route,
+                    run,
+                    auxiliary,
+                )
+                .await
             {
-                Ok(data) => {
-                    all_empty &= data.is_empty();
-                    apply_field(&mut metadata, *field, &data);
+                Ok(routed) => {
+                    all_empty &= routed.data.is_empty();
+                    apply_field(&mut metadata, *field, &routed.data);
+                    Some(routed.source)
                 }
-                Err(CallError::Execution(_)) => all_empty = false,
-                Err(CallError::Transient(error)) => {
+                Err(RoutedError {
+                    error: CallError::Execution(_),
+                    source,
+                    ..
+                }) => {
+                    all_empty = false;
+                    source
+                }
+                Err(RoutedError {
+                    error: CallError::Transient(error),
+                    ..
+                }) => {
                     debug!(
                         "Token metadata call failed for {token}, it will \
-                         be retried when seen again: {error}"
+                         be retried later: {error}"
                     );
                     return None;
                 }
+            };
+
+            // Every field of a token from the same node.
+            if let Some(answered_by) = answered_by {
+                route.only = Some(answered_by.id);
+                source = Some(answered_by);
             }
         }
 
-        Some(if all_empty {
+        let result = if all_empty {
             TokenResult::Empty
         } else {
             TokenResult::Resolved(metadata)
-        })
+        };
+
+        Some((result, source?))
     }
 
     async fn call_with_retry(
         &self,
         to: Address,
         data: Bytes,
+        route: &Route,
         run: &FetchRun,
-    ) -> Result<Bytes, CallError> {
-        let max_retries =
-            if run.probing { 0 } else { self.options.max_retries };
+        auxiliary: bool,
+    ) -> Result<Routed, RoutedError> {
+        let max_retries = if run.probing {
+            0
+        } else if auxiliary {
+            self.options.max_retries.min(1)
+        } else {
+            self.options.max_retries
+        };
         let mut attempt: u32 = 0;
 
         loop {
             // Another request of this run already gave up on the node.
             if run.gave_up.load(Ordering::Relaxed) {
-                return Err(CallError::Transient(
-                    "skipped, the RPC is unavailable".to_string(),
-                ));
+                return Err(RoutedError {
+                    error: CallError::Transient(
+                        "skipped, the RPC is unavailable".to_string(),
+                    ),
+                    source: None,
+                    no_source: false,
+                });
             }
 
-            match self.caller.call(to, data.clone()).await {
-                Err(CallError::Transient(error)) => {
+            match self.caller.call_routed(to, data.clone(), route).await {
+                Err(failure)
+                    if matches!(
+                        failure.error,
+                        CallError::Transient(_)
+                    ) =>
+                {
+                    if failure.no_source {
+                        return Err(failure);
+                    }
+
                     if attempt >= max_retries {
-                        run.give_up(&error);
-                        return Err(CallError::Transient(error));
+                        if let CallError::Transient(error) = &failure.error
+                        {
+                            if !auxiliary && !run.quiet {
+                                run.give_up(error);
+                            }
+                        }
+                        return Err(failure);
                     }
 
                     let delay = self
@@ -899,7 +1496,7 @@ impl MetadataFetcher {
                         .saturating_mul(2u32.saturating_pow(attempt));
                     debug!(
                         "Token metadata eth_call failed (attempt {}), \
-                         retrying in {delay:?}: {error}",
+                         retrying in {delay:?}",
                         attempt + 1
                     );
                     tokio::time::sleep(delay).await;
@@ -973,6 +1570,12 @@ pub(crate) mod testing {
         pub attempts: AtomicUsize,
         pub chain_id: AtomicU64,
         pub chain_id_calls: AtomicUsize,
+        /// Block height of the node (`getBlockNumber`, `eth_blockNumber`).
+        pub height: AtomicU64,
+        pub block_number_calls: AtomicUsize,
+        /// Sub-calls of an aggregate from this index on fail (0 = off):
+        /// a neighbour ate the gas half way through a token.
+        pub fail_subcalls_from: AtomicUsize,
     }
 
     impl FakeChain {
@@ -980,6 +1583,7 @@ pub(crate) mod testing {
             let chain = Self::default();
             chain.multicall_deployed.store(true, Ordering::SeqCst);
             chain.chain_id.store(1, Ordering::SeqCst);
+            chain.height.store(1_000, Ordering::SeqCst);
             Arc::new(chain)
         }
 
@@ -1074,7 +1678,27 @@ pub(crate) mod testing {
                 let mut exploded = false;
                 let mut results = Vec::with_capacity(decoded.calls.len());
 
-                for call in &decoded.calls {
+                let fail_from =
+                    self.fail_subcalls_from.load(Ordering::SeqCst);
+
+                for (index, call) in decoded.calls.iter().enumerate() {
+                    exploded |= fail_from > 0 && index >= fail_from;
+
+                    if call.target == MULTICALL3_ADDRESS
+                        && call
+                            .callData
+                            .starts_with(&getBlockNumberCall::SELECTOR)
+                    {
+                        let height = self.height.load(Ordering::SeqCst);
+                        results.push(Call3Result {
+                            success: true,
+                            returnData: U256::from(height)
+                                .abi_encode()
+                                .into(),
+                        });
+                        continue;
+                    }
+
                     exploded |= bombs.contains(&call.target);
                     let output = if exploded {
                         None
@@ -1101,6 +1725,21 @@ pub(crate) mod testing {
                 }
 
                 Ok(self.chain_id.load(Ordering::SeqCst))
+            })
+        }
+
+        fn block_number(
+            &self,
+        ) -> BoxFuture<'_, Result<Option<u64>, CallError>> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.block_number_calls.fetch_add(1, Ordering::SeqCst);
+
+                if self.offline.load(Ordering::SeqCst) {
+                    return Err(CallError::Transient("offline".into()));
+                }
+
+                Ok(Some(self.height.load(Ordering::SeqCst)))
             })
         }
     }
@@ -1147,51 +1786,43 @@ mod tests {
     }
 
     #[test]
-    fn classifies_rpc_errors() {
-        let resp = |code: i64, message: &'static str| {
-            RpcError::<TransportErrorKind>::ErrorResp(
-                serde_json::from_value(
-                    serde_json::json!({ "code": code, "message": message }),
-                )
-                .unwrap(),
-            )
+    fn classifies_error_responses() {
+        let classify = |code: i64, message: &str| {
+            classify_error_response(code, message, &Redactor::default())
         };
 
         let execution = [
-            resp(3, "execution reverted"),
-            resp(-32000, "execution reverted: nope"),
-            resp(-32000, "out of gas"),
-            resp(-32015, "VM execution error."),
-            resp(-32000, "invalid opcode: INVALID"),
+            (3, "execution reverted"),
+            (-32000, "execution reverted: nope"),
+            (-32000, "out of gas"),
+            (-32015, "VM execution error."),
+            (-32000, "invalid opcode: INVALID"),
         ];
-        for error in &execution {
+        for (code, message) in execution {
             assert!(
-                matches!(
-                    classify_rpc_error(error, &Redactor::default()),
-                    CallError::Execution(_)
-                ),
-                "{error}"
+                matches!(classify(code, message), CallError::Execution(_)),
+                "{code} {message}"
             );
         }
 
         let transient = [
-            resp(429, "Too many requests"),
-            resp(-32005, "project rate limit exceeded"),
-            resp(-32000, "header not found"),
-            resp(-32603, "internal error"),
-            resp(-32000, "something unexpected"),
-            TransportErrorKind::http_error(502, "bad gateway".into()),
-            TransportErrorKind::http_error(429, String::new()),
-            TransportErrorKind::backend_gone(),
-            TransportErrorKind::custom_str("connection refused"),
+            (429, "Too many requests"),
+            (-32005, "project rate limit exceeded"),
+            (-32000, "header not found"),
+            (-32603, "internal error"),
+            (-32000, "something unexpected"),
+            // Conditions of the node, however much they sound like the
+            // contract's fault: another node may well answer.
+            (-32000, "execution aborted (timeout = 5s)"),
+            (-32000, "gas required exceeds allowance (50000000)"),
+            (3, "execution reverted: rate limit exceeded"),
+            (-32016, "execution reverted"),
+            (-32000, "evm timeout"),
         ];
-        for error in &transient {
+        for (code, message) in transient {
             assert!(
-                matches!(
-                    classify_rpc_error(error, &Redactor::default()),
-                    CallError::Transient(_)
-                ),
-                "{error}"
+                matches!(classify(code, message), CallError::Transient(_)),
+                "{code} {message}"
             );
         }
     }
@@ -1575,6 +2206,31 @@ mod tests {
         assert_eq!(wrong.check_chain_id().await, ChainCheck::Mismatch(1));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_mismatch_is_looked_at_again_after_an_hour() {
+        let chain = FakeChain::new();
+        chain.add(addr(1), FakeToken::erc20("Token", "TKN", 8));
+        chain.chain_id.store(56, Ordering::SeqCst);
+        let tokens = [(addr(1), TokenStandard::Erc20)];
+        let fetcher = fetcher(&chain).expect_chain_id(1);
+
+        assert!(fetcher.fetch(&tokens).await.resolved.is_empty());
+        assert!(fetcher.wrong_chain());
+        assert!(fetcher.chain_recheck_at().is_some());
+
+        // The operator points the URL at the right network. Nothing
+        // happens for an hour (no hammering), then it just works.
+        chain.chain_id.store(1, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(3_000)).await;
+        assert!(fetcher.fetch(&tokens).await.resolved.is_empty());
+        assert_eq!(chain.chain_id_calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(700)).await;
+        assert!(!fetcher.wrong_chain());
+        assert_eq!(fetcher.fetch(&tokens).await.resolved.len(), 1);
+        assert_eq!(fetcher.chain_recheck_at(), None);
+    }
+
     #[tokio::test]
     async fn chain_id_is_checked_lazily_when_the_node_was_down_at_startup()
     {
@@ -1613,57 +2269,16 @@ mod tests {
         let redactor = Redactor::for_url(url);
 
         let errors = [
-            TransportErrorKind::custom_str(&format!(
-                "error sending request for url ({url}): connection refused"
-            )),
-            TransportErrorKind::http_error(
-                401,
-                "unknown api key SuPerSecretKey123".into(),
-            ),
-            RpcError::<TransportErrorKind>::ErrorResp(
-                serde_json::from_value(serde_json::json!({
-                    "code": -32000,
-                    "message": format!("execution reverted at {url}"),
-                }))
-                .unwrap(),
-            ),
+            (401, "unknown api key SuPerSecretKey123".to_string()),
+            (-32000, format!("execution reverted at {url}")),
         ];
 
-        for error in &errors {
-            assert!(error.to_string().contains("SuPerSecretKey123"));
+        for (code, message) in &errors {
             let (CallError::Transient(message)
             | CallError::Execution(message)) =
-                classify_rpc_error(error, &redactor);
+                classify_error_response(*code, message, &redactor);
             assert!(!message.contains("SuPerSecretKey123"), "{message}");
             assert!(!message.contains("alchemy"), "{message}");
         }
-    }
-
-    #[tokio::test]
-    async fn alloy_caller_errors_do_not_leak_the_url() {
-        // Closed local port: reqwest reports the full URL in its error.
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let caller = AlloyCaller::new(
-            &format!("http://127.0.0.1:{port}/v2/SuPerSecretKey123"),
-            Duration::from_secs(5),
-        )
-        .unwrap();
-
-        let Err(CallError::Transient(message)) = caller.chain_id().await
-        else {
-            panic!("expected a transport error");
-        };
-        assert!(!message.contains("SuPerSecretKey123"), "{message}");
-
-        let Err(CallError::Transient(message)) =
-            caller.call(addr(1), Bytes::new()).await
-        else {
-            panic!("expected a transport error");
-        };
-        assert!(!message.contains("SuPerSecretKey123"), "{message}");
     }
 }

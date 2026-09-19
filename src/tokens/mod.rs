@@ -25,8 +25,21 @@
 //! RPC endpoints with failover, optionally discovered with `--rpc auto`)
 //! and heals anything it missed from the database itself.
 //!
+//! **Trust.** Endpoints the operator configured are trusted; endpoints
+//! discovered from the public registry are not (tirith decision "Public
+//! RPC endpoints are untrusted"). Nothing a discovered endpoint says is
+//! stored unless a second, independent provider gives the same decoded
+//! answer, and "nothing there" needs agreement from anybody whenever
+//! somebody else can be asked; without agreement there is no row and the
+//! token is tried again later. Nodes that lag behind (their block height
+//! is part of every Multicall3 answer) are not listened to, and blank rows
+//! are verified again later: they expire from Redis and the database is
+//! asked for them. [`call_confirmed`] applies the same rules to any other
+//! `eth_call` (the DEX pool resolver).
+//!
 //! Redis keys are `evm-indexer:token:{chain_id}:{0xaddress-lowercase}` and
-//! hold a compact JSON `{"name","symbol","decimals","type"}` without TTL.
+//! hold a compact JSON `{"name","symbol","decimals","type"}`, without TTL
+//! unless the row is blank (1 day, 7 days once verified again).
 //! When the ClickHouse `tokens` table is reset, those keys must be flushed
 //! too.
 
@@ -35,13 +48,15 @@ pub mod cache;
 pub mod decode;
 pub mod discovery;
 pub mod endpoints;
+pub mod http;
 pub mod multicall;
 pub mod redact;
 pub mod worker;
 
 pub use self::{
-    discovery::{build_caller, discover_public_rpcs},
+    discovery::{build_caller, build_caller_shared, discover_public_rpcs},
     endpoints::MultiEndpointCaller,
+    multicall::call_confirmed,
     worker::{
         MissingTokenSource, TokenSink, TokenWorker, TokenWorkerOptions,
         TokenWorkerStats,
@@ -66,7 +81,7 @@ use crate::db::models::token::DatabaseToken;
 use self::{
     cache::{KnownTokens, RedisTokenCache, TokenCache},
     multicall::{
-        AlloyCaller, CallerHealth, ChainCheck, EthCaller, FetchOptions,
+        CallerHealth, ChainCheck, EthCaller, FetchOptions, HttpCaller,
         MetadataFetcher,
     },
 };
@@ -122,6 +137,16 @@ pub struct TokenResolverOptions {
     /// more by then, and without it such addresses would be reported by
     /// the database backfill forever. `0` never gives up.
     pub empty_strikes: u32,
+    /// A blank row (no metadata at all) is believed for this long, then
+    /// it is due to be verified again: a wrong "nothing there" must not
+    /// be forever.
+    pub blank_ttl: Duration,
+    /// ...and for this long once it was verified again and still blank.
+    pub blank_recheck_ttl: Duration,
+    /// A token the database reports as missing is only fetched again
+    /// when the caches learned about it at least this long before the
+    /// query started (the query may not see a row inserted just now).
+    pub backfill_margin: Duration,
     pub fetch: FetchOptions,
 }
 
@@ -134,6 +159,9 @@ impl Default for TokenResolverOptions {
             empty_ttl: cache::DEFAULT_EMPTY_TTL,
             empty_capacity: cache::DEFAULT_EMPTY_CAPACITY,
             empty_strikes: 3,
+            blank_ttl: Duration::from_secs(24 * 3_600),
+            blank_recheck_ttl: Duration::from_secs(7 * 24 * 3_600),
+            backfill_margin: Duration::from_secs(10),
             fetch: FetchOptions::default(),
         }
     }
@@ -148,6 +176,9 @@ struct Inner {
     pending_writes: Mutex<VecDeque<DatabaseToken>>,
     max_pending_writes: usize,
     empty_strikes: u32,
+    blank_ttl: Duration,
+    blank_recheck_ttl: Duration,
+    backfill_margin: Duration,
     counters: Counters,
 }
 
@@ -159,6 +190,7 @@ struct Counters {
     negative: AtomicU64,
     codeless: AtomicU64,
     rpc_failures: AtomicU64,
+    unconfirmed: AtomicU64,
 }
 
 /// Counters of a [`TokenResolver`] since it was created.
@@ -176,6 +208,9 @@ pub struct ResolverStats {
     pub codeless: u64,
     /// Tokens that could not be fetched because the RPC was unavailable.
     pub rpc_failures: u64,
+    /// Tokens that were answered but not confirmed by a second,
+    /// independent endpoint (nothing was stored for them).
+    pub unconfirmed: u64,
     /// The RPC circuit breaker is open (or the RPC serves another chain).
     pub breaker_open: bool,
 }
@@ -266,7 +301,7 @@ impl TokenResolver {
         let fetcher = match rpc_url {
             Some(url) => {
                 let caller =
-                    AlloyCaller::new(url, options.fetch.call_timeout)?;
+                    HttpCaller::new(url, options.fetch.call_timeout)?;
                 let fetcher = MetadataFetcher::new(
                     Arc::new(caller),
                     options.fetch.clone(),
@@ -366,6 +401,9 @@ impl TokenResolver {
                 pending_writes: Mutex::new(VecDeque::new()),
                 max_pending_writes: options.max_pending_writes,
                 empty_strikes: options.empty_strikes,
+                blank_ttl: options.blank_ttl,
+                blank_recheck_ttl: options.blank_recheck_ttl,
+                backfill_margin: options.backfill_margin,
                 counters: Counters::default(),
             }),
         }
@@ -408,6 +446,7 @@ impl TokenResolver {
             negative: load(&counters.negative),
             codeless: load(&counters.codeless),
             rpc_failures: load(&counters.rpc_failures),
+            unconfirmed: load(&counters.unconfirmed),
             breaker_open: self.is_enabled() && !self.rpc_available(),
         }
     }
@@ -431,6 +470,112 @@ impl TokenResolver {
             .filter(|(address, _)| known.needs_resolution(address, now))
             .map(|(address, standard)| (*address, *standard))
             .collect()
+    }
+
+    /// The height the indexer has reached. Cheap and non blocking; lets
+    /// the RPC backend tell stale nodes apart (see
+    /// [`EthCaller::head_hint`]).
+    pub fn set_head(&self, block: u64) {
+        if let Some(fetcher) = &self.inner.fetcher {
+            fetcher.caller().head_hint(block);
+        }
+    }
+
+    /// When the wrong-chain verdict on the RPC is looked at again.
+    pub fn chain_recheck_at(&self) -> Option<tokio::time::Instant> {
+        self.inner.fetcher.as_ref().and_then(|f| f.chain_recheck_at())
+    }
+
+    /// Of the tokens the database reported as having no `tokens` row (in
+    /// a query that started at `query_started`), the ones to fetch, in
+    /// [`ResolveMode::Forced`]: the database is the authority, whatever
+    /// memory or Redis believe. See [`KnownTokens::missing_in_database`]
+    /// for what is left out. Synchronous: no I/O, claims nothing.
+    pub fn missing_in_database(
+        &self,
+        reported: &[(Address, TokenStandard)],
+        query_started: tokio::time::Instant,
+    ) -> Vec<(Address, TokenStandard)> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
+
+        let now = now();
+        let query_started = query_started.into_std();
+        let margin = self.inner.backfill_margin;
+        let mut known = self.inner.known();
+
+        reported
+            .iter()
+            .filter(|(address, _)| {
+                known.missing_in_database(
+                    address,
+                    now,
+                    query_started,
+                    margin,
+                )
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Of the blank rows the database listed, the ones due to be
+    /// verified again: not the ones memory or the persistent cache still
+    /// vouch for (their blank entries expire, which is the schedule).
+    pub async fn blank_recheck_due(
+        &self,
+        listed: &[(Address, TokenStandard)],
+    ) -> Vec<(Address, TokenStandard)> {
+        let inner = &*self.inner;
+
+        if !self.is_enabled() || listed.is_empty() {
+            return Vec::new();
+        }
+
+        let now = now();
+        let mut due: Vec<(Address, TokenStandard)> = {
+            let known = inner.known();
+            listed
+                .iter()
+                .filter(|(address, _)| {
+                    known.blank_recheck_due(address, now)
+                        && !known.is_in_flight(address)
+                })
+                .copied()
+                .collect()
+        };
+
+        let Some(cache) = &inner.cache else {
+            return due;
+        };
+        if due.is_empty() {
+            return due;
+        }
+
+        let addresses: Vec<Address> =
+            due.iter().map(|(address, _)| *address).collect();
+
+        match cache.contains_many(&addresses).await {
+            Ok(found) if found.len() == due.len() => {
+                let mut known = inner.known();
+                let mut found = found.into_iter();
+                due.retain(|(address, _)| {
+                    let vouched = found.next().unwrap_or(false);
+                    if vouched {
+                        // Another process verified it; ask again later
+                        // rather than on every listing.
+                        known.set_blank_until(
+                            *address,
+                            now + inner.blank_ttl,
+                        );
+                    }
+                    !vouched
+                });
+                due
+            }
+            // Cache unavailable: memory alone decides.
+            _ => due,
+        }
     }
 
     /// Whether the token is known in memory to be stored.
@@ -474,6 +619,18 @@ impl TokenResolver {
         &self,
         tokens: &HashMap<Address, TokenStandard>,
         mode: ResolveMode,
+    ) -> Resolution {
+        self.resolve_with(tokens, mode, false).await
+    }
+
+    /// [`resolve`](Self::resolve); with `quiet` a failure is blamed on
+    /// the tokens (known troublemakers) rather than on the RPC: no
+    /// circuit breaker opens over it.
+    pub async fn resolve_with(
+        &self,
+        tokens: &HashMap<Address, TokenStandard>,
+        mode: ResolveMode,
+        quiet: bool,
     ) -> Resolution {
         let inner = &*self.inner;
         let mut resolution = Resolution::default();
@@ -532,7 +689,7 @@ impl TokenResolver {
                         hits.into_iter().map(|(a, _)| a).collect();
                     missing = misses.into_iter().map(|(a, _)| a).collect();
 
-                    inner.known().confirm(&hits);
+                    inner.known().confirm_at(&hits, now());
                     inner
                         .counters
                         .cache_hits
@@ -583,8 +740,15 @@ impl TokenResolver {
         // Deterministic chunks (HashMap order is random).
         to_fetch.sort_unstable();
 
-        let outcome = fetcher.fetch(&to_fetch).await;
+        let outcome = fetcher.fetch_with(&to_fetch, quiet).await;
         let mut fetched = outcome.resolved;
+
+        // Answered, but not by two independent endpoints: no row. The
+        // claims go back through the guard like any other failure.
+        inner.counters.unconfirmed.fetch_add(
+            outcome.unconfirmed.len() as u64,
+            Ordering::Relaxed,
+        );
 
         // No code at the address as far as the node knows: not definitive
         // (lagging node), so no row and nothing persisted. Skipped for a
@@ -683,14 +847,42 @@ impl TokenResolver {
     ///
     /// Never fails: if Redis is unavailable the rows are kept (bounded) and
     /// written on a later call, and the tokens are known in memory anyway.
+    ///
+    /// Blank rows are only vouched for during
+    /// [`blank_ttl`](TokenResolverOptions::blank_ttl).
     pub async fn mark_stored(&self, tokens: &[DatabaseToken]) {
+        self.mark(tokens, self.inner.blank_ttl).await;
+    }
+
+    /// [`mark_stored`](Self::mark_stored) for rows that were verified
+    /// *again*: a blank that is still blank is vouched for longer
+    /// ([`blank_recheck_ttl`](TokenResolverOptions::blank_recheck_ttl)).
+    pub async fn mark_rechecked(&self, tokens: &[DatabaseToken]) {
+        self.mark(tokens, self.inner.blank_recheck_ttl).await;
+    }
+
+    async fn mark(&self, tokens: &[DatabaseToken], blank_ttl: Duration) {
         let inner = &*self.inner;
 
         if tokens.is_empty() {
             return;
         }
 
-        inner.known().confirm(tokens.iter().map(|token| &token.address));
+        {
+            let now = now();
+            let mut known = inner.known();
+            known.confirm_at(
+                tokens.iter().map(|token| &token.address),
+                now,
+            );
+            for token in tokens {
+                if cache::is_blank(token) {
+                    known.set_blank_until(token.address, now + blank_ttl);
+                } else {
+                    known.clear_blank(&token.address);
+                }
+            }
+        }
 
         let Some(cache) = &inner.cache else {
             return;
@@ -701,7 +893,9 @@ impl TokenResolver {
             inner.pending_writes().drain(..).collect();
         batch.extend_from_slice(tokens);
 
-        if let Err(error) = cache.store_many(&batch).await {
+        if let Err(error) =
+            cache.store_many_expiring(&batch, blank_ttl).await
+        {
             debug!("Token cache write failed: {error}");
 
             let mut pending = inner.pending_writes();
