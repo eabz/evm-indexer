@@ -30,8 +30,20 @@ pub mod verify;
 pub mod workers;
 pub mod writer;
 
+// `indexer run --chain solana`. A SEPARATE sync loop, deliberately: the
+// commit marker, what a gap is, what continuity means and whether a
+// mismatch is a fork all differ (see `solana.rs`). Nothing below is
+// reachable from the EVM path, and the EVM path is unchanged.
+pub mod solana;
+pub mod solana_store;
+pub mod solana_verify;
+pub mod solana_writer;
+
 #[cfg(test)]
 mod acceptance;
+
+#[cfg(test)]
+mod solana_acceptance;
 
 use crate::{
     configs::Config,

@@ -1,6 +1,50 @@
 use clap::{ArgAction, Args, Parser, Subcommand};
 use std::ffi::OsString;
 
+/// Chains that have a NAME as well as an id, because their id is not the
+/// thing anyone knows them by.
+///
+/// Exactly one entry, on purpose. `--chain 1` is Ethereum and everybody
+/// reads that; `--chain 1399811149` is Solana and nobody does - the number
+/// is the Hyperlane domain id this project adopted (docs/design.md §14)
+/// because no standard integer id for Solana exists. So the name is
+/// accepted as an alias and the id keeps working unchanged, on the command
+/// line and in `CHAIN_ID`.
+///
+/// This is not a chain registry and must not grow into one: EVM chain ids
+/// are the identifier for EVM chains, and a second name here would start
+/// an argument about spelling for every chain in the fleet.
+const NAMED_CHAINS: &[(&str, u64)] = &[("solana", 1_399_811_149)];
+
+/// `--chain`: a number as before, or a name from [`NAMED_CHAINS`].
+///
+/// The number is tried FIRST, so nothing that worked before can change
+/// meaning.
+fn parse_chain(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+
+    if let Ok(id) = value.parse::<u64>() {
+        return Ok(id);
+    }
+
+    let lower = value.to_ascii_lowercase();
+    if let Some((_, id)) =
+        NAMED_CHAINS.iter().find(|(name, _)| *name == lower)
+    {
+        return Ok(*id);
+    }
+
+    Err(format!(
+        "invalid chain '{value}': expected a chain id (a number) or one \
+         of {}",
+        NAMED_CHAINS
+            .iter()
+            .map(|(name, id)| format!("{name} (= {id})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 /// Boolean flags are driven from the environment by docker-compose, which
 /// passes every variable even when blank. So `DEBUG=false`, `DEBUG=0` and
 /// `DEBUG=` must all mean "off" instead of failing to parse.
@@ -79,8 +123,9 @@ pub struct VerifyArgs {
     #[arg(
         long,
         env = "CHAIN_ID",
-        help = "Number identifying the chain id to verify.",
-        default_value_t = 1
+        help = "Chain to verify: a chain id, or the name `solana` (= 1399811149).",
+        default_value_t = 1,
+        value_parser = parse_chain
     )]
     pub chain: u64,
 
@@ -130,8 +175,9 @@ pub struct BackfillArgs {
     #[arg(
         long,
         env = "CHAIN_ID",
-        help = "Number identifying the chain id to backfill.",
-        default_value_t = 1
+        help = "Chain to backfill: a chain id, or the name `solana` (= 1399811149).",
+        default_value_t = 1,
+        value_parser = parse_chain
     )]
     pub chain: u64,
 
@@ -182,8 +228,9 @@ pub struct IndexerArgs {
     #[arg(
         long,
         env = "CHAIN_ID",
-        help = "Number identifying the chain id to sync.",
-        default_value_t = 1
+        help = "Chain to sync: a chain id, or the name `solana` (= 1399811149). On Solana --start-block is a SLOT and several EVM-only flags are refused or ignored; see the README.",
+        default_value_t = 1,
+        value_parser = parse_chain
     )]
     pub chain: u64,
 

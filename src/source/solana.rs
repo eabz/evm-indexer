@@ -28,7 +28,7 @@ use anyhow::{bail, Context, Result};
 use hypersync_client_solana::{
     config::{ClientConfig, StreamConfig},
     simple_types::SolanaResponse,
-    Client,
+    Client, RateLimitInfo,
 };
 use hypersync_solana_net_types::{
     field_selection::{
@@ -436,6 +436,40 @@ impl SolanaSource {
                 || format!("query Solana slots [{from}, {to})"),
             )?;
         Ok(to_batch(response))
+    }
+
+    /// [`Self::fetch`] over Arrow, with the response's rate-limit headers.
+    ///
+    /// This is what the pipeline's head follower uses, for two reasons:
+    ///
+    /// * **Arrow is 43% of JSON for the identical query and costs the same
+    ///   1000 budget units** (measured: 19.9 MB against 46.2 MB,
+    ///   docs/solana-research.md §11.1). At 162 GB/day of head traffic
+    ///   that is not a micro-optimisation.
+    /// * **It surfaces `x-ratelimit-*`.** The budget is 30 queries per
+    ///   60 s per endpoint and `remaining` counts BUDGET UNITS, not
+    ///   requests, so the follower divides it by `cost` rather than
+    ///   hard-coding 30 - the documentation publishes neither number, and
+    ///   the runtime headers are the only source of truth.
+    ///
+    /// One request, not a stream: the follower wants to spend exactly one
+    /// metered query and be told where the server stopped.
+    pub async fn fetch_arrow(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<(SolanaBatch, RateLimitInfo)> {
+        let answer = self
+            .client
+            .get_arrow_with_rate_limit(&build_query(from, to))
+            .await
+            .with_context(|| {
+                format!("query Solana slots [{from}, {to}) as Arrow")
+            })?;
+
+        let response = decode_arrow(answer.response)?;
+
+        Ok((to_batch(response), answer.rate_limit))
     }
 
     /// Streams `[from, to)`. Always a BOUNDED range: the client has no
