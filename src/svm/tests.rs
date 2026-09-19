@@ -834,6 +834,708 @@ fn venue_event_lengths_match_the_chain() {
     );
 }
 
+// --- review round 4 ------------------------------------------------------
+//
+// Everything below pins a finding of the ADDENDUM of docs/review-round-4.md.
+// Where the report names a real transaction, that transaction is the
+// fixture (`fixtures/round4.json`); where it names a shape no recording of
+// which could be found, the transaction is BUILT here and the test says so.
+
+/// The five vault authorities the addendum measured: one account per
+/// PROGRAM, shared by every pool that program runs.
+const GLOBAL_VAULT_AUTHORITIES: &[(&str, &str)] = &[
+    ("raydium_amm_v4", "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"),
+    ("raydium_cpmm", "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL"),
+    ("meteora_damm_v2", "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC"),
+    ("meteora_dbc", "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM"),
+    ("raydium_launchlab", "WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh"),
+];
+
+/// B3. Half the streamed venues own EVERY pool's vaults with one
+/// program-wide account, and the movement layer's idea of a pool is exactly
+/// that owner. Storing it keys the whole venue into ONE candle series:
+/// open/high/low/close would mix USDC/SOL with arbitrary memecoin prices
+/// and the volumes would sum amounts of unrelated mints.
+///
+/// The transaction is the one the report names,
+/// `3ZZw4CfNzTMgPnnJRhKk28bteiip6zDimArpQSNURYfLn94J4UTPmYfBqTU2SfJ3pbwodZV3rGsUz7Qfyh8MVPJP`,
+/// and it is decoded with its LOGS REMOVED - which is the condition the
+/// finding is about: Raydium v4's only event is a log line, so any
+/// transaction whose logs the validator truncated, or whose `ray_log` says
+/// something the movement layer contradicts, reaches the table on the
+/// movement layer alone.
+#[test]
+fn a_program_wide_vault_authority_is_never_stored_as_a_pool() {
+    let authorities: Vec<crate::svm::models::Pubkey> =
+        GLOBAL_VAULT_AUTHORITIES
+            .iter()
+            .map(|(_, id)| crate::svm::programs::pubkey(id))
+            .collect();
+
+    for fixture in fixtures::all() {
+        // Both readings of every recording: the event confirming the row,
+        // and the event absent.
+        for logs in [true, false] {
+            let mut tx = fixture.transaction.clone();
+            if !logs {
+                tx.logs.clear();
+                tx.dropped_logs = true;
+            }
+            let outcome = decode_transaction_with(
+                CHAIN,
+                fixture.timestamp(),
+                &tx,
+                &Registry::with_venues(&Venue::ALL),
+            );
+            for swap in &outcome.swaps {
+                assert!(
+                    !authorities.contains(&swap.pool_id),
+                    "{}: {} stored the program-wide vault authority {} as \
+                     its pool, which collapses every pair of the venue \
+                     into one candle series",
+                    fixture.name,
+                    swap.protocol,
+                    to_base58(&swap.pool_id),
+                );
+            }
+        }
+    }
+}
+
+/// And the row is not merely un-mis-keyed: the pool is RECOVERED from the
+/// instruction's own account metas, so a Raydium v4 fill whose log is gone
+/// still lands on the right series.
+#[test]
+fn the_raydium_v4_pool_survives_the_loss_of_its_log() {
+    let fixture = fixtures::get("raydium_v4_and_pumpswap");
+    let mut tx = fixture.transaction.clone();
+    tx.logs.clear();
+    tx.dropped_logs = true;
+
+    let outcome = decode_transaction_with(
+        CHAIN,
+        fixture.timestamp(),
+        &tx,
+        &Registry::with_venues(&Venue::ALL),
+    );
+    let v4 = outcome
+        .swaps
+        .iter()
+        .find(|swap| swap.protocol == Venue::RaydiumAmmV4.as_str())
+        .expect("the Raydium v4 hop");
+
+    // The real pool, which the same transaction's `ray_log` path also
+    // names when the log is there: Raydium's SOL/USDC v4 market.
+    assert_eq!(
+        to_base58(&v4.pool_id),
+        "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+    );
+    // ... and it is honestly labelled, because no event confirmed it.
+    assert_eq!(v4.confidence, "movement");
+}
+
+/// The account index each venue's pool sits at is not a guess: wherever a
+/// recording carries both the instruction and the venue's own event, the
+/// index must select exactly the account the event names.
+#[test]
+fn the_pool_account_index_is_the_account_the_venue_names() {
+    use crate::svm::{
+        programs::IxKind,
+        venues::{
+            DbcSwap2, LaunchlabTrade, MeteoraDamm2Swap, RaydiumCpmmSwap,
+        },
+    };
+
+    let registry = Registry::with_venues(&Venue::ALL);
+    let mut checked = 0;
+
+    for fixture in fixtures::all() {
+        let tx = &fixture.transaction;
+        for instruction in &tx.instructions {
+            let Some(venue) = registry.venue(&instruction.program) else {
+                continue;
+            };
+            if !venue.vault_authority_is_global()
+                || venue.instruction_kind(&instruction.data)
+                    != IxKind::Swap
+            {
+                continue;
+            }
+
+            // What the venue itself says the pool is, from its own event.
+            let mut named = Vec::new();
+            for child in &tx.instructions {
+                if child.path.len() != instruction.path.len() + 1
+                    || !child.path.starts_with(&instruction.path)
+                {
+                    continue;
+                }
+                if let Some(event) = MeteoraDamm2Swap::parse(&child.data) {
+                    named.push(event.pool);
+                }
+                if let Some(event) = DbcSwap2::parse(&child.data) {
+                    named.push(event.pool);
+                }
+                if let Some(event) = LaunchlabTrade::parse(&child.data) {
+                    named.push(event.pool_state);
+                }
+            }
+            for log in tx
+                .logs
+                .iter()
+                .filter(|log| log.path == instruction.path && log.is_data)
+            {
+                if let Some(event) = log
+                    .event_bytes()
+                    .and_then(|bytes| RaydiumCpmmSwap::parse(&bytes))
+                {
+                    named.push(event.pool_id);
+                }
+            }
+
+            for pool in named {
+                let index =
+                    venue.pool_account_index().unwrap_or_else(|| {
+                        panic!(
+                            "{}: {} names a pool in its event but has no \
+                         verified account index, so a movement-only row \
+                         of it would have no pool key",
+                            fixture.name,
+                            venue.as_str()
+                        )
+                    });
+                assert_eq!(
+                    instruction.account(index),
+                    Some(pool),
+                    "{}: {}'s pool account index {index} does not select \
+                     the pool its own event names",
+                    fixture.name,
+                    venue.as_str()
+                );
+                checked += 1;
+            }
+        }
+    }
+
+    assert!(
+        checked >= 2,
+        "no recording exercises a global-authority venue's pool index"
+    );
+
+    // And the decoder checks the same thing on every row it writes, so a
+    // venue that changes an account layout shows up as a counter rather
+    // than as a wrong pool key. It must be zero over the whole corpus.
+    for fixture in fixtures::all() {
+        let outcome = decode_transaction_with(
+            CHAIN,
+            fixture.timestamp(),
+            &fixture.transaction,
+            &registry,
+        );
+        assert_eq!(
+            outcome.diagnostics.pool_index_disagreed, 0,
+            "{}: the account index and the venue's event name different \
+             pools",
+            fixture.name
+        );
+    }
+}
+
+/// M4. `amount_out` is what the TAKER received, and on a routed trade the
+/// taker's receive account is created and closed inside the transaction -
+/// so it appears in neither the pre nor the post balances and has no
+/// readable delta. Taking "the next movement with a readable delta"
+/// instead lands on a protocol or creator FEE recipient, whose small
+/// positive delta passes every guard.
+///
+/// Both numbers below are the report's, measured on the chain.
+#[test]
+fn amount_out_is_never_a_fee_recipients_balance_delta() {
+    let outcome = decode("raydium_v4_and_pumpswap");
+    let sell = outcome
+        .swaps
+        .iter()
+        .find(|swap| unpack_ordinal(swap.ordinal) == vec![4])
+        .expect("the PumpSwap sell at [4]");
+    // The fee recipient's delta the row used to store.
+    assert_ne!(
+        sell.amount_out,
+        U256::from(32_922_301u64),
+        "amount_out is a fee recipient's balance delta"
+    );
+    // The taker's account is unreadable, so the honest answer is what the
+    // pool SENT - never some other account's delta.
+    assert_eq!(sell.amount_out, sell.amount_out_gross);
+    assert_eq!(sell.amount_out, U256::from(131_425_822_336u64));
+
+    let outcome = decode("launchlab_sell");
+    let launchlab = outcome
+        .swaps
+        .iter()
+        .find(|swap| swap.protocol == Venue::RaydiumLaunchlab.as_str())
+        .expect("the LaunchLab sell");
+    assert_ne!(
+        launchlab.amount_out,
+        U256::from(29_570u64),
+        "amount_out is the fee, not the fill"
+    );
+    assert_eq!(launchlab.amount_out, U256::from(2_949_621u64));
+}
+
+/// M6. `trader` was the transaction's fee payer, always. On this recorded
+/// curve sell the fee payer is a BOT and the venue's event names the person
+/// who traded - and `sol_dex_candles_*.traders` is `uniqState(trader)`, so
+/// the unique-trader count was a count of bots.
+///
+/// The launchpad decoder already stored the event's user for this very
+/// trade, so the two tables disagreed about one trade. They must agree.
+#[test]
+fn the_trader_is_the_venues_user_and_not_the_bot_that_paid_the_fee() {
+    let fixture = fixtures::get("pumpfun_sell");
+    let outcome = decode("pumpfun_sell");
+    let swap = &outcome.swaps[0];
+
+    let user = crate::svm::programs::pubkey(fixtures::PUMPFUN_SELL_USER);
+    assert_eq!(swap.trader, user, "the trader is the event's user");
+    assert_ne!(
+        swap.trader, fixture.transaction.fee_payer,
+        "the fee payer of this recording is a bot, not the trader"
+    );
+
+    // And the launchpad row of the SAME trade agrees, which it did not
+    // before: it has always used the event's user.
+    let launchpads = crate::svm::launchpads::decode_transaction(
+        CHAIN,
+        fixture.timestamp(),
+        &fixture.transaction,
+        &outcome.swaps,
+    );
+    let trade = launchpads
+        .trades
+        .first()
+        .expect("the curve trade's launchpad row");
+    assert_eq!(
+        trade.trader, swap.trader,
+        "sol_dex_swaps and launchpad_trades disagree about who traded"
+    );
+}
+
+/// M7. `has_dropped_log_messages` is the validator saying this
+/// transaction's log stream is incomplete. For a venue whose event exists
+/// ONLY as a log line that is decisive - a line that survived cannot be
+/// told from one that did not - and the flag was plumbed end to end and
+/// never read.
+#[test]
+fn a_transaction_with_dropped_logs_is_not_enriched_from_its_logs() {
+    let fixture = fixtures::get("launchlab_sell");
+    let mut tx = fixture.transaction.clone();
+    tx.dropped_logs = true;
+
+    let outcome = decode_transaction_with(
+        CHAIN,
+        fixture.timestamp(),
+        &tx,
+        &Registry::with_venues(&Venue::ALL),
+    );
+
+    for swap in &outcome.swaps {
+        let venue = Venue::ALL
+            .iter()
+            .find(|venue| venue.as_str() == swap.protocol)
+            .copied()
+            .expect("a known venue");
+        match venue.event_source() {
+            crate::svm::programs::EventSource::Log => assert_eq!(
+                swap.confidence, "movement",
+                "{}: its event is a LOG LINE and the validator dropped \
+                 log lines here, so nothing can confirm this row",
+                swap.protocol
+            ),
+            // A self-CPI event is an INSTRUCTION. Validators never drop
+            // those, so the LaunchLab row is unaffected - which is the
+            // other half of the property: the flag must not make the
+            // decoder blind to events that are still all there.
+            _ => {
+                assert_eq!(swap.confidence, "decoded", "{}", swap.protocol)
+            }
+        }
+    }
+    assert!(
+        outcome.diagnostics.dropped_logs >= 2,
+        "the incomplete rows must be COUNTED, or the agreement rate reads \
+         them as 'this venue emits no event': {:?}",
+        outcome.diagnostics
+    );
+    // And the same transaction with the flag clear decodes both log
+    // venues, so the test is about the flag and not about the bytes.
+    let honest = decode("launchlab_sell");
+    assert!(honest.swaps.iter().all(|swap| swap.confidence == "decoded"));
+}
+
+/// M9. A fill routed through an aggregator other than Jupiter v6 used to
+/// read as a DIRECT trade, because Jupiter v6 was the only registered
+/// router. Volume was never wrong - the fill is attributed to the venue
+/// either way - but the attribution was missing for most of the 40% of
+/// the chain that is routed.
+#[test]
+fn a_fill_under_any_registered_router_carries_it_as_attribution() {
+    let registry = Registry::with_venues(&Venue::ALL);
+    let mut seen = 0;
+    for (name, id) in crate::svm::programs::ROUTERS_B58 {
+        let router = crate::svm::programs::pubkey(id);
+        assert_eq!(registry.router(&router), Some(*name));
+
+        let tx = build::routed_pumpswap_like(router);
+        let outcome = decode_transaction_with(CHAIN, 1, &tx, &registry);
+        let swap = outcome
+            .swaps
+            .first()
+            .unwrap_or_else(|| panic!("{name}: the fill went missing"));
+        assert_eq!(
+            swap.route_program, router,
+            "{name}: a fill under it is not attributed to it"
+        );
+        assert_ne!(swap.route_ordinal, 0);
+        // The venue keeps the volume. A router is never a venue.
+        assert_eq!(swap.protocol, Venue::MeteoraDammV2.as_str());
+        seen += 1;
+    }
+    assert!(seen >= 10, "the router list did not grow");
+}
+
+/// The counter-example, on real bytes: the recorded pump.fun sell sits
+/// under `MAyhSmzX...`, which the research listed next to the routers.
+/// It is pump.fun's OWN "Mayhem Mode" program - a launchpad program - and
+/// registering it would have attributed this curve trade to an aggregator
+/// that does not exist.
+#[test]
+fn the_pumpfun_mayhem_wrapper_is_not_a_route() {
+    let fixture = fixtures::get("pumpfun_sell");
+    let mayhem = crate::svm::programs::pubkey(
+        "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e",
+    );
+    assert!(
+        fixture
+            .transaction
+            .instructions
+            .iter()
+            .any(|instruction| instruction.program == mayhem
+                && instruction.path.len() == 1),
+        "the recording no longer has the Mayhem wrapper"
+    );
+
+    let swap = &decode("pumpfun_sell").swaps[0];
+    assert_eq!(swap.route_program, crate::svm::models::ZERO_PUBKEY);
+    assert_eq!(swap.route_ordinal, 0);
+}
+
+/// B3, the other half: when the pool cannot be named at all the row is
+/// stored with NO pool key and stays out of the pool-keyed aggregates,
+/// rather than being keyed on the vault authority.
+///
+/// Meteora DAMM v2 is the venue with no verified pool account index, so a
+/// DAMM v2 fill whose event did not turn up is exactly that case.
+#[test]
+fn a_pool_that_cannot_be_named_is_left_out_of_the_pool_keyed_series() {
+    let registry = Registry::with_venues(&Venue::ALL);
+    let router = crate::svm::programs::pubkey(
+        crate::svm::programs::ROUTERS_B58[0].1,
+    );
+    let tx = build::routed_pumpswap_like(router);
+    let outcome = decode_transaction_with(CHAIN, 1, &tx, &registry);
+
+    let swap = &outcome.swaps[0];
+    assert_eq!(swap.protocol, Venue::MeteoraDammV2.as_str());
+    // The trade is still counted - the amounts, mints and price are exact.
+    assert_eq!(swap.amount_in, U256::from(1_000u64));
+    // It simply has no pool key, which is what the candle views filter on.
+    assert_eq!(swap.pool_id, crate::svm::models::ZERO_PUBKEY);
+    assert_eq!(swap.confidence, "movement");
+    assert_eq!(outcome.diagnostics.unnamed_pool, 1);
+}
+
+/// M5. Orca's `two_hop_swap` and Raydium CLMM's `swap_router_base_in`
+/// execute TWO fills from one instruction, on two different pools. The
+/// decoder produced a single row for them - the later hops were proposed
+/// as competing readings of one trade and then dropped - and even if two
+/// rows had been built they would have collided on the position key,
+/// because the ordinal is the instruction path and both hops share it.
+#[test]
+fn a_two_hop_instruction_becomes_one_row_per_hop() {
+    let registry = Registry::with_venues(&Venue::ALL);
+    let tx = build::orca_two_hop();
+    let outcome = decode_transaction_with(CHAIN, 1, &tx, &registry);
+
+    assert_eq!(
+        outcome.swaps.len(),
+        2,
+        "a two-hop swap must be two fills, got {:?}",
+        outcome
+            .swaps
+            .iter()
+            .map(|swap| (swap.amount_in, swap.amount_out))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(outcome.diagnostics.extra_hops, 1);
+
+    let (first, second) = (&outcome.swaps[0], &outcome.swaps[1]);
+    // Two different pools, and the hops chain: the first hop's output mint
+    // is the second's input.
+    assert_ne!(first.pool_id, second.pool_id);
+    assert_eq!(first.token_out, second.token_in);
+    // Each hop keeps its OWN amounts. Before, one hop's legs landed in the
+    // other's fee column.
+    assert_eq!(first.amount_in, U256::from(1_000u64));
+    assert_eq!(first.amount_out_gross, U256::from(900u64));
+    assert_eq!(second.amount_in, U256::from(900u64));
+    assert_eq!(second.amount_out_gross, U256::from(800u64));
+    assert_eq!(first.fee_amount, U256::ZERO);
+    assert_eq!(second.fee_amount, U256::ZERO);
+
+    // Same instruction, distinct positions: the hop sub-index is the four
+    // bits the packed path leaves free at the bottom, so the two rows
+    // cannot replace each other in a ReplacingMergeTree and they still
+    // sort in execution order.
+    assert_eq!(unpack_ordinal(first.ordinal), vec![0]);
+    assert_eq!(unpack_ordinal(second.ordinal), vec![0]);
+    assert_eq!(crate::svm::models::unpack_hop(first.ordinal), 0);
+    assert_eq!(crate::svm::models::unpack_hop(second.ordinal), 1);
+    assert!(first.ordinal < second.ordinal);
+}
+
+/// M8. Every transfer in the subtree that was not a leg went into
+/// `fee_amount`, whatever its mint - and a System transfer of LAMPORTS
+/// becomes a WSOL movement, so the column could hold lamports added to
+/// token base units. There is one number and one mint column now, and only
+/// fees of a LEG's mint are counted.
+#[test]
+fn a_fee_of_another_mint_is_not_added_to_the_legs_fee() {
+    let registry = Registry::with_venues(&Venue::ALL);
+    let tx = build::swap_with_two_fee_mints();
+    let outcome = decode_transaction_with(CHAIN, 1, &tx, &registry);
+
+    let swap = &outcome.swaps[0];
+    // 50 of the OUTPUT mint is a real fee of this trade.
+    assert_eq!(swap.fee_amount, U256::from(50u64));
+    assert_eq!(swap.fee_mint, swap.token_out);
+    // The 7,000,000 lamports that also left the taker in this subtree are
+    // not in it: they are a different unit entirely.
+    assert_ne!(swap.fee_amount, U256::from(7_000_050u64));
+}
+
+/// Transactions BUILT for the shapes no recording of which could be found.
+///
+/// The addendum itself could not produce an Orca `two_hop_swap` (0 in 118
+/// sampled transactions) and none of the recordings carries a Meteora DAMM
+/// v2 swap or a cross-mint fee, so those three shapes are constructed here
+/// from the report's description. Everything about them that the decoder
+/// reads - transfer instructions, owners, mints - is exactly what HyperSync
+/// serves for a real one.
+mod build {
+    use crate::svm::{
+        decode::{SvmAccountActivity, SvmInstruction, SvmTransaction},
+        models::Pubkey,
+        pda::is_on_curve,
+        programs::{
+            anchor_discriminator, pubkey, Venue, IX_TRANSFER,
+            SPL_TOKEN_B58,
+        },
+    };
+
+    /// A key no private key can exist for, like every pool authority.
+    pub fn off_curve(seed: u8) -> Pubkey {
+        let mut key = [seed; 32];
+        while is_on_curve(&key) {
+            key[31] = key[31].wrapping_add(1);
+        }
+        key
+    }
+
+    /// A plain wallet: a real ed25519 public key, i.e. ON the curve. That
+    /// is what tells a taker from a pool, so a test wallet that happened to
+    /// be off the curve would make every trade ambiguous.
+    pub fn wallet(seed: u8) -> Pubkey {
+        let mut key = [seed; 32];
+        while !is_on_curve(&key) {
+            key[31] = key[31].wrapping_add(1);
+        }
+        key
+    }
+
+    pub struct Builder {
+        pub tx: SvmTransaction,
+        next: u8,
+    }
+
+    impl Builder {
+        pub fn new() -> Self {
+            Self {
+                tx: SvmTransaction {
+                    success: true,
+                    fee_payer: wallet(0xfe),
+                    ..Default::default()
+                },
+                next: 0x10,
+            }
+        }
+
+        pub fn program(
+            &mut self,
+            path: &[u32],
+            program: Pubkey,
+            data: Vec<u8>,
+            accounts: Vec<Pubkey>,
+        ) {
+            self.tx.instructions.push(SvmInstruction {
+                path: path.to_vec(),
+                program,
+                accounts,
+                data,
+            });
+        }
+
+        pub fn venue(
+            &mut self,
+            path: &[u32],
+            venue: Venue,
+            instruction: &str,
+            accounts: Vec<Pubkey>,
+        ) {
+            self.program(
+                path,
+                pubkey(venue.program_b58()),
+                anchor_discriminator("global", instruction).to_vec(),
+                accounts,
+            );
+        }
+
+        /// One SPL transfer, with the two token accounts and their owners
+        /// in `account_activity` exactly as the source serves them.
+        pub fn transfer(
+            &mut self,
+            path: &[u32],
+            mint: Pubkey,
+            amount: u64,
+            from: Pubkey,
+            to: Pubkey,
+        ) {
+            let source = self.token_account(from, mint, amount);
+            let destination = self.token_account(to, mint, 0);
+            let mut data = vec![IX_TRANSFER];
+            data.extend_from_slice(&amount.to_le_bytes());
+            self.program(
+                path,
+                pubkey(SPL_TOKEN_B58),
+                data,
+                vec![source, destination, from],
+            );
+        }
+
+        /// A System transfer of lamports. The movement layer records it as
+        /// a WSOL movement, which is right - and is also how a fee paid in
+        /// lamports used to be added to a fee paid in token base units.
+        pub fn system_transfer(
+            &mut self,
+            path: &[u32],
+            lamports: u64,
+            from: Pubkey,
+            to: Pubkey,
+        ) {
+            let mut data =
+                crate::svm::programs::IX_SYSTEM_TRANSFER.to_vec();
+            data.extend_from_slice(&lamports.to_le_bytes());
+            self.program(
+                path,
+                pubkey(crate::svm::programs::SYSTEM_B58),
+                data,
+                vec![from, to],
+            );
+        }
+
+        fn token_account(
+            &mut self,
+            owner: Pubkey,
+            mint: Pubkey,
+            balance: u64,
+        ) -> Pubkey {
+            let mut account = [0u8; 32];
+            account[0] = self.next;
+            account[1..].copy_from_slice(&owner[1..]);
+            account[31] = mint[0];
+            self.next = self.next.wrapping_add(1);
+            self.tx.activity.push(SvmAccountActivity {
+                account,
+                mint: Some(mint),
+                pre_owner: Some(owner),
+                post_owner: Some(owner),
+                decimals: Some(6),
+                pre_token_balance: Some(balance),
+                post_token_balance: Some(balance),
+                ..Default::default()
+            });
+            account
+        }
+    }
+
+    /// A DAMM v2 swap under `router`: one venue instruction, two legs
+    /// across one pool authority.
+    pub fn routed_pumpswap_like(router: Pubkey) -> SvmTransaction {
+        let mut build = Builder::new();
+        let authority = off_curve(0x21);
+        let taker = wallet(0x31);
+        let (mint_a, mint_b) = ([0xa1u8; 32], [0xb1u8; 32]);
+
+        build.program(&[0], router, vec![0x01], Vec::new());
+        build.venue(&[0, 0], Venue::MeteoraDammV2, "swap", Vec::new());
+        build.transfer(&[0, 0, 0], mint_a, 1_000, taker, authority);
+        build.transfer(&[0, 0, 1], mint_b, 900, authority, taker);
+        build.tx
+    }
+
+    /// Orca's `two_hop_swap`: ONE instruction, two pools, four transfers.
+    /// The taker pays mint A to pool 1, is paid mint B, pays that mint B to
+    /// pool 2 and is paid mint C - which is why the two pools are disjoint
+    /// counterparties and the taker is a counterparty of all four legs.
+    pub fn orca_two_hop() -> SvmTransaction {
+        let mut build = Builder::new();
+        let pool_one = off_curve(0x41);
+        let pool_two = off_curve(0x51);
+        let taker = wallet(0x61);
+        let (mint_a, mint_b, mint_c) =
+            ([0xa2u8; 32], [0xb2u8; 32], [0xc2u8; 32]);
+
+        build.venue(
+            &[0],
+            Venue::OrcaWhirlpool,
+            "two_hop_swap",
+            vec![pool_one, pool_two],
+        );
+        build.transfer(&[0, 0], mint_a, 1_000, taker, pool_one);
+        build.transfer(&[0, 1], mint_b, 900, pool_one, taker);
+        build.transfer(&[0, 2], mint_b, 900, taker, pool_two);
+        build.transfer(&[0, 3], mint_c, 800, pool_two, taker);
+        build.tx
+    }
+
+    /// A swap that pays two fees in two different units: 50 of the output
+    /// mint, and 7,000,000 LAMPORTS through a System transfer - which the
+    /// movement layer records as a WSOL movement, WSOL being neither leg.
+    pub fn swap_with_two_fee_mints() -> SvmTransaction {
+        let mut build = Builder::new();
+        let authority = off_curve(0x71);
+        let taker = wallet(0x81);
+        let treasury = wallet(0x91);
+        let (mint_a, mint_b) = ([0xa3u8; 32], [0xb3u8; 32]);
+
+        build.venue(&[0], Venue::MeteoraDammV2, "swap", Vec::new());
+        build.transfer(&[0, 0], mint_a, 1_000, taker, authority);
+        build.transfer(&[0, 1], mint_b, 900, authority, taker);
+        build.transfer(&[0, 2], mint_b, 50, taker, treasury);
+        build.system_transfer(&[0, 3], 7_000_000, taker, treasury);
+        build.tx
+    }
+}
+
 /// A truncated event is `None`, never a panic and never an invented value.
 ///
 /// A validator can and does cut a log line short, so every one of these

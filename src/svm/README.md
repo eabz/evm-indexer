@@ -54,10 +54,30 @@ detector genuinely needs a variant.
 
 `(chain, block_number, tx_index, ordinal)`, where `ordinal` packs the
 instruction tree path 12 bits per level, left aligned (Solana's CPI stack
-height limit is 5). A parent sorts before its children, siblings sort in
-execution order, and the value is unique inside a transaction — and it is
+height limit is 5), and the HOP sub-index of a multi-fill instruction in the
+four bits left over at the bottom. A parent sorts before its children,
+siblings sort in execution order, hop 0 sorts before hop 1 of the same
+instruction, and the value is unique inside a transaction — and it is
 computable from ONE row, which matters because a program-filtered stream
 never sees the sibling instructions a flat rank would need.
+
+The sub-index exists because Orca's `two_hop_swap` and Raydium CLMM's
+`swap_router_base_in` execute TWO fills, on two different pools, from one
+instruction. They share an `instruction_address`, so without it the second
+row replaces the first in a `ReplacingMergeTree`.
+
+### The pool key
+
+`pool_id` is the venue's own pool account and **never a vault authority**.
+Five of the ten streamed venues — Raydium AMM v4 and CPMM, Meteora DAMM v2
+and DBC, Raydium LaunchLab — own every pool's two vaults with ONE
+program-wide PDA, which is also the "common counterparty" the movement layer
+finds. Storing it would key the whole venue into a single candle series.
+So for those five the pool comes from the instruction's own account metas
+(an index verified against the pool each venue's event names), and a fill
+whose pool cannot be named at all is written with 32 zero bytes and left out
+of the pool-keyed aggregates — the trade still counts, the series does not
+exist.
 
 ## How decoding works
 
@@ -119,7 +139,12 @@ uniform:
 A log is weaker evidence than an instruction — validators truncate log lines,
 and `has_dropped_log_messages` says when they did — so a log-sourced event may
 only ever CONFIRM a row that real token transfers already proved. It can never
-create one.
+create one. **And when that flag is set, no log of the transaction is read at
+all**: a line that survived cannot be told from one that did not, and Orca's
+two `Traded` lines are selected by position. Those rows keep `movement`
+confidence and are counted in `Diagnostics::dropped_logs`, which is a
+different fact from "this venue emits no event" and must not be mistaken for
+it.
 
 Dispatch is on the **event**, never the instruction discriminator, wherever a
 program has grown variants: PumpSwap and pump.fun have `buy_exact_quote_in`,
@@ -144,10 +169,23 @@ counted in `Diagnostics::kind_disagreed`. Live, that counter is zero.
 40% of Solana DEX volume is routed. A fill under an aggregator gets
 `route_ordinal` and `route_program` set and is still credited to the venue
 that executed it. A Jupiter three-hop becomes three swaps, one per venue —
-there is a recorded fixture for exactly that.
+there is a recorded fixture for exactly that. The list is every Jupiter
+version, DFlow, both OKX routers, Titan, Photon, Trojan, Ave, Terminal and
+GMGN; registering one changes attribution only, because the fill is
+attributed to the venue whether the router above it is known or not.
 
-`trader` is the transaction's **fee payer**, never the instruction's signer,
-which is usually a router PDA or a bot.
+`trader` is the account the **venue's own event** names as the user, and the
+transaction's fee payer only when no event names one. It is never the
+instruction's signer. The fee payer alone was wrong often enough to matter:
+on the recorded pump.fun curve sell it is a bot, and
+`sol_dex_candles_*.traders` is `uniqState(trader)`.
+
+### `fee_amount` is in ONE mint, and the row says which
+
+A swap can pay a fee in lamports and another in the token. `fee_mint` names
+the mint `fee_amount` is in, and only fees of that mint are summed — the
+column used to add every non-pool transfer of the subtree together whatever
+its unit.
 
 ### Event layouts are verified by LENGTH
 
@@ -268,6 +306,12 @@ across two different phase 2 venues, an Orca liquidity instruction that must
 decode to **no** swap, a Token-2022 transfer-fee mint, and a
 concentrated-liquidity swap that moves the price across a tick. Each one
 records, in the file, why it was captured.
+
+`fixtures/round4.json` holds the two transactions the review round 4
+addendum names, recorded by slot and signature: a Raydium v4 fill whose
+vaults are owned by the one program-wide authority next to a PumpSwap sell
+whose taker account is opened and closed inside the transaction, and a
+LaunchLab sell with a real 1% Token-2022 transfer fee.
 
 The live tests do not compare HyperSync against HyperSync: they recompute
 each swap from the public RPC's own `getTransaction` metadata and require the

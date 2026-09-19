@@ -191,6 +191,71 @@ impl Venue {
         !matches!(self, Venue::BisonFi)
     }
 
+    /// Is the common OWNER of this venue's two vault token accounts one
+    /// program-wide account rather than a per-pool one?
+    ///
+    /// This is the single most dangerous fact about a Solana venue for an
+    /// indexer, and it is true for half of the streamed ones. The movement
+    /// layer identifies a pool as "the common counterparty of both legs",
+    /// which is the vault OWNER; for these five venues that owner is one
+    /// PDA shared by every pool the program runs:
+    ///
+    /// | Venue | The one authority |
+    /// |---|---|
+    /// | Raydium AMM v4 | `5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1` |
+    /// | Raydium CPMM | `GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL` |
+    /// | Meteora DAMM v2 | `HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC` |
+    /// | Meteora DBC | `FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM` |
+    /// | Raydium LaunchLab | `WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh` |
+    ///
+    /// Storing that account as `pool_id` would key EVERY pair of the venue
+    /// into ONE candle series: open/high/low/close would mix USDC/SOL with
+    /// arbitrary memecoin prices and the volumes would sum amounts of
+    /// unrelated mints with unrelated decimals. So it is never stored -
+    /// see [`Venue::pool_from_accounts`], and the row is left out of the
+    /// pool-keyed aggregates when the pool cannot be named.
+    ///
+    /// Orca, Raydium CLMM, Meteora DLMM, PumpSwap and the pump.fun curve
+    /// own their vaults per pool and are fine.
+    pub const fn vault_authority_is_global(&self) -> bool {
+        matches!(
+            self,
+            Venue::RaydiumAmmV4
+                | Venue::RaydiumCpmm
+                | Venue::MeteoraDammV2
+                | Venue::MeteoraDbc
+                | Venue::RaydiumLaunchlab
+        )
+    }
+
+    /// Where the pool state account sits in the account metas of a SWAP
+    /// instruction of this venue.
+    ///
+    /// Only needed for the venues of [`Venue::vault_authority_is_global`],
+    /// and only ever consulted for an instruction the registry already
+    /// knows is a swap, so a variant added after this was written yields
+    /// `None` rather than some other account. Every index here was read off
+    /// a RECORDED mainnet instruction and is asserted against the pool the
+    /// venue's own event names by
+    /// `the_pool_account_index_is_the_account_the_venue_names`.
+    ///
+    /// `None` for Meteora DAMM v2: no recording of one of its swaps exists
+    /// yet, and an unverified index would store the WRONG pool, which is
+    /// worse than storing none.
+    pub const fn pool_account_index(&self) -> Option<usize> {
+        match self {
+            // tags 9 / 11 / 16 / 17, all four with the same prefix.
+            Venue::RaydiumAmmV4 => Some(1),
+            // payer, authority, amm_config, POOL_STATE, ...
+            Venue::RaydiumCpmm => Some(3),
+            // pool_authority, config, POOL, input_token_account, ...
+            Venue::MeteoraDbc => Some(2),
+            // payer, authority, global_config, platform_config, POOL, ...
+            Venue::RaydiumLaunchlab => Some(4),
+            _ => None,
+        }
+    }
+
     /// Where the venue publishes its swap event.
     ///
     /// This is the single most consequential fact about a venue for this
@@ -286,8 +351,74 @@ pub const VENUES: [Venue; 10] = [
 /// A swap whose instruction sits under one of these gets `route_ordinal` and
 /// `route_program` set; the fill itself is still attributed to the venue
 /// that executed it.
-pub const ROUTERS_B58: &[(&str, &str)] =
-    &[("jupiter_v6", "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4")];
+///
+/// Registering only Jupiter v6 left the other ~60% of routed flow reading as
+/// DIRECT trade (review round 4, M9). Nothing about VOLUME changes when a
+/// router is added - the nearest-registered-venue subtree rule attributes
+/// the fill to the venue either way, and an unregistered router is simply
+/// transparent - so this list is attribution and only attribution.
+///
+/// Provenance: DefiLlama's aggregator table names the shares (Jupiter
+/// $16.6B, DFlow $9.3B, OKX $4.0B, Titan $0.7B over 30 days,
+/// docs/solana-research.md §1.2); every id below was taken from the
+/// operator's OWN repository or from Jupiter's official platform list and
+/// then checked on mainnet, where each is an executable program. The six
+/// ids docs/solana-research.md records only as a PREFIX are resolved here,
+/// and `routers_match_the_prefixes_the_research_recorded` asserts each full
+/// id against the recorded prefix so a wrong completion is a test failure.
+///
+/// Two programs the research listed under "routers seen in real
+/// transactions" are deliberately NOT here:
+///
+/// * `MAyhSmzX...` is pump.fun's own "Mayhem Mode" program, a launchpad
+///   program and not an aggregator at all.
+/// * a venue is never a router (`a_venue_is_never_also_a_router`).
+pub const ROUTERS_B58: &[(&str, &str)] = &[
+    // Jupiter, every deployed version. The older programs still carry
+    // flow, and each one is a different id: a route under v4 read as a
+    // direct trade until this list grew.
+    ("jupiter_v1", "JUP6i4ozu5ydDCnLiMogSckDPpbtr7BJ4FtzYWkb5Rk"),
+    ("jupiter_v2", "JUP2jxvXaqu7NQY1GmNF4m1vodw12LVXYxbFL2uJvfo"),
+    ("jupiter_v3", "JUP3c2Uh3WA4Ng34tw6kPd2G4C5BB21Xo36Je1s32Ph"),
+    ("jupiter_v4", "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB"),
+    ("jupiter_v5", "JUP5pEAZeHdHrLxh5UCwAbpjGwYKKoquCpda2hfP4u8"),
+    ("jupiter_v6", "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
+    ("jupiter_v7", "JUP7pNXFL1G2BESRYMtZ1jepzfDQVffkkkf5JhXWWhC"),
+    // The second largest aggregator on the chain.
+    ("dflow", "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH"),
+    // OKX ships two live router versions; both appear in current traffic.
+    ("okx_v2", "6m2CDdhRgxpH4WjvdzxAYbGxwdGUz5MziiL5jek2kBma"),
+    ("okx_v6", "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u"),
+    ("titan", "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT"),
+    // Front ends and bots. They route into somebody else's venue exactly
+    // as an aggregator does, so the same rule applies: attribution, never
+    // volume.
+    ("photon", "BSfD6SHZigAfDWSjzD5Q41jw8LmKwtmjskPH9XW1mrRW"),
+    ("trojan", "troyXT7Ty3s2rjJe4bqWaroUrS4Fjd8rbHHNHxcACF4"),
+    ("ave", "AveaiuA1emN71q9mS2QQ9BEWNAAHmp8sHSvwLFHQjufM"),
+    // `term9YPb...` in the research. It is Terminal (formerly Padre), a
+    // trading terminal - NOT Titan, which is the separate id above.
+    ("terminal", "term9YPb9mzAsABaqN71A4xdbxHmpBNZavpBiQKZzN3"),
+    // The research recorded this prefix as a router seen live and the id
+    // is a real deployed program, but no source attributes it to GMGN the
+    // company; public explorers label it only as an arbitrage bot. The
+    // NAME is therefore the weakest claim on this list. Nothing depends on
+    // it being right: a wrong name on an attribution column cannot move
+    // volume anywhere.
+    ("gmgn", "GMGNreQcJFufBiCTLDBgKhYEfEe9B454UjpDr5CaSLA1"),
+];
+
+/// The router prefixes docs/solana-research.md §1.2 recorded from real
+/// mainnet transactions, and the full id each one resolves to. A completion
+/// that does not start with the observed prefix is a wrong program.
+pub const ROUTER_PREFIXES: &[(&str, &str)] = &[
+    ("DF1ow4ts", "dflow"),
+    ("proVF4pM", "okx_v6"),
+    ("GMGNreQc", "gmgn"),
+    ("AveaiuA1", "ave"),
+    ("term9YPb", "terminal"),
+    ("JUP6Lkb", "jupiter_v6"),
+];
 
 // --- discriminators -----------------------------------------------------
 
@@ -928,6 +1059,48 @@ mod tests {
         // discriminator alone.
         assert_ne!(DISC_BUY, DISC_SELL);
         assert_ne!(DISC_BUY, EVENT_CPI_PREFIX);
+    }
+
+    /// Every router id resolves the PREFIX the research recorded from a
+    /// real transaction. A full id guessed from a prefix is a filter that
+    /// matches nothing, or worse, matches the wrong program.
+    #[test]
+    fn routers_match_the_prefixes_the_research_recorded() {
+        for (prefix, name) in ROUTER_PREFIXES {
+            let (_, id) = ROUTERS_B58
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .unwrap_or_else(|| panic!("no router named {name}"));
+            assert!(
+                id.starts_with(prefix),
+                "{name} is {id}, which does not start with the observed \
+                 prefix {prefix}"
+            );
+        }
+    }
+
+    /// Router NAMES are unique: two rows with one name would make the
+    /// attribution ambiguous.
+    #[test]
+    fn router_names_are_unique() {
+        let mut names: Vec<&str> =
+            ROUTERS_B58.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "a router name is used twice");
+    }
+
+    /// pump.fun's "Mayhem Mode" program shows up next to the routers in the
+    /// research's list of ids seen live, and it is a LAUNCHPAD program.
+    /// Registering it would attribute curve trades to a non-existent
+    /// aggregator.
+    #[test]
+    fn the_pumpfun_mayhem_program_is_not_a_router() {
+        assert!(
+            !ROUTERS_B58.iter().any(|(_, id)| id.starts_with("MAyhSmzX")),
+            "MAyhSmzX... is pump.fun's Mayhem Mode program, not a router"
+        );
     }
 
     #[test]

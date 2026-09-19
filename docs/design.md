@@ -574,6 +574,21 @@ wallet history, no chain-wide transfers, and the schema/README must say so.
   per-program decoders for venues with a public format (fees, pool state). SPL/Token-2022
   transfer instructions must be selected in the same query (a matched instruction does
   not return its children). Aggregators/routers are attribution, never venue volume.
+- The pool key is the venue's own pool account and NEVER the owner of its vaults: five
+  of the ten streamed venues (Raydium AMM v4 and CPMM, Meteora DAMM v2 and DBC, Raydium
+  LaunchLab) own every pool's vaults with one program-wide PDA, which is also what the
+  movement layer finds as "the common counterparty". A fill whose pool cannot be named
+  from the venue's event or from the instruction's account metas is written with a zero
+  `pool_id` and excluded from the pool-keyed aggregates, never keyed on the authority.
+- `trader` is the account the venue's own event names, and the transaction's fee payer
+  only where no event names one - on Solana the fee payer is very often a relayer or a
+  bot, and the candle `traders` series counts distinct traders.
+- One instruction can execute SEVERAL fills (Orca `two_hop_swap`, Raydium CLMM
+  `swap_router_base_in`). Each is its own row, told apart by a hop sub-index in the low
+  bits of `ordinal`.
+- A transaction whose logs the validator truncated (`has_dropped_log_messages`) is never
+  enriched from those logs: for the venues whose event exists only as a log line the row
+  keeps `movement` confidence and the case is counted.
 - Chain id for Solana: 1399811149 (no standard exists; recorded in `chains`).
 - Resume on Solana is the CHECKPOINT TILING and not a gap query over the commit marker
   (a slot with no row is usually a skipped slot, not a gap), but section 2's rule still

@@ -234,8 +234,19 @@ pub struct SolLaunchpadTrade {
     #[serde_as(as = "SerU256")]
     pub progress_wad: U256,
     pub graduating: u8,
-    /// Always 1 on Solana: every quote leg is a real token or lamport
-    /// movement, so there is never an unverified one to disambiguate.
+    /// 1 when this is the ONLY trade of the transaction whose quote leg is
+    /// unverified, exactly as on EVM (`launchpads::decode`'s
+    /// `mark_sole_unverified_quotes`).
+    ///
+    /// It used to be hard-coded to 1 on every Solana trade, on the grounds
+    /// that a quote leg is always a real movement here. It is not always:
+    /// a trade the movement layer produced no row for, or one whose sides
+    /// the event and the transfers disagree about, has
+    /// `quote_verified = 0`. The published reading of the flag is
+    /// `sole_unverified_quote = 1 AND tx_value >= quote_amount` as an
+    /// upper bound on what the buyer paid - and `tx_value` is always 0 on
+    /// Solana, so a blanket 1 asserted that every such trade paid at most
+    /// nothing.
     pub sole_unverified_quote: u8,
     pub tx_from: Pubkey,
     pub tx_to: Pubkey,
@@ -412,6 +423,10 @@ pub struct LaunchpadDiagnostics {
     /// An event this module knows the discriminator of but could not parse
     /// at the length it arrived in - i.e. the layout has changed.
     pub bad_length: u64,
+    /// A launchpad instruction whose path could not be packed into an
+    /// ordinal. Its rows are DROPPED rather than filed at position 0,
+    /// where they would overwrite each other.
+    pub unpackable_ordinal: u64,
 }
 
 impl LaunchpadDiagnostics {
@@ -419,6 +434,7 @@ impl LaunchpadDiagnostics {
         self.curve_not_derived += other.curve_not_derived;
         self.trade_unverified += other.trade_unverified;
         self.bad_length += other.bad_length;
+        self.unpackable_ordinal += other.unpackable_ordinal;
     }
 }
 
@@ -979,7 +995,16 @@ pub fn decode_transaction(
     let wsol = registry().wsol;
 
     for (family, instruction) in launchpad_calls(tx) {
-        let ordinal = pack_ordinal(&instruction.path).unwrap_or(0);
+        // `pack_ordinal` fails loudly rather than truncating, because two
+        // instructions folded onto one position key overwrite each other
+        // in a ReplacingMergeTree. `unwrap_or(0)` threw that away and
+        // filed every unpackable instruction at ordinal 0 - where they
+        // would overwrite each OTHER, and where no swap row could ever
+        // join them.
+        let Ok(ordinal) = pack_ordinal(&instruction.path) else {
+            rows.diagnostics.unpackable_ordinal += 1;
+            continue;
+        };
         let swap = swaps.iter().find(|swap| swap.ordinal == ordinal);
 
         for event in events_of(tx, instruction) {
@@ -1112,8 +1137,27 @@ pub fn decode_transaction(
         }
     }
 
+    mark_sole_unverified_quotes(&mut rows);
     collect_balances(&position, &mut rows);
     rows
+}
+
+/// The same rule the EVM decoder applies, for the same reason: `tx_value`
+/// can only bound an unverified quote leg when the transaction holds ONE
+/// such trade. A bundler that buys for fifteen wallets in one transaction
+/// sends one value for all fifteen.
+///
+/// This runs per transaction, which is the scope the rule is about.
+fn mark_sole_unverified_quotes(rows: &mut SolLaunchpadRows) {
+    let unverified = rows
+        .trades
+        .iter()
+        .filter(|trade| trade.quote_verified == 0)
+        .count();
+    for trade in &mut rows.trades {
+        trade.sole_unverified_quote =
+            u8::from(trade.quote_verified == 0 && unverified == 1);
+    }
 }
 
 /// Balances of every LAUNCHPAD TOKEN this transaction touched.
@@ -1264,10 +1308,24 @@ fn decode_pumpfun_trade(
     });
 
     let (token_verified, quote_verified) =
-        verify_legs(swap, event.mint, quote_token);
+        verify_legs(swap, event.mint, quote_token, event.is_buy);
     if token_verified == 0 {
         rows.diagnostics.trade_unverified += 1;
     }
+
+    // Through the SAME helper the other two families use. Taking pump.fun's
+    // amounts from the event while DBC and LaunchLab take theirs from the
+    // swap row let `launchpad_trades` and `sol_dex_swaps` report different
+    // numbers for one trade - on a Token-2022 curve the event states what
+    // the curve was credited and the transfer states what the trader sent.
+    let (token_amount, quote_amount) = legs(
+        swap,
+        event.is_buy,
+        // `legs` takes the event's (in, out) as the TAKER sent and
+        // received them.
+        if event.is_buy { quote_amount } else { event.token_amount },
+        if event.is_buy { event.token_amount } else { quote_amount },
+    );
 
     rows.trades.push(SolLaunchpadTrade {
         chain: position.chain,
@@ -1287,15 +1345,17 @@ fn decode_pumpfun_trade(
         // often a bot or a router.
         trader: event.user,
         caller: position.tx.fee_payer,
-        token_amount: U256::from(event.token_amount),
-        quote_amount: U256::from(quote_amount),
+        token_amount,
+        quote_amount,
         fee_amount: U256::from(event.total_fee()),
         tax_amount: U256::ZERO,
         // Real reserves against the curve's own target are not in the
         // event, so progress is left at 0 rather than guessed.
         progress_wad: U256::ZERO,
         graduating: u8::from(graduating),
-        sole_unverified_quote: 1,
+        // Filled in by `mark_sole_unverified_quotes` once every trade
+        // of this transaction is known.
+        sole_unverified_quote: 0,
         tx_from: position.tx.fee_payer,
         tx_to: ZERO_PUBKEY,
         tx_value: U256::ZERO,
@@ -1461,7 +1521,7 @@ fn decode_dbc_trade(
         None => (ZERO_PUBKEY, ZERO_PUBKEY),
     };
     let (token_verified, quote_verified) =
-        verify_legs(swap, token, quote_token);
+        verify_legs(swap, token, quote_token, is_buy);
     if token_verified == 0 {
         rows.diagnostics.trade_unverified += 1;
     }
@@ -1503,7 +1563,9 @@ fn decode_dbc_trade(
         // carries both the quote raised and the threshold.
         progress_wad: event.progress_wad(),
         graduating: u8::from(graduating),
-        sole_unverified_quote: 1,
+        // Filled in by `mark_sole_unverified_quotes` once every trade
+        // of this transaction is known.
+        sole_unverified_quote: 0,
         tx_from: position.tx.fee_payer,
         tx_to: ZERO_PUBKEY,
         tx_value: U256::ZERO,
@@ -1762,7 +1824,7 @@ fn decode_launchlab_trade(
         .unwrap_or((ZERO_PUBKEY, ZERO_PUBKEY)),
     };
     let (token_verified, quote_verified) =
-        verify_legs(swap, token, quote_token);
+        verify_legs(swap, token, quote_token, is_buy);
     if token_verified == 0 {
         rows.diagnostics.trade_unverified += 1;
     }
@@ -1795,7 +1857,9 @@ fn decode_launchlab_trade(
         graduating: u8::from(
             event.pool_status == LaunchlabTrade::STATUS_MIGRATE,
         ),
-        sole_unverified_quote: 1,
+        // Filled in by `mark_sole_unverified_quotes` once every trade
+        // of this transaction is known.
+        sole_unverified_quote: 0,
         tx_from: position.tx.fee_payer,
         tx_to: ZERO_PUBKEY,
         tx_value: U256::ZERO,
@@ -1842,14 +1906,23 @@ fn verify_legs(
     swap: Option<&SvmSwap>,
     token: Pubkey,
     quote_token: Pubkey,
+    is_buy: bool,
 ) -> (u8, u8) {
     let Some(swap) = swap else { return (0, 0) };
-    let pair = [swap.verified_in, swap.verified_out];
+    // The SIDE matters, not merely the membership. A buy takes the quote
+    // in and pays the token out; a sell is the other way round. Asking
+    // only "is this mint one of the two" marked an INVERTED trade - one
+    // whose side the event and the movement layer disagree about - as
+    // verified on both legs, which is precisely the case the check exists
+    // to catch.
+    let (token_side, quote_side) = if is_buy {
+        (swap.verified_out, swap.verified_in)
+    } else {
+        (swap.verified_in, swap.verified_out)
+    };
     (
-        u8::from(token != ZERO_PUBKEY && pair.contains(&token)),
-        u8::from(
-            quote_token != ZERO_PUBKEY && pair.contains(&quote_token),
-        ),
+        u8::from(token != ZERO_PUBKEY && token_side == token),
+        u8::from(quote_token != ZERO_PUBKEY && quote_side == quote_token),
     )
 }
 

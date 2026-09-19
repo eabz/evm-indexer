@@ -49,6 +49,14 @@ pub enum Enrichment {
     /// The event decoded but contradicted the movement layer. The row keeps
     /// `movement` confidence.
     Disagreed,
+    /// The venue publishes its event as a LOG LINE and the validator
+    /// truncated this transaction's logs, so its event stream is
+    /// incomplete by the validator's own admission. No log of it is read
+    /// at all: a surviving line may belong to another hop, and Orca's
+    /// `nth` indexing into the two `Traded` lines of a `two_hop_swap` is
+    /// meaningless once one of them can be missing. The row keeps
+    /// `movement` confidence and says so (review round 4, M7).
+    Incomplete,
 }
 
 // --- byte readers --------------------------------------------------------
@@ -412,6 +420,18 @@ pub fn enrich(
     row: &mut SvmSwap,
     nth: usize,
 ) -> Enrichment {
+    // `has_dropped_log_messages` is the validator saying the log stream of
+    // this transaction is INCOMPLETE. For a venue whose event only ever
+    // exists as a log line that is decisive: a line that did survive
+    // cannot be told apart from the one that did not, and enriching from
+    // it would present a guess with `decoded` confidence. It was plumbed
+    // end to end and then never consulted (review round 4, M7).
+    if tx.dropped_logs
+        && venue.event_source() == crate::svm::programs::EventSource::Log
+    {
+        return Enrichment::Incomplete;
+    }
+
     match venue {
         Venue::PumpSwap => match event_of(tx, instruction) {
             Some(event) => enrich_pumpswap(&event.data, swap, row),
@@ -497,7 +517,10 @@ fn enrich_pumpswap(
     );
 
     row.sender = event.user;
-    row.fee_amount = U256::from(event.total_fee());
+    // Every PumpSwap fee - lp, protocol and coin creator - comes out of
+    // the QUOTE leg.
+    row.set_fee(event.total_fee(), quote_mint);
+    row.mark_trader(event.user);
     row.mark_decoded(event.pool);
     Enrichment::Applied
 }
@@ -556,7 +579,10 @@ fn enrich_pumpfun(
         U256::from(event.quote_reserves(wsol)),
     );
     row.sender = event.user;
-    row.fee_amount = U256::from(event.total_fee());
+    // pump.fun's fee and creator fee are both taken out of the quote leg,
+    // whatever the curve is quoted in.
+    row.set_fee(event.total_fee(), quote_mint);
+    row.mark_trader(event.user);
     // The bonding curve IS the pool, and the movement layer already found
     // it as the non-signer counterparty. The event confirms the trade.
     row.mark_decoded(swap.authority);
