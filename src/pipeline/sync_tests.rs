@@ -155,12 +155,12 @@ impl ReorgStore for MemoryStore {
         Box::pin(async { Ok(0) })
     }
 
-    fn min_timestamp(
+    fn timestamp_span(
         &self,
         _: u64,
         _: u64,
         _: Option<u64>,
-    ) -> BoxFuture<'_, Result<Option<u32>>> {
+    ) -> BoxFuture<'_, Result<Option<(u32, u32)>>> {
         Box::pin(async { Ok(None) })
     }
 
@@ -221,6 +221,7 @@ impl ReorgStore for MemoryStore {
     fn rebuild_derived(
         &self,
         _: u64,
+        _: u32,
         _: u32,
         _: u32,
         _: u64,

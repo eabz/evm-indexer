@@ -29,8 +29,17 @@ CREATE TABLE IF NOT EXISTS reorgs (
   -- carry it.
   epoch UInt32,
   -- Start of the first aggregate bucket the purge touched (start of day,
-  -- UTC): buckets from here on only count contributions of epoch >= epoch.
+  -- UTC): buckets in [from_ts, to_ts) only count contributions of
+  -- epoch >= epoch.
   from_ts DateTime('UTC'),
+  -- Exclusive end of that bucket range: the start of the day AFTER the
+  -- newest row the purge removed. A purge only invalidates the buckets
+  -- its own rows contributed to, so this is what its repair covers and
+  -- what the validity rule may hide - NOT everything up to now. Without
+  -- it a gap heal deep in history rebuilt (and, until the rebuild was
+  -- through, hid) every aggregate of the chain from that day to the head
+  -- on every pass. The default is the one day a tip reorg needs.
+  to_ts DateTime('UTC') DEFAULT from_ts + toIntervalDay(1),
   detected_at DateTime('UTC') DEFAULT now(),
   -- The purged block range [fork_block, to_block); to_block = max UInt64
   -- means open ended (a rollback at the tip).
@@ -58,26 +67,79 @@ CREATE TABLE IF NOT EXISTS reorgs (
 ENGINE = MergeTree
 ORDER BY (chain, epoch);
 
--- The validity rule as a step function per chain: from from_ts on (until
--- the next row of the chain), contributions need epoch >= epoch_floor.
--- Joined by the *_v views with ASOF (the closest from_ts <= bucket): one
--- hash lookup plus a binary search per aggregate row, however many reorgs a
--- chain has had. Several purges sharing a from_ts collapse into one row and
--- the running maximum makes a later from_ts never lower the bar.
+-- The validity rule as a step function per chain: a contribution with
+-- epoch e in bucket b counts iff e >= max(r.epoch) over the `reorgs` rows
+-- r of the chain with r.from_ts <= b AND b < r.to_ts (0 when none covers
+-- b). Every consumer joins it the same way, and its SQL never changes:
+--
+--   ASOF LEFT JOIN epoch_floor_v AS r ON r.chain = a.chain AND a.bucket >= r.from_ts
+--   WHERE a.epoch >= ifNull(r.epoch_floor, 0)
+--
+-- which works because this view emits NON-OVERLAPPING segments: one row
+-- per repaired UTC day with the floor of that day, plus an explicit
+-- segment end (floor 0) on the day after the last day of a run. ASOF
+-- picks the segment a bucket falls into - one binary search per aggregate
+-- row - and the floor is constant inside it.
+--
+-- Why not a running maximum over from_ts (what this view did while the
+-- repair was open ended): with a `to_ts` the intervals can OVERLAP and a
+-- later purge can end EARLIER than an older one. A running maximum would
+-- then keep the newer, higher floor from its from_ts to infinity and hide
+-- the older epoch's contributions in buckets nobody ever rebuilt - the
+-- deep gap-heal case. Measured alternatives: the same rule expressed as
+-- arrayFilter/arrayMax over per-chain interval arrays is exact but asks
+-- for 58 GiB on 10k reorg rows (code 241) - the day expansion below costs
+-- the same as the old running maximum (0.28 s vs 0.28 s over 10k reorg
+-- rows x 1M aggregate rows; a plain scan is 0.26 s) and stays there even
+-- when every one of those 10k rows is 400 days wide.
+--
+-- Day granularity is exact: `from_ts` and `to_ts` are always starts of UTC
+-- days (the widest aggregate bucket), so no bucket ever straddles a step.
 CREATE VIEW IF NOT EXISTS epoch_floor_v AS
 SELECT
   chain,
-  from_ts,
-  max(epoch_at) OVER (
-    PARTITION BY chain ORDER BY from_ts ASC
-    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-  ) AS epoch_floor
+  toDateTime(step.1, 'UTC') AS from_ts,
+  toUInt32(step.2) AS epoch_floor
 FROM
 (
-  SELECT chain, from_ts, max(epoch) AS epoch_at
-  FROM reorgs
-  GROUP BY chain, from_ts
-);
+  SELECT
+    chain,
+    day,
+    floor_at,
+    leadInFrame(day, 1, toUInt32(0)) OVER (
+      PARTITION BY chain ORDER BY day ASC
+      ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING
+    ) AS next_day
+  FROM
+  (
+    SELECT chain, d AS day, max(epoch) AS floor_at
+    FROM
+    (
+      -- One row per repaired UTC day. `greatest(...)`: a row whose to_ts
+      -- was never set (or set wrong) still hides its own first day.
+      SELECT
+        chain,
+        epoch,
+        arrayJoin(range(
+          toUInt32(from_ts),
+          greatest(toUInt32(to_ts), toUInt32(from_ts) + 86400),
+          86400
+        )) AS d
+      FROM reorgs
+    )
+    GROUP BY chain, d
+  )
+)
+ARRAY JOIN arrayConcat(
+  [(day, floor_at)],
+  -- The day after the last day of a contiguous run is where the floor
+  -- drops back to 0: older contributions in later buckets are untouched.
+  if(
+    next_day = day + 86400,
+    CAST([], 'Array(Tuple(UInt32, UInt32))'),
+    [(day + 86400, toUInt32(0))]
+  )
+) AS step;
 
 -- Checkpoints: one row per contiguous range a flush committed, written
 -- after `blocks`. Resume = the highest contiguous to_block from the start

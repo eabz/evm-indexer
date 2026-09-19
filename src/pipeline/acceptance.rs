@@ -1956,8 +1956,9 @@ async fn a_purge_eleven_years_deep_can_finish() {
     let chain = TestChain::with_block_time(135, MONTH);
     scenario.index_until(&chain, 135, &SMALL_FLUSHES).await;
 
-    // Block 3 (11 years before the head) has to go: every aggregate is
-    // rebuilt from its day on, 132 months.
+    // Block 3 (11 years before the head) has to go. Its rows only ever
+    // contributed to ITS day, so that is the whole window the purge hides
+    // and rebuilds - not the 132 months from that day to the head.
     let purger = Purger::new(
         Arc::new(ClickhouseReorgStore::new(
             scenario.db.clone(),
@@ -1975,6 +1976,49 @@ async fn a_purge_eleven_years_deep_can_finish() {
         .expect("the rebuild must be sliced by month");
     assert_eq!(report.blocks_tombstoned, 1);
     assert_eq!(report.epoch, 1);
+
+    // The repair is BOUNDED: one day wide, and that is exactly what the
+    // `reorgs` row hides.
+    let (from_ts, to_ts) =
+        (report.from_ts.unwrap(), report.to_ts.unwrap());
+    assert_eq!(to_ts - from_ts, 86_400, "{from_ts}..{to_ts}");
+    let recorded: Vec<(u32, u32)> = scenario
+        .db
+        .db
+        .query(&format!(
+            "SELECT toUInt32(from_ts), toUInt32(to_ts) FROM reorgs \
+             WHERE chain = {CHAIN} AND completed = 1"
+        ))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(recorded, vec![(from_ts, to_ts)]);
+
+    // And the work is bounded with it: NOTHING outside that day was
+    // re-filed under the new epoch. Unbounded, all 132 months would carry
+    // epoch 1 rows - and every bucket in them would have been hidden
+    // until the rebuild had refilled it. (Inside the window there is
+    // nothing left to re-file either: block 3 was the only block of its
+    // day and the rebuild leaves the purged range out.)
+    let repaired = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM daily_block_stats \
+             WHERE chain = {CHAIN} AND epoch = 1 AND \
+             (day < {from_ts} OR day >= {to_ts})"
+        ))
+        .await;
+    assert_eq!(repaired, 0, "{repaired} buckets outside the window");
+
+    // The 11 years of buckets AFTER the purged day keep their epoch 0
+    // contributions: nothing rebuilt them, so hiding them would zero
+    // them for ever.
+    let later = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM daily_block_stats_v \
+             WHERE chain = {CHAIN} AND day >= {to_ts}"
+        ))
+        .await;
+    assert!(later > 100, "{later} later daily buckets survived the purge");
 
     // The hole is streamed again and everything equals a clean index.
     scenario.index_until(&chain, 135, &SMALL_FLUSHES).await;

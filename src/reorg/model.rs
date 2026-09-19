@@ -390,14 +390,19 @@ impl ChainData {
         entry.1 += value;
     }
 
-    /// The `*_v` view: the VALIDITY RULE of docs/design.md.
+    /// The `*_v` view: the VALIDITY RULE of docs/design.md. A
+    /// contribution with epoch e in bucket b counts iff e >= max(r.epoch)
+    /// over the `reorgs` rows r of the chain with r.from_ts <= b AND
+    /// b < r.to_ts - the INTERVAL rule, the same step function
+    /// `epoch_floor_v` builds. An older purge whose window is not over
+    /// keeps its floor in buckets a newer, narrower one never repaired.
     pub fn aggregates(&self) -> AggView {
         let mut view = AggView::new();
         for ((agg, bucket, epoch), (count, sum)) in &self.aggs {
             let floor = self
                 .reorgs
                 .iter()
-                .filter(|r| r.from_ts <= *bucket)
+                .filter(|r| r.from_ts <= *bucket && *bucket < r.to_ts)
                 .map(|r| r.epoch)
                 .max()
                 .unwrap_or(0);
@@ -796,7 +801,9 @@ impl FakeStore {
     pub fn rebuild_keeping(
         &self,
         chain: u64,
-        from_ts: u32,
+        // The bucket window `[from_ts, to_ts)` the `reorgs` row hides:
+        // exactly what a repair may re-file.
+        (from_ts, to_ts): (u32, u32),
         epoch: u32,
         purged_from: u64,
         purged_to: Option<u64>,
@@ -820,6 +827,7 @@ impl FakeStore {
         for (number, versions) in &view.blocks {
             for row in live(versions) {
                 if row.timestamp >= from_ts
+                    && row.timestamp < to_ts
                     && !purged(Agg::BlocksDaily, *number)
                 {
                     data.add(
@@ -840,6 +848,7 @@ impl FakeStore {
             for ((number, _), versions) in table {
                 for row in live(versions) {
                     if row.timestamp >= from_ts
+                        && row.timestamp < to_ts
                         && !purged(Agg::child(index), *number)
                     {
                         data.add(
@@ -1130,12 +1139,12 @@ impl ReorgStore for FakeStore {
         .boxed()
     }
 
-    fn min_timestamp(
+    fn timestamp_span(
         &self,
         chain: u64,
         from: u64,
         to: Option<u64>,
-    ) -> BoxFuture<'_, anyhow::Result<Option<u32>>> {
+    ) -> BoxFuture<'_, anyhow::Result<Option<(u32, u32)>>> {
         async move {
             let mut state = self.state.lock().unwrap();
             Self::enter(&mut state, chain, PurgeStep::MinTimestamp)?;
@@ -1181,7 +1190,10 @@ impl ReorgStore for FakeStore {
                 }
             }
 
-            Ok(all.into_iter().min())
+            let min = all.iter().copied().min();
+            Ok(min.map(|min| {
+                (min, all.iter().copied().max().unwrap_or(min))
+            }))
         }
         .boxed()
     }
@@ -1444,6 +1456,7 @@ impl ReorgStore for FakeStore {
         &self,
         chain: u64,
         from_ts: u32,
+        to_ts: u32,
         epoch: u32,
         purged_from: u64,
         purged_to: Option<u64>,
@@ -1451,7 +1464,7 @@ impl ReorgStore for FakeStore {
         async move {
             self.rebuild_keeping(
                 chain,
-                from_ts,
+                (from_ts, to_ts),
                 epoch,
                 purged_from,
                 purged_to,

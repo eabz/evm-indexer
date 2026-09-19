@@ -851,6 +851,40 @@ mod tests {
         );
     }
 
+    /// A repair covers EXACTLY the bucket window its `reorgs` row hides,
+    /// `[from_ts, to_ts)`. An aggregate whose `rebuild_sql` has no
+    /// `{to_ts}` can not be bounded: it would file new-epoch contributions
+    /// into buckets past `to_ts`, whose floor was not raised, and they
+    /// would be counted ON TOP of the old ones. (It also could not be
+    /// sliced by month, which ClickHouse needs past 100 partitions.)
+    #[test]
+    fn every_aggregate_of_every_module_can_be_bounded() {
+        let mut checked = 0;
+
+        for table in db::derived::CORE_DERIVED {
+            assert!(
+                table.rebuild_sql.contains("{to_ts}"),
+                "{}",
+                table.name
+            );
+            checked += 1;
+        }
+
+        for spec in ALL_MODULES {
+            for table in spec.derived {
+                assert!(
+                    table.rebuild_sql.contains("{to_ts}"),
+                    "{}: {}",
+                    spec.name,
+                    table.name
+                );
+                checked += 1;
+            }
+        }
+
+        assert!(checked >= 10, "{checked} aggregates found");
+    }
+
     #[test]
     fn range_predicates_use_the_module_block_column_and_filter() {
         assert_eq!(

@@ -1931,10 +1931,14 @@ async fn purge(
             .await;
     }
 
+    // `to_ts`: the exclusive end of the window this repair covers. It
+    // must match the range the rebuild below writes - the validity rule
+    // hides exactly [from_ts, to_ts).
     database
         .execute(&format!(
-            "INSERT INTO reorgs (chain, epoch, from_ts) VALUES \
-             ({chain}, {new_epoch}, toDateTime({from_ts}))"
+            "INSERT INTO reorgs (chain, epoch, from_ts, to_ts) VALUES \
+             ({chain}, {new_epoch}, toDateTime({from_ts}), \
+              toDateTime({REBUILD_TO}))"
         ))
         .await;
 

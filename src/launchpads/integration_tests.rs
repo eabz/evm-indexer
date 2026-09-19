@@ -637,10 +637,13 @@ async fn a_purge_and_a_rebuild_equal_a_clean_index() {
         let sql = tombstone_sql(table, CHAIN, fork, None, 2).expect(table);
         db.execute(&sql).await;
     }
+    // `to_ts`: the exclusive end of the window the validity rule hides,
+    // which must be the range the rebuild below covers.
     db.execute(&format!(
-        "INSERT INTO reorgs (chain, epoch, from_ts, detected_at, \
+        "INSERT INTO reorgs (chain, epoch, from_ts, to_ts, detected_at, \
          fork_block, old_head, depth, rows_tombstoned, reason) \
-         VALUES ({CHAIN}, {epoch}, toDateTime({from_ts}), now(), {fork}, \
+         VALUES ({CHAIN}, {epoch}, toDateTime({from_ts}), \
+         toDateTime(1790000000), now(), {fork}, \
          {GRADUATION_BLOCK}, 12, 0, 'reorg')"
     ))
     .await;
