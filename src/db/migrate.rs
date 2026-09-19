@@ -56,6 +56,12 @@
 //!   the second one is a no-op. A statement that still reports "already
 //!   exists" (DDL written without `IF NOT EXISTS`) is tolerated with a
 //!   warning.
+//! - Getting to that no-op can itself fail while the other runner is
+//!   half way through the same statement: `CREATE OR REPLACE` is a
+//!   create-then-EXCHANGE, and the loser of the exchange gets an
+//!   errno-based `ATOMIC_RENAME_FAIL`, not a tidy "already exists". Those
+//!   collisions ([`is_race`]) are retried with a short jittered backoff
+//!   instead of failing the migration.
 //! - Recording is idempotent: the tables are `ReplacingMergeTree`s ordered
 //!   by `(version, checksum)` / `(version, statement, checksum)` and always
 //!   read with `FINAL`. Two runners recording the same thing collapse into
@@ -123,11 +129,34 @@ pub const PROGRESS_TABLE: &str = "schema_migrations_progress";
 
 const CONNECT_ATTEMPTS: u32 = 10;
 
+/// How often a statement that lost a race with a concurrent runner is
+/// tried again before the failure is real. See [`is_race`].
+const RACE_ATTEMPTS: u32 = 5;
+
+/// Wait before the first retry of a lost race; doubled each time, always
+/// jittered. Four retries take roughly 50 + 100 + 200 + 400 ms.
+pub const RACE_BACKOFF: Duration = Duration::from_millis(50);
+
 /// ClickHouse error codes the runner reacts to.
 const CODE_TABLE_ALREADY_EXISTS: u32 = 57;
 const CODE_UNKNOWN_TABLE: u32 = 60;
 const CODE_UNKNOWN_DATABASE: u32 = 81;
 const CODE_DATABASE_ALREADY_EXISTS: u32 = 82;
+
+/// Collisions inside the database's store directory. Two runners
+/// executing the SAME `CREATE` at the same time can hit these; no
+/// statement produces them on its own, so they are always a lost race:
+/// DIRECTORY_ALREADY_EXISTS (84), FILE_ALREADY_EXISTS (504),
+/// ATOMIC_RENAME_FAIL (521, `renameat2` on a path the winner moved).
+const CODES_DDL_RACE: [u32; 3] = [84, 504, 521];
+
+/// Extra codes an atomic replace can lose with (see
+/// [`replaces_atomically`]): the object is created under a temporary name
+/// and then EXCHANGEd into place, so a concurrent replace of the same
+/// object is seen as the target appearing, vanishing or being dropped
+/// mid-flight. TABLE_ALREADY_EXISTS (57), UNKNOWN_TABLE (60),
+/// TABLE_IS_DROPPED (218), ABORTED (236), UNFINISHED (341).
+const CODES_REPLACE_RACE: [u32; 5] = [57, 60, 218, 236, 341];
 
 /// The server answered and said no to who we are: AUTHENTICATION_FAILED
 /// (516), ACCESS_DENIED (497), UNKNOWN_USER (192), WRONG_PASSWORD (193),
@@ -907,6 +936,88 @@ fn error_code(error: &ClickhouseError) -> Option<u32> {
     }
 }
 
+/// Whether ClickHouse puts this statement in place with an atomic
+/// exchange: `CREATE OR REPLACE ...` builds the object under a temporary
+/// name and then EXCHANGEs it with the existing one (`EXCHANGE` does the
+/// swap directly). The exchange is atomic against readers, NOT against a
+/// second process exchanging the same paths: the loser fails with an
+/// errno-based error although its own work was fine.
+///
+/// Comments and quoted text are stripped first, so `-- CREATE OR REPLACE`
+/// above an `ALTER` does not count.
+pub fn replaces_atomically(statement: &str) -> bool {
+    match skeleton(statement) {
+        Ok(code) => {
+            code.starts_with("CREATE OR REPLACE ")
+                || code.starts_with("EXCHANGE ")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether `code` means "another runner was executing this same statement
+/// at the same instant and won", which a retry resolves, rather than
+/// something wrong with the statement.
+///
+/// Deliberately narrow. The path collisions in [`CODES_DDL_RACE`] cannot
+/// be produced by a statement on its own, so they are a race whatever the
+/// statement is. The codes in [`CODES_REPLACE_RACE`] are ordinary errors
+/// in general (an `ALTER` on a missing table is really code 60), so they
+/// only count for a statement that [`replaces_atomically`], where the
+/// runner itself is what makes the target come and go.
+pub fn is_race(replaces_atomically: bool, code: u32) -> bool {
+    CODES_DDL_RACE.contains(&code)
+        || (replaces_atomically && CODES_REPLACE_RACE.contains(&code))
+}
+
+/// Runs `execute` again while it loses a race with a concurrent runner
+/// ([`is_race`]), at most `attempts` times in total, waiting `backoff`
+/// (jittered, doubling) in between. Returns the last result and how many
+/// retries it took.
+///
+/// Statements are idempotent by construction, so repeating one is always
+/// allowed; this only decides how long to keep trying before calling the
+/// failure real.
+async fn with_race_retries<F, Fut>(
+    statement: &str,
+    attempts: u32,
+    backoff: Duration,
+    mut execute: F,
+) -> (Result<(), ClickhouseError>, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ClickhouseError>>,
+{
+    let replaces = replaces_atomically(statement);
+    let mut wait = backoff;
+
+    for retry in 0..attempts.saturating_sub(1) {
+        let error = match execute().await {
+            Ok(()) => return (Ok(()), retry),
+            Err(error) => error,
+        };
+
+        match error_code(&error) {
+            Some(code) if is_race(replaces, code) => {}
+            _ => return (Err(error), retry),
+        }
+
+        if retry == 0 {
+            warn!(
+                "A concurrent indexer is running the same statement; \
+                 retrying up to {} times ({error}). Statement: {}",
+                attempts - 1,
+                excerpt(statement)
+            );
+        }
+
+        tokio::time::sleep(jittered(wait)).await;
+        wait = wait.saturating_mul(2);
+    }
+
+    (execute().await, attempts.saturating_sub(1))
+}
+
 fn quote_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('\\', "\\\\").replace('`', "\\`"))
 }
@@ -933,6 +1044,7 @@ pub struct Migrator {
     database: String,
     lock_stale: Duration,
     lock_poll: Duration,
+    race_backoff: Duration,
 }
 
 /// The lock this process holds.
@@ -1019,6 +1131,7 @@ impl Migrator {
             database: params.database,
             lock_stale: LOCK_STALE,
             lock_poll: LOCK_POLL,
+            race_backoff: RACE_BACKOFF,
         })
     }
 
@@ -1031,6 +1144,12 @@ impl Migrator {
     /// Overrides [`LOCK_POLL`].
     pub fn with_lock_poll(mut self, lock_poll: Duration) -> Self {
         self.lock_poll = lock_poll;
+        self
+    }
+
+    /// Overrides [`RACE_BACKOFF`].
+    pub fn with_race_backoff(mut self, race_backoff: Duration) -> Self {
+        self.race_backoff = race_backoff;
         self
     }
 
@@ -1664,6 +1783,11 @@ impl Migrator {
     }
 
     /// Drops the lock if it is still ours (it is not after a takeover).
+    ///
+    /// Fails CLOSED: when the check itself fails we do not know whose lock
+    /// is there, and dropping it could remove the fresh lock of the runner
+    /// that took over from us. Leaving it costs at most [`LOCK_STALE`],
+    /// after which it is taken over like any abandoned lock.
     async fn release_lock(&self, lock: &HeldLock) {
         let holder = format!(
             "SELECT comment FROM system.tables WHERE database = \
@@ -1671,8 +1795,18 @@ impl Migrator {
         );
 
         match self.db.query(&holder).fetch_optional::<String>().await {
-            Ok(Some(comment)) if !comment.starts_with(&lock.token) => {}
-            _ => self.drop_lock_table(LOCK_TABLE).await,
+            // Ours: drop it so the next runner starts at once.
+            Ok(Some(comment)) if comment.starts_with(&lock.token) => {
+                self.drop_lock_table(LOCK_TABLE).await;
+            }
+            // Somebody else's (we were taken over), or already gone.
+            Ok(_) => {}
+            Err(e) => warn!(
+                "Could not tell whether the migration lock is still ours \
+                 ({e}); leaving it alone rather than risk dropping another \
+                 runner's lock. It is taken over after {:?}.",
+                self.lock_stale
+            ),
         }
     }
 
@@ -1724,11 +1858,28 @@ impl Migrator {
                 self.touch_lock(lock).await;
             }
 
-            let result = self
-                .db
-                .query(&escape_placeholders(statement))
-                .execute()
-                .await;
+            // Two runners inside the same migration execute the same
+            // statement. Idempotent DDL makes the second one a no-op, but
+            // ClickHouse can still fail it on the way there (an atomic
+            // replace whose paths the winner already moved, a store
+            // directory the winner already made). Those are retried.
+            let query = escape_placeholders(statement);
+            let (result, retries) = with_race_retries(
+                statement,
+                RACE_ATTEMPTS,
+                self.race_backoff,
+                || self.db.query(&query).execute(),
+            )
+            .await;
+
+            if retries > 0 && result.is_ok() {
+                info!(
+                    "Migration {} statement {}/{total} went through after \
+                     {retries} retry/retries.",
+                    migration.label(),
+                    index + 1
+                );
+            }
 
             match result {
                 Ok(()) => {}
@@ -1785,6 +1936,7 @@ pub async fn status(database_url: &str) -> Result<Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::Cell, rc::Rc};
 
     fn split(sql: &str) -> Vec<String> {
         split_statements(sql).unwrap()
@@ -2733,6 +2885,182 @@ FROM transactions;
         assert!(CODES_DENIED.contains(&164));
     }
 
+    // ---- lost races with a concurrent runner ----
+
+    #[test]
+    fn atomic_replacements_are_recognised() {
+        for statement in [
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "create or replace table t (a UInt8) ENGINE = Memory",
+            "CREATE OR REPLACE DICTIONARY d (a UInt8) PRIMARY KEY a",
+            "/* c */ -- x\nCREATE OR REPLACE FUNCTION f AS (x) -> x",
+            "EXCHANGE TABLES a AND b",
+        ] {
+            assert!(replaces_atomically(statement), "{statement}");
+        }
+
+        for statement in [
+            "CREATE VIEW IF NOT EXISTS v AS SELECT 1",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t AS SELECT 1",
+            "CREATE TABLE IF NOT EXISTS t (a UInt8) ENGINE = Memory",
+            "DROP TABLE IF EXISTS t",
+            // The words only count as code, not as comment or string.
+            "-- CREATE OR REPLACE VIEW v\nALTER TABLE t MODIFY TTL d",
+            "INSERT INTO t VALUES ('CREATE OR REPLACE VIEW v')",
+            "SELECT 'unterminated",
+        ] {
+            assert!(!replaces_atomically(statement), "{statement}");
+        }
+    }
+
+    #[test]
+    fn race_codes_are_classified_per_statement_kind() {
+        // Store-path collisions are a race whatever the statement is.
+        for code in CODES_DDL_RACE {
+            assert!(is_race(false, code), "{code}");
+            assert!(is_race(true, code), "{code}");
+        }
+        assert!(is_race(false, 521), "the code CI hit");
+
+        // The ambiguous ones only count for an atomic replacement: an
+        // ALTER on a table that really is missing must fail, not spin.
+        for code in CODES_REPLACE_RACE {
+            assert!(is_race(true, code), "{code}");
+            assert!(!is_race(false, code), "{code}");
+        }
+        assert!(!is_race(false, CODE_UNKNOWN_TABLE));
+
+        // Never a race: a broken statement, or a refused user.
+        for code in [50, 62, too_denied(), 516, 497] {
+            assert!(!is_race(true, code), "{code}");
+            assert!(!is_race(false, code), "{code}");
+        }
+    }
+
+    /// READONLY: retrying it would hide finding 14's error message.
+    fn too_denied() -> u32 {
+        164
+    }
+
+    /// Error as the client reports one from the server.
+    fn server_error(code: u32, text: &str) -> ClickhouseError {
+        ClickhouseError::BadResponse(format!(
+            "Code: {code}. DB::Exception: {text} (version 25.12.1.322)"
+        ))
+    }
+
+    /// The exact failure CI saw on Linux/ClickHouse 25.8; it cannot be
+    /// reproduced on macOS/APFS, so the loop is tested against it here.
+    fn exchange_race() -> ClickhouseError {
+        server_error(
+            521,
+            "DB::ErrnoException: Paths cannot be exchanged because \
+             /var/lib/clickhouse/store/abc/... does not exist",
+        )
+    }
+
+    /// Counts calls and fails the first `failures` of them with `error`.
+    fn flaky(
+        failures: usize,
+        error: impl Fn() -> ClickhouseError,
+    ) -> (impl Fn() -> Result<(), ClickhouseError>, Rc<Cell<usize>>) {
+        let calls = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&calls);
+
+        let run = move || {
+            let call = seen.get();
+            seen.set(call + 1);
+            if call < failures {
+                Err(error())
+            } else {
+                Ok(())
+            }
+        };
+
+        (run, calls)
+    }
+
+    /// No real waiting in the tests.
+    const QUICK: Duration = Duration::from_millis(1);
+
+    #[tokio::test]
+    async fn a_lost_exchange_race_is_retried_until_it_goes_through() {
+        let statement = "CREATE OR REPLACE VIEW v AS SELECT 1";
+        let (run, calls) = flaky(3, exchange_race);
+
+        let (result, retries) =
+            with_race_retries(statement, RACE_ATTEMPTS, QUICK, || {
+                std::future::ready(run())
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(retries, 3);
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_race_that_never_clears_fails_with_the_server_error() {
+        let (run, calls) = flaky(usize::MAX, exchange_race);
+
+        let (result, retries) = with_race_retries(
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            RACE_ATTEMPTS,
+            QUICK,
+            || std::future::ready(run()),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error_code(&error), Some(521));
+        assert!(error.to_string().contains("cannot be exchanged"));
+        // Tried once, then retried, and no more than that.
+        assert_eq!(retries, RACE_ATTEMPTS - 1);
+        assert_eq!(calls.get(), RACE_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_real_error_is_not_retried() {
+        for (statement, code) in [
+            // A broken statement, on a statement kind that DOES retry.
+            ("CREATE OR REPLACE VIEW v AS SELECT nope()", 46),
+            // UNKNOWN_TABLE is a race only for an atomic replacement.
+            ("ALTER TABLE gone MODIFY TTL d", CODE_UNKNOWN_TABLE),
+            // Finding 15 must keep failing fast.
+            ("CREATE OR REPLACE VIEW v AS SELECT 1", 497),
+        ] {
+            let (run, calls) =
+                flaky(usize::MAX, || server_error(code, "no"));
+
+            let (result, retries) =
+                with_race_retries(statement, RACE_ATTEMPTS, QUICK, || {
+                    std::future::ready(run())
+                })
+                .await;
+
+            assert!(result.is_err(), "{statement}");
+            assert_eq!(retries, 0, "{statement}");
+            assert_eq!(calls.get(), 1, "{statement}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_statement_that_works_at_once_is_run_exactly_once() {
+        let (run, calls) = flaky(0, exchange_race);
+
+        let (result, retries) = with_race_retries(
+            "CREATE TABLE IF NOT EXISTS t (a UInt8) ENGINE = Memory",
+            RACE_ATTEMPTS,
+            QUICK,
+            || std::future::ready(run()),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(retries, 0);
+        assert_eq!(calls.get(), 1);
+    }
+
     // ---- helpers ----
 
     #[test]
@@ -2833,11 +3161,13 @@ mod integration {
             Self { name, url: url.to_string(), server }
         }
 
-        /// Polls faster than production so the tests stay quick.
+        /// Polls and backs off faster than production so the tests stay
+        /// quick; the code paths are the same.
         fn migrator(&self) -> Migrator {
             Migrator::new(&self.url)
                 .unwrap()
                 .with_lock_poll(Duration::from_millis(200))
+                .with_race_backoff(Duration::from_millis(10))
         }
 
         /// Url of the same database for another user.
@@ -2953,10 +3283,15 @@ mod integration {
             Migration::new(
                 2,
                 "read_path",
+                // The OR REPLACE view is what makes the racing tests
+                // exercise the create-then-EXCHANGE path: on Linux two
+                // concurrent runners can lose it with ATOMIC_RENAME_FAIL.
                 "CREATE TABLE IF NOT EXISTS t1_by_b (b String, a UInt64)\n\
                  ENGINE = ReplacingMergeTree ORDER BY (b, a);\n\
                  CREATE MATERIALIZED VIEW IF NOT EXISTS t1_by_b_mv TO t1_by_b\n\
-                 AS SELECT b, a FROM t1;",
+                 AS SELECT b, a FROM t1;\n\
+                 CREATE OR REPLACE VIEW t1_head AS\n\
+                 SELECT a, b FROM t1 ORDER BY a LIMIT 10;",
             ),
             Migration::new(
                 10,
@@ -3160,6 +3495,43 @@ mod integration {
         scratch.drop().await;
     }
 
+    /// The unit tests drive [`with_race_retries`] directly; this one
+    /// proves it is wired into the runner against a real server, using a
+    /// retryable code that can be provoked deterministically (60 on an
+    /// atomic replacement). ATOMIC_RENAME_FAIL itself cannot be produced
+    /// on macOS/APFS, so it is only covered by the unit tests.
+    #[tokio::test]
+    #[ignore = "needs ClickHouse (TEST_DATABASE_URL)"]
+    async fn a_retryable_failure_that_never_clears_still_fails() {
+        let scratch = Scratch::new("retry");
+
+        let broken = vec![Migration::new(
+            1,
+            "replace",
+            "CREATE OR REPLACE VIEW v AS SELECT * FROM no_such_table;",
+        )];
+
+        let started = Instant::now();
+        let error = scratch.migrator().apply(&broken).await.unwrap_err();
+        let text = format!("{error:#}");
+
+        // Retried (the backoff is 10 ms here), then the server's own
+        // error, not a retry message, is what the operator reads.
+        assert_eq!(
+            clickhouse_code(&error),
+            Some(CODE_UNKNOWN_TABLE),
+            "{text}"
+        );
+        assert!(text.contains("failed at statement 1/1"), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{text}");
+
+        // Nothing recorded, nothing left behind.
+        assert!(scratch.recorded().await.is_empty());
+        assert!(!scratch.table_exists(LOCK_TABLE).await);
+
+        scratch.drop().await;
+    }
+
     #[tokio::test]
     #[ignore = "needs ClickHouse (TEST_DATABASE_URL)"]
     async fn non_idempotent_ddl_already_present_is_tolerated() {
@@ -3310,6 +3682,9 @@ mod integration {
         // Duplicate records collapse.
         assert_eq!(scratch.recorded().await, [1, 2]);
         assert!(scratch.table_exists("t1_by_b_mv").await);
+        // The OR REPLACE view survived every runner replacing it at the
+        // same time (on Linux some of those lose the exchange and retry).
+        assert!(scratch.table_exists("t1_head").await);
 
         let report = scratch.migrator().apply(&migrations).await.unwrap();
         assert_eq!(report.already_applied, 2);
