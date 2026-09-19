@@ -147,12 +147,26 @@ async fn run_registry_history(
         );
     };
 
-    // `--from-block` / `--from-date` narrow the pass; by default it goes
-    // as far down as the source will serve these addresses.
+    // The pass READS FROM THE SOURCE - these logs are below the floor, so
+    // this database has never had them - which is what makes it different
+    // from every other backfill.
+    let token = std::env::var("ENVIO_API_TOKEN").unwrap_or_default();
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!(
+            "this pass reads blocks below the coverage floor from the \
+             source, so it needs ENVIO_API_TOKEN in the environment. \
+             (Every other `indexer backfill` re-decodes logs this \
+             database already has and needs no token.)"
+        );
+    }
+
+    // By default the pass goes as far down as the source will serve these
+    // addresses; it remembers how far it got in `prediction_history`.
     let source = evm_indexer::source::evm::Source::new(
         config.chain_id,
         None,
-        std::env::var("ENVIO_API_TOKEN").unwrap_or_default().trim(),
+        token,
     )?;
 
     let report = history::run(

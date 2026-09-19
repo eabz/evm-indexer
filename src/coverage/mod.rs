@@ -169,6 +169,26 @@ pub async fn establish(
         Decision::Resolve(wanted) => wanted,
     };
 
+    // An UPGRADE, not a new chain: this database was already indexing
+    // before floors existed, so the promise it can make is the one its data
+    // already supports. Computing "a year ago" here would shrink the window
+    // and stop the gap heal from ever looking below the new line again.
+    if let Some(lowest) = store::lowest_stored(db).await? {
+        let floor =
+            resolve_floor(chain, head, now, Wanted::Block(lowest)).await?;
+        let floor = Floor { reason: Reason::Existing, ..floor };
+
+        warn!(
+            "Chain {}: this database already holds blocks down to {}, so \
+             that is its coverage floor rather than the default. Nothing \
+             is lost and nothing changes about what gets indexed; `indexer \
+             verify` says whether the window below is gap-free.",
+            db.chain_id, lowest
+        );
+
+        return store::set_if_absent(db, fence, floor).await;
+    }
+
     let floor = resolve_floor(chain, head, now, wanted).await?;
 
     store::set_if_absent(db, fence, floor).await

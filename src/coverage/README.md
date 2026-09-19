@@ -23,7 +23,7 @@ On a chain's **first** start, and only then:
 
 | What was given | Floor |
 |---|---|
-| nothing, on an EVM chain | now - 365 days, resolved to a block |
+| nothing, on an EVM chain | a year back, resolved to a block |
 | nothing, on Solana | the head |
 | `--start-block N` | block `N` |
 | `--start-date YYYY-MM-DD` | the first block at or after midnight UTC of that day |
@@ -32,9 +32,21 @@ On a chain's **first** start, and only then:
 `--start-block` and `--start-date` are mutually exclusive, at the command
 line and through the environment.
 
+**One case beats all of them: a database that already has blocks.** A
+deployment that was indexing before floors existed holds, say, three years
+of Ethereum. Computing "a year back" for it would make it promise less than
+it is sitting on and - worse - would stop the gap heal from ever looking
+below that line again. So such a chain's floor is its oldest stored block,
+with the reason `existing`, and `indexer verify` is what says whether the
+window below is actually gap-free.
+
 A **year** is the default because it is what makes "all-time", "last 12
 months" and every year-on-year comparison a real answer rather than an
-artefact of the day somebody happened to start the indexer.
+artefact of the day somebody happened to start the indexer. It is measured
+from the newest block the source HAS, or from now, whichever is earlier: a
+year is a promise about the data, and an archive that is behind would
+otherwise quietly give less than a year - or, if it is more than a year
+behind, nothing at all.
 
 **Solana starts at the head.** Envio serves Solana history from 2026-01-03
 and the free tier is slow, so a year of it is not something anybody should

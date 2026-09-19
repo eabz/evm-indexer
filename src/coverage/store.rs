@@ -23,6 +23,9 @@ pub enum Reason {
     StartDate,
     /// Lowered by `indexer backfill`.
     Backfill,
+    /// The oldest block this database ALREADY had when the floor was first
+    /// written: a deployment that had been indexing before floors existed.
+    Existing,
 }
 
 impl Reason {
@@ -33,6 +36,7 @@ impl Reason {
             Self::StartBlock => "start-block",
             Self::StartDate => "start-date",
             Self::Backfill => "backfill",
+            Self::Existing => "existing",
         }
     }
 
@@ -45,6 +49,7 @@ impl Reason {
             "start-block" => Self::StartBlock,
             "start-date" => Self::StartDate,
             "backfill" => Self::Backfill,
+            "existing" => Self::Existing,
             _ => return None,
         })
     }
@@ -57,6 +62,7 @@ impl Reason {
             Self::StartBlock => "--start-block",
             Self::StartDate => "--start-date",
             Self::Backfill => "lowered by indexer backfill",
+            Self::Existing => "the oldest block this database already had",
         }
     }
 }
@@ -104,6 +110,43 @@ impl Coverage {
     pub fn is_empty(&self) -> bool {
         self.covered_to_block <= self.floor.block
     }
+}
+
+/// The oldest block (or Solana slot) this database already holds for the
+/// chain, if any.
+///
+/// This is what makes an UPGRADE safe. A deployment that has been indexing
+/// since before there were coverage floors holds, say, three years of
+/// Ethereum; computing a floor of "one year ago" for it on the next start
+/// would be a smaller promise than the data it is sitting on, and - worse -
+/// would stop the gap heal from ever looking below that line again. So a
+/// database that already has rows keeps what it has: the floor is its
+/// oldest block, and `indexer verify` is what says whether the window below
+/// is actually gap-free.
+pub async fn lowest_stored(db: &Database) -> Result<Option<u64>> {
+    let table = if db.chain_id == crate::pipeline::solana::SOLANA_CHAIN_ID
+    {
+        "sol_slots"
+    } else {
+        "blocks"
+    };
+
+    // `FINAL`, so a tombstoned block does not count as stored.
+    let sql = format!(
+        "SELECT toUInt64(count()), toUInt64(min({column})) \
+         FROM {table} FINAL WHERE chain = {}",
+        db.chain_id,
+        column = if table == "blocks" { "number" } else { "block_number" }
+    );
+
+    let (count, lowest) = db
+        .db
+        .query(&sql)
+        .fetch_one::<(u64, u64)>()
+        .await
+        .context("look for blocks this database already has")?;
+
+    Ok((count > 0).then_some(lowest))
 }
 
 /// The floor this chain already has, or `None` when it has none yet.
@@ -386,6 +429,7 @@ mod tests {
             Reason::StartBlock,
             Reason::StartDate,
             Reason::Backfill,
+            Reason::Existing,
         ] {
             assert_eq!(Reason::parse(reason.as_str()), Some(reason));
             assert!(!reason.plainly().is_empty());

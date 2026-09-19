@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS chain_coverage (
   --   'start-date'   --start-date YYYY-MM-DD on the chain's first start
   --   'backfill'     lowered by `indexer backfill`, after the older range
   --                  was complete and verified
+  --   'existing'     the oldest block this database already had when the
+  --                  floor was first written (an upgrade of a deployment
+  --                  that was indexing before floors existed)
   reason LowCardinality(String),
   set_at DateTime DEFAULT now(),
   -- See the header: MAX - coverage_from_block, so the LOWEST floor wins.
