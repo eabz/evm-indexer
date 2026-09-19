@@ -551,6 +551,12 @@ wallet history, no chain-wide transfers, and the schema/README must say so.
   transfer instructions must be selected in the same query (a matched instruction does
   not return its children). Aggregators/routers are attribution, never venue volume.
 - Chain id for Solana: 1399811149 (no standard exists; recorded in `chains`).
+- Resume on Solana is the CHECKPOINT TILING and not a gap query over the commit marker
+  (a slot with no row is usually a skipped slot, not a gap), but section 2's rule still
+  binds: **the data decides.** Before a hole in the tiling is streamed again, it is
+  purged whenever it still holds anything - orphan children, or live `sol_slots` rows
+  whose checkpoint insert never landed. The tiling is read with no `LIMIT` and compacted
+  after a covered pass, exactly as on the EVM path.
 - Order: (1) source + `svm` core + generic movement decoder + PumpSwap and pump.fun
   curve decoders, validated live with the owner's token; (2) Raydium / Orca / Meteora
   per-program decoders; (3) launchpads on Solana (pump.fun, Meteora DBC, LaunchLab) into

@@ -290,8 +290,8 @@ pub async fn verify(
     // served window a missing integer is a skipped slot, so nothing in the
     // data distinguishes the two.
     let tiling =
-        store.checkpoint_tiling(chain, range.from, 1_000_000).await?;
-    let mut unasked = holes(range, &tiling, MAX_HOLES_REPORTED + 1);
+        store.checkpoint_tiling(chain, range.from, Some(range.to)).await?;
+    let mut unasked = holes(range, &tiling, MAX_HOLES_REPORTED + 1).ranges;
     let unasked_truncated = unasked.len() > MAX_HOLES_REPORTED;
     unasked.truncate(MAX_HOLES_REPORTED);
 

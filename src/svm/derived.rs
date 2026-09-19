@@ -17,12 +17,15 @@ use crate::db::derived::DerivedTable;
 /// own; `solana_tests` compares the two texts so a change to one breaks
 /// without the other.
 ///
-/// Like the DEX candles (`dex::derived`), they carry no
-/// `{purge_from}`/`{purge_to}`: every one of them reads `sol_dex_swaps`,
-/// which the purge tombstones BEFORE it rebuilds and verifies with
-/// `live_children`. Only an aggregate sourced from the commit marker itself
-/// would need the exclusion, and Solana deliberately has none
-/// (`migrations/0040`: no `daily_*_stats` over a filtered subset).
+/// Like the DEX candles (`dex::derived`) they carry the purged block range
+/// `{purge_from}` / `{purge_to}` and leave it out themselves. Relying on
+/// the tombstones instead is what docs/design.md §2 says not to do:
+/// ClickHouse gives no read-your-writes guarantee, so a `sol_dex_swaps`
+/// part tombstoned a moment earlier can still be visible to the rebuild,
+/// which would file the purged swaps under the NEW epoch and count them a
+/// second time when the range is streamed again. `block_number` on
+/// `sol_dex_swaps` is the SLOT, which is exactly what a Solana purge ranges
+/// over.
 macro_rules! sol_candles {
     ($name:literal, $seconds:literal) => {
         DerivedTable {
@@ -60,6 +63,7 @@ macro_rules! sol_candles {
                 " FROM sol_dex_swaps FINAL",
                 " WHERE chain = {chain} AND timestamp >= toDateTime({from_ts}) AND timestamp < toDateTime({to_ts})",
                 " AND is_deleted = 0",
+                " AND NOT (block_number >= {purge_from} AND block_number < {purge_to})",
                 " GROUP BY chain, pool_id, venue_program, bucket, epoch"
             ),
         }
@@ -157,6 +161,37 @@ mod tests {
             SOL_DERIVED.iter().map(|t| t.bucket_seconds).collect();
         assert_eq!(widths, vec![60, 3_600, 86_400]);
         assert_eq!(SOL_DERIVED.len(), SOL_CANDLE_VIEWS.len());
+    }
+
+    /// A rebuild must leave the purged slot range out BY ITSELF: the
+    /// tombstones of that range may not be visible yet when it runs
+    /// (docs/design.md §2), and a swap counted here under the new epoch is
+    /// counted a second time when the range is streamed again.
+    #[test]
+    fn every_candle_rebuild_excludes_the_purged_slot_range() {
+        for table in SOL_DERIVED {
+            assert!(
+                table.rebuild_sql.contains("{purge_from}")
+                    && table.rebuild_sql.contains("{purge_to}"),
+                "{} does not exclude the purged slot range",
+                table.name
+            );
+
+            let sql = table.rebuild_slice(1, 0, 86_400, 3, 500, Some(600));
+            assert!(
+                sql.contains(
+                    "NOT (block_number >= 500 AND block_number < 600)"
+                ),
+                "{sql}"
+            );
+
+            // An open ended purge reaches to the top of the chain.
+            let open = table.rebuild_slice(1, 0, 86_400, 3, 500, None);
+            assert!(
+                open.contains(&format!("block_number < {}", u64::MAX)),
+                "{open}"
+            );
+        }
     }
 
     #[test]

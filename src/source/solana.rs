@@ -435,7 +435,7 @@ impl SolanaSource {
             self.client.get(&build_query(from, to)).await.with_context(
                 || format!("query Solana slots [{from}, {to})"),
             )?;
-        Ok(to_batch(response))
+        to_batch(response)
     }
 
     /// [`Self::fetch`] over Arrow, with the response's rate-limit headers.
@@ -469,7 +469,7 @@ impl SolanaSource {
 
         let response = decode_arrow(answer.response)?;
 
-        Ok((to_batch(response), answer.rate_limit))
+        Ok((to_batch(response)?, answer.rate_limit))
     }
 
     /// Streams `[from, to)`. Always a BOUNDED range: the client has no
@@ -489,7 +489,7 @@ impl SolanaSource {
 
             while let Some(response) = responses.recv().await {
                 let message = match response {
-                    Ok(arrow) => decode_arrow(arrow).map(to_batch),
+                    Ok(arrow) => decode_arrow(arrow).and_then(to_batch),
                     Err(e) => Err(e.context(format!(
                         "stream Solana slots [{from}, {to})"
                     ))),
@@ -564,8 +564,47 @@ fn decode_arrow(
     Ok(response)
 }
 
+/// A header field the server left out of a slot that DID produce a block.
+///
+/// A plain, retryable error on purpose. The four fields below are what the
+/// continuity tripwire compares, and `unwrap_or_default()` used to turn an
+/// omission into a ZERO: a `block_height` of 0 reads as "the whole chain
+/// height is missing between these two blocks", a zero `parent_blockhash`
+/// as "this is a different block". The tripwire is not retryable - it stops
+/// the process and tells the operator NOT to restart - so a single dropped
+/// field would wedge the indexer and, under a restart policy, become a
+/// crash loop. A field that is ABSENT is a bad answer from the server and
+/// nothing more; only values that are PRESENT and disagree are a tripwire.
+///
+/// `block_time` is in the list for a second reason: a timestamp of 0 inside
+/// a purged range sets `reorgs.from_ts = 0`, which hides and re-aggregates
+/// every day of the chain since 1970.
+#[derive(Debug, Clone)]
+pub struct MissingSlotField {
+    pub slot: u64,
+    pub field: &'static str,
+}
+
+impl std::fmt::Display for MissingSlotField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Solana HyperSync served slot {} without `{}`. Every produced \
+             block has one, and substituting a zero would either trip the \
+             continuity tripwire (which stops the process on purpose and \
+             is not retryable) or stamp the slot with timestamp 0. Treating \
+             the answer as bad instead: the query is retried.",
+            self.slot, self.field
+        )
+    }
+}
+
+impl std::error::Error for MissingSlotField {}
+
 /// Groups a response's flat rows into per-slot, per-transaction batches.
-pub fn to_batch(response: SolanaResponse) -> SolanaBatch {
+///
+/// Fails when a block header is incomplete - see [`MissingSlotField`].
+pub fn to_batch(response: SolanaResponse) -> Result<SolanaBatch> {
     use std::collections::HashMap;
 
     // (slot, tx_index) -> transaction under construction.
@@ -690,35 +729,48 @@ pub fn to_batch(response: SolanaResponse) -> SolanaBatch {
         by_slot.entry(slot).or_default().push(tx);
     }
 
-    let mut batches: Vec<SvmSlotBatch> = response
-        .blocks
-        .iter()
-        .filter_map(|block| {
-            let slot = block.slot?;
-            let mut transactions =
-                by_slot.remove(&slot).unwrap_or_default();
-            transactions.sort_by_key(|tx| tx.tx_index);
-            Some(SvmSlotBatch {
-                slot,
-                blockhash: block
-                    .blockhash
-                    .map(|hash| hash.0)
-                    .unwrap_or_default(),
-                parent_slot: block.parent_slot.unwrap_or_default(),
-                parent_blockhash: block
-                    .parent_blockhash
-                    .map(|hash| hash.0)
-                    .unwrap_or_default(),
-                block_height: block.block_height.unwrap_or_default(),
-                timestamp: block.block_time.unwrap_or_default().max(0)
-                    as u32,
-                transactions,
-            })
-        })
-        .collect();
+    let mut batches: Vec<SvmSlotBatch> = Vec::new();
+
+    for block in &response.blocks {
+        // A row with no slot at all is not a block: there is nothing to
+        // name in an error and nothing to store.
+        let Some(slot) = block.slot else {
+            continue;
+        };
+
+        let required =
+            |field: &'static str| MissingSlotField { slot, field };
+
+        let mut transactions = by_slot.remove(&slot).unwrap_or_default();
+        transactions.sort_by_key(|tx| tx.tx_index);
+
+        batches.push(SvmSlotBatch {
+            slot,
+            blockhash: block
+                .blockhash
+                .ok_or_else(|| required("blockhash"))?
+                .0,
+            parent_slot: block
+                .parent_slot
+                .ok_or_else(|| required("parent_slot"))?,
+            parent_blockhash: block
+                .parent_blockhash
+                .ok_or_else(|| required("parent_blockhash"))?
+                .0,
+            block_height: block
+                .block_height
+                .ok_or_else(|| required("block_height"))?,
+            timestamp: block
+                .block_time
+                .ok_or_else(|| required("block_time"))?
+                .max(0) as u32,
+            transactions,
+        });
+    }
+
     batches.sort_by_key(|batch| batch.slot);
 
-    SolanaBatch {
+    Ok(SolanaBatch {
         next_slot: response.next_slot,
         batches,
         rollback_guard: response.rollback_guard.map(|guard| {
@@ -730,7 +782,7 @@ pub fn to_batch(response: SolanaResponse) -> SolanaBatch {
                 timestamp: guard.timestamp,
             }
         }),
-    }
+    })
 }
 
 /// Signature bytes, for callers that build a transaction filter.
@@ -986,5 +1038,96 @@ mod tests {
         // Match-all: the server short circuits an empty selection.
         assert_eq!(query.instruction_calls.len(), 1);
         assert!(query.instruction_calls[0].is_empty());
+    }
+
+    // ------------------------------------------- incomplete slot headers
+
+    type TestBlock = hypersync_client_solana::simple_types::Block;
+
+    /// A block header with every field the tripwire compares.
+    fn complete_block(slot: u64) -> TestBlock {
+        TestBlock {
+            slot: Some(slot),
+            blockhash: Some(hypersync_solana_net_types::Hash([1u8; 32])),
+            parent_slot: Some(slot - 1),
+            parent_blockhash: Some(hypersync_solana_net_types::Hash(
+                [2u8; 32],
+            )),
+            block_height: Some(900_000),
+            block_time: Some(1_767_225_600),
+        }
+    }
+
+    fn response_of(block: TestBlock) -> SolanaResponse {
+        SolanaResponse {
+            next_slot: 500,
+            blocks: vec![block],
+            ..Default::default()
+        }
+    }
+
+    /// A complete header decodes, and nothing about it is invented.
+    #[test]
+    fn a_complete_slot_header_decodes() {
+        let batch = to_batch(response_of(complete_block(400))).unwrap();
+
+        assert_eq!(batch.batches.len(), 1);
+        assert_eq!(batch.batches[0].slot, 400);
+        assert_eq!(batch.batches[0].block_height, 900_000);
+        assert_eq!(batch.batches[0].timestamp, 1_767_225_600);
+    }
+
+    /// A header field the server left out must be a PLAIN RETRYABLE ERROR
+    /// naming the slot and the field - never a zero.
+    ///
+    /// A `block_height` of 0 reads to `check_continuity` as "the whole
+    /// chain height went missing between these two blocks" and a zero
+    /// `parent_blockhash` as "this is a different block"; both fire the
+    /// continuity tripwire, which stops the process, is not retryable and
+    /// tells the operator NOT to restart. One dropped field would wedge the
+    /// indexer, and under a restart policy turn into a crash loop.
+    ///
+    /// A `block_time` of 0 is the other half: `start_of_day(0) = 0`, so a
+    /// purge that touches such a slot writes `reorgs.from_ts = 0` and hides
+    /// - then re-aggregates - every day of the chain since 1970.
+    #[test]
+    fn a_slot_header_missing_a_field_is_a_retryable_error_not_a_zero() {
+        type DropField = Box<dyn Fn(&mut TestBlock)>;
+
+        let cases: Vec<(&str, DropField)> = vec![
+            ("blockhash", Box::new(|b| b.blockhash = None)),
+            ("parent_slot", Box::new(|b| b.parent_slot = None)),
+            ("parent_blockhash", Box::new(|b| b.parent_blockhash = None)),
+            ("block_height", Box::new(|b| b.block_height = None)),
+            ("block_time", Box::new(|b| b.block_time = None)),
+        ];
+
+        for (field, drop_it) in cases {
+            let mut block = complete_block(400);
+            drop_it(&mut block);
+
+            let error = to_batch(response_of(block))
+                .expect_err(&format!("a missing `{field}` must fail"));
+
+            assert!(
+                error.downcast_ref::<MissingSlotField>().is_some(),
+                "`{field}`: {error:#}"
+            );
+
+            let text = format!("{error:#}");
+            assert!(text.contains(field), "{text}");
+            assert!(text.contains("400"), "{text}");
+        }
+    }
+
+    /// A row that is not a block at all (no slot) is skipped, as before:
+    /// there is nothing to name in an error and nothing to store.
+    #[test]
+    fn a_row_without_a_slot_is_not_an_incomplete_header() {
+        let mut block = complete_block(400);
+        block.slot = None;
+
+        let batch = to_batch(response_of(block)).unwrap();
+        assert!(batch.batches.is_empty());
     }
 }

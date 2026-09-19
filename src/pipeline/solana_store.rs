@@ -273,6 +273,21 @@ fn checkpoint_writes(
     writes
 }
 
+/// The live checkpoint tiling of a chain, ordered for
+/// `db::ranges::contiguous_until`. Deliberately without a `LIMIT`: see
+/// [`SolanaReorgStore::checkpoint_tiling`].
+fn tiling_sql(chain: u64, start: u64, until: Option<u64>) -> String {
+    let upper = until
+        .map(|until| format!(" AND from_block < {until}"))
+        .unwrap_or_default();
+
+    format!(
+        "SELECT from_block, to_block FROM checkpoints FINAL \
+         WHERE chain = {chain} AND to_block > {start}{upper} \
+         ORDER BY from_block ASC, to_block ASC"
+    )
+}
+
 fn overlap_predicate(chain: u64, from: u64, to: Option<u64>) -> String {
     let mut predicate = format!("chain = {chain} AND to_block > {from}");
     if let Some(to) = to {
@@ -347,37 +362,106 @@ impl SolanaReorgStore {
 
     // --------------------------------------------- reads the loop needs
 
-    /// Live checkpoints of the chain ending above `start`, ordered for
+    /// Live checkpoints of the chain ending above `start` (and, when
+    /// `until` is given, starting below it), ordered for
     /// `db::ranges::contiguous_until`. This is witness 1 of
     /// docs/solana-research.md §11.4.3: the cursor tiling, which is the
     /// ONLY contiguity test that survives skipped slots, because a
     /// checkpoint's `to_block` is the server's `next_slot` and not
     /// `max(slot) + 1`.
+    ///
+    /// **No `LIMIT`**, and that is load bearing. A truncated tiling makes
+    /// `contiguous_until` return a slot far below the real head and
+    /// `holes()` report everything above it as never asked for, so the
+    /// range is streamed a second time OVER LIVE DATA and every candle in
+    /// it doubles. The rows are STREAMED instead (one row per flush adds
+    /// up over the years, exactly as on the EVM path,
+    /// `pipeline::verify::resume_point`), and `compact_checkpoints`
+    /// collapses the contiguous runs so the answer stays small.
     pub async fn checkpoint_tiling(
         &self,
         chain: u64,
         start: u64,
-        limit: usize,
+        until: Option<u64>,
     ) -> Result<Vec<(u64, u64)>> {
-        #[derive(Debug, Row, Deserialize)]
-        struct Row2 {
-            from_block: u64,
-            to_block: u64,
-        }
-
-        let rows = self
+        let mut cursor = self
             .db
             .db
-            .query(&format!(
-                "SELECT from_block, to_block FROM checkpoints FINAL \
-                 WHERE chain = {chain} AND to_block > {start} \
-                 ORDER BY from_block ASC, to_block ASC LIMIT {limit}"
-            ))
-            .fetch_all::<Row2>()
-            .await
+            .query(&tiling_sql(chain, start, until))
+            .fetch::<(u64, u64)>()
             .context("query the Solana checkpoint tiling")?;
 
-        Ok(rows.into_iter().map(|r| (r.from_block, r.to_block)).collect())
+        let mut tiling = Vec::new();
+        while let Some(row) =
+            cursor.next().await.context("read the checkpoint tiling")?
+        {
+            tiling.push(row);
+        }
+
+        Ok(tiling)
+    }
+
+    /// Witness 1 as a cursor: the slot up to which the live checkpoints
+    /// tile `[start, ..)` with no hole.
+    ///
+    /// Streams and stops at the FIRST hole, so a chain with a long tail of
+    /// checkpoints above a partial backfill costs no more than one that is
+    /// complete. Same shape as `pipeline::verify::resume_point`.
+    pub async fn resume_point(
+        &self,
+        chain: u64,
+        start: u64,
+    ) -> Result<u64> {
+        let mut cursor = self
+            .db
+            .db
+            .query(&tiling_sql(chain, start, None))
+            .fetch::<(u64, u64)>()
+            .context("query the Solana resume point")?;
+
+        let mut until = start;
+
+        while let Some((from, to)) =
+            cursor.next().await.context("read the checkpoint tiling")?
+        {
+            let next = db::ranges::contiguous_until(until, [(from, to)]);
+            if next == until && from > until {
+                break;
+            }
+            until = next;
+        }
+
+        Ok(until)
+    }
+
+    /// Is there a live checkpoint ending EXACTLY at `slot`?
+    ///
+    /// That is what "the stored data below `slot` is adjacent to it" means
+    /// on a chain with skipped slots: every integer between the stored
+    /// predecessor and `slot` was asked for and served, so the next
+    /// produced block must be the predecessor's immediate successor.
+    pub async fn checkpoint_ends_at(
+        &self,
+        chain: u64,
+        slot: u64,
+    ) -> Result<bool> {
+        Ok(self
+            .count(&format!(
+                "SELECT toUInt64(count()) FROM (SELECT to_block FROM \
+                 checkpoints FINAL WHERE chain = {chain} \
+                 AND to_block = {slot} LIMIT 1)"
+            ))
+            .await?
+            > 0)
+    }
+
+    /// Collapses the runs of contiguous live checkpoints into one covering
+    /// row each (`Database::compact_checkpoints`), exactly as the EVM loop
+    /// does after every covered pass.
+    ///
+    /// The CALLER must hold the chain's lease.
+    pub async fn compact_checkpoints(&self) -> Result<u64> {
+        self.db.compact_checkpoints().await
     }
 
     /// The highest stored slot at or below `below`, with its `blockhash`
@@ -864,24 +948,24 @@ impl ReorgStore for SolanaReorgStore {
         purged_to: Option<u64>,
     ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            // Every aggregate here reads a CHILD table - `sol_dex_swaps`
-            // for the candles, `launchpad_trades` / `_tokens` /
-            // `_graduations` / `_creator_fees` for the launchpad ones -
-            // and the purge tombstoned and verified all of them with
-            // `live_children` before this step. None reads the commit
-            // marker, whose rows are still alive at this point, so there
-            // is no block range to exclude. Same reasoning as the EVM DEX
-            // and launchpad aggregates.
-            let _ = (purged_from, purged_to);
-
+            // The purged SLOT range is excluded by the statement itself,
+            // never by trusting that the tombstones are already visible
+            // (docs/design.md §2, "No read-your-writes": a rebuild issued
+            // right after an INSERT returned may not see its part yet, and
+            // `tombstone_until_gone` is a verification loop, not a
+            // guarantee to lean on). Every aggregate here reads a child
+            // table keyed on `block_number` = the slot, so the same
+            // `{purge_from}` / `{purge_to}` the EVM aggregates use works
+            // unchanged. The canonical rows add themselves through the
+            // materialized view when the range is streamed again.
             for table in repaired_derived() {
                 for sql in table.rebuild_statements(
                     chain,
                     from_ts,
                     to_ts,
                     epoch,
-                    u64::MAX,
-                    None,
+                    purged_from,
+                    purged_to,
                 ) {
                     self.execute(&sql).await.with_context(|| {
                         format!("rebuild of '{}'", table.name)

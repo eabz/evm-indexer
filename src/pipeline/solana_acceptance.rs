@@ -473,6 +473,79 @@ impl Scenario {
         let report = self.verify().await;
         assert!(report.is_consistent(), "{report}");
     }
+
+    /// Removes `[from, to)` from the live checkpoint tiling WITHOUT
+    /// touching a single row of data: every overlapping checkpoint is
+    /// tombstoned and the parts of it outside the range are re-inserted.
+    ///
+    /// This is exactly the state a flush whose `sol_slots` insert landed
+    /// and whose checkpoint insert did not leaves behind - and also what a
+    /// purge that died between tombstoning a checkpoint and re-inserting
+    /// its surviving remainder leaves. The slots are stored, and nothing
+    /// claims them.
+    async fn unclaim(&self, from: u64, to: u64) {
+        let live: Vec<(u64, u64, u32)> = self
+            .db
+            .db
+            .query(&format!(
+                "SELECT from_block, to_block, epoch FROM checkpoints FINAL \
+                 WHERE chain = {CHAIN} AND to_block > {from} \
+                 AND from_block < {to}"
+            ))
+            .fetch_all()
+            .await
+            .unwrap();
+        assert!(!live.is_empty(), "nothing claims [{from}, {to}) already");
+
+        let version = next_version();
+        let mut values = Vec::new();
+
+        for (f, t, epoch) in live {
+            values.push(format!(
+                "({CHAIN}, {f}, {t}, {epoch}, {version}, 1)"
+            ));
+            if f < from {
+                values.push(format!(
+                    "({CHAIN}, {f}, {from}, {epoch}, {version}, 0)"
+                ));
+            }
+            if t > to {
+                values.push(format!(
+                    "({CHAIN}, {to}, {t}, {epoch}, {version}, 0)"
+                ));
+            }
+        }
+
+        self.db
+            .db
+            .query(&format!(
+                "INSERT INTO checkpoints (chain, from_block, to_block, \
+                 epoch, _version, is_deleted) VALUES {}",
+                values.join(", ")
+            ))
+            .execute()
+            .await
+            .unwrap();
+
+        // No read-your-writes: wait until the hole is really visible,
+        // otherwise the run that follows may not see it and the test would
+        // pass for the wrong reason.
+        let store = SolanaReorgStore::new(self.db.clone());
+        for _ in 0..200 {
+            let tiling = store
+                .checkpoint_tiling(CHAIN, FIRST_SLOT, None)
+                .await
+                .unwrap();
+            if crate::db::ranges::contiguous_until(FIRST_SLOT, tiling)
+                <= from
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("the unclaimed range [{from}, {to}) never became a hole");
+    }
 }
 
 /// Quick heartbeats, but a ttl that survives a saturated test machine.
@@ -600,7 +673,7 @@ async fn a_canned_range_with_skipped_slots_is_indexed_end_to_end() {
     let resume = crate::pipeline::solana_store::SolanaReorgStore::new(
         scenario.db.clone(),
     )
-    .checkpoint_tiling(CHAIN, FIRST_SLOT, 10_000)
+    .checkpoint_tiling(CHAIN, FIRST_SLOT, None)
     .await
     .unwrap();
     assert_eq!(
@@ -713,10 +786,10 @@ async fn a_flush_killed_before_the_commit_marker_is_healed_on_restart() {
     let orphaned_swaps = rows.swaps.len() as u64;
     assert!(orphaned_swaps > 0, "the crash must leave real rows behind");
 
-    let batch = SvmBatch {
+    let batch = SvmBatch::new(
         rows,
-        windows: vec![BlockRange::new(middle, chain.slot_at(30))],
-    };
+        vec![BlockRange::new(middle, chain.slot_at(30))],
+    );
     store_children(&scenario.db, &batch).await.unwrap();
 
     // The orphans are really there and really have no slot.
@@ -846,10 +919,10 @@ async fn the_holder_projection_is_re_observed_after_a_heal() {
     rows.set_epoch(0);
     store_children(
         &scenario.db,
-        &SvmBatch {
+        &SvmBatch::new(
             rows,
-            windows: vec![BlockRange::new(middle, chain.slot_at(30))],
-        },
+            vec![BlockRange::new(middle, chain.slot_at(30))],
+        ),
     )
     .await
     .unwrap();
@@ -912,7 +985,7 @@ async fn a_retried_flush_counts_once() {
     let slots = rows.slots.len() as u64;
     assert!(swaps > 0 && slots > 0);
 
-    let batch = SvmBatch { rows, windows: vec![window] };
+    let batch = SvmBatch::new(rows, vec![window]);
 
     // The whole commit protocol, twice.
     crate::pipeline::solana_writer::store_batch(&scenario.db, &batch)
@@ -987,7 +1060,7 @@ async fn a_retried_flush_counts_once() {
     again.set_epoch(0);
     crate::pipeline::solana_writer::store_batch(
         &scenario.db,
-        &SvmBatch { rows: again, windows: vec![window] },
+        &SvmBatch::new(again, vec![window]),
     )
     .await
     .unwrap();
@@ -1154,7 +1227,7 @@ async fn verify_tells_a_consistent_index_from_an_inconsistent_one() {
     // check would have been screaming about the skipped slots all along
     // instead.
     let tiling = SolanaReorgStore::new(scenario.db.clone())
-        .checkpoint_tiling(CHAIN, FIRST_SLOT, 10_000)
+        .checkpoint_tiling(CHAIN, FIRST_SLOT, None)
         .await
         .unwrap();
     assert!(!tiling.is_empty(), "{tiling:?}");
@@ -1330,4 +1403,304 @@ async fn a_restart_over_a_complete_range_asks_for_nothing() {
     );
 
     scenario.assert_consistent().await;
+}
+
+// ------------------------------------------------- (h) round 4 findings
+
+/// Review round 4, BLOCKER 1.
+///
+/// The commit protocol writes `sol_slots` and THEN, as a separate awaited
+/// insert, the checkpoint. When the marker lands and the checkpoint does
+/// not - its six retries are exhausted, or the writer is aborted between
+/// the two awaits - the slots are stored but no checkpoint claims them.
+///
+/// The resume path reads only the checkpoint tiling, so it calls that range
+/// a hole and streams it again. `has_orphan_children` is FALSE for those
+/// slots (their marker is alive, which is the whole point), so the gap heal
+/// used to skip them: the range was re-streamed on top of live data with a
+/// fresh `_version` and therefore a fresh deduplication token, every insert
+/// was accepted, and the candle and launchpad materialized views - which
+/// only ever ADD into `SimpleAggregateFunction(sum, ..)` columns - counted
+/// the whole window twice. The base tables still read perfectly under
+/// `FINAL`, so nothing but `indexer verify` could see it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_hole_whose_slots_are_still_stored_is_purged_before_the_restream(
+) {
+    let chain = chain(40);
+    let clean = clean_index("h_lost_cp_clean", &chain, chain.head).await;
+    let scenario = Scenario::new("h_lost_cp").await;
+
+    scenario.index_until(&chain, chain.head).await.unwrap();
+    scenario.assert_consistent().await;
+
+    let swaps = scenario.rows("sol_dex_swaps").await;
+    let slots = scenario.rows("sol_slots").await;
+    assert!(swaps > 0 && slots > 0);
+
+    // The crash: the checkpoint of a middle window never became live,
+    // while every row it covered did. Exactly what an exhausted retry of
+    // the checkpoint insert leaves behind.
+    let hole_from = chain.slot_at(15);
+    let hole_to = chain.slot_at(25);
+    scenario.unclaim(hole_from, hole_to).await;
+
+    // The rows are all still there - this is NOT the orphan-children case.
+    let stored_in_hole = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM sol_slots FINAL \
+             WHERE chain = {CHAIN} AND block_number >= {hole_from} \
+             AND block_number < {hole_to}"
+        ))
+        .await;
+    assert!(
+        stored_in_hole > 0,
+        "the scenario must leave live slots inside the unclaimed range"
+    );
+
+    // Restart and run to the head: the heal must purge the hole before the
+    // range is streamed again.
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    // The number the doubling shows up in, and the only one a reader sees.
+    let swaps_after = scenario.rows("sol_dex_swaps").await;
+    assert_eq!(swaps_after, swaps, "sol_dex_swaps");
+
+    for view in SOL_CANDLE_VIEWS {
+        let counted = scenario
+            .count(&format!(
+                "SELECT toUInt64(sum(swaps)) FROM `{view}` \
+                 WHERE chain = {CHAIN}"
+            ))
+            .await;
+        assert_eq!(
+            counted, swaps,
+            "{view} counted the re-streamed window a second time"
+        );
+    }
+
+    scenario.assert_consistent().await;
+
+    // ... and the whole index, candles and launchpad aggregates included,
+    // is what a clean one would have been.
+    assert_same(
+        "after a lost checkpoint was healed",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+}
+
+/// Review round 4, BLOCKER 2.
+///
+/// `checkpoints` gains one row per flush and nothing ever removed them on
+/// this path: at the head's 4 s cadence that is ~25k rows a day, so the
+/// old `LIMIT 100_000` on the tiling read was reached in four or five days.
+/// From then on the tiling truncated, the resume point fell far below the
+/// real head, everything above it read as a hole and was re-streamed over
+/// live data - BLOCKER 1's doubling, applied to days of candles.
+///
+/// The EVM loop compacts after every covered pass; this proves the Solana
+/// loop now does the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_loop_compacts_the_checkpoints_it_keeps_adding() {
+    let scenario = Scenario::new("h_compaction").await;
+    let chain = chain(30);
+
+    // A first process stores part of the range, so the second one really
+    // has a pass to cover (a run with nothing to do never reaches the
+    // housekeeping).
+    let middle = chain.slot_at(15);
+    scenario.index_until(&chain, middle).await.unwrap();
+
+    // A year of head-following, in one insert: 400 contiguous live
+    // checkpoint rows. They sit BELOW the indexed range so they change no
+    // answer the loop depends on, and they are contiguous so compaction
+    // has something to collapse.
+    let base = FIRST_SLOT - 500;
+    let version = next_version();
+    let values: Vec<String> = (0..400u64)
+        .map(|i| {
+            format!(
+                "({CHAIN}, {}, {}, 0, {version}, 0)",
+                base + i,
+                base + i + 1
+            )
+        })
+        .collect();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO checkpoints (chain, from_block, to_block, epoch, \
+             _version, is_deleted) VALUES {}",
+            values.join(", ")
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    let store = SolanaReorgStore::new(scenario.db.clone());
+    let live = |scenario: &Scenario| {
+        let db = scenario.db.clone();
+        async move {
+            db.db
+                .query(&format!(
+                    "SELECT toUInt64(count()) FROM checkpoints FINAL \
+                     WHERE chain = {CHAIN}"
+                ))
+                .fetch_one::<u64>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let before = live(&scenario).await;
+    assert!(before > 400, "{before}");
+
+    // The tiling read must not be truncated by anything, so the answer it
+    // gives now is the one that has to survive the compaction.
+    let covered_before = store.resume_point(CHAIN, base).await.unwrap();
+    assert_eq!(
+        covered_before,
+        base + 400,
+        "the 400 rows tile [base, +400)"
+    );
+
+    // A second process covers the rest of the range, and compacts.
+    scenario.index_until(&chain, chain.head).await.unwrap();
+
+    let after = live(&scenario).await;
+    assert!(
+        after < before / 4,
+        "the checkpoints were not compacted: {before} -> {after}"
+    );
+
+    // The ANSWER is unchanged: compaction collapses rows, never coverage.
+    assert_eq!(store.resume_point(CHAIN, base).await.unwrap(), base + 400);
+    assert_eq!(
+        store.resume_point(CHAIN, FIRST_SLOT).await.unwrap(),
+        chain.head,
+        "the indexed range is still tiled"
+    );
+
+    scenario.assert_consistent().await;
+}
+
+/// Review round 4, MAJOR 7.
+///
+/// The gate a purge waits on used to poll `sol_slots` only, and the mark it
+/// polled for was set only when the flush had slot rows. A window whose
+/// slots were ALL SKIPPED therefore left the mark untouched: the gate
+/// returned immediately, having proved nothing, and the purge could
+/// tombstone slots whose checkpoint was still invisible - after which the
+/// tiling shows no hole, the slots are never streamed again, and `verify`
+/// calls the index complete.
+///
+/// The same flush is also what pinned down the second half: its checkpoint
+/// must carry the flush `_version`, although no row carries one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_visibility_gate_covers_a_window_of_only_skipped_slots() {
+    use crate::pipeline::{
+        lease::Lease,
+        solana::wait_until_visible,
+        solana_writer::{ClickhouseSvmSink, LastFlush, SvmSink},
+    };
+
+    let scenario = Scenario::new("h_visibility").await;
+
+    let (fatal, _fatal_rx) = tokio::sync::watch::channel(None::<String>);
+    let lease =
+        Lease::acquire(&scenario.db, fast_lease(), fatal).await.unwrap();
+
+    let last_flush = LastFlush::default();
+    let sink = ClickhouseSvmSink {
+        db: scenario.db.clone(),
+        fence: lease.fence(),
+        last_flush: last_flush.clone(),
+        stale: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+
+    // A served window in which the chain produced no block at all. Normal
+    // on Solana, and it still claims its slots.
+    let window = BlockRange::new(FIRST_SLOT, FIRST_SLOT + 40);
+    let version = next_version();
+    let mut batch = SvmBatch::new(Default::default(), vec![window]);
+    batch.stamp_version(version);
+    assert!(batch.rows.slots.is_empty());
+
+    sink.store(&batch).await.unwrap();
+
+    // The mark names the CHECKPOINT: there is no marker row to name.
+    let mark = last_flush.lock().unwrap().expect(
+        "a flush of a skipped-only window left no mark for the purge gate \
+         to wait on",
+    );
+    assert_eq!(mark.slot, None);
+    assert_eq!(mark.checkpoint, (window.from, window.to));
+    assert_eq!(mark.version, version);
+
+    // ... and that checkpoint really carries the flush version. With 0
+    // there it would lose the ReplacingMergeTree merge against the
+    // tombstone of any earlier purge of the same range, and the window
+    // would stay invisible for ever.
+    let rows = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM checkpoints \
+             WHERE chain = {CHAIN} AND from_block = {} AND to_block = {} \
+             AND _version = {version} AND is_deleted = 0",
+            window.from, window.to
+        ))
+        .await;
+    assert_eq!(
+        rows, 1,
+        "the checkpoint was not written with the flush version"
+    );
+
+    // The gate proves it, rather than returning on an empty mark.
+    wait_until_visible(scenario.db.clone(), last_flush).await.unwrap();
+
+    lease.release().await;
+}
+
+/// Review round 4, MINOR 22: the `sol_dex_programs` overlay is read again
+/// while the loop runs, so an operator's registry change does not need a
+/// restart. (The loop re-reads it on the same 5 minute interval as the
+/// checkpoint compaction; this pins the read itself.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn the_program_registry_is_read_again_not_only_at_startup() {
+    use crate::pipeline::solana::load_program_names;
+
+    let scenario = Scenario::new("h_registry_reload").await;
+
+    let before = load_program_names(&scenario.db).await.unwrap();
+    assert_eq!(before.len(), 0, "a fresh database has no operator rows");
+
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO sol_dex_programs (program_id, name, kind, \
+             confidence, source, _version) VALUES \
+             (toFixedString(base58Decode(\
+             '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'), 32), \
+             'raydium-v4-operator', 'venue', 2, 'operator', {})",
+            next_version()
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // No read-your-writes: poll rather than pretend the race is not there.
+    for _ in 0..200 {
+        let now = load_program_names(&scenario.db).await.unwrap();
+        if now.len() == 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("the registry read never saw the operator's new row");
 }

@@ -54,9 +54,31 @@ pub struct SvmBatch {
     /// Half open `[from_slot, next_slot)` windows, as the SERVER cursor
     /// reported them. This is what a checkpoint records.
     pub windows: Vec<BlockRange>,
+    /// The flush `_version` stamped on every row of this batch.
+    ///
+    /// Kept HERE and not only on the rows: a served window whose slots were
+    /// all skipped carries no row at all, and its checkpoint still has to
+    /// be written with the flush's version. A checkpoint written with
+    /// version 0 loses the `ReplacingMergeTree(_version, is_deleted)` merge
+    /// against the tombstone any earlier purge of that range left behind
+    /// (`checkpoints` is keyed on `(chain, from_block, to_block)`), so the
+    /// re-streamed window would stay invisible and the range would be
+    /// purged and streamed again for ever.
+    flush_version: u64,
 }
 
 impl SvmBatch {
+    /// A batch that has not been stamped yet.
+    pub fn new(rows: SvmRows, windows: Vec<BlockRange>) -> Self {
+        Self { rows, windows, flush_version: 0 }
+    }
+
+    /// One `_version` for the whole flush: on the batch and on every row.
+    pub fn stamp_version(&mut self, version: u64) {
+        self.flush_version = version;
+        self.rows.set_version(version);
+    }
+
     pub fn rows(&self) -> usize {
         self.rows.rows()
     }
@@ -68,6 +90,7 @@ impl SvmBatch {
     pub fn append(&mut self, other: &mut SvmBatch) {
         self.rows.append(&mut other.rows);
         self.windows.append(&mut other.windows);
+        self.flush_version = self.flush_version.max(other.flush_version);
     }
 
     /// Lowest and highest SLOT WITH A ROW in the batch. `None` when every
@@ -95,8 +118,14 @@ impl SvmBatch {
         Some((first.from, last.to))
     }
 
+    /// The flush `_version`. Falls back to the rows when the batch was
+    /// stamped through `SvmRows::set_version` directly, which is what the
+    /// acceptance tests that drive the commit protocol by hand do.
     pub fn version(&self) -> u64 {
-        self.rows.slots.first().map(|s| s._version).unwrap_or(0)
+        match self.flush_version {
+            0 => self.rows.slots.first().map(|s| s._version).unwrap_or(0),
+            version => version,
+        }
     }
 
     pub fn epoch(&self) -> u32 {
@@ -313,7 +342,7 @@ async fn flush<S: SvmSink>(
     metrics.flush_started();
 
     let stored = async {
-        batch.rows.set_version(next_version());
+        batch.stamp_version(next_version());
         batch
             .rows
             .set_epoch(sink.epoch().await.context("read the epoch")?);
@@ -368,8 +397,29 @@ async fn flush<S: SvmSink>(
 
 // --------------------------------------------------- the ClickHouse sink
 
-/// The last flush: highest stored slot and the flush `_version`.
-pub type LastFlush = Arc<Mutex<Option<(u64, u64)>>>;
+/// What the last flush committed, and therefore what a purge has to be
+/// able to READ BACK before it may tombstone anything.
+///
+/// Both halves are needed. A flush writes the commit marker and then the
+/// checkpoints as two separate inserts, and a window whose slots were ALL
+/// SKIPPED writes no marker row at all - so proving the marker visible
+/// proves nothing about the checkpoint, and a purge that runs while the
+/// newest checkpoint is still invisible removes slots whose checkpoint
+/// survives: the tiling then shows no hole, the slots are never streamed
+/// again, and `indexer verify` calls the index complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushMark {
+    /// Highest slot WITH A ROW, `None` when every served slot was skipped.
+    pub slot: Option<u64>,
+    /// The highest checkpoint `[from_block, to_block)` the flush claimed.
+    /// Always present: the writer never flushes without a served window.
+    pub checkpoint: (u64, u64),
+    /// The flush `_version` both were written with.
+    pub version: u64,
+}
+
+/// The last flush, or `None` when this process has not flushed yet.
+pub type LastFlush = Arc<Mutex<Option<FlushMark>>>;
 
 pub struct ClickhouseSvmSink {
     pub db: Database,
@@ -393,11 +443,21 @@ impl SvmSink for ClickhouseSvmSink {
 
         store_batch(&self.db, batch).await?;
 
-        if let Some(last) =
-            batch.rows.slots.iter().max_by_key(|s| s.block_number)
-        {
-            *self.last_flush.lock().unwrap() =
-                Some((last.block_number, batch.version()));
+        // The CHECKPOINT, not only the marker: `store_batch` writes the
+        // marker first and the checkpoints after it, so the checkpoint is
+        // the last thing that becomes readable and the only one a
+        // skipped-only window writes at all.
+        if let Some(last) = batch.covered().last() {
+            *self.last_flush.lock().unwrap() = Some(FlushMark {
+                slot: batch
+                    .rows
+                    .slots
+                    .iter()
+                    .map(|s| s.block_number)
+                    .max(),
+                checkpoint: (last.from, last.to),
+                version: batch.version(),
+            });
         }
 
         match self.db.refresh_epoch().await {
@@ -554,7 +614,7 @@ mod tests {
         for number in slots {
             rows.slots.push(slot(*number));
         }
-        SvmBatch { rows, windows: vec![BlockRange::new(from, to)] }
+        SvmBatch::new(rows, vec![BlockRange::new(from, to)])
     }
 
     /// One recorded flush: the row count and the checkpoint windows it
@@ -592,6 +652,24 @@ mod tests {
         assert_eq!(batch.covered(), vec![BlockRange::new(100, 140)]);
         assert_eq!(batch.token_span(), Some((100, 140)));
         assert!(!batch.is_empty(), "a served window is not nothing");
+    }
+
+    /// ... and that checkpoint must carry the FLUSH's `_version`, although
+    /// there is no row to read one from.
+    ///
+    /// `checkpoints` is a `ReplacingMergeTree(_version, is_deleted)` keyed
+    /// on `(chain, from_block, to_block)`: a checkpoint written with
+    /// version 0 loses against the tombstone of any earlier purge of the
+    /// same range, so the re-streamed window would stay invisible and the
+    /// range would be purged and streamed again for ever.
+    #[test]
+    fn a_skipped_only_window_still_carries_the_flush_version() {
+        let mut batch = batch(100, 140, &[]);
+        assert_eq!(batch.version(), 0, "nothing stamped it yet");
+
+        batch.stamp_version(1_700_000_000_123);
+
+        assert_eq!(batch.version(), 1_700_000_000_123);
     }
 
     #[test]
