@@ -35,9 +35,9 @@ use crate::{
         cookbook, decode,
         derived::rebuild_statements,
         fixtures::{self, address, Place, RawTx},
-        models::id_of,
         LaunchpadRows, BASE_TABLES, LAUNCHPADS_DERIVED, SIDE_TABLES,
     },
+    utils::format::id32,
 };
 
 const CHAIN: u64 = 4663;
@@ -67,6 +67,12 @@ struct TestDb {
     admin: Client,
     client: Client,
     name: String,
+    /// Request parameters of the cookbook queries, BOUND (sent beside the
+    /// statement as `param_x=`), never spliced into its text - that is
+    /// what the cookbook promises and what these tests have to exercise.
+    /// ClickHouse ignores a parameter a query does not use, so one set
+    /// covers every screen.
+    params: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl TestDb {
@@ -98,12 +104,32 @@ impl TestDb {
         migrate::run(target.as_str()).await.unwrap();
 
         let client = admin.clone().with_database(&name);
-        Self { admin, client, name }
+        Self {
+            admin,
+            client,
+            name,
+            params: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Replaces the bound parameters used by every following query.
+    fn set(&self, params: &[(&str, &str)]) {
+        *self.params.lock().unwrap() = params
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+    }
+
+    fn query(&self, sql: &str) -> clickhouse::query::Query {
+        let mut query = self.client.query(&sql.replace('?', "??"));
+        for (name, value) in self.params.lock().unwrap().iter() {
+            query = query.param(name, value.as_str());
+        }
+        query
     }
 
     async fn execute(&self, sql: &str) {
-        self.client
-            .query(&sql.replace('?', "??"))
+        self.query(sql)
             .execute()
             .await
             .unwrap_or_else(|error| panic!("{error}\n{sql}"));
@@ -113,8 +139,7 @@ impl TestDb {
     where
         T: clickhouse::RowOwned + clickhouse::RowRead,
     {
-        self.client
-            .query(&sql.replace('?', "??"))
+        self.query(sql)
             .fetch_all::<T>()
             .await
             .unwrap_or_else(|error| panic!("{error}\n{sql}"))
@@ -196,11 +221,31 @@ impl TestDb {
 
 /// A `FixedString(32)` identity literal for SQL.
 fn id_literal(address_hex: &str) -> String {
-    format!("unhex('{}')", hex::encode(id_of(address(address_hex))))
+    format!("unhex('{}')", id_hex(address_hex))
 }
 
 fn id_hex(address_hex: &str) -> String {
-    hex::encode(id_of(address(address_hex)))
+    hex::encode(id32(address(address_hex)))
+}
+
+/// The bound parameters every cookbook query and every parameterized view
+/// of these tests is sent with. ClickHouse ignores the ones a statement
+/// does not use, so one set covers every screen.
+fn cookbook_parameters<'a>(
+    token: &'a str,
+    creator: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("chain", "4663"),
+        ("since", "0"),
+        ("now", "1789999999"),
+        ("dead_after", "3600"),
+        ("from_block", "0"),
+        ("as_of_block", "18446744073709551615"),
+        ("blocks", "5"),
+        ("token", token),
+        ("creator", creator),
+    ]
 }
 
 /// Every fixture decoded the way the pipeline does it, stamped.
@@ -360,25 +405,12 @@ async fn the_cookbook_runs_on_real_data() {
 
     let token = id_hex(TOKEN);
     let creator = id_hex(CREATOR);
-    let parameters: Vec<(&str, &str)> = vec![
-        ("chain", "4663"),
-        ("since", "0"),
-        ("now", "1789999999"),
-        ("dead_after", "3600"),
-        ("from_block", "0"),
-        ("as_of_block", "18446744073709551615"),
-        ("blocks", "5"),
-        ("token", &token),
-        ("creator", &creator),
-    ];
+    db.set(&cookbook_parameters(&token, &creator));
 
-    // Every recipe runs, and each one is a single cheap statement.
+    // Every recipe runs AS WRITTEN, with its values bound beside it.
     for recipe in cookbook::COOKBOOK {
-        let sql = recipe.render(&parameters);
-        assert!(!sql.contains('{'), "{sql}");
-
         let started = Instant::now();
-        let lines = db.snapshot(&sql).await;
+        let lines = db.snapshot(recipe.sql).await;
         println!(
             "{:<38} {:>4} rows  {:>6.1} ms",
             recipe.screen,
@@ -393,7 +425,7 @@ async fn the_cookbook_runs_on_real_data() {
     assert_eq!(
         db.count(&format!(
             "SELECT count() FROM ({})",
-            cookbook::NEW_LAUNCHES.render(&parameters)
+            cookbook::NEW_LAUNCHES.sql
         ))
         .await,
         3
@@ -401,7 +433,7 @@ async fn the_cookbook_runs_on_real_data() {
     assert_eq!(
         db.count(&format!(
             "SELECT count() FROM ({})",
-            cookbook::NEW_LAUNCHES_ALL.render(&parameters)
+            cookbook::NEW_LAUNCHES_ALL.sql
         ))
         .await,
         7
@@ -411,7 +443,8 @@ async fn the_cookbook_runs_on_real_data() {
     let page = |column: &str| {
         format!(
             "SELECT ifNull(toString({column}), '') FROM \
-             launchpad_token_v(chain = {CHAIN}, token = unhex('{token}'))"
+             launchpad_token_v(chain = {{chain:UInt64}}, \
+             token = {{token:String}})"
         )
     };
     assert_eq!(
@@ -428,26 +461,26 @@ async fn the_cookbook_runs_on_real_data() {
     );
     // The 33 buys raised the threshold exactly (4.2e18 + 3 wei).
     let raised = db
-        .number(&format!(
-            "SELECT raised_raw FROM launchpad_token_v(chain = {CHAIN}, \
-             token = unhex('{token}'))"
-        ))
+        .number(
+            "SELECT raised_raw FROM launchpad_token_v(\
+             chain = {chain:UInt64}, token = {token:String})",
+        )
         .await;
     assert!((raised - THRESHOLD).abs() < 1.0, "raised {raised}");
     assert_eq!(db.text(&page("curve_progress")).await, "1");
 
     // ---- candles: the curve lived for 13 blocks inside one minute.
     let buckets = db
-        .count(&format!(
-            "SELECT count() FROM launchpad_candles_1m_v WHERE chain = \
-             {CHAIN} AND token = unhex('{token}')"
-        ))
+        .count(
+            "SELECT count() FROM launchpad_candles_1m_v(\
+             chain = {chain:UInt64}, token = {token:String})",
+        )
         .await;
     assert_eq!(buckets, 1);
     let candle = |column: &str| {
         format!(
-            "SELECT {column} FROM launchpad_candles_1m_v WHERE chain = \
-             {CHAIN} AND token = unhex('{token}')"
+            "SELECT {column} FROM launchpad_candles_1m_v(\
+             chain = {{chain:UInt64}}, token = {{token:String}})"
         )
     };
     assert_eq!(db.number(&candle("toFloat64(trades)")).await, 32.0);
@@ -482,19 +515,20 @@ async fn the_cookbook_runs_on_real_data() {
     let creator_row = |column: &str| {
         format!(
             "SELECT ifNull(toString({column}), '') FROM \
-             launchpad_creator_v(chain = {CHAIN}, creator = \
-             unhex('{creator}'), as_of = 1789999999, dead_after = 3600)"
+             launchpad_creator_v(chain = {{chain:UInt64}}, \
+             creator = {{creator:String}}, as_of = {{now:UInt32}}, \
+             dead_after = {{dead_after:UInt32}})"
         )
     };
     assert_eq!(db.text(&creator_row("launches")).await, "1");
     assert_eq!(db.text(&creator_row("graduated")).await, "1");
     assert_eq!(db.text(&creator_row("died")).await, "0");
     let fees = db
-        .number(&format!(
+        .number(
             "SELECT realised_creator_fees_raw FROM launchpad_creator_v(\
-             chain = {CHAIN}, creator = unhex('{creator}'), as_of = \
-             1789999999, dead_after = 3600)"
-        ))
+             chain = {chain:UInt64}, creator = {creator:String}, \
+             as_of = {now:UInt32}, dead_after = {dead_after:UInt32})",
+        )
         .await;
     assert!(
         (fees - 147_906_635_318_930_699.0).abs() < 1_000.0,
@@ -503,29 +537,30 @@ async fn the_cookbook_runs_on_real_data() {
 
     // ---- sniper view: the bundle of 15 recipients is visible as such.
     let bundle = db
-        .count(&format!(
-            "SELECT count() FROM launchpad_snipers_v(chain = {CHAIN}, \
-             token = unhex('{token}'), blocks = 5) WHERE bundle_size = 15"
-        ))
+        .count(
+            "SELECT count() FROM launchpad_snipers_v(\
+             chain = {chain:UInt64}, token = {token:String}, \
+             blocks = {blocks:UInt64}) WHERE bundle_size = 15",
+        )
         .await;
     assert_eq!(bundle, 15);
     let funders = db
-        .count(&format!(
-            "SELECT uniqExact(funder) FROM launchpad_snipers_v(chain = \
-             {CHAIN}, token = unhex('{token}'), blocks = 5) WHERE \
-             bundle_size = 15"
-        ))
+        .count(
+            "SELECT uniqExact(funder) FROM launchpad_snipers_v(\
+             chain = {chain:UInt64}, token = {token:String}, \
+             blocks = {blocks:UInt64}) WHERE bundle_size = 15",
+        )
         .await;
     assert_eq!(funders, 1, "one transaction funded all fifteen");
 
     // ---- holders: the curve gave the tokens out, so the sum of the
     // balances is the initial supply minus what the curve still holds.
     let holders = db
-        .count(&format!(
-            "SELECT count() FROM launchpad_token_holders_v(chain = {CHAIN}, \
-             token = unhex('{token}'), as_of_block = \
-             18446744073709551615)"
-        ))
+        .count(
+            "SELECT count() FROM launchpad_token_holders_v(\
+             chain = {chain:UInt64}, token = {token:String}, \
+             as_of_block = {as_of_block:UInt64})",
+        )
         .await;
     assert!(holders >= 15, "holders {holders}");
 
@@ -644,6 +679,9 @@ async fn a_purge_and_a_rebuild_equal_a_clean_index() {
     // incrementally, and floating point addition is not associative. Every
     // integer, id and timestamp is compared exactly.
     let token = id_hex(TOKEN);
+    let creator = id_hex(CREATOR);
+    db.set(&cookbook_parameters(&token, &creator));
+    clean.set(&cookbook_parameters(&token, &creator));
     let candles = |view: &str| {
         format!(
             "SELECT chain, token, emitter, bucket, toFloat32(open_raw), \
@@ -655,8 +693,8 @@ async fn a_purge_and_a_rebuild_equal_a_clean_index() {
         )
     };
     for view in [
-        candles("launchpad_candles_1m_v"),
-        candles("launchpad_candles_1h_v"),
+        candles("launchpad_candles_1m_all_v"),
+        candles("launchpad_candles_1h_all_v"),
         format!(
             "SELECT chain, family, emitter, bucket, trades, buys, \
              toFloat32(volume_quote_raw), \
@@ -685,13 +723,12 @@ async fn a_purge_and_a_rebuild_equal_a_clean_index() {
              unique_creators, trusted FROM \
              launchpad_venues_1d_all_v(chain = {CHAIN})"
         ),
-        format!(
-            "SELECT token, family, emitter, curve, creator, launch_block, \
-             launch_time, trades, buys, unique_traders, \
-             toFloat32(volume_quote_raw), toFloat32(last_price_raw), \
-             toFloat32(curve_progress), graduated, pool_id FROM \
-             launchpad_token_v(chain = {CHAIN}, token = unhex('{token}'))"
-        ),
+        "SELECT token, family, emitter, curve, creator, launch_block, \
+         launch_time, trades, buys, unique_traders, \
+         toFloat32(volume_quote_raw), toFloat32(last_price_raw), \
+         toFloat32(curve_progress), graduated, pool_id FROM \
+         launchpad_token_v(chain = {chain:UInt64}, token = {token:String})"
+            .to_owned(),
     ] {
         assert_eq!(
             db.snapshot(&view).await,
@@ -702,10 +739,10 @@ async fn a_purge_and_a_rebuild_equal_a_clean_index() {
 
     // And the repaired index really lost the four trades.
     assert_eq!(
-        db.count(&format!(
-            "SELECT sum(trades) FROM launchpad_candles_1m_v WHERE chain = \
-             {CHAIN} AND token = unhex('{token}')"
-        ))
+        db.count(
+            "SELECT sum(trades) FROM launchpad_candles_1m_v(\
+             chain = {chain:UInt64}, token = {token:String})",
+        )
         .await,
         28
     );
@@ -828,6 +865,194 @@ async fn a_forged_venue_moves_no_headline_number() {
     db.drop_database().await;
 }
 
+/// Review finding #6. Picking a token is not a trust decision: a forged
+/// curve can emit `CurveBuy` naming a REAL token, and a forger who
+/// predicts a token address can emit a `TokenLaunched` for it EARLIER
+/// than the real venue did. Every token-scoped `_v` view must therefore
+/// read exactly the same before and after those rows exist, and every
+/// `_all_v` twin must show them.
+#[tokio::test]
+#[ignore]
+async fn a_forged_curve_moves_no_token_page_number() {
+    let db = TestDb::create("tokenpage").await;
+    db.store(&rows_of(fixtures::ALL, 1, 0)).await;
+    db.write("erc20_transfers", &transfers_of(fixtures::ALL, 1, 0)).await;
+    db.trust_the_real_venues().await;
+
+    let token = id_hex(TOKEN);
+    let creator = id_hex(CREATOR);
+    db.set(&cookbook_parameters(&token, &creator));
+
+    // Every screen of the real token, before the forgery.
+    let screens: Vec<&str> = vec![
+        // The whole header row, so nothing in it can move unnoticed.
+        "SELECT * FROM launchpad_token_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT * FROM launchpad_candles_1m_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT * FROM launchpad_candles_1h_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT * FROM launchpad_token_trades_v(chain = {chain:UInt64}, \
+         token = {token:String}, from_block = {from_block:UInt64})",
+        "SELECT * FROM launchpad_snipers_v(chain = {chain:UInt64}, \
+         token = {token:String}, blocks = {blocks:UInt64})",
+        "SELECT * FROM launchpad_token_holders_v(chain = {chain:UInt64}, \
+         token = {token:String}, as_of_block = {as_of_block:UInt64})",
+        // The feeds, which were already filtered - a regression guard.
+        "SELECT * FROM launchpad_new_launches_v(chain = {chain:UInt64}, \
+         since = {since:UInt32})",
+        "SELECT * FROM launchpad_venues_1d_v(chain = {chain:UInt64})",
+    ];
+    let mut before = Vec::new();
+    for screen in &screens {
+        let rows = db.snapshot(screen).await;
+        assert!(!rows.is_empty(), "nothing to protect: {screen}");
+        before.push(rows);
+    }
+
+    // The exploration twins, which MUST move.
+    let twins: Vec<&str> = vec![
+        "SELECT * FROM launchpad_token_all_v(chain = {chain:UInt64}, \
+         token = {token:String})",
+        "SELECT * FROM launchpad_token_trades_all_v(\
+         chain = {chain:UInt64}, token = {token:String}, \
+         from_block = {from_block:UInt64})",
+        "SELECT * FROM launchpad_snipers_all_v(chain = {chain:UInt64}, \
+         token = {token:String}, blocks = {blocks:UInt64})",
+        "SELECT * FROM launchpad_token_holders_all_v(\
+         chain = {chain:UInt64}, token = {token:String}, \
+         as_of_block = {as_of_block:UInt64})",
+    ];
+    let mut twins_before = Vec::new();
+    for twin in &twins {
+        twins_before.push(db.snapshot(twin).await);
+    }
+
+    // ---- the forgery, all of it naming the REAL token.
+    let real_token = address(TOKEN);
+    let forger = Address::repeat_byte(0x77);
+    let fake_curve = Address::repeat_byte(0x78);
+    let fake_factory = Address::repeat_byte(0x79);
+    let huge = U256::from(10u64).pow(U256::from(30u64));
+    let place = |block: u64, log_index: u32| Place {
+        chain: CHAIN,
+        block_number: block,
+        log_index,
+        timestamp: 1_789_780_286,
+        transaction_hash: B256::repeat_byte(0x88),
+    };
+
+    let logs = vec![
+        // A mint of the real token to the forger, in the same
+        // transaction as the forged launch: `initial_supply` is the
+        // largest Transfer from the zero address, so this is what makes
+        // everyone's share_of_initial_supply collapse.
+        fixtures::constructed_transfer(
+            place(LAUNCH_BLOCK - 3, 0),
+            real_token,
+            Address::ZERO,
+            forger,
+            huge,
+        ),
+        // A TokenLaunched for the real token, EARLIER than the real
+        // launch: without the trust filter this wins every argMin, so
+        // the header would show the forger as creator and `trusted` 0.
+        fixtures::constructed_launch(
+            place(LAUNCH_BLOCK - 3, 1),
+            fake_factory,
+            real_token,
+            fake_curve,
+            forger,
+            huge,
+        ),
+        // A real movement of the real token through the forger's curve,
+        // so the corroboration PASSES and the trade is `verified`.
+        fixtures::constructed_transfer(
+            place(LAUNCH_BLOCK - 2, 0),
+            real_token,
+            fake_curve,
+            forger,
+            huge,
+        ),
+        // ... and the buy itself: quote >= the graduation threshold, the
+        // "this real token is about to graduate" lie.
+        fixtures::constructed_buy(
+            place(LAUNCH_BLOCK - 2, 1),
+            fake_curve,
+            forger,
+            forger,
+            huge,
+            huge,
+            U256::ZERO,
+            U256::ZERO,
+        ),
+    ];
+
+    let mut forged = decode(CHAIN, &logs);
+    assert_eq!(forged.tokens.len(), 1);
+    assert_eq!(forged.trades.len(), 1);
+    assert_eq!(forged.trades[0].token, real_token, "it names the token");
+    assert_eq!(forged.trades[0].token_verified, 1, "corroboration passes");
+    assert!(forged.tokens[0].block_number < LAUNCH_BLOCK);
+    assert_eq!(forged.tokens[0].initial_supply, huge, "a forged supply");
+    forged.set_version(2);
+    db.store(&forged).await;
+
+    // A forged ERC-20 transfer of the real token would be the token
+    // contract's own claim, so the holder BALANCES are left alone: what
+    // the forgery attacks there is the supply it is divided by.
+    for (screen, expected) in screens.iter().zip(&before) {
+        assert_eq!(&db.snapshot(screen).await, expected, "{screen}");
+    }
+
+    // The twins see all of it - that is what they are for.
+    let mut moved = 0;
+    for (twin, was) in twins.iter().zip(&twins_before) {
+        if &db.snapshot(twin).await != was {
+            moved += 1;
+        }
+    }
+    assert_eq!(moved, twins.len(), "an _all_v twin hid the forgery");
+
+    // And the specific lies, spelled out against the trusted header.
+    let page = |column: &str| {
+        format!(
+            "SELECT ifNull(toString({column}), '') FROM \
+             launchpad_token_v(chain = {{chain:UInt64}}, \
+             token = {{token:String}})"
+        )
+    };
+    assert_eq!(db.text(&page("trades")).await, "32");
+    assert_eq!(db.text(&page("trusted")).await, "1");
+    assert_eq!(db.text(&page("curve_progress")).await, "1");
+    assert_eq!(
+        db.text(&page("launch_block")).await,
+        LAUNCH_BLOCK.to_string(),
+        "the earlier forged launch won the argMin"
+    );
+    assert_eq!(
+        db.text(&page("hex(creator)")).await.to_lowercase(),
+        id_hex(CREATOR)
+    );
+
+    // The untrusted twin shows every one of them instead.
+    let all = |column: &str| {
+        format!(
+            "SELECT ifNull(toString({column}), '') FROM \
+             launchpad_token_all_v(chain = {{chain:UInt64}}, \
+             token = {{token:String}})"
+        )
+    };
+    assert_eq!(db.text(&all("trusted")).await, "0");
+    assert_eq!(db.text(&all("trades")).await, "33");
+    assert_eq!(
+        db.text(&all("launch_block")).await,
+        (LAUNCH_BLOCK - 3).to_string()
+    );
+
+    db.drop_database().await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn hostile_amounts_do_not_wrap() {
@@ -897,12 +1122,12 @@ async fn hostile_amounts_do_not_wrap() {
     assert!(volume.is_finite());
 
     // The price of max/max is 1, not a division blow-up.
+    db.set(&cookbook_parameters(&id_hex(TOKEN), &id_hex(CREATOR)));
     let close = db
-        .number(&format!(
-            "SELECT ifNull(close_raw, 0.) FROM launchpad_candles_1m_v WHERE chain = \
-             {CHAIN} AND token = unhex('{}')",
-            id_hex(TOKEN)
-        ))
+        .number(
+            "SELECT ifNull(close_raw, 0.) FROM launchpad_candles_1m_v(\
+             chain = {chain:UInt64}, token = {token:String})",
+        )
         .await;
     assert_eq!(close, 1.0);
 

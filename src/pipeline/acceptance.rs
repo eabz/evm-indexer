@@ -1404,9 +1404,13 @@ async fn launchpads_are_indexed_by_default_and_opted_out_cleanly() {
             .await,
         expected.trades.len() as u64
     );
+    // The unfiltered twin: no emitter is trusted yet at this point in the
+    // test, and launchpad_candles_1m_v counts only trusted curves.
     assert!(
         scenario
-            .count("SELECT toUInt64(count()) FROM launchpad_candles_1m_v")
+            .count(
+                "SELECT toUInt64(count()) FROM launchpad_candles_1m_all_v"
+            )
             .await
             > 0
     );

@@ -2,49 +2,50 @@
 //! (`migrations/0030_launchpad_tables.sql`).
 //!
 //! Field order is irrelevant (the clickhouse crate inserts by name), field
-//! NAMES must match the columns. Hashes / amounts go through the
+//! NAMES must match the columns. Hashes / ids / amounts go through the
 //! `crate::utils::format` serializers, which write the binary column types
-//! of docs/design.md §1. `is_deleted` is never written by the decoder (it
-//! defaults to 0; tombstones are server side `INSERT ... SELECT`s).
+//! of docs/design.md §1 and §13. `is_deleted` is never written by the
+//! decoder (it defaults to 0; tombstones are server side
+//! `INSERT ... SELECT`s).
 //!
-//! # Chain-neutral identity (docs/solana-research.md §0)
+//! # Chain-neutral identity (docs/design.md §13)
 //!
-//! Every identity column (token, curve/emitter, creator, trader, pool,
-//! tx_from / tx_to) is a `FixedString(32)` holding an [`Id`]: on EVM the
-//! 20 address bytes left-padded with 12 zero bytes, exactly like
-//! `dex_pools.pool_id`, so a 32-byte Solana pubkey fits the same column
-//! later. Use [`id_of`] / [`address_of`] to convert.
+//! The tables are shared by every chain family, so
+//!
+//! * every identity field (token, curve, emitter, creator, trader,
+//!   caller, recipient, quote_token, tx_from / tx_to) is an [`Address`]
+//!   written through [`SerId32`] into a `FixedString(32)` column: 12 zero
+//!   bytes + the 20 address bytes. The Rust type stays [`Address`]
+//!   because THIS decoder only ever sees EVM logs; nothing here hand
+//!   rolls the padding, and reading a row whose padding is not zero fails
+//!   loudly instead of truncating a pubkey into an address.
+//! * a `pool_id` is NOT an address even on EVM (a Uniswap V4 / Balancer
+//!   pool id is a native 32 byte value), so it stays [`B256`] with
+//!   `SerB256` - exactly like `dex_pools.pool_id`. `pool_kind` says
+//!   whether the 32 bytes are such an id or a left-padded pool contract.
+//! * the transaction id is `tx_id`: [`Bytes`] through [`SerTxId`] into a
+//!   `String` column of RAW bytes, because a Solana signature is 64 bytes
+//!   and a [`B256`] cannot hold one. Never a sorting key column; build it
+//!   with [`tx_id`] and read the EVM hash back with [`tx_hash_of`].
 //!
 //! The position of a row is `(chain, block_number, tx_index, ordinal)`
 //! instead of `(chain, block_number, log_index)` for the same reason:
 //! `ordinal` is the log index on EVM and the packed instruction path on a
 //! chain that has no block-global log index.
+//!
+//! [`SerId32`]: crate::utils::format::SerId32
+//! [`SerTxId`]: crate::utils::format::SerTxId
+//! [`tx_id`]: crate::utils::format::tx_id
+//! [`tx_hash_of`]: crate::utils::format::tx_hash_of
 
 use std::{fmt, str::FromStr};
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 
-use crate::utils::format::{SerB256, SerU256};
-
-/// A chain-neutral identity: 32 bytes. EVM addresses are left-padded.
-pub type Id = B256;
-
-/// EVM address -> [`Id`] (12 zero bytes + the 20 address bytes).
-pub fn id_of(address: Address) -> Id {
-    address.into_word()
-}
-
-/// [`Id`] -> EVM address, `None` when the 12 leading bytes are not zero
-/// (i.e. the id does not come from an EVM chain).
-pub fn address_of(id: Id) -> Option<Address> {
-    id.0[..12]
-        .iter()
-        .all(|byte| *byte == 0)
-        .then(|| Address::from_word(id))
-}
+use crate::utils::format::{SerB256, SerId32, SerTxId, SerU256};
 
 macro_rules! string_enum {
     ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident => $text:literal),+ $(,)? }) => {
@@ -173,27 +174,27 @@ string_enum! {
 pub struct LaunchpadToken {
     pub chain: u64,
     /// The launched token.
-    #[serde_as(as = "SerB256")]
-    pub token: Id,
+    #[serde_as(as = "SerId32")]
+    pub token: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub family: Family,
     /// Who emitted the launch event (the factory / portal). This is the
     /// address `launchpad_trusted_emitters` is about.
-    #[serde_as(as = "SerB256")]
-    pub emitter: Id,
+    #[serde_as(as = "SerId32")]
+    pub emitter: Address,
     /// The contract that emits the token's curve trades: the per-token
     /// curve (`pons_v2`, `bags`) or the portal itself (`flap_portal`).
     /// Zero for attribution-only families.
-    #[serde_as(as = "SerB256")]
-    pub curve: Id,
-    #[serde_as(as = "SerB256")]
-    pub creator: Id,
+    #[serde_as(as = "SerId32")]
+    pub curve: Address,
+    #[serde_as(as = "SerId32")]
+    pub creator: Address,
     pub name: String,
     pub symbol: String,
     pub metadata_uri: String,
     /// What the curve is priced in; zero = the chain's native coin.
-    #[serde_as(as = "SerB256")]
-    pub quote_token: Id,
+    #[serde_as(as = "SerId32")]
+    pub quote_token: Address,
     /// Minted in the launch transaction by the token itself (the
     /// `Transfer` from the zero address). 0 when the token did not mint in
     /// this transaction.
@@ -204,9 +205,10 @@ pub struct LaunchpadToken {
     pub graduation_threshold: U256,
     /// Destination pool named BY THE LAUNCH EVENT (attribution-only
     /// families launch straight into a pool). Zero for curve families:
-    /// their pool only exists at graduation.
+    /// their pool only exists at graduation. A native 32 byte id or a
+    /// left-padded pool contract, per `pool_kind`.
     #[serde_as(as = "SerB256")]
-    pub pool_id: Id,
+    pub pool_id: B256,
     #[serde_as(as = "DisplayFromStr")]
     pub pool_kind: PoolKind,
     /// The venue's per-launch configuration id, when the event has one.
@@ -214,13 +216,14 @@ pub struct LaunchpadToken {
     pub launch_config_id: U256,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
+    /// Raw transaction id: the 32 bytes of the EVM transaction hash.
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
     pub tx_index: u32,
-    /// Log index on EVM (docs/solana-research.md §0).
+    /// Log index on EVM (docs/design.md §13).
     pub ordinal: u64,
-    #[serde_as(as = "SerB256")]
-    pub tx_from: Id,
+    #[serde_as(as = "SerId32")]
+    pub tx_from: Address,
     pub epoch: u32,
     pub _version: u64,
 }
@@ -236,37 +239,38 @@ pub struct LaunchpadTrade {
     pub chain: u64,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
+    /// Raw transaction id: the 32 bytes of the EVM transaction hash.
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
     pub tx_index: u32,
     pub ordinal: u64,
     #[serde_as(as = "DisplayFromStr")]
     pub family: Family,
     /// The contract that emitted the trade: the curve (`pons_v2`) or the
     /// portal (`flap_portal`).
-    #[serde_as(as = "SerB256")]
-    pub emitter: Id,
+    #[serde_as(as = "SerId32")]
+    pub emitter: Address,
     /// The traded token: named by the event (`flap_portal`) or proven by
     /// the corroborating `Transfer` (`pons_v2`). Zero when neither.
-    #[serde_as(as = "SerB256")]
-    pub token: Id,
+    #[serde_as(as = "SerId32")]
+    pub token: Address,
     /// 1 when the token contract itself reported a movement of exactly
     /// `token_amount` to / from `emitter` in this transaction.
     pub token_verified: u8,
     /// Proven quote asset, zero when the quote leg is unverified (it is
     /// always unverified for a native-coin quote: there is no log).
-    #[serde_as(as = "SerB256")]
-    pub quote_token: Id,
+    #[serde_as(as = "SerId32")]
+    pub quote_token: Address,
     pub quote_verified: u8,
     #[serde_as(as = "DisplayFromStr")]
     pub side: Side,
     /// Who receives the tokens (buy) / gives them up (sell) per the event.
-    #[serde_as(as = "SerB256")]
-    pub trader: Id,
+    #[serde_as(as = "SerId32")]
+    pub trader: Address,
     /// The event's `buyer` / `seller` field: a router, an aggregator or
     /// the launch forwarder when it differs from `trader`.
-    #[serde_as(as = "SerB256")]
-    pub caller: Id,
+    #[serde_as(as = "SerId32")]
+    pub caller: Address,
     #[serde_as(as = "SerU256")]
     pub token_amount: U256,
     #[serde_as(as = "SerU256")]
@@ -285,10 +289,10 @@ pub struct LaunchpadTrade {
     /// 1 when this is the ONLY trade of the transaction whose quote leg is
     /// unverified. Only then can `tx_value` bound the native quote paid.
     pub sole_unverified_quote: u8,
-    #[serde_as(as = "SerB256")]
-    pub tx_from: Id,
-    #[serde_as(as = "SerB256")]
-    pub tx_to: Id,
+    #[serde_as(as = "SerId32")]
+    pub tx_from: Address,
+    #[serde_as(as = "SerId32")]
+    pub tx_to: Address,
     /// Native coin sent WITH the transaction ([`super::LaunchpadRows::attach_transactions`]).
     #[serde_as(as = "SerU256")]
     pub tx_value: U256,
@@ -305,24 +309,26 @@ pub struct LaunchpadGraduation {
     pub chain: u64,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
+    /// Raw transaction id: the 32 bytes of the EVM transaction hash.
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
     pub tx_index: u32,
     pub ordinal: u64,
     #[serde_as(as = "DisplayFromStr")]
     pub family: Family,
-    #[serde_as(as = "SerB256")]
-    pub emitter: Id,
-    #[serde_as(as = "SerB256")]
-    pub token: Id,
+    #[serde_as(as = "SerId32")]
+    pub emitter: Address,
+    #[serde_as(as = "SerId32")]
+    pub token: Address,
     /// Zero when the graduation event does not name the pool and no
-    /// sibling event of the same transaction does.
+    /// sibling event of the same transaction does. A native 32 byte id or
+    /// a left-padded pool contract, per `pool_kind`.
     #[serde_as(as = "SerB256")]
-    pub pool_id: Id,
+    pub pool_id: B256,
     #[serde_as(as = "DisplayFromStr")]
     pub pool_kind: PoolKind,
-    #[serde_as(as = "SerB256")]
-    pub quote_token: Id,
+    #[serde_as(as = "SerId32")]
+    pub quote_token: Address,
     /// Tokens moved into the pool.
     #[serde_as(as = "SerU256")]
     pub token_amount: U256,
@@ -332,8 +338,8 @@ pub struct LaunchpadGraduation {
     /// Liquidity position id, when the venue mints one.
     #[serde_as(as = "SerU256")]
     pub position_id: U256,
-    #[serde_as(as = "SerB256")]
-    pub tx_from: Id,
+    #[serde_as(as = "SerId32")]
+    pub tx_from: Address,
     pub epoch: u32,
     pub _version: u64,
 }
@@ -345,8 +351,9 @@ pub struct LaunchpadCreatorFee {
     pub chain: u64,
     pub block_number: u64,
     pub timestamp: u32,
-    #[serde_as(as = "SerB256")]
-    pub transaction_hash: B256,
+    /// Raw transaction id: the 32 bytes of the EVM transaction hash.
+    #[serde_as(as = "SerTxId")]
+    pub tx_id: Bytes,
     pub tx_index: u32,
     pub ordinal: u64,
     /// Several components share one log: 0, 1, 2 ... inside it.
@@ -354,28 +361,29 @@ pub struct LaunchpadCreatorFee {
     #[serde_as(as = "DisplayFromStr")]
     pub family: Family,
     /// The contract that swept (a curve, the graduation hook, a portal).
-    #[serde_as(as = "SerB256")]
-    pub emitter: Id,
+    #[serde_as(as = "SerId32")]
+    pub emitter: Address,
     /// Zero when the sweep names a pool instead of a token.
+    #[serde_as(as = "SerId32")]
+    pub token: Address,
+    /// A native 32 byte pool id, or a left-padded pool contract.
     #[serde_as(as = "SerB256")]
-    pub token: Id,
-    #[serde_as(as = "SerB256")]
-    pub pool_id: Id,
+    pub pool_id: B256,
     #[serde_as(as = "DisplayFromStr")]
     pub phase: FeePhase,
     #[serde_as(as = "DisplayFromStr")]
     pub kind: FeeKind,
     /// Who was credited, when an escrow `Credited` of the same amount and
     /// the same source is in the transaction. Zero otherwise.
-    #[serde_as(as = "SerB256")]
-    pub recipient: Id,
+    #[serde_as(as = "SerId32")]
+    pub recipient: Address,
     pub recipient_known: u8,
-    #[serde_as(as = "SerB256")]
-    pub quote_token: Id,
+    #[serde_as(as = "SerId32")]
+    pub quote_token: Address,
     #[serde_as(as = "SerU256")]
     pub amount: U256,
-    #[serde_as(as = "SerB256")]
-    pub tx_from: Id,
+    #[serde_as(as = "SerId32")]
+    pub tx_from: Address,
     pub epoch: u32,
     pub _version: u64,
 }
@@ -388,8 +396,8 @@ pub struct LaunchpadCreatorFee {
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct LaunchpadTrustedEmitter {
     pub chain: u64,
-    #[serde_as(as = "SerB256")]
-    pub emitter: Id,
+    #[serde_as(as = "SerId32")]
+    pub emitter: Address,
     #[serde_as(as = "DisplayFromStr")]
     pub family: Family,
     pub label: String,
@@ -403,8 +411,8 @@ pub struct LaunchpadTrustedEmitter {
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct LaunchpadFrontend {
     pub chain: u64,
-    #[serde_as(as = "SerB256")]
-    pub address: Id,
+    #[serde_as(as = "SerId32")]
+    pub address: Address,
     pub name: String,
     /// `fee_recipient` | `router`.
     pub kind: String,
@@ -444,15 +452,17 @@ mod tests {
 
     #[test]
     fn evm_ids_round_trip_and_keep_the_dex_pool_id_convention() {
+        use crate::utils::format::{address_of_id32, id32};
+
         let address = Address::repeat_byte(0x5a);
-        let id = id_of(address);
+        let id = id32(address);
 
         assert_eq!(id.0[..12], [0u8; 12]);
-        assert_eq!(address_of(id), Some(address));
+        assert_eq!(address_of_id32(id), Some(address));
         // Exactly what src/dex/models.rs does for pool addresses.
         assert_eq!(id, crate::dex::models::pool_id_of(address));
 
         // A 32 byte id that is not an EVM address stays unconvertible.
-        assert_eq!(address_of(B256::repeat_byte(0x11)), None);
+        assert_eq!(address_of_id32(B256::repeat_byte(0x11)), None);
     }
 }
