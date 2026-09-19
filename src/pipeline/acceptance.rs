@@ -1047,7 +1047,11 @@ async fn a_flush_killed_before_blocks_is_healed_on_restart() {
     db.insert_flush("erc20_transfers", &batch.erc20_transfers, &key)
         .await
         .unwrap();
-    batch.modules.store(db, &key).await.unwrap();
+    batch
+        .modules
+        .store(db, &key, crate::db::FlushWindow::ALL)
+        .await
+        .unwrap();
 
     // The orphans are there, and they already inflated the aggregates.
     let report = verify::verify(db, 0, 0).await.unwrap();
@@ -1302,7 +1306,10 @@ async fn backfill_from_stored_logs_equals_a_fresh_index() {
     forged.set_version(next_version());
     let key =
         FlushKey { chain: CHAIN, span: (6, 6), version: next_version() };
-    forged.store(&fixed.db, &key).await.unwrap();
+    forged
+        .store(&fixed.db, &key, crate::db::FlushWindow::ALL)
+        .await
+        .unwrap();
     assert_eq!(fixed.rows("dex_swaps").await, 17);
 
     let report =
@@ -1947,9 +1954,9 @@ async fn a_lost_view_push_leaves_orphans_that_the_purge_repairs() {
 async fn a_purge_eleven_years_deep_can_finish() {
     const MONTH: u32 = 30 * 86_400;
 
-    // Small flushes: ONE insert may not span more than 100 monthly
-    // partitions either (not a concern on a real chain, where a flush of
-    // 100k rows covers hours or days, never eight years).
+    // Small flushes, so this test says something about the REPAIR only;
+    // a flush spanning more months than one insert may touch is its own
+    // test (`a_flush_over_a_hundred_monthly_partitions_is_split`).
     const SMALL_FLUSHES: [&str; 2] = ["--flush-rows", "300"];
 
     let scenario = Scenario::new("deep").await;
@@ -2031,6 +2038,61 @@ async fn a_purge_eleven_years_deep_can_finish() {
         &clean.snapshot().await,
     );
     scenario.assert_consistent().await;
+}
+
+/// Every base table and every aggregate is `PARTITION BY toYYYYMM(...)`,
+/// and ClickHouse refuses ONE insert block that touches more than
+/// `max_partitions_per_insert_block` (100) partitions with code 252 - in
+/// the table and in everything its materialized views feed. A flush
+/// normally covers hours, but a pass healing gaps spread over the whole
+/// history, or a chain with a very long block time, puts hundreds of
+/// months into one. It has to be split by month, oldest part first, with
+/// `blocks` still last inside each part and its own checkpoints after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_flush_over_a_hundred_monthly_partitions_is_split() {
+    const MONTH: u32 = 30 * 86_400;
+    const BLOCKS: u64 = 135;
+
+    // One block per month and no row limit: all 135 blocks - 135 monthly
+    // partitions in `blocks`, `transactions`, `logs`, the transfer tables
+    // and every daily aggregate behind them - are buffered into a single
+    // flush.
+    let scenario = Scenario::new("months").await;
+    let chain = TestChain::with_block_time(BLOCKS, MONTH);
+    scenario
+        .index_until(&chain, BLOCKS, &["--flush-rows", "1000000"])
+        .await;
+
+    // Nothing was lost or duplicated by the split: the same chain indexed
+    // in small flushes (no split anywhere) reads exactly the same.
+    let clean = Scenario::new("months_clean").await;
+    clean.index_until(&chain, BLOCKS, &["--flush-rows", "300"]).await;
+
+    assert_same(
+        "a flush split by month",
+        &scenario.snapshot().await,
+        &clean.snapshot().await,
+    );
+    scenario.assert_consistent().await;
+
+    // The checkpoints of the parts still cover the whole flush without a
+    // hole, so the resume point is the head.
+    let resume = scenario
+        .count(&format!(
+            "SELECT toUInt64(max(to_block)) FROM checkpoints FINAL \
+             WHERE chain = {CHAIN}"
+        ))
+        .await;
+    assert_eq!(resume, BLOCKS);
+
+    let stored = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM blocks FINAL WHERE chain = \
+             {CHAIN}"
+        ))
+        .await;
+    assert_eq!(stored, BLOCKS);
 }
 
 // ------------------------------------------------------------ the views
