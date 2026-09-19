@@ -87,6 +87,8 @@ use std::collections::HashSet;
 
 use alloy::primitives::{Address, B256};
 
+use crate::utils::format::tx_hash_of;
+
 pub use self::{
     decode::decode,
     derived::PREDICTIONS_DERIVED,
@@ -143,6 +145,7 @@ pub const UNSCOPED_TABLES: &[&str] = &[
     "prediction_outcome_tokens",
     "prediction_outcome_tokens_by_market",
     "prediction_venues",
+    "prediction_trusted",
     "prediction_venue_labels",
     "prediction_market_metadata",
 ];
@@ -167,21 +170,42 @@ pub fn block_column(_table: &str) -> &'static str {
 /// Exchanges / pools that traded in the last week and have no
 /// `prediction_venues` row, for the [`MissingVenueSource`] of the pipeline.
 /// Placeholders: `{chain}`, `{limit}`. Columns: `exchange
-/// FixedString(20)`, `protocol String`.
+/// FixedString(32)`, `protocol String`.
+///
+/// `FINAL` / `is_deleted = 0`: a reorged-out trade is a tombstone, not a
+/// deletion, so without it an orphaned block keeps nominating its
+/// exchanges for ever and the resolver keeps spending calls on them.
 pub const MISSING_VENUES_SQL: &str = "\
 SELECT exchange, any(toString(protocol)) AS protocol \
-FROM prediction_trades \
-WHERE chain = {chain} AND timestamp >= now() - INTERVAL 7 DAY \
+FROM prediction_trades FINAL \
+WHERE chain = {chain} AND is_deleted = 0 \
+AND timestamp >= now() - INTERVAL 7 DAY \
 AND exchange NOT IN (\
-SELECT exchange FROM prediction_venues WHERE chain = {chain}) \
+SELECT exchange FROM prediction_venues FINAL WHERE chain = {chain}) \
 GROUP BY exchange \
 LIMIT {limit}";
 
 /// Registries known to the database, to seed a [`RegistrySet`].
-/// Placeholder: `{chain}`. Column: `registry FixedString(20)`.
+/// Placeholder: `{chain}`. Column: `registry FixedString(32)`.
+///
+/// From the SPLITS as well as the preparations: a registry whose
+/// `ConditionPreparation` is older than the first indexed block is only
+/// ever seen through its position events, and until
+/// [`RegistrySet::observe`] sees one of those,
+/// [`PredictionRows::retain_transfers`] would drop its transfers - so a
+/// restart would lose the first batch of them. The operator's trusted
+/// registries seed it too: they are registries by definition, even before
+/// the indexer has seen a single event from them.
 pub const KNOWN_REGISTRIES_SQL: &str = "\
-SELECT DISTINCT registry FROM prediction_markets FINAL \
-WHERE chain = {chain}";
+SELECT DISTINCT registry FROM (\
+SELECT registry FROM prediction_markets FINAL \
+WHERE chain = {chain} AND is_deleted = 0 \
+UNION DISTINCT \
+SELECT emitter AS registry FROM prediction_position_events FINAL \
+WHERE chain = {chain} AND is_deleted = 0 AND protocol = 'ctf' \
+UNION DISTINCT \
+SELECT registry FROM prediction_trusted_registries_v \
+WHERE chain = {chain})";
 
 /// An exchange / pool whose collateral is unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -305,18 +329,27 @@ impl PredictionRows {
         F: Fn(&B256) -> Option<TxOrigin>,
     {
         for trade in &mut self.trades {
-            if let Some(origin) = lookup(&trade.transaction_hash) {
+            let Some(hash) = tx_hash_of(&trade.tx_id) else {
+                continue;
+            };
+            if let Some(origin) = lookup(&hash) {
                 trade.tx_from = origin.from;
                 trade.tx_to = origin.to.unwrap_or_default();
             }
         }
         for market in &mut self.markets {
-            if let Some(origin) = lookup(&market.transaction_hash) {
+            let Some(hash) = tx_hash_of(&market.tx_id) else {
+                continue;
+            };
+            if let Some(origin) = lookup(&hash) {
                 market.tx_from = origin.from;
             }
         }
         for event in &mut self.position_events {
-            if let Some(origin) = lookup(&event.transaction_hash) {
+            let Some(hash) = tx_hash_of(&event.tx_id) else {
+                continue;
+            };
+            if let Some(origin) = lookup(&hash) {
                 event.tx_from = origin.from;
             }
         }
@@ -611,6 +644,17 @@ mod tests {
     fn sql_constants_have_their_placeholders() {
         assert_eq!(MISSING_VENUES_SQL.matches("{chain}").count(), 2);
         assert_eq!(MISSING_VENUES_SQL.matches("{limit}").count(), 1);
-        assert_eq!(KNOWN_REGISTRIES_SQL.matches("{chain}").count(), 1);
+        assert_eq!(KNOWN_REGISTRIES_SQL.matches("{chain}").count(), 3);
+
+        // Tombstoned rows never nominate a venue or a registry again.
+        assert_eq!(MISSING_VENUES_SQL.matches("FINAL").count(), 2);
+        assert_eq!(
+            MISSING_VENUES_SQL.matches("is_deleted = 0").count(),
+            1
+        );
+        assert_eq!(
+            KNOWN_REGISTRIES_SQL.matches("is_deleted = 0").count(),
+            2
+        );
     }
 }
