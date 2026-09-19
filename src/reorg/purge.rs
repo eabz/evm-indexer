@@ -367,7 +367,7 @@ impl Purger {
 
         let looks = || first_look.into_iter().chain(second_look);
 
-        let from_ts = looks()
+        let mut from_ts = looks()
             .map(|(min, _)| min)
             .min()
             .map(start_of_day)
@@ -381,6 +381,38 @@ impl Purger {
             .map(end_of_day)
             .unwrap_or_default()
             .max(from_ts.saturating_add(super::REPAIR_ALIGNMENT_SECONDS));
+
+        // Zero is not a block time, it is a MISSING one: an EVM genesis
+        // block often has `timestamp` 0, and a Solana slot whose
+        // `blockTime` the node omitted is stored as 0 too. Starting the
+        // repair window there armed the validity rule from 1970 on -
+        // `epoch_floor_v` expands one row per day since the epoch and
+        // raises the floor on every one of them, so the WHOLE chain
+        // reads as zero until a rebuild that slices fifty years into
+        // monthly INSERTs per aggregate finishes (measured: ~20,700 day
+        // rows, ~678 months x ~20 aggregates). One bogus row blanked a
+        // chain's entire history (docs/review-round-4.md, MAJOR 6).
+        //
+        // [`ReorgStore::timestamp_span`] is asked for the smallest
+        // NON-ZERO timestamp for that reason. A store that still reports
+        // 0 next to a real newest timestamp is clamped here, loudly: the
+        // repair covers the last day of the range instead of every day
+        // since 1970. What clamping costs is that the days below keep
+        // the contributions of the rows being tombstoned - wrong numbers
+        // in old buckets, incomparably better than hiding every bucket
+        // of the chain behind a rebuild that takes hours.
+        if from_ts == 0 && to_ts > super::REPAIR_ALIGNMENT_SECONDS {
+            from_ts = to_ts.saturating_sub(super::REPAIR_ALIGNMENT_SECONDS);
+            warn!(
+                "Chain {chain}: a row of blocks [{from}, {}) has \
+                 `timestamp` 0, which is not a block time. Repairing \
+                 only unix time [{from_ts}, {to_ts}) instead of \
+                 everything since 1970 - the buckets below it keep what \
+                 the purged rows contributed. Fix the source: a missing \
+                 block time is being stored as 0.",
+                to.map_or("head".to_string(), |to| to.to_string()),
+            );
+        }
 
         // 4. Before the rebuild: under-count for a moment, never double
         //    count.

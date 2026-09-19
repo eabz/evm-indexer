@@ -1519,6 +1519,48 @@ async fn tombstoned_orphans_still_mark_an_unfinished_heal() {
     assert!(problem.contains("aggregates differ"), "{problem}");
 }
 
+/// One row whose block time is missing (`timestamp` 0) must not set the
+/// repair window to "every day since 1970": `epoch_floor_v` would then
+/// raise the floor on ~20,700 days at once and every aggregate of the
+/// chain would read as zero until a rebuild that slices fifty years into
+/// monthly INSERTs per aggregate finished (docs/review-round-4.md,
+/// MAJOR 6). The store leaves the 0 out of the window; a store that still
+/// reports it is clamped here, to the last day of the range.
+#[tokio::test]
+async fn a_missing_block_time_does_not_repair_from_1970() {
+    async fn purge(store: Arc<FakeStore>) -> (u32, u32) {
+        let chain = FakeChain::new(91, 60_000);
+        chain.extend(29);
+        let mut options = NodeOptions::new(CHAIN);
+        options.flush_every = 100;
+        let mut node = Node::new(options, chain, store);
+        node.settle(false).await.unwrap();
+
+        node.chain.reorg(4, 6);
+        node.settle(false).await.unwrap();
+
+        let reorg = node.data().reorgs.last().cloned().unwrap();
+        (reorg.from_ts, reorg.to_ts)
+    }
+
+    // The real store never reports a 0 next to real timestamps.
+    let (from_ts, to_ts) = purge(FakeStore::new()).await;
+    assert!(from_ts > 0);
+    assert!(to_ts > from_ts);
+
+    // A store that does (the Solana one still takes `min(timestamp)`
+    // straight, and a node that omits `blockTime` stores 0): the window
+    // is clamped to the last day instead of arming the rule from 1970.
+    let (clamped_from, clamped_to) =
+        purge(FakeStore::with_min_ts_zero()).await;
+    assert_eq!(clamped_to, to_ts, "the end of the window is unchanged");
+    assert_eq!(
+        clamped_from,
+        to_ts - super::REPAIR_ALIGNMENT_SECONDS,
+        "a repair from unix time 0 hides every bucket of the chain"
+    );
+}
+
 #[tokio::test]
 async fn orphans_above_a_chain_that_got_shorter_are_healed() {
     let mut options = NodeOptions::new(CHAIN);

@@ -1882,27 +1882,17 @@ async fn a_module_purge_does_not_settle_somebody_elses_orphans() {
     let store =
         ClickhouseReorgStore::new(scenario.db.clone(), Scope::Chain);
 
-    // A gap heal that tombstoned the core children of blocks [9, 12) and
-    // died before its `reorgs` row: the blocks are gone, the children are
-    // tombstoned, nothing recorded it.
+    // A gap heal that tombstoned every child of blocks [9, 12) and died
+    // before its `reorgs` row: the blocks are gone, the children are
+    // tombstoned, and nothing recorded that it happened. No LIVE orphan
+    // is left, so the tombstones are the only trace.
     let interrupted = next_version();
-    for table in ["logs", "transactions", "blocks"] {
-        let column =
-            if table == "blocks" { "number" } else { "block_number" };
-        scenario
-            .db
-            .db
-            .query(&format!(
-                "INSERT INTO `{table}` SELECT * REPLACE (\
-                 toUInt64({interrupted}) AS _version, \
-                 toUInt8(1) AS is_deleted) FROM (SELECT * FROM `{table}` \
-                 WHERE chain = {CHAIN} AND `{column}` >= 9 \
-                 AND `{column}` < 12 AND is_deleted = 0)"
-            ))
-            .execute()
-            .await
-            .unwrap();
-    }
+    store
+        .tombstone_children(CHAIN, 9, Some(12), interrupted)
+        .await
+        .unwrap();
+    store.tombstone_blocks(CHAIN, 9, Some(12), interrupted).await.unwrap();
+    assert_eq!(store.live_children(CHAIN, 9, Some(12)).await.unwrap(), 0);
 
     assert!(
         store.has_orphan_children(CHAIN, 9, Some(12)).await.unwrap(),
@@ -1957,6 +1947,71 @@ async fn a_module_purge_does_not_settle_somebody_elses_orphans() {
 
     scenario.index_until(&chain, 12, &[]).await;
     scenario.assert_consistent().await;
+}
+
+/// A stored row whose block time is MISSING (`timestamp` 0 - an EVM
+/// genesis block, a Solana slot whose `blockTime` the node omitted) must
+/// not set a purge's repair window to "every day since 1970".
+///
+/// Measured in the report (docs/review-round-4.md, MAJOR 6): `from_ts` 0
+/// makes `epoch_floor_v` expand ~20,700 day rows and raise the floor on
+/// every day since the epoch - the whole chain reads as zero - while the
+/// rebuild slices fifty years into ~678 monthly INSERTs per aggregate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn a_row_without_a_block_time_does_not_blank_the_chain() {
+    let scenario = Scenario::new("no_block_time").await;
+    let chain = TestChain::new(12);
+    scenario.index_until(&chain, 12, &[]).await;
+
+    // One stored log of block 5 with no block time, at a key of its own.
+    let version = next_version();
+    scenario
+        .db
+        .db
+        .query(&format!(
+            "INSERT INTO logs SELECT * REPLACE (\
+             toDateTime(0) AS timestamp, toUInt32(999) AS log_index, \
+             toUInt64({version}) AS _version) FROM (SELECT * FROM logs \
+             FINAL WHERE chain = {CHAIN} AND block_number = 5 LIMIT 1)"
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(
+            scenario.db.clone(),
+            Scope::Chain,
+        )),
+        Arc::new(backfill::EpochOnly::new(scenario.db.clone())),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(Metrics::disabled()),
+    );
+
+    let report = purger
+        .purge_range(CHAIN, 4, Some(8), PurgeReason::GapHeal)
+        .await
+        .unwrap();
+
+    let day = BASE_TIMESTAMP - BASE_TIMESTAMP % 86_400;
+    assert_eq!(
+        (report.from_ts, report.to_ts),
+        (Some(day), Some(day + 86_400)),
+        "the repair covers the day the real rows are on, not every day \
+         since 1970"
+    );
+
+    // And the `reorgs` row the validity rule reads says the same.
+    let armed_at_zero: u64 = scenario
+        .count(&format!(
+            "SELECT toUInt64(count()) FROM reorgs WHERE chain = {CHAIN} \
+             AND toUInt32(from_ts) = 0"
+        ))
+        .await;
+    assert_eq!(armed_at_zero, 0);
+
+    scenario.index_until(&chain, 12, &[]).await;
 }
 
 // ------------------------------------------------------ side tables

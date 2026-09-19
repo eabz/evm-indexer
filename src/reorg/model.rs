@@ -557,6 +557,11 @@ pub struct FakeStore {
     min_ts_live_only: bool,
     orphans_live_only: bool,
     trust_the_views: bool,
+    /// A store that reports a `timestamp` of 0 as the start of the repair
+    /// window instead of the oldest REAL timestamp of the range - what a
+    /// row with a missing block time does to a store that does not filter
+    /// it out (docs/review-round-4.md, MAJOR 6).
+    min_ts_zero: bool,
 }
 
 fn in_range(number: u64, from: u64, to: Option<u64>) -> bool {
@@ -609,6 +614,12 @@ impl FakeStore {
     /// NEGATIVE CONTROL: `from_ts` over live rows only.
     pub fn with_min_ts_live_only() -> Arc<Self> {
         Arc::new(Self { min_ts_live_only: true, ..Self::default() })
+    }
+
+    /// A store that reports the missing block time (`timestamp` 0) of a
+    /// row as the start of the repair window.
+    pub fn with_min_ts_zero() -> Arc<Self> {
+        Arc::new(Self { min_ts_zero: true, ..Self::default() })
     }
 
     /// NEGATIVE CONTROL: only live rows count as orphans.
@@ -1190,10 +1201,16 @@ impl ReorgStore for FakeStore {
                 }
             }
 
-            let min = all.iter().copied().min();
-            Ok(min.map(|min| {
-                (min, all.iter().copied().max().unwrap_or(min))
-            }))
+            // The contract of `ReorgStore::timestamp_span`: the smallest
+            // timestamp ABOVE ZERO, 0 only when every row has one. A
+            // timestamp of 0 is a missing block time.
+            let high = all.iter().copied().max();
+            let low = if self.min_ts_zero {
+                None
+            } else {
+                all.iter().copied().filter(|ts| *ts > 0).min()
+            };
+            Ok(high.map(|high| (low.unwrap_or(0).min(high), high)))
         }
         .boxed()
     }

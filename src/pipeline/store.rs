@@ -27,7 +27,7 @@ use alloy::primitives::B256;
 use anyhow::{Context, Result};
 use clickhouse::Row;
 use futures::future::BoxFuture;
-use log::debug;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 
 /// How many completed purges [`ReorgStore::has_orphan_children`] reads to
@@ -573,11 +573,22 @@ impl ReorgStore for ClickhouseReorgStore {
         to: Option<u64>,
     ) -> BoxFuture<'_, Result<Option<(u32, u32)>>> {
         Box::pin(async move {
-            let mut span: Option<(u32, u32)> = None;
-
+            // `minIf(timestamp > 0)`: a timestamp of 0 is a MISSING block
+            // time, not a block time of 1970, and taking it as the start
+            // of the repair window hides every aggregate bucket of the
+            // chain (docs/review-round-4.md, MAJOR 6). It reads 0 when
+            // the table has no row with a real timestamp in the range,
+            // which is why the row count and the zero count come too.
             const COUNTED: &str =
-                "SELECT toUInt64(count()), toUInt32(min(timestamp)), \
-                 toUInt32(max(timestamp))";
+                "SELECT toUInt64(count()), \
+                 toUInt32(minIf(timestamp, timestamp > 0)), \
+                 toUInt32(max(timestamp)), \
+                 toUInt64(countIf(timestamp = 0))";
+
+            // (smallest real timestamp, largest timestamp seen).
+            let mut low: Option<u32> = None;
+            let mut high: Option<u32> = None;
+            let mut missing = 0u64;
 
             let mut queries: Vec<String> = self
                 .children()
@@ -603,7 +614,7 @@ impl ReorgStore for ClickhouseReorgStore {
             }
 
             for sql in queries {
-                let (rows, min, max): (u64, u32, u32) = self
+                let (rows, min, max, zeros): (u64, u32, u32, u64) = self
                     .db
                     .db
                     .query(&sql)
@@ -611,15 +622,33 @@ impl ReorgStore for ClickhouseReorgStore {
                     .await
                     .with_context(|| format!("query failed: {sql}"))?;
 
-                if rows > 0 {
-                    span = Some(match span {
-                        Some((low, high)) => (low.min(min), high.max(max)),
-                        None => (min, max),
-                    });
+                if rows == 0 {
+                    continue;
+                }
+
+                missing += zeros;
+                high = Some(high.map_or(max, |high: u32| high.max(max)));
+                if min > 0 {
+                    low = Some(low.map_or(min, |low: u32| low.min(min)));
                 }
             }
 
-            Ok(span)
+            if missing > 0 {
+                warn!(
+                    "Chain {chain}: {missing} stored row(s) of blocks \
+                     [{from}, {to:?}) have `timestamp` 0, which is not a \
+                     block time but a missing one. They are left out of \
+                     the repair window of this purge (they would set it \
+                     to every day since 1970 and hide every aggregate of \
+                     the chain until the rebuild finished). Fix the \
+                     source: a block time it does not report is being \
+                     stored as 0."
+                );
+            }
+
+            // Every row of the range has timestamp 0: day 0 really is the
+            // only bucket they contributed to.
+            Ok(high.map(|high| (low.unwrap_or(0).min(high), high)))
         })
     }
 
