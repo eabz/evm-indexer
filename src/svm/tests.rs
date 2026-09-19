@@ -571,3 +571,304 @@ fn version_and_epoch_are_stamped_on_every_block_scoped_row() {
     // sol_tokens is chain state, not block scoped: it carries no epoch.
     assert!(rows.tokens.iter().all(|r| r._version == 42));
 }
+
+// --- phase 2: the recorded venue fixtures --------------------------------
+
+/// One transaction, hops on two DIFFERENT phase 2 venues, one swap each.
+///
+/// This is the property the whole two-layer design rests on: a route is not
+/// one trade, it is N venue fills, and the subtree rule separates them
+/// without knowing anything about the router.
+#[test]
+fn a_route_across_two_phase_2_venues_is_one_swap_per_venue() {
+    let outcome = decode("multi_hop_route");
+
+    let mut venues: Vec<&str> =
+        outcome.swaps.iter().map(|s| s.protocol.as_str()).collect();
+    venues.sort_unstable();
+    venues.dedup();
+    assert!(
+        venues.len() >= 2,
+        "the recorded route crosses two venues but decoded to {venues:?}"
+    );
+
+    // Every hop is a real fill with both legs proven by token movement,
+    // and no hop is attributed to a router.
+    for swap in &outcome.swaps {
+        assert!(
+            swap.amount_in > U256::ZERO,
+            "{} has no input",
+            swap.protocol
+        );
+        assert!(
+            swap.amount_out_gross > U256::ZERO,
+            "{} has no output",
+            swap.protocol
+        );
+        assert_eq!(swap.verified_in, swap.token_in);
+        assert_eq!(swap.verified_out, swap.token_out);
+        assert_ne!(swap.token_in, swap.token_out);
+        assert_ne!(
+            swap.protocol, "jupiter_v6",
+            "a router must never be a venue"
+        );
+    }
+
+    // Distinct positions, so two hops can never overwrite each other in a
+    // ReplacingMergeTree.
+    let mut ordinals: Vec<u64> =
+        outcome.swaps.iter().map(|s| s.ordinal).collect();
+    let before = ordinals.len();
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    assert_eq!(before, ordinals.len(), "two hops share one ordinal");
+}
+
+/// A liquidity instruction must decode to NO swap at all.
+///
+/// The movement layer's sign test is what does it: both mints cross the
+/// pool the SAME way, which is not a trade. The venue's own discriminator
+/// says the same thing independently, and the test asserts BOTH - a row
+/// here would be fabricated volume.
+#[test]
+fn a_liquidity_instruction_decodes_to_no_swap() {
+    use crate::svm::programs::{registry, IxKind};
+
+    let fixture = fixtures::get("liquidity_no_swap");
+    let outcome = decode("liquidity_no_swap");
+
+    assert!(
+        outcome.swaps.is_empty(),
+        "a liquidity add/remove produced {} swap rows: {:?}",
+        outcome.swaps.len(),
+        outcome.swaps.iter().map(|s| &s.protocol).collect::<Vec<_>>()
+    );
+
+    // And the venue's own instruction name agrees that it is not a swap.
+    let registry = registry();
+    let kinds: Vec<IxKind> = fixture
+        .transaction
+        .instructions
+        .iter()
+        .filter_map(|ix| {
+            registry
+                .venue(&ix.program)
+                .map(|venue| venue.instruction_kind(&ix.data))
+        })
+        .collect();
+    assert!(
+        kinds.contains(&IxKind::Liquidity),
+        "the recorded transaction has no liquidity instruction: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&IxKind::Swap),
+        "the recorded transaction also contains a swap, so it does not \
+         isolate the liquidity case"
+    );
+}
+
+/// A Token-2022 transfer fee: what the pool SENT and what the taker
+/// RECEIVED are different numbers, and both are kept.
+///
+/// Storing one `amount_out` would be silently wrong for every Token-2022
+/// pair, which is why the row has two columns for it.
+#[test]
+fn a_token_2022_transfer_fee_keeps_gross_and_net_apart() {
+    let fixture = fixtures::get("token_2022_fee");
+    let outcome = decode("token_2022_fee");
+    assert!(!outcome.swaps.is_empty(), "no swap decoded");
+
+    // The transfer fee is stated by the venue itself, in its own event.
+    // Every log-event venue is asked, because which of them the recorder
+    // happened to find is not the point of the test - and because asking
+    // only one of Raydium's two would read the other's bytes at the wrong
+    // offsets, they sharing a discriminator.
+    use crate::svm::venues::{
+        OrcaTraded, RaydiumClmmSwap, RaydiumCpmmSwap,
+    };
+    let declared: u64 = fixture
+        .transaction
+        .logs
+        .iter()
+        .filter_map(|log| log.event_bytes())
+        .map(|bytes| {
+            if let Some(event) = RaydiumCpmmSwap::parse(&bytes) {
+                event.input_transfer_fee + event.output_transfer_fee
+            } else if let Some(event) = RaydiumClmmSwap::parse(&bytes) {
+                event.transfer_fee_0 + event.transfer_fee_1
+            } else if let Some(event) = OrcaTraded::parse(&bytes) {
+                event.input_transfer_fee + event.output_transfer_fee
+            } else {
+                0
+            }
+        })
+        .sum();
+    assert!(
+        declared > 0,
+        "the recorded transaction declares no Token-2022 transfer fee, so \
+         it does not exercise the case"
+    );
+
+    // The Token-2022 program really is in the transaction, and it is not
+    // the classic SPL Token program.
+    let token_2022 =
+        crate::svm::programs::pubkey(crate::svm::programs::TOKEN_2022_B58);
+    assert!(
+        fixture
+            .transaction
+            .instructions
+            .iter()
+            .any(|ix| ix.program == token_2022),
+        "no Token-2022 instruction in the recorded transaction"
+    );
+
+    for swap in &outcome.swaps {
+        assert!(
+            swap.amount_out <= swap.amount_out_gross,
+            "the taker cannot receive more than the pool sent"
+        );
+    }
+}
+
+/// A concentrated-liquidity swap that moved the price across a tick.
+///
+/// Orca's `Traded` is the only event among these venues that reports the
+/// sqrt price BEFORE as well as after, so it is the only one that can state
+/// a tick crossing rather than imply one. One tick is a 1.0001x price step,
+/// i.e. ~0.00005 in sqrt price.
+#[test]
+fn a_clmm_swap_crossing_ticks_decodes_and_reports_its_price_move() {
+    let fixture = fixtures::get("clmm_tick_crossing");
+    let outcome = decode("clmm_tick_crossing");
+
+    let orca: Vec<_> = outcome
+        .swaps
+        .iter()
+        .filter(|s| s.protocol == Venue::OrcaWhirlpool.as_str())
+        .collect();
+    assert!(!orca.is_empty(), "the Orca hop did not decode");
+
+    let events: Vec<crate::svm::venues::OrcaTraded> = fixture
+        .transaction
+        .logs
+        .iter()
+        .filter_map(|log| log.event_bytes())
+        .filter_map(|bytes| crate::svm::venues::OrcaTraded::parse(&bytes))
+        .collect();
+    assert!(!events.is_empty(), "no Orca `Traded` event in the recording");
+
+    let crossed = events.iter().any(|event| {
+        let (low, high) = if event.pre_sqrt_price < event.post_sqrt_price {
+            (event.pre_sqrt_price, event.post_sqrt_price)
+        } else {
+            (event.post_sqrt_price, event.pre_sqrt_price)
+        };
+        low > 0
+            && (high.saturating_sub(low) as f64 / low as f64) > 0.00005
+    });
+    assert!(
+        crossed,
+        "the recorded swap did not move the price by a whole tick, so it \
+         does not exercise a tick crossing"
+    );
+
+    // And the event confirmed the movement layer, which is the point: a
+    // log-sourced event is only ever allowed to CONFIRM a row that real
+    // token transfers already proved.
+    assert!(
+        orca.iter().any(|swap| swap.confidence == "decoded"),
+        "the Orca event did not confirm any hop"
+    );
+}
+
+/// Every phase 2 event layout, checked against the recorded mainnet bytes
+/// by PAYLOAD LENGTH.
+///
+/// This is the check that catches a stale IDL, and it has already earned
+/// its place twice: Raydium's CPMM `SwapEvent` is 170 bytes on the wire
+/// against 89 in the pre-creator-fee snapshot, and CLMM's is 221 against
+/// 205 before the trade-fee fields were added. A decoder written to either
+/// older layout parses the newer bytes happily and returns nonsense.
+#[test]
+fn venue_event_lengths_match_the_chain() {
+    use crate::svm::venues::{
+        MeteoraDlmmSwap, MeteoraDlmmSwap2, OrcaTraded, RaydiumClmmSwap,
+        RaydiumCpmmSwap,
+    };
+
+    let mut seen: Vec<(&str, usize)> = Vec::new();
+
+    for fixture in fixtures::all() {
+        for log in &fixture.transaction.logs {
+            let Some(bytes) = log.event_bytes() else { continue };
+            if OrcaTraded::parse(&bytes).is_some() {
+                assert_eq!(bytes.len(), OrcaTraded::LEN);
+                seen.push(("orca Traded", bytes.len()));
+            }
+            if RaydiumCpmmSwap::parse(&bytes).is_some() {
+                assert_eq!(bytes.len(), RaydiumCpmmSwap::LEN);
+                seen.push(("raydium cpmm SwapEvent", bytes.len()));
+            }
+            if RaydiumClmmSwap::parse(&bytes).is_some() {
+                assert_eq!(bytes.len(), RaydiumClmmSwap::LEN);
+                seen.push(("raydium clmm SwapEvent", bytes.len()));
+            }
+        }
+        for instruction in &fixture.transaction.instructions {
+            if MeteoraDlmmSwap::parse(&instruction.data).is_some() {
+                assert_eq!(instruction.data.len(), MeteoraDlmmSwap::LEN);
+                seen.push(("dlmm Swap", instruction.data.len()));
+            }
+            if MeteoraDlmmSwap2::parse(&instruction.data).is_some() {
+                assert_eq!(instruction.data.len(), MeteoraDlmmSwap2::LEN);
+                seen.push(("dlmm Swap2Evt", instruction.data.len()));
+            }
+        }
+    }
+
+    seen.sort_unstable();
+    seen.dedup();
+    assert!(
+        seen.len() >= 3,
+        "too few phase 2 event layouts appear in the fixtures to be a \
+         meaningful check: {seen:?}"
+    );
+}
+
+/// A truncated event is `None`, never a panic and never an invented value.
+///
+/// A validator can and does cut a log line short, so every one of these
+/// parsers is fed every prefix of a real event.
+#[test]
+fn a_truncated_venue_event_is_never_a_panic() {
+    use crate::svm::venues::{
+        MeteoraDamm2Swap, MeteoraDlmmSwap, MeteoraDlmmSwap2, OrcaTraded,
+        RayLogSwap, RaydiumClmmSwap, RaydiumCpmmSwap,
+    };
+
+    let mut bodies: Vec<Vec<u8>> = Vec::new();
+    for fixture in fixtures::all() {
+        for log in &fixture.transaction.logs {
+            if let Some(bytes) = log.event_bytes() {
+                bodies.push(bytes);
+            }
+        }
+        for instruction in &fixture.transaction.instructions {
+            bodies.push(instruction.data.clone());
+        }
+    }
+    assert!(!bodies.is_empty());
+
+    for body in &bodies {
+        for length in 0..body.len() {
+            let prefix = &body[..length];
+            let _ = OrcaTraded::parse(prefix);
+            let _ = RaydiumCpmmSwap::parse(prefix);
+            let _ = RaydiumClmmSwap::parse(prefix);
+            let _ = MeteoraDlmmSwap::parse(prefix);
+            let _ = MeteoraDlmmSwap2::parse(prefix);
+            let _ = MeteoraDamm2Swap::parse(prefix);
+            let _ = RayLogSwap::parse(prefix);
+        }
+    }
+}

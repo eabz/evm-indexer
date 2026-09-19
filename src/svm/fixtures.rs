@@ -29,6 +29,20 @@ use crate::svm::{
 /// The recorded dump, embedded at compile time.
 const RECORDED: &str = include_str!("fixtures/recorded.json");
 
+/// Phase 2's recordings, in the same shape. Separate file so the phase 1
+/// corpus stays byte-identical to what that engineer captured.
+///
+/// | Name | Why it is here |
+/// |---|---|
+/// | `multi_hop_route` | one transaction, hops on two DIFFERENT phase 2 venues: it must become one swap per venue |
+/// | `liquidity_no_swap` | a liquidity instruction on a phase 2 venue. Both mints move the SAME way, so it must decode to NO swap |
+/// | `token_2022_fee` | a Token-2022 transfer-fee mint, where what the pool SENT and what the taker RECEIVED differ |
+/// | `clmm_tick_crossing` | an Orca concentrated-liquidity swap whose `pre_sqrt_price` and `post_sqrt_price` are more than one tick apart |
+///
+/// Unlike `recorded.json` these carry a `logs` array, because half the
+/// phase 2 venues publish their swap event only as a log line.
+const PHASE2: &str = include_str!("fixtures/phase2.json");
+
 #[derive(Debug, Deserialize)]
 struct RawFixture {
     name: String,
@@ -40,6 +54,8 @@ struct RawFixture {
     transaction: RawTransaction,
     instruction_calls: Vec<RawInstruction>,
     account_activity: Vec<RawActivity>,
+    #[serde(default)]
+    why: Option<String>,
     /// Phase 2. Absent from the phase 1 recordings, which is why it
     /// defaults: Raydium's and Orca's swap events are LOG lines, so a
     /// fixture for those venues has to carry the log table too.
@@ -143,8 +159,12 @@ fn signature(base58: &str) -> SigBytes {
 }
 
 fn parse() -> Vec<Fixture> {
-    let raw: Vec<RawFixture> = serde_json::from_str(RECORDED)
+    let mut raw: Vec<RawFixture> = serde_json::from_str(RECORDED)
         .expect("fixtures/recorded.json parses");
+    raw.extend(
+        serde_json::from_str::<Vec<RawFixture>>(PHASE2)
+            .expect("fixtures/phase2.json parses"),
+    );
 
     raw.into_iter()
         .map(|fixture| {
@@ -293,7 +313,7 @@ mod tests {
     #[test]
     fn every_fixture_parses() {
         let fixtures = all();
-        assert_eq!(fixtures.len(), 5, "a fixture went missing");
+        assert_eq!(fixtures.len(), 9, "a fixture went missing");
         for fixture in fixtures {
             assert!(
                 !fixture.transaction.instructions.is_empty(),

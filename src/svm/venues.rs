@@ -208,8 +208,13 @@ impl RaydiumCpmmSwap {
     pub const LEN: usize = LOG_BODY + 162;
 
     pub fn parse(data: &[u8]) -> Option<Self> {
+        // EXACT length, not a minimum. Raydium's CPMM and CLMM both named
+        // their event `SwapEvent`, so the 8-byte discriminator is identical
+        // and the LENGTH is the only thing that tells them apart: a 221-byte
+        // CLMM event otherwise parses cleanly here and yields plausible
+        // nonsense. (It did, until this test caught it.)
         if data.get(..8)? != DISC_RAYDIUM_SWAP_EVENT
-            || data.len() < Self::LEN
+            || data.len() != Self::LEN
         {
             return None;
         }
@@ -281,8 +286,11 @@ impl RaydiumClmmSwap {
     pub const LEN: usize = LOG_BODY + 213;
 
     pub fn parse(data: &[u8]) -> Option<Self> {
+        // Exact, for the same reason the CPMM parser is: same
+        // discriminator, different struct, and only the length separates
+        // them.
         if data.get(..8)? != DISC_RAYDIUM_SWAP_EVENT
-            || data.len() < Self::LEN
+            || data.len() != Self::LEN
         {
             return None;
         }
@@ -360,7 +368,7 @@ impl OrcaTraded {
     pub const LEN: usize = LOG_BODY + 113;
 
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.get(..8)? != DISC_ORCA_TRADED || data.len() < Self::LEN {
+        if data.get(..8)? != DISC_ORCA_TRADED || data.len() != Self::LEN {
             return None;
         }
         Some(Self {
@@ -419,7 +427,7 @@ impl MeteoraDlmmSwap {
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.get(..8)? != EVENT_CPI_PREFIX
             || data.get(8..16)? != DISC_DLMM_SWAP
-            || data.len() < Self::LEN
+            || data.len() != Self::LEN
         {
             return None;
         }
@@ -478,7 +486,7 @@ impl MeteoraDlmmSwap2 {
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.get(..8)? != EVENT_CPI_PREFIX
             || data.get(8..16)? != DISC_DLMM_SWAP2
-            || data.len() < Self::LEN
+            || data.len() != Self::LEN
         {
             return None;
         }
@@ -558,7 +566,7 @@ impl MeteoraDamm2Swap {
     pub fn parse(data: &[u8]) -> Option<Self> {
         if data.get(..8)? != EVENT_CPI_PREFIX
             || data.get(8..16)? != DISC_DAMM2_SWAP
-            || data.len() < Self::LEN
+            || data.len() != Self::LEN
         {
             return None;
         }
@@ -763,12 +771,8 @@ pub fn enrich_raydium_cpmm(
     let Some(bytes) = log.event_bytes() else {
         return Enrichment::None;
     };
-    // Length tells the CPMM event apart from the CLMM one, which shares its
-    // discriminator. `program` has already done that; this is the second
-    // guard.
-    if bytes.len() != RaydiumCpmmSwap::LEN {
-        return Enrichment::None;
-    }
+    // `RaydiumCpmmSwap::parse` rejects on exact length, which is what tells
+    // this event apart from the CLMM one that shares its discriminator.
     let Some(event) = RaydiumCpmmSwap::parse(&bytes) else {
         return Enrichment::None;
     };
@@ -821,9 +825,6 @@ pub fn enrich_raydium_clmm(
     let Some(bytes) = log.event_bytes() else {
         return Enrichment::None;
     };
-    if bytes.len() != RaydiumClmmSwap::LEN {
-        return Enrichment::None;
-    }
     let Some(event) = RaydiumClmmSwap::parse(&bytes) else {
         return Enrichment::None;
     };

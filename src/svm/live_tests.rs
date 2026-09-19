@@ -918,3 +918,332 @@ async fn live_head_and_history_bounds() {
          skipped (normal on Solana)"
     );
 }
+// Recording the phase 2 fixtures from live mainnet.
+//
+// `cargo test --release svm::live_tests::record -- --ignored --nocapture`
+//
+// Writes `src/svm/fixtures/phase2.json` from real transactions, in the same
+// shape `fixtures.rs` reads. The rows are the server's own - the only
+// transformation is back into JSON from the structs the source decoded them
+// into, which is lossless for everything the decoder consumes.
+//
+// It is an ignored, hand-run tool rather than part of any suite: fixtures
+// are recorded once, committed, and then tested against for ever.
+
+use serde_json::json;
+
+/// The four shapes the fixture set has to contain, and why each one is
+/// worth a recording.
+const WANTED: &[(&str, &str)] = &[
+    (
+        "multi_hop_route",
+        "an aggregator route whose hops land on DIFFERENT phase 2 venues: \
+         it must become one swap per venue, each credited to the venue and \
+         not to the router",
+    ),
+    (
+        "liquidity_no_swap",
+        "an add or remove of liquidity on a phase 2 venue. Both mints move \
+         the SAME way across the pool, so it must decode to NO swap at all",
+    ),
+    (
+        "token_2022_fee",
+        "a swap on a mint with a Token-2022 transfer fee, where what the \
+         pool SENT and what the taker RECEIVED differ - and where the venue \
+         event's idea of the input leg differs from the movement layer's by \
+         exactly that fee",
+    ),
+    (
+        "clmm_tick_crossing",
+        "a concentrated-liquidity swap that moves the pool price across at \
+         least one tick boundary, i.e. pre_sqrt_price != post_sqrt_price by \
+         more than one tick's worth",
+    ),
+];
+
+fn hexify(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+
+fn b58(key: &crate::svm::models::Pubkey) -> String {
+    to_base58(key)
+}
+
+/// One transaction, in the shape `fixtures::RawFixture` reads.
+fn fixture_json(
+    name: &str,
+    why: &str,
+    slot: &crate::svm::SvmSlotBatch,
+    tx: &crate::svm::decode::SvmTransaction,
+) -> serde_json::Value {
+    json!({
+        "name": name,
+        "why": why,
+        "slot": slot.slot,
+        "block_time": slot.timestamp as i64,
+        "blockhash": b58(&slot.blockhash),
+        "parent_slot": slot.parent_slot,
+        "parent_blockhash": b58(&slot.parent_blockhash),
+        "transaction": {
+            "transaction_index": tx.tx_index,
+            "transaction_id": bs58::encode(tx.signature).into_string(),
+            "fee_payer": b58(&tx.fee_payer),
+            "success": tx.success,
+            "fee": tx.fee,
+            "compute_units_consumed": tx.compute_units,
+            "has_dropped_log_messages": tx.dropped_logs,
+        },
+        "instruction_calls": tx.instructions.iter().map(|ix| json!({
+            "instruction_address": ix.path,
+            "executing_account": b58(&ix.program),
+            "account_arguments": ix.accounts.iter().map(b58)
+                .collect::<Vec<_>>(),
+            "data": hexify(&ix.data),
+        })).collect::<Vec<_>>(),
+        "account_activity": tx.activity.iter().map(|row| json!({
+            "account": b58(&row.account),
+            "mint": row.mint.as_ref().map(b58),
+            "pre_owner": row.pre_owner.as_ref().map(b58),
+            "post_owner": row.post_owner.as_ref().map(b58),
+            "token_decimals": row.decimals,
+            "pre_token_balance": row.pre_token_balance
+                .map(|v| v.to_string()),
+            "post_token_balance": row.post_token_balance
+                .map(|v| v.to_string()),
+            "pre_balance": row.pre_balance,
+            "post_balance": row.post_balance,
+            "is_signer": row.is_signer,
+            "is_fee_payer": row.is_fee_payer,
+            "post_program_id": row.token_program.as_ref().map(b58),
+        })).collect::<Vec<_>>(),
+        "logs": tx.logs.iter().map(|log| json!({
+            "instruction_address": log.path,
+            "program_id": b58(&log.program),
+            "kind": if log.is_data { "data" } else { "log" },
+            "message": log.message,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Scans live slots for the four wanted shapes and records the first of
+/// each.
+#[tokio::test]
+#[ignore]
+async fn record_phase2_fixtures() {
+    use crate::svm::{
+        programs::{registry, IxKind, Venue},
+        venues::{OrcaTraded, RaydiumClmmSwap, RaydiumCpmmSwap},
+    };
+
+    let Some(token) = token() else {
+        eprintln!("ENVIO_API_TOKEN is not set; skipping");
+        return;
+    };
+
+    let source = SolanaSource::new(None, &token).expect("source");
+    let head = source.head().await.expect("head");
+
+    let mut found: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    // One transaction can satisfy two of the shapes at once - a route
+    // across two venues that also happens to touch a Token-2022 mint. Each
+    // fixture should be a distinct transaction, so the corpus covers more
+    // of the chain rather than storing the same bytes twice.
+    let mut used: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let registry = registry();
+
+    // A few windows, because the four shapes do not all appear in any one
+    // of them - a liquidity add is far rarer than a swap.
+    let mut window = 0u64;
+    while found.len() < WANTED.len() && window < 6 {
+        let from = head - HEAD_MARGIN - 80 - window * 400;
+        let batch = source.fetch(from, from + 80).await.expect("fetch");
+        window += 1;
+
+        for slot in &batch.batches {
+            for tx in &slot.transactions {
+                let signature =
+                    bs58::encode(tx.signature).into_string();
+                if used.contains(&signature) {
+                    continue;
+                }
+                let outcome = crate::svm::decode::decode_transaction(
+                    SOLANA_CHAIN,
+                    slot.timestamp,
+                    tx,
+                );
+
+                // (a) a route across two DIFFERENT phase 2 venues.
+                //
+                // NOT filtered on `route_ordinal`, deliberately. Only
+                // Jupiter v6 is in `ROUTERS_B58`, and a large share of
+                // Solana routing goes through DFlow, OKX, GMGN and others
+                // whose program ids the research records only as prefixes.
+                // Requiring a REGISTERED router therefore finds nothing
+                // most windows, while the property actually worth pinning
+                // is the subtree rule splitting one transaction into one
+                // swap per venue - which holds whoever the router is.
+                if !found.contains_key("multi_hop_route")
+                    && !used.contains(&signature)
+                {
+                    let mut venues: Vec<&str> = outcome
+                        .swaps
+                        .iter()
+                        .map(|s| s.protocol.as_str())
+                        .collect();
+                    venues.sort_unstable();
+                    venues.dedup();
+                    if venues.len() >= 2 {
+                        found.insert(
+                            "multi_hop_route",
+                            fixture_json(
+                                "multi_hop_route",
+                                WANTED[0].1,
+                                slot,
+                                tx,
+                            ),
+                        );
+                        used.insert(signature.clone());
+                    }
+                }
+
+                // (b) a liquidity instruction that produced no swap.
+                if !found.contains_key("liquidity_no_swap")
+                    && !used.contains(&signature)
+                {
+                    let liquidity = tx.instructions.iter().any(|ix| {
+                        registry
+                            .venue(&ix.program)
+                            .map(|venue| {
+                                venue.instruction_kind(&ix.data)
+                                    == IxKind::Liquidity
+                            })
+                            .unwrap_or(false)
+                    });
+                    if liquidity && outcome.swaps.is_empty() {
+                        found.insert(
+                            "liquidity_no_swap",
+                            fixture_json(
+                                "liquidity_no_swap",
+                                WANTED[1].1,
+                                slot,
+                                tx,
+                            ),
+                        );
+                        used.insert(signature.clone());
+                    }
+                }
+
+                // (c) a Token-2022 transfer fee, stated by the venue itself.
+                if !found.contains_key("token_2022_fee")
+                    && !used.contains(&signature)
+                {
+                    // All three log-event venues report transfer fees, and
+                    // the criterion has to ask each of them: the CPMM and
+                    // CLMM events share a discriminator and differ only in
+                    // length, so asking only one of them reads the other's
+                    // bytes at the wrong offsets and "finds" a fee that is
+                    // not there.
+                    let fee = tx.logs.iter().any(|log| {
+                        let Some(bytes) = log.event_bytes() else {
+                            return false;
+                        };
+                        if let Some(event) = RaydiumCpmmSwap::parse(&bytes) {
+                            return event.input_transfer_fee > 0
+                                || event.output_transfer_fee > 0;
+                        }
+                        if let Some(event) = RaydiumClmmSwap::parse(&bytes) {
+                            return event.transfer_fee_0 > 0
+                                || event.transfer_fee_1 > 0;
+                        }
+                        if let Some(event) = OrcaTraded::parse(&bytes) {
+                            return event.input_transfer_fee > 0
+                                || event.output_transfer_fee > 0;
+                        }
+                        false
+                    });
+                    if fee && !outcome.swaps.is_empty() {
+                        found.insert(
+                            "token_2022_fee",
+                            fixture_json(
+                                "token_2022_fee",
+                                WANTED[2].1,
+                                slot,
+                                tx,
+                            ),
+                        );
+                        used.insert(signature.clone());
+                    }
+                }
+
+                // (d) a CLMM swap that moved the price across a tick.
+                //
+                // Orca's `Traded` reports the sqrt price BEFORE and AFTER,
+                // which is the only event among these venues that states a
+                // tick crossing rather than implying one. One tick is a
+                // 1.0001x price step, so a sqrt-price ratio above 1.00005
+                // means at least one boundary was crossed.
+                if !found.contains_key("clmm_tick_crossing")
+                    && !used.contains(&signature)
+                {
+                    let crossed = tx.logs.iter().any(|log| {
+                        log.event_bytes()
+                            .and_then(|bytes| OrcaTraded::parse(&bytes))
+                            .map(|event| {
+                                let (low, high) = if event.pre_sqrt_price
+                                    < event.post_sqrt_price
+                                {
+                                    (event.pre_sqrt_price,
+                                     event.post_sqrt_price)
+                                } else {
+                                    (event.post_sqrt_price,
+                                     event.pre_sqrt_price)
+                                };
+                                low > 0
+                                    && high.saturating_sub(low) as f64
+                                        / low as f64
+                                        > 0.00005
+                            })
+                            .unwrap_or(false)
+                    });
+                    let orca = outcome
+                        .swaps
+                        .iter()
+                        .any(|s| s.protocol == Venue::OrcaWhirlpool.as_str());
+                    if crossed && orca {
+                        found.insert(
+                            "clmm_tick_crossing",
+                            fixture_json(
+                                "clmm_tick_crossing",
+                                WANTED[3].1,
+                                slot,
+                                tx,
+                            ),
+                        );
+                        used.insert(signature.clone());
+                    }
+                }
+            }
+        }
+        println!(
+            "  window {window}: have {} of {}",
+            found.len(),
+            WANTED.len()
+        );
+    }
+
+    for (name, why) in WANTED {
+        if !found.contains_key(name) {
+            println!("  MISSING {name}: {why}");
+        }
+    }
+
+    let out: Vec<serde_json::Value> = found.into_values().collect();
+    let path = "src/svm/fixtures/phase2.json";
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&out).expect("serialise"),
+    )
+    .expect("write fixtures");
+    println!("\nwrote {} fixtures to {path}", out.len());
+}
