@@ -1598,6 +1598,56 @@ async fn verify_tells_a_consistent_index_from_an_inconsistent_one() {
     assert!(report.to_string().contains("never asked for"), "{report}");
 }
 
+/// `--new-blocks-only` promises the head slot and has to INDEX it.
+///
+/// The twin of `pipeline::acceptance::
+/// new_blocks_only_indexes_the_block_its_floor_promises`: the floor is
+/// `head - 1` and the cursor was a SECOND head poll, one slot above it, so
+/// the floor's own slot was never asked for. No checkpoint then started at
+/// or below the floor, `coverage_v`'s fold never left it, and `verify`,
+/// the fleet status line and the control panel all said "Coverage: nothing
+/// stored yet" for ever about a chain following the head perfectly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn new_blocks_only_indexes_the_slot_its_floor_promises() {
+    use crate::coverage::store;
+
+    let scenario = Scenario::new("f_new_only").await;
+    let chain = chain(20);
+
+    let end = chain.head.to_string();
+    let config = scenario.config(&[
+        "--new-blocks-only",
+        "--end-block",
+        &end,
+        "--flush-interval-ms",
+        "200",
+    ]);
+
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        run_with(config, runtime(chain.clone())),
+    )
+    .await
+    .expect("the Solana pipeline did not finish in time")
+    .unwrap();
+
+    let coverage = store::coverage(&scenario.db).await.unwrap().unwrap();
+    assert_eq!(coverage.floor.block, chain.head - 1, "{coverage:?}");
+    assert_eq!(coverage.floor.reason, store::Reason::Head);
+    assert!(
+        !coverage.is_empty(),
+        "the floor's own slot was never asked for, so every surface says \
+         'nothing stored yet' for ever: {coverage:?}"
+    );
+
+    let report =
+        solana_verify::verify(&scenario.db, None, 0).await.unwrap();
+    assert_eq!(report.range.from, chain.head - 1, "{report}");
+    assert!(report.unasked.is_empty(), "{report}");
+    assert!(report.is_consistent(), "{report}");
+}
+
 /// THE LIVE-RUN BUG, Solana half. `indexer fleet --chain solana` on a
 /// fresh database puts the coverage floor at the head slot and indexes
 /// forward from there - and `indexer verify` then checked from slot 0,

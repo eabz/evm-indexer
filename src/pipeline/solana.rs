@@ -1146,16 +1146,27 @@ impl<S: SlotSource> SolanaIndexer<S> {
             info!("Chain {chain}: epoch {epoch}.");
         }
 
-        // `--new-blocks-only` starts at the head and asks the checkpoints
-        // nothing: saying "the checkpoints tile [start, head)" there would
-        // be a plain lie on an empty database, which is exactly what the
-        // first live run printed.
+        // `--new-blocks-only` starts at the FLOOR - which is the head of
+        // this chain's first start - and asks the checkpoints nothing:
+        // saying "the checkpoints tile [start, head)" there would be a
+        // plain lie on an empty database, which is exactly what the first
+        // live run printed.
+        //
+        // The floor and not `head`: this poll is a second one, so `head`
+        // is at or above the slot the floor was placed at, and starting
+        // there left the floor's own slot unindexed for ever. The first
+        // checkpoint then began above the floor, `coverage_v`'s fold never
+        // left it, and every surface said "Coverage: nothing stored yet"
+        // about a chain that was following the head perfectly. The EVM
+        // twin had the same off-by-one (`pipeline::sync`).
         let mut cursor = if self.settings.new_slots_only {
             info!(
-                "--new-blocks-only: starting at the head, slot {head}. \
-                 Nothing below it will be indexed by this process."
+                "--new-blocks-only: starting at slot {}, the head when \
+                 this chain was first indexed. Nothing below it will be \
+                 indexed by this process.",
+                self.settings.start_slot
             );
-            head
+            self.settings.start_slot
         } else {
             let resume = self.resume_point().await?;
             if resume > self.settings.start_slot {

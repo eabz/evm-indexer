@@ -2882,6 +2882,68 @@ async fn a_gap_elsewhere_does_not_switch_the_aggregate_check_off() {
     );
 }
 
+/// `--new-blocks-only` promises the head and has to INDEX the head.
+///
+/// Two head polls with two conventions: the floor is `head - 1` (the last
+/// block the source has, `coverage::resolve_floor`) and the cursor was
+/// `head - confirmations`, i.e. one block ABOVE it with the default zero
+/// confirmations. So the floor's own block was never indexed, the first
+/// checkpoint started one block above the floor, and `coverage_v`'s fold -
+/// which extends its reach only while the next tile starts at or below it
+/// - never left the floor. The result was "Coverage: nothing stored yet"
+/// for ever, in `indexer verify`, in the fleet's status line and on the
+/// control panel, about a chain that was following the head perfectly.
+///
+/// The cursor is the floor, on both families. Nothing unconfirmed is
+/// stored either way: that is the loop's TARGET, which has always been
+/// `head - confirmations`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TEST_DATABASE_URL"]
+async fn new_blocks_only_indexes_the_block_its_floor_promises() {
+    use crate::coverage::store;
+
+    let scenario = Scenario::new("new_only").await;
+    let chain = TestChain::new(60);
+
+    scenario
+        .run(
+            scenario.config(&[
+                "--new-blocks-only",
+                "--end-block",
+                "60",
+                "--rpc",
+                "none",
+            ]),
+            &chain,
+            &FakeRpc::new(),
+            |_| async { false },
+        )
+        .await
+        .unwrap();
+
+    let coverage = store::coverage(&scenario.db).await.unwrap().unwrap();
+    assert_eq!(coverage.floor.block, 59, "{coverage:?}");
+    assert_eq!(coverage.floor.reason, store::Reason::Head);
+    assert!(
+        !coverage.is_empty(),
+        "the floor's own block was never indexed, so every surface says \
+         'nothing stored yet' for ever: {coverage:?}"
+    );
+
+    let line = store::sentence(
+        &coverage,
+        store::unit_of(CHAIN),
+        None,
+        Some(59),
+    );
+    assert!(line.contains("gap-free from"), "{line}");
+    assert!(!line.contains("nothing stored yet"), "{line}");
+
+    let report = verify::verify(&scenario.db, None, 0).await.unwrap();
+    assert!(report.is_consistent(), "{report}");
+    assert_eq!(report.range.from, 59, "{report}");
+}
+
 // --------------------------------------------- the floor starts the check
 
 /// THE LIVE-RUN BUG. `indexer fleet --chain 1` on a fresh database placed
