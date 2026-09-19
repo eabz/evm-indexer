@@ -47,6 +47,7 @@ mod solana_acceptance;
 
 use crate::{
     configs::Config,
+    core::convert::hash_to_b256,
     db::{
         ranges::{subtract_ranges, BlockRange, MissingRanges},
         Database, RowBatch,
@@ -59,7 +60,6 @@ use crate::{
     },
     source::Source,
     tokens::{self, multicall::EthCaller},
-    utils::convert::hash_to_b256,
 };
 use anyhow::{bail, Context, Result};
 use futures::future::BoxFuture;

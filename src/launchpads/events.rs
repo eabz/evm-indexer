@@ -409,7 +409,7 @@ mod tests {
     fn the_transfer_signature_is_the_shared_one() {
         assert_eq!(
             ERC20_TRANSFER.topic0,
-            crate::utils::events::TRANSFER_EVENT_SIGNATURE
+            crate::core::events::TRANSFER_EVENT_SIGNATURE
         );
     }
 }

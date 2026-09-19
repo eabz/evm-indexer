@@ -6,4 +6,6 @@
 //! signatures, its decoding, its table constants and its aggregates. See
 //! `README.md` in this directory for the table catalogue.
 
+pub mod convert;
+pub mod events;
 pub mod models;

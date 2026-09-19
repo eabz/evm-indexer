@@ -5,11 +5,11 @@ use serde_with::serde_as;
 
 use super::log::DatabaseLog;
 use crate::{
-    db::format::{SerAddress, SerB256, SerU256},
-    utils::events::{
+    core::events::{
         ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
         ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE,
     },
+    db::format::{SerAddress, SerB256, SerU256},
 };
 
 /// Row of `erc1155_transfers`. Field names are the column names.

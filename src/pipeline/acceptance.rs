@@ -17,6 +17,7 @@
 use super::*;
 use crate::{
     configs::Command,
+    core::events::TRANSFER_EVENT_SIGNATURE,
     db::{self, migrate, next_version, DatabaseParams, FlushKey},
     dex, launchpads,
     pipeline::{backfill, modules::ALL_MODULES, verify},
@@ -27,7 +28,6 @@ use crate::{
         },
         multicall::testing::{FakeChain, FakeToken},
     },
-    utils::events::TRANSFER_EVENT_SIGNATURE,
 };
 use alloy::primitives::{Address, B256, I256, U256};
 use clickhouse::Client;

@@ -5,8 +5,8 @@ use serde_with::serde_as;
 
 use super::log::DatabaseLog;
 use crate::{
+    core::events::TRANSFER_EVENT_SIGNATURE,
     db::format::{SerAddress, SerB256, SerU256},
-    utils::events::TRANSFER_EVENT_SIGNATURE,
 };
 
 /// Row of `erc721_transfers`. Field names are the column names.

@@ -5,10 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use crate::{
+    core::convert::{address_to_alloy, quantity_to_u256, quantity_to_u64},
     db::format::{SerAddress, SerU256},
-    utils::convert::{
-        address_to_alloy, quantity_to_u256, quantity_to_u64,
-    },
 };
 
 #[serde_as]

@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use crate::{
-    db::format::{SerAddress, SerB256, SerBytes, SerTopic},
-    utils::convert::{
+    core::convert::{
         address_to_alloy, data_to_bytes, hash_to_b256, sat_u32,
     },
+    db::format::{SerAddress, SerB256, SerBytes, SerTopic},
 };
 
 /// Row of `logs`. Field names are the column names.

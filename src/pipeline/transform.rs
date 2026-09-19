@@ -1,6 +1,10 @@
 //! HyperSync response -> database rows. Pure, no I/O.
 
 use crate::{
+    core::events::{
+        ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
+        ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
+    },
     core::models::{
         block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
         erc20_transfer::DatabaseERC20Transfer,
@@ -10,10 +14,6 @@ use crate::{
     db::{ranges::BlockRange, RowBatch},
     pipeline::modules::{self, DecodeState, EnabledModules},
     tokens::TokenStandard,
-    utils::events::{
-        ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE,
-        ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
-    },
 };
 use alloy::primitives::{Address, U256};
 use anyhow::{bail, Context, Result};

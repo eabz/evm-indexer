@@ -22,6 +22,9 @@ use super::{
     SIDE_TABLES,
 };
 use crate::{
+    core::events::{
+        ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
+    },
     core::models::{
         block::DatabaseBlock, erc1155_transfer::DatabaseERC1155Transfer,
         erc20_transfer::DatabaseERC20Transfer,
@@ -30,9 +33,6 @@ use crate::{
     },
     pipeline::transform::{transform, ResponseRows},
     tokens::models::DatabaseToken,
-    utils::events::{
-        ERC1155_TRANSFER_BATCH_EVENT_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
-    },
 };
 use alloy::primitives::{Address, U256};
 use clickhouse::{Client, Row};

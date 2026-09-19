@@ -9,10 +9,10 @@
 pub mod solana;
 
 use crate::{
+    core::convert::{hash_to_b256, quantity_to_u32},
     db::ranges::BlockRange,
     pipeline::{transform::ResponseRows, BlockSource, SourceResponse},
     reorg::{BlockHeader, CanonicalChain},
-    utils::convert::{hash_to_b256, quantity_to_u32},
 };
 use anyhow::{bail, Context, Result};
 use futures::future::BoxFuture;
@@ -554,7 +554,7 @@ mod tests {
             ..Default::default()
         };
         log.topics.push(Some(LogArgument::from(
-            crate::utils::events::TRANSFER_EVENT_SIGNATURE.0,
+            crate::core::events::TRANSFER_EVENT_SIGNATURE.0,
         )));
         log.topics.push(Some(LogArgument::from([0x43; 32])));
         log.topics.push(Some(LogArgument::from([0x44; 32])));

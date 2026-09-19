@@ -228,8 +228,8 @@ const MAX_CHARS: usize = 128;
 /// TEXT and **the UI escapes them** for whatever it renders into (the
 /// README says so next to the cookbook). A `<script>` in a symbol is data
 /// here and must stay data there. Same rule, and very nearly the same
-/// code, as `crate::predictions::text::sanitize`; the shared home is
-/// `src/utils` once a change may touch it.
+/// code, as `crate::predictions::text::sanitize`; if a change ever has to
+/// touch both, one of the two modules owns it and the other calls it.
 ///
 /// Public so the Solana launchpad decoder (`svm::launchpads`) applies the
 /// SAME rule to the same columns: a pump.fun symbol carrying a bidi
