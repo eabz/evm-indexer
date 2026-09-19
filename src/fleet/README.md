@@ -59,16 +59,31 @@ A chain leaves the fleet by getting `desired = 'stopped'`. There is no
 Adding a chain needs nothing but its id: an absent setting is the `run`
 default, so `{}` is the whole configuration of a normal chain.
 
-## Settings: one validator, never two
+## Settings: a short allow-list, and one validator
 
-A setting typed into a web page is untrusted input, and the obvious mistake
-is a small parser next to the HTTP handler that accepts "about the same"
-values as the command line. Instead, `configs::fleet::apply_chain_settings`
-turns the settings map into **the command line `indexer run` would have been
-given** and hands it to clap - the same `IndexerArgs`, the same
-`value_parser`s. Every number, every boolean spelling and every unknown
-option is judged by the code that judges the command line, and
-`configs::CHAIN_SETTINGS` is proved against clap by a unit test.
+**Which settings** the panel may change is an allow-list:
+`configs::fleet::CHAIN_SETTINGS`, and it holds only how a chain behaves
+while it runs - how far behind the head to stay, how deep a rollback may
+go, how big and how frequent the writes are, which decoders run.
+
+Endpoints and credentials are not on it, and that is structural rather than
+careful. The HyperSync token is process-wide and is attached to whatever url
+a chain names, so a panel that could set the endpoint could send the token
+to any host, reach the indexer host's private network, and feed the indexer
+fabricated blocks (security review MAJOR 4). The start block is not on it
+either: it fixes the coverage floor, which design section 16 decides once,
+on a chain's first start. `configs::fleet::NOT_PANEL_EDITABLE` names every
+excluded option with its reason, and a test walks the whole CLI and fails if
+a new flag is in neither list.
+
+**How a value is validated** is the second half. A setting typed into a web
+page is untrusted input, and the obvious mistake is a small parser next to
+the HTTP handler that accepts "about the same" values as the command line.
+Instead, `apply_chain_settings` turns the settings map into **the command
+line `indexer run` would have been given** and hands it to clap - the same
+`IndexerArgs`, the same `value_parser`s. Every number, every boolean
+spelling and every unknown option is judged by the code that judges the
+command line.
 
 One deliberate difference from `indexer run`: the per-chain parse has clap's
 ENVIRONMENT fallbacks removed. A fleet is configured once at start, so a

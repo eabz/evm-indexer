@@ -159,6 +159,13 @@ services:
   # (`ssh -N -L 8090:127.0.0.1:8090 you@host`) or a TLS reverse proxy, see
   # the README.
   #
+  # WORTH KNOWING: inside the compose network the panel listens on
+  # 0.0.0.0:8090, so ClickHouse, Dragonfly and any sidecar you add can reach
+  # it directly - the host publish only controls who gets in from OUTSIDE.
+  # It is still password protected, but if you add containers you do not
+  # fully trust, put the fleet on its own internal network with the proxy
+  # and leave the shared one to the database.
+  #
   # fleet:
   #   <<: *indexer
   #   container_name: evm-indexer-fleet

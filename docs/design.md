@@ -699,6 +699,37 @@ Order of work: after the review round 4 core fixes merge (both touch `src/pipeli
    proxy's `X-Forwarded-Proto`. The process cannot otherwise know it is
    behind TLS, and a header any client can set must not decide it.
 
+**After the security review (2026-09-19).** An independent review of
+`src/admin` returned no blocker, five majors and ten minors; all are fixed,
+and five of them changed behaviour this section describes:
+
+6. **The panel's editable settings are an allow-list, and endpoints are not
+   on it.** Section 15 said "settings show them redacted"; redaction was not
+   enough. `--hypersync-token` is process-wide and is attached to whatever
+   url a chain is configured with, so a panel that could set
+   `--hypersync-url` could send the token to any host, reach the indexer
+   host's private network, and - since `verify_chain_id` merely warned when
+   an endpoint failed to answer - feed the indexer fabricated blocks under a
+   real chain's id. Endpoints and credentials are now process-only and shown
+   read-only; the start block, end block and `--new-blocks-only` are out too
+   because they move the section 16 coverage floor. What is left is
+   behaviour while running. `configs::fleet::NOT_PANEL_EDITABLE` records the
+   reason for every excluded flag and a test fails when a new flag is
+   classified as neither.
+7. **`Host` is validated before routing** (`--admin-host <name>`,
+   repeatable; 421 otherwise). The same-origin check compared two headers
+   the client sends, which said nothing about which server was addressed:
+   classic DNS rebinding against a loopback-bound panel.
+8. **The panel has its own accept loop** (`src/admin/server.rs`) with a
+   connection cap and header-read / request / idle timeouts. `axum::serve`
+   has none, and the sockets belong to the process that indexes every chain.
+9. **`ADMIN_PASSWORD` has a 12 character minimum**, below which the panel
+   does not start.
+10. **The login throttle decays and is bounded**, and `X-Forwarded-For` is
+    believed only from `--admin-trusted-proxy <ip>`. As written, an attacker
+    who failed five times every quarter of an hour kept the OWNER out
+    indefinitely - and behind a proxy every client shares one address.
+
 Two additions worth recording: the pipeline's `StatusSink`
 (`src/pipeline/status.rs`) is two methods called on a state CHANGE and on a
 retried failure - everything else the panel shows is read from the

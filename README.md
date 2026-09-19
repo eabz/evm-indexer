@@ -207,10 +207,12 @@ Options of `indexer fleet`. Everything here is the same for every chain in the p
 | `--redis` | `REDIS_URL` | *none* | Shared by every chain |
 | `--metrics-addr` | `METRICS_ADDR` | *off* | ONE `/metrics` for the whole fleet; every series carries its `chain` label |
 | `--admin-addr` | `ADMIN_ADDR` | `127.0.0.1:8090` | Where the control panel listens. Refused unless it is a loopback address or `--admin-allow-remote` is given |
-| | `ADMIN_PASSWORD` | *unset* | **Environment only, never a flag** (a flag is visible in `ps`). The panel is off and unbound while this is unset |
+| | `ADMIN_PASSWORD` | *unset* | **Environment only, never a flag** (a flag is visible in `ps`). The panel is off and unbound while this is unset, and also while it is **shorter than 12 characters** - the panel starts and stops the indexing of every chain, and it will not run behind a password that can be guessed |
 | `--admin-allow-remote` | | `false` | Allow the panel to bind something other than localhost. Only behind a TLS reverse proxy |
 | `--admin-secure-cookie` | | `false` | Mark the session cookie `Secure` (the panel is behind TLS) |
 | `--admin-trust-forwarded-proto` | | `false` | Believe `X-Forwarded-Proto: https` from the proxy. Off by default: any client can set that header |
+| `--admin-host <name>` | | *none* | A name the panel answers to besides its own address and the loopback names. **Required behind a reverse proxy**, which serves it under a name; a request for any other name is refused with `421` before it is routed. That check is what stops a web page you merely visit from reaching the panel through DNS rebinding. Repeatable |
+| `--admin-trusted-proxy <ip>` | | *none* | The reverse proxy's address. Only a connection from exactly this address has its `X-Forwarded-For` believed, and then the sign-in throttle counts per client instead of counting every client behind the proxy as one. Without it the header is ignored entirely |
 | `--fleet-max-inflight-mb` | `FLEET_MAX_INFLIGHT_MB` | `2048` | Rough cap on the rows the WHOLE fleet buffers before writing, split over the running chains |
 | `--solana-queries-per-minute` | `SOLANA_QUERIES_PER_MINUTE` | `25` | Metered Solana HyperSync queries a minute, shared by every Solana chain in the process. The free tier allows 30 |
 | `--no-migrate` | `NO_MIGRATE` | `false` | As above; the fleet migrates once, before any chain starts |
@@ -648,8 +650,18 @@ and stops, while the others keep indexing.
 Settings changed in the panel apply the next time that chain starts; press
 Restart to apply them now. They are validated by the same parser the command
 line uses, so the page cannot accept a configuration `indexer run` would
-refuse. Anything that can hold an API key (the HyperSync endpoint, the RPC
-endpoints) is shown redacted and is never sent to the browser in full.
+refuse.
+
+**What the panel can change is a short list on purpose**: how far behind the
+head to stay, how deep a rollback may go, how big and how frequent the
+writes are, and which decoders run. It cannot change where a chain reads
+from - the HyperSync endpoint and token, the RPC endpoints, the database and
+the cache come from how you started the process, and the panel shows them
+only as "set" or "not set". A web page that could redirect an endpoint could
+send your Envio API token to someone else's server and feed the indexer
+made-up blocks, so that door is closed rather than guarded. It also cannot
+change a chain's start block: that fixes the coverage floor, which is
+decided once, on a chain's first start.
 
 Chains that a DIFFERENT indexer process is writing into the same database
 appear in the list read-only, so you can see the whole database from one
@@ -739,7 +751,12 @@ The Compose health check of the indexer containers calls `/healthz`. The runtime
 bash -c "exec 3<>/dev/tcp/127.0.0.1/9090 && printf 'GET /healthz HTTP/1.0\r\n\r\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"
 ```
 
-The endpoint has no authentication: bind it to localhost or a private network.
+**The metrics endpoint has no authentication and no loopback guard.** Unlike
+`--admin-addr`, `--metrics-addr` accepts any address and a bare `:9090` even
+expands to `0.0.0.0:9090`. It exposes no secret, but in fleet mode that one
+endpoint publishes every chain's position, lag and error counts. Bind it to
+localhost or a private network, or put it behind the same reverse proxy as
+the panel.
 
 ## Performance tuning
 

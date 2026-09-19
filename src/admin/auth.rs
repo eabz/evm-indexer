@@ -7,14 +7,16 @@
 //! |---|---|
 //! | the password ends up in `ps`, a shell history, a compose file dump | it comes from the environment only, never from a flag ([`Password::from_env`]) |
 //! | a memory dump or a core file hands out the password | only a salted SHA-256 of it is kept ([`Password`]) |
-//! | timing tells an attacker how much of a guess was right | every comparison is constant time (`subtle`) |
+//! | timing tells an attacker how much of a guess was right | the PASSWORD comparison is constant time (`subtle`), over two 32-byte digests, so neither length nor content leaks. The session lookup is an ordinary `HashMap` probe, which is safe for a different reason: its key is a SHA-256 of the token, so a timing signal reveals nothing that can be inverted into a usable cookie (review MINOR 10) |
 //! | a guessable session token | 256 bits from the operating system's CSPRNG ([`random_token`]) |
-//! | a stolen token replayed for ever | 12 h of idleness expires a session ([`Sessions`]) |
+//! | a stolen token replayed for ever | 12 h of idleness, and 7 days absolute, expire a session ([`Sessions`]) |
 //! | a leaked token list (log, dump) replayed | sessions are stored as the HASH of the token, never the token |
 //! | JavaScript on another page reads the cookie | `HttpOnly` |
-//! | another site makes the browser send the cookie | `SameSite=Strict`, plus an `Origin` check on every state-changing request ([`same_origin`]) |
+//! | another site makes the browser send the cookie | `SameSite=Strict`, an `Origin` check on every state-changing request ([`same_origin`]), and a `Host` allow-list checked before routing ([`AllowedHosts`]) so the origin check is not two attacker-supplied headers agreeing |
+//! | a sibling subdomain shadows the cookie | `__Host-` prefix behind TLS, and a duplicated cookie name is refused rather than resolved |
 //! | the cookie travels in clear text | `Secure` when the panel is behind TLS |
-//! | brute force over the network | 5 attempts a minute per address, then a doubling lock-out ([`RateLimiter`]) |
+//! | brute force over the network | 5 attempts a minute per address, then a lock-out that decays and is capped at one minute unless the address is hammering ([`RateLimiter`]) |
+//! | a guessable password | shorter than [`MIN_PASSWORD_CHARS`] and the panel does not start at all |
 //! | an attacker fills memory with addresses or sessions | both maps are capped and pruned |
 
 use serde::Serialize;
