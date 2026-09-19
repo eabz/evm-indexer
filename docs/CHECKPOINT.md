@@ -3,7 +3,7 @@
 Living file, kept current by the dev lead (Claude) so a usage-limit cut never loses the
 thread. Delete it in the end-of-project cleanup.
 
-**Last updated:** 2026-09-18 23:00 (America/Mexico_City)
+**Last updated:** 2026-09-18 23:35 (America/Mexico_City)
 
 ## Where things are
 
@@ -38,7 +38,10 @@ reorg core (`src/reorg/`, proven in memory) · first live HyperSync run OK on co
 | pipeline | Fable | MAIN tree (uncommitted edits!) | wire tokens/DEX/predictions/metrics/reorg into the running binary, checkpoints, insert dedup (migration 0090), `indexer verify` / `backfill`, zero-flag acceptance tests | commits prefixed `pipeline:` when the tree compiles; WIP notes on tirith |
 | launchpads | Opus | worktree `.claude/worktrees/agent-ab96eb1af8d691753` | `src/launchpads/` (Pons V2, Flap Portal; design section 11) | commits in the worktree + tirith notes |
 | migrator | Opus | worktree `.claude/worktrees/agent-a81326682e269a32c` | review fixes 14-19 for the migration runner | commits in the worktree |
-| solana-research | Opus | writes only `docs/solana-research.md` | Solana DEX + launchpad feasibility | the file itself |
+| solana-research | done | `docs/solana-research.md` | finished and committed | - |
+| dex-neutral | Opus | new worktree (see `git worktree list`) | DEX tables chain-neutral (design 13) + shared `SerId32`/`SerTxId` + `chains` registry (0006) | commits + tirith notes |
+| predictions-neutral | Opus | new worktree | predictions tables chain-neutral (design 13) | commits + tirith notes |
+| solana | Opus | new worktree | Solana phase 1: `src/svm/`, `src/source/solana.rs`, migrations 0040+, generic token-movement decoder + PumpSwap/pump.fun, live proof (design 14, `docs/solana-research.md`) | commits + tirith notes |
 | review-c | Opus | read-only | review round 2: predictions, reorg proof, core schema SQL | findings sent to `lead` on tirith |
 
 Briefs for the four Opus agents: `<session scratchpad>/handoff/*.md` (original brief +
@@ -56,7 +59,7 @@ given the handoff file plus `git status`/`git log` of the worktree can continue.
 6. Live end-to-end run on the final binary (zero flags: DEX rows + token metadata),
    tune the HyperSync `StreamConfig`.
 7. Docs final pass (README flag table vs real CLI; single-provider RPC note).
-8. Owner: Solana go/no-go after the research. Perps are deferred.
+8. Owner decided 2026-09-18: analytics tables chain-neutral NOW (design 13) and Solana is a GO (design 14). Merge order after pipeline wiring: dex-neutral -> predictions-neutral -> launchpads -> solana phase 1, each validated in its worktree against the current branch first. Then Solana phase 2 (Raydium/Orca/Meteora decoders, launchpads on Solana, head follower + reorg variant, history backfill). Perps are deferred.
 9. END cleanup: delete research docs (`perps-`, `launchpads-`, `solana-research.md`,
    `data-model-proposals.md`) and this file; `docs/` keeps decisions only.
 
