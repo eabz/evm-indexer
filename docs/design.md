@@ -291,3 +291,31 @@ out of scope by design. There is NO contract-deployment aggregate (the data is p
 
 Everywhere else in this document, references to traces / `traces_by_tx` / a `contracts`
 table are superseded by this section.
+
+## 10. Prediction markets — display-first
+
+Module `src/predictions/`, flag `--predictions`, same shape as `src/dex/` (pure decoders
+by event family, tables under the §1–§2 storage rules incl. tombstones + epochs,
+aggregates as `DerivedTable`s, background resolver off the commit path, re-decodable
+from stored `logs`). Migrations `0020`–`0029`.
+
+**The tables are designed backwards from the screens of a trading UI.** Each screen must
+be servable by ONE cheap query against a view, with no client-side joins or math:
+
+| Screen | Must show | Served by |
+|---|---|---|
+| Market list / search | title, category/tags if known, outcomes with **current price = implied probability**, 24h volume, total volume, open interest, trader count, end date, status (open / resolved / disputed), venue | `prediction_markets_v` (one row per market, outcome arrays) |
+| Market page header | same + resolution source/oracle, creation time, winning outcome + payout vector once resolved | `prediction_markets_v` |
+| Price chart | per-outcome candles 1m / 1h / 1d (OHLC of probability 0..1, volume in collateral units, trades) | `prediction_candles_*_v` |
+| Trades tape | time, outcome, side (buy/sell from the taker's view), price, size, collateral amount, trader, tx hash | `prediction_trades` by (market, time desc) side table |
+| Holders / top positions | per outcome: holder, net position, avg entry price | `prediction_positions_v` |
+| Portfolio (a wallet) | open positions with avg entry, current price, unrealised PnL; realised PnL; redeemable winnings; trade history | `prediction_positions_v`, `prediction_trades` by trader |
+| Leaderboard | volume and realised PnL per trader per period | daily aggregate |
+
+Principles: prices are stored as the raw amounts AND exposed as Float64 probability in
+views; collateral is decimals-adjusted in views via `tokens`; one normalised `market_id`
+(`FixedString(32)`) per venue-market with outcome index → outcome token id mapping;
+multi-outcome / negative-risk groupings are first class (an "event" groups markets);
+everything is source-agnostic (`venue`, `protocol` columns) so a non-EVM venue could be
+fed by an API adapter later. What is NOT on chain (order book depth, off-chain titles)
+is explicitly out of scope — record what would be needed and where it lives; never fake it.
