@@ -122,8 +122,8 @@ pub struct VerifyArgs {
 pub struct BackfillArgs {
     #[arg(
         long,
-        help = "Module to re-decode from the stored logs. Available: dex.",
-        value_parser = ["dex"]
+        help = "Module to re-decode from the stored logs. Available: dex, predictions.",
+        value_parser = ["dex", "predictions"]
     )]
     pub module: String,
 
@@ -145,11 +145,7 @@ pub struct BackfillArgs {
 
     // No env fallback on purpose: START_BLOCK / END_BLOCK of a compose
     // file describe the sync, not a one-off backfill.
-    #[arg(
-        long,
-        help = "First block to re-decode.",
-        default_value_t = 0
-    )]
+    #[arg(long, help = "First block to re-decode.", default_value_t = 0)]
     pub from_block: u64,
 
     #[arg(
@@ -298,6 +294,15 @@ pub struct IndexerArgs {
 
     #[arg(
         long,
+        env = "NO_PREDICTIONS",
+        action = ArgAction::SetTrue,
+        value_parser = parse_flag,
+        help = "Do not decode prediction market events (prediction market analytics are ON by default)."
+    )]
+    pub no_predictions: bool,
+
+    #[arg(
+        long,
         env = "METRICS_ADDR",
         help = "ip:port to serve Prometheus metrics, /healthz and /readyz on. Off when unset."
     )]
@@ -341,6 +346,8 @@ pub struct Config {
     pub max_reorg_depth: u64,
     /// DEX decoding (on unless `--no-dex`).
     pub dex: bool,
+    /// Prediction market decoding (on unless `--no-predictions`).
+    pub predictions: bool,
     /// Where to serve metrics; `None` = off.
     pub metrics_addr: Option<std::net::SocketAddr>,
     pub new_blocks_only: bool,
@@ -437,6 +444,7 @@ impl TryFrom<IndexerArgs> for Config {
             confirmations: args.confirmations,
             max_reorg_depth: args.max_reorg_depth,
             dex: !args.no_dex,
+            predictions: !args.no_predictions,
             metrics_addr: parse_metrics_addr(args.metrics_addr)?,
             new_blocks_only: args.new_blocks_only,
             flush_rows: args.flush_rows.max(1),
@@ -499,7 +507,7 @@ impl TryFrom<Cli> for Command {
 }
 
 /// Environment variables read by the CLI.
-const ENV_VARS: [&str; 17] = [
+const ENV_VARS: [&str; 18] = [
     "CHAIN_ID",
     "DATABASE_URL",
     "HYPERSYNC_URL",
@@ -511,6 +519,7 @@ const ENV_VARS: [&str; 17] = [
     "CONFIRMATIONS",
     "MAX_REORG_DEPTH",
     "NO_DEX",
+    "NO_PREDICTIONS",
     "METRICS_ADDR",
     "NEW_BLOCKS_ONLY",
     "FLUSH_ROWS",
@@ -673,6 +682,7 @@ mod tests {
         // The owner's defaults: DEX on, RPC auto (= unset), reorgs rolled
         // back up to 512 blocks, metrics off.
         assert!(config.dex);
+        assert!(config.predictions);
         assert_eq!(config.max_reorg_depth, 512);
         assert_eq!(config.metrics_addr, None);
     }
@@ -691,6 +701,16 @@ mod tests {
             assert_eq!(config.dex, dex, "NO_DEX={value}");
         }
 
+        let mut args = REQUIRED.to_vec();
+        args.push("--no-predictions");
+        let config = parse_with_env(&[], &args).unwrap();
+        assert!(config.dex && !config.predictions);
+        assert!(
+            !parse_with_env(&[("NO_PREDICTIONS", "true")], &REQUIRED)
+                .unwrap()
+                .predictions
+        );
+
         // The old opt-in flag is gone: asking for it is an error, not a
         // silent no-op.
         let mut args = REQUIRED.to_vec();
@@ -703,7 +723,10 @@ mod tests {
         for (value, expected) in [
             ("none", Some("none")),
             ("auto", Some("auto")),
-            ("https://mine.example,auto", Some("https://mine.example,auto")),
+            (
+                "https://mine.example,auto",
+                Some("https://mine.example,auto"),
+            ),
             ("", None),
             ("   ", None),
         ] {
@@ -739,13 +762,18 @@ mod tests {
         assert_eq!(config.metrics_addr, None);
 
         let config =
-            parse_with_env(&[("METRICS_ADDR", ":9100")], &REQUIRED).unwrap();
-        assert_eq!(config.metrics_addr, Some("0.0.0.0:9100".parse().unwrap()));
-
-        assert!(
-            parse_with_env(&[("METRICS_ADDR", "nonsense")], &REQUIRED)
-                .is_err()
+            parse_with_env(&[("METRICS_ADDR", ":9100")], &REQUIRED)
+                .unwrap();
+        assert_eq!(
+            config.metrics_addr,
+            Some("0.0.0.0:9100".parse().unwrap())
         );
+
+        assert!(parse_with_env(
+            &[("METRICS_ADDR", "nonsense")],
+            &REQUIRED
+        )
+        .is_err());
     }
 
     #[test]
@@ -798,7 +826,7 @@ mod tests {
         .is_err());
         assert!(parse_command(
             &[("DATABASE_URL", DATABASE)],
-            &["backfill", "--module", "predictions"],
+            &["backfill", "--module", "launchpads"],
             false
         )
         .is_err());

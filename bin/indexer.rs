@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
 use evm_indexer::{
-    configs::{Command, Config, MigrateConfig},
-    db::migrate,
+    configs::{
+        BackfillConfig, Command, Config, MigrateConfig, VerifyConfig,
+    },
+    db::{migrate, Database},
     pipeline,
 };
 use log::{error, info, LevelFilter};
 use simple_logger::SimpleLogger;
 use std::process::ExitCode;
 
-/// Exit code of commands that exist but are not implemented yet.
-const EXIT_NOT_IMPLEMENTED: u8 = 2;
+/// Exit code of `indexer verify` when it found problems.
+const EXIT_PROBLEMS_FOUND: u8 = 1;
 
 fn main() -> ExitCode {
     // Parsed before the runtime exists: it scrubs blank environment
@@ -52,14 +54,10 @@ fn execute(command: Command) -> Result<ExitCode> {
             runtime.block_on(run_migrate(config))?
         }
         Command::Verify(config) => {
-            // Placeholder, filled in by the pipeline: gap / consistency
-            // verification over `blocks` and `checkpoints`.
-            println!(
-                "indexer verify (chain {}, blocks {}..{}): not implemented \
-                 yet",
-                config.chain_id, config.start_block, config.end_block
-            );
-            return Ok(ExitCode::from(EXIT_NOT_IMPLEMENTED));
+            return runtime.block_on(run_verify(config));
+        }
+        Command::Backfill(config) => {
+            runtime.block_on(run_backfill(config))?
         }
     }
 
@@ -80,6 +78,57 @@ async fn run(config: Config) -> Result<()> {
     }
 
     pipeline::run(config).await
+}
+
+/// Read only. Exit code 0 = consistent, 1 = problems found.
+async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
+    let db = Database::new(&config.database_url, config.chain_id).await?;
+
+    let report = pipeline::verify::verify(
+        &db,
+        config.start_block,
+        config.end_block,
+    )
+    .await?;
+
+    println!("{report}");
+
+    Ok(if report.is_consistent() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_PROBLEMS_FOUND)
+    })
+}
+
+async fn run_backfill(config: BackfillConfig) -> Result<()> {
+    let db = Database::new(&config.database_url, config.chain_id).await?;
+
+    let report = pipeline::backfill::backfill(
+        &db,
+        &config.module,
+        config.from_block,
+        config.to_block,
+        config.chunk_blocks,
+    )
+    .await?;
+
+    match report.rewritten {
+        None => println!(
+            "{}: blocks {} already match the stored logs ({} logs \
+             checked). Nothing was written.",
+            report.module, report.range, report.logs
+        ),
+        Some(range) => println!(
+            "{}: blocks {range} re-decoded from the stored logs: {} rows \
+             replaced by {}. Epoch is now {}.",
+            report.module,
+            report.rows_tombstoned,
+            report.rows_written,
+            report.epoch
+        ),
+    }
+
+    Ok(())
 }
 
 async fn run_migrate(config: MigrateConfig) -> Result<()> {

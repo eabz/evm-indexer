@@ -2,39 +2,69 @@
 //!
 //! ```text
 //! HyperSync stream (ordered responses, whole blocks per response)
-//!   -> transform (response -> rows, block timestamp joined by number)
-//!   -> TokenResolver::resolve_new for the token contracts seen
+//!   -> transform (response -> rows, block timestamp joined by number;
+//!      decoder modules - DEX, predictions - over ALL logs of the response)
+//!   -> reorg guard: do these blocks build on what is stored / streamed?
+//!        no  -> fork-point search, purge_range, resume from the fork point
+//!   -> token / pool / venue workers: non-blocking `discover` (never awaits)
 //!   -> bounded channel (backpressure)
 //!   -> writer: accumulate, flush on rows / interval / barrier
-//!        flush = every table concurrently, `blocks` LAST (commit marker),
-//!                then TokenResolver::mark_stored
+//!        flush = one `_version` + the chain's `epoch` on every row, every
+//!                child table concurrently (module tables included),
+//!                `blocks` LAST (commit marker), then `checkpoints`
 //! ```
+//!
+//! Nothing on this path talks to an RPC endpoint: token, pool and venue
+//! metadata is resolved by background workers (`workers`), which insert
+//! their own rows and heal what they missed from the database.
 
-pub mod reorg;
+pub mod backfill;
+mod dedup;
+pub mod lease;
+pub mod modules;
+pub mod store;
 #[cfg(test)]
 mod sync_tests;
 pub mod transform;
+pub mod verify;
+pub mod workers;
 pub mod writer;
+
+#[cfg(test)]
+mod acceptance;
 
 use crate::{
     configs::Config,
     db::{
-        models::token::DatabaseToken,
-        ranges::{BlockRange, MissingRanges},
+        ranges::{subtract_ranges, BlockRange, MissingRanges},
         Database, RowBatch,
     },
+    metrics::{self, Metrics},
+    reorg::{
+        BlockHeader, CanonicalChain, DiscoveryCache, PurgeReason, Purger,
+        ReorgConfig, ReorgError, ReorgGuard, StreamGuard, Verdict,
+        WriterControl,
+    },
     source::Source,
-    tokens::{TokenResolver, TokenStandard},
+    tokens::{self, multicall::EthCaller},
+    utils::convert::hash_to_b256,
 };
-use alloy::primitives::{Address, B256};
 use anyhow::{bail, Context, Result};
+use futures::future::BoxFuture;
 use hypersync_client::net_types::RollbackGuard;
-use log::{debug, info, warn};
-use reorg::{ReorgDetector, ReorgEvidence};
-use std::{collections::HashMap, future::Future, time::Duration};
-use tokio::sync::mpsc::Receiver;
+use lease::{Lease, LeaseOptions};
+use log::{debug, error, info, warn};
+use modules::{DecodeState, EnabledModules};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use store::{ClickhouseReorgStore, Scope};
+use tokio::sync::{mpsc::Receiver, watch};
 use transform::ResponseRows;
-use writer::{Sink, Writer, WriterStopped};
+use workers::{Discovery, WorkerOptions, Workers};
+use writer::{Sink, Writer, WriterHandle, WriterStopped};
 
 /// One ordered response of a block stream: every block of
 /// `[previous next_block, next_block)`.
@@ -65,12 +95,6 @@ pub trait Progress: Send + Sync + 'static {
         &self,
         range: BlockRange,
     ) -> impl Future<Output = Result<MissingRanges>> + Send;
-
-    /// Hash of a stored canonical block, for reorg detection.
-    fn block_hash(
-        &self,
-        number: u64,
-    ) -> impl Future<Output = Result<Option<B256>>> + Send;
 }
 
 impl Progress for Database {
@@ -80,10 +104,6 @@ impl Progress for Database {
     ) -> Result<MissingRanges> {
         Database::missing_ranges(self, range).await
     }
-
-    async fn block_hash(&self, number: u64) -> Result<Option<B256>> {
-        Database::block_hash(self, number).await
-    }
 }
 
 /// How often the chain head is polled once caught up.
@@ -92,23 +112,135 @@ const HEAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Cap of the backoff between failed passes (HyperSync / query errors).
 const MAX_PASS_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Production sink: ClickHouse, then the token cache.
+/// A pass of at most this many blocks means "following the head".
+const TIP_PASS_BLOCKS: u64 = 64;
+
+/// `/readyz`: not ready when nothing happened for this long.
+const READY_STALENESS: Duration = Duration::from_secs(120);
+
+/// How long [`WriterGate::quiesce`] waits for the last flush to become
+/// readable (ClickHouse has no read-your-writes; normally a few ms).
+const VISIBILITY_ATTEMPTS: u32 = 200;
+const VISIBILITY_DELAY: Duration = Duration::from_millis(25);
+
+/// The last flush: highest block and the flush `_version`.
+type LastFlush = Arc<Mutex<Option<(u64, u64)>>>;
+
+/// Production sink: ClickHouse, then the workers' discovery.
 struct ClickhouseSink {
     db: Database,
-    tokens: TokenResolver,
+    discovery: Discovery,
+    last_flush: LastFlush,
+    /// Block spans flushed with an epoch that was superseded WHILE the
+    /// flush ran (a purge of another process, i.e. `indexer backfill`):
+    /// the validity rule may hide their aggregate contributions, so the
+    /// sync loop purges and streams them again.
+    stale: Arc<Mutex<Vec<BlockRange>>>,
 }
 
 impl Sink for ClickhouseSink {
+    /// The epoch in force: what this process adopted, or a newer one
+    /// another process (`indexer backfill`) wrote into `reorgs`.
+    async fn epoch(&self) -> Result<u32> {
+        self.db.refresh_epoch().await
+    }
+
     async fn store(&self, batch: &RowBatch) -> Result<()> {
         self.db.store(batch).await?;
 
-        if !batch.tokens.is_empty() {
-            // Only now are the rows durable: persist them to the cache.
-            self.tokens.mark_stored(&batch.tokens).await;
+        if let Some((from, to)) = batch.block_span() {
+            *self.last_flush.lock().unwrap() = Some((to, batch.version()));
+
+            // Did the epoch move while the rows were on their way? Best
+            // effort (a failed read is not a failed flush).
+            match self.db.refresh_epoch().await {
+                Ok(epoch) if epoch > batch.epoch() => {
+                    warn!(
+                        "Chain {}: the epoch moved from {} to {epoch} while                          blocks {from}..={to} were flushed; they will be                          purged and indexed again.",
+                        self.db.chain_id,
+                        batch.epoch()
+                    );
+                    self.stale
+                        .lock()
+                        .unwrap()
+                        .push(BlockRange::new(from, to + 1));
+                }
+                Ok(_) => {}
+                Err(e) => debug!("Epoch re-read after the flush: {e:#}"),
+            }
         }
+
+        // Only now are the rows durable. Never awaits.
+        self.discovery.stored(&batch.modules);
 
         Ok(())
     }
+}
+
+/// What the reorg logic needs from the writer.
+struct WriterGate {
+    writer: WriterHandle,
+    /// Resolves once the last flush can be read back.
+    visible: Box<dyn Fn() -> BoxFuture<'static, Result<()>> + Send + Sync>,
+    adopt: Box<dyn Fn(u32) + Send + Sync>,
+}
+
+impl WriterControl for WriterGate {
+    fn quiesce(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.writer.barrier().await?;
+            (self.visible)().await
+        })
+    }
+
+    fn adopt_epoch(&self, epoch: u32) {
+        (self.adopt)(epoch);
+    }
+}
+
+/// Polls until the `blocks` row of the last flush is readable.
+async fn wait_until_visible(db: Database, last: LastFlush) -> Result<()> {
+    let Some((number, version)) = *last.lock().unwrap() else {
+        return Ok(());
+    };
+
+    // No FINAL: the exact row version this process wrote.
+    let sql = format!(
+        "SELECT toUInt64(count()) FROM blocks WHERE chain = {} \
+         AND number = {number} AND _version = {version}",
+        db.chain_id
+    );
+
+    for _ in 0..VISIBILITY_ATTEMPTS {
+        let rows: u64 = db
+            .db
+            .query(&sql)
+            .fetch_one()
+            .await
+            .context("read back the last flush")?;
+
+        if rows > 0 {
+            return Ok(());
+        }
+
+        tokio::time::sleep(VISIBILITY_DELAY).await;
+    }
+
+    bail!(
+        "block {number} of the last flush (version {version}) can not be \
+         read back after {:?}",
+        VISIBILITY_DELAY * VISIBILITY_ATTEMPTS
+    )
+}
+
+/// The workers' caches are keyed by address, not by block: a token or a
+/// pool discovered on an abandoned fork is still a contract worth a
+/// metadata row, and the database backfill finds whatever is missing
+/// after the range is streamed again. Nothing to evict.
+struct NoBlockKeyedCaches;
+
+impl DiscoveryCache for NoBlockKeyedCaches {
+    fn evict_range(&self, _from: u64, _to: Option<u64>) {}
 }
 
 /// The part of the configuration the sync loop cares about.
@@ -121,23 +253,53 @@ struct SyncSettings {
     /// Blocks to stay behind the chain head.
     confirmations: u64,
     new_blocks_only: bool,
+    /// Minimum time between two commits while following the head: fewer,
+    /// larger inserts (every insert of a flush is a synchronous ClickHouse
+    /// part, and 50+ chains share the server).
+    tip_interval: Duration,
 }
 
 struct Indexer<S: BlockSource, P: Progress> {
     settings: SyncSettings,
     progress: P,
     source: S,
-    tokens: TokenResolver,
     writer: Writer,
-    detector: ReorgDetector,
+    guard: ReorgGuard,
+    modules: EnabledModules,
+    decode_state: DecodeState,
+    /// `None` in tests without workers.
+    discovery: Option<Discovery>,
+    metrics: Metrics,
+    /// Ranges this process committed (and did not purge since). A gap
+    /// listing that reports one of them is a stale read (no
+    /// read-your-writes), not a gap.
+    committed: Vec<BlockRange>,
+    /// See [`ClickhouseSink::stale`].
+    stale: Arc<Mutex<Vec<BlockRange>>>,
+    /// Shares the epoch memory with the guard's purger.
+    purger: Purger,
+}
+
+/// What [`run_with`] needs besides the configuration: everything that
+/// talks to the outside world, so the acceptance tests can run the REAL
+/// pipeline against an in-memory chain and a fake RPC.
+pub struct Runtime<S: BlockSource> {
+    pub source: S,
+    /// The chain as the source sees it now, for the fork-point search.
+    pub canonical: Arc<dyn CanonicalChain>,
+    /// The shared RPC backend of the workers, as built by
+    /// `tokens::build_caller*` from `--rpc` (`None` = `--rpc none`).
+    pub caller: Option<Arc<dyn EthCaller>>,
+    pub workers: WorkerOptions,
+    pub lease: LeaseOptions,
+    /// Resolves when the process should stop (SIGINT / SIGTERM).
+    pub shutdown: BoxFuture<'static, ()>,
 }
 
 /// Runs the indexer. Returns `Ok` when `--end-block` was reached or a
 /// shutdown signal arrived, `Err` on a fatal error (startup failure or a
 /// flush that failed after all its retries).
 pub async fn run(config: Config) -> Result<()> {
-    let db = Database::new(&config.database_url, config.chain_id).await?;
-
     let source = Source::new(
         config.chain_id,
         config.hypersync_url.as_deref(),
@@ -150,19 +312,144 @@ pub async fn run(config: Config) -> Result<()> {
         source.verify_chain_id(config.chain_id).await?;
     }
 
-    let tokens = TokenResolver::new(
+    // `--rpc` unset / blank = `auto` (public endpoints, discovered in the
+    // background: this never blocks or fails the start), `none` = no RPC.
+    let caller = tokens::build_caller_shared(
         config.chain_id,
         config.rpc_url.as_deref(),
         config.redis_url.as_deref(),
     )
     .await
-    .context("create token resolver")?;
+    .context("set up the RPC endpoints (--rpc)")?;
 
-    let writer = Writer::spawn(
-        ClickhouseSink { db: db.clone(), tokens: tokens.clone() },
+    let runtime = Runtime {
+        canonical: Arc::new(source.clone()),
+        source,
+        caller,
+        workers: WorkerOptions::default(),
+        lease: LeaseOptions::default(),
+        shutdown: Box::pin(shutdown_signal()),
+    };
+
+    run_with(config, runtime).await
+}
+
+/// [`run`] over explicit backends.
+pub async fn run_with<S: BlockSource>(
+    config: Config,
+    runtime: Runtime<S>,
+) -> Result<()> {
+    let metrics = match config.metrics_addr {
+        Some(_) => Metrics::new(config.chain_id, READY_STALENESS),
+        None => Metrics::disabled(),
+    };
+
+    let (stop_metrics, metrics_stopped) = watch::channel(false);
+
+    if let Some(addr) = config.metrics_addr {
+        // Fails fast: a port that is taken is a configuration error.
+        let server = metrics::bind(addr, metrics.clone())
+            .await
+            .with_context(|| format!("bind --metrics-addr {addr}"))?;
+        info!(
+            "Serving metrics on http://{}/metrics.",
+            server.local_addr()?
+        );
+
+        let mut stopped = metrics_stopped.clone();
+        tokio::spawn(async move {
+            let shutdown = async move {
+                let _ = stopped.wait_for(|stop| *stop).await;
+            };
+            if let Err(e) = server.run(shutdown).await {
+                error!("Metrics server stopped: {e:#}");
+            }
+        });
+    }
+
+    let db = Database::new(&config.database_url, config.chain_id)
+        .await?
+        .with_metrics(metrics.clone());
+
+    // One process per chain, before anything is written.
+    let (fatal_tx, mut fatal) = watch::channel(None::<String>);
+    let lease = Lease::acquire(&db, runtime.lease, fatal_tx).await?;
+
+    let enabled = EnabledModules {
+        dex: config.dex,
+        predictions: config.predictions,
+    };
+
+    info!(
+        "Modules: DEX {}, prediction markets {}. RPC metadata: {}.",
+        if enabled.dex { "on" } else { "off (--no-dex)" },
+        if enabled.predictions { "on" } else { "off (--no-predictions)" },
+        if runtime.caller.is_some() { "on" } else { "off (--rpc none)" },
+    );
+
+    // The epoch of a chain survives restarts in `reorgs`.
+    db.set_epoch(db.current_epoch().await?);
+
+    let workers = Workers::spawn(
+        &db,
+        runtime.caller,
+        config.redis_url.as_deref(),
+        enabled,
+        metrics.clone(),
+        runtime.workers,
+    )?;
+    let discovery = workers.discovery();
+
+    let last_flush = LastFlush::default();
+    let stale = Arc::new(Mutex::new(Vec::new()));
+
+    let writer = Writer::spawn_with_metrics(
+        ClickhouseSink {
+            db: db.clone(),
+            discovery: discovery.clone(),
+            last_flush: last_flush.clone(),
+            stale: stale.clone(),
+        },
         config.flush_rows,
         Duration::from_millis(config.flush_interval_ms),
+        metrics.clone(),
     );
+
+    let gate = WriterGate {
+        writer: writer.handle(),
+        visible: {
+            let db = db.clone();
+            Box::new(move || {
+                Box::pin(wait_until_visible(
+                    db.clone(),
+                    last_flush.clone(),
+                ))
+            })
+        },
+        adopt: {
+            let db = db.clone();
+            let discovery = discovery.clone();
+            Box::new(move |epoch| {
+                db.set_epoch(epoch);
+                discovery.set_epoch(epoch);
+            })
+        },
+    };
+
+    let purger = Purger::new(
+        Arc::new(ClickhouseReorgStore::new(db.clone(), Scope::Chain)),
+        Arc::new(gate),
+        Arc::new(NoBlockKeyedCaches),
+        Arc::new(metrics.clone()),
+    );
+
+    let mut reorg_config =
+        ReorgConfig::new(config.chain_id, config.start_block);
+    reorg_config.max_reorg_depth = config.max_reorg_depth;
+
+    let decode_state = DecodeState {
+        registries: modules::known_registries(&db, enabled).await?,
+    };
 
     let mut indexer = Indexer {
         settings: SyncSettings {
@@ -171,25 +458,53 @@ pub async fn run(config: Config) -> Result<()> {
             end_block: config.end_block,
             confirmations: config.confirmations,
             new_blocks_only: config.new_blocks_only,
+            tip_interval: Duration::from_millis(
+                config.flush_interval_ms.saturating_mul(2),
+            ),
         },
-        progress: db,
-        source,
-        tokens,
+        progress: db.clone(),
+        source: runtime.source,
         writer,
-        detector: ReorgDetector::default(),
+        guard: ReorgGuard::new(
+            reorg_config,
+            runtime.canonical,
+            purger.clone(),
+        ),
+        purger,
+        modules: enabled,
+        decode_state,
+        discovery: Some(discovery),
+        metrics: metrics.clone(),
+        committed: Vec::new(),
+        stale,
     };
 
+    // 1. Stop the stream ...
     let result = tokio::select! {
         result = indexer.sync() => result,
-        _ = shutdown_signal() => {
+        _ = runtime.shutdown => {
             info!("Shutdown requested, flushing buffered rows.");
             Ok(())
         }
+        reason = async {
+            match fatal.wait_for(|reason| reason.is_some()).await {
+                Ok(reason) => reason.clone().unwrap_or_default(),
+                // The lease task ended without a verdict: never fatal.
+                Err(_) => std::future::pending().await,
+            }
+        } => Err(anyhow::anyhow!(reason)),
     };
 
-    // Flushes what is buffered. If the writer died its error is the root
-    // cause (the sync loop only sees "writer stopped").
+    metrics.set_ready(false);
+
+    // 2. ... final flush (if the writer died its error is the root cause,
+    //    the sync loop only sees "writer stopped") ...
     let flushed = indexer.writer.shutdown().await;
+
+    // 3. ... then the workers, then the lease and the metrics endpoint.
+    workers.shutdown().await;
+    lease.release().await;
+    let _ = stop_metrics.send(true);
 
     match (result, flushed) {
         (_, Err(e)) => Err(e),
@@ -197,7 +512,7 @@ pub async fn run(config: Config) -> Result<()> {
     }
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -230,9 +545,9 @@ fn pass_backoff(failures: u32) -> Duration {
 /// Exclusive block the indexer wants to reach right now.
 ///
 /// `head` is the exclusive bound of the blocks the source can serve. The
-/// newest `confirmations` blocks are left alone: reorgs are only detected,
-/// never repaired, so a block must not be stored while it can still be
-/// replaced. An explicit `end_block` (exclusive) caps the result.
+/// newest `confirmations` blocks are left alone: a reorg no deeper than
+/// that never touches a stored block. An explicit `end_block` (exclusive)
+/// caps the result.
 fn target_block(head: u64, confirmations: u64, end_block: u64) -> u64 {
     let confirmed = head.saturating_sub(confirmations);
 
@@ -243,6 +558,46 @@ fn target_block(head: u64, confirmations: u64, end_block: u64) -> u64 {
     }
 }
 
+/// Errors no retry can fix: a flush that failed for good, a reorg deeper
+/// than `--max-reorg-depth`, another network under this chain id, ...
+fn is_fatal(error: &anyhow::Error) -> bool {
+    WriterStopped::is_cause_of(error)
+        || error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<ReorgError>())
+            .any(ReorgError::is_fatal)
+}
+
+/// Adds `range` to the ordered, merged list of committed ranges.
+fn remember(committed: &mut Vec<BlockRange>, range: BlockRange) {
+    if range.is_empty() {
+        return;
+    }
+
+    committed.push(range);
+    committed.sort_unstable_by_key(|r| r.from);
+
+    let mut merged: Vec<BlockRange> = Vec::with_capacity(committed.len());
+    for range in committed.drain(..) {
+        match merged.last_mut() {
+            Some(last) if range.from <= last.to => {
+                last.to = last.to.max(range.to)
+            }
+            _ => merged.push(range),
+        }
+    }
+
+    *committed = merged;
+}
+
+/// How a pass ended.
+enum PassOutcome {
+    /// Everything below this block is stored.
+    Covered(u64),
+    /// A rollback happened: continue from this block.
+    RolledBack(u64),
+}
+
 impl<S: BlockSource, P: Progress> Indexer<S, P> {
     async fn sync(&mut self) -> Result<()> {
         let end_block = self.settings.end_block;
@@ -251,6 +606,13 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
         // Startup errors are fatal (bad token, wrong url...). Later ones
         // are retried forever.
         let mut head = self.source.head().await?;
+        self.saw_head(head);
+
+        // The writer stamps the epoch the chain is at.
+        let epoch = self.guard.startup().await?;
+        if epoch > 0 {
+            info!("Chain {}: epoch {epoch}.", self.settings.chain_id);
+        }
 
         // Everything below the cursor is known to be stored.
         let mut cursor = if self.settings.new_blocks_only {
@@ -275,27 +637,46 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
         );
 
         let mut failures: u32 = 0;
+        let mut last_tip_commit: Option<tokio::time::Instant> = None;
 
         loop {
             let target = target_block(head, confirmations, end_block);
 
-            if target > cursor {
+            let at_tip = target.saturating_sub(cursor) <= TIP_PASS_BLOCKS;
+            let paced = at_tip
+                && end_block == 0
+                && last_tip_commit.is_some_and(|at| {
+                    at.elapsed() < self.settings.tip_interval
+                });
+
+            if target > cursor && !paced {
                 match self.pass(BlockRange::new(cursor, target)).await {
-                    Ok(covered_until) => {
+                    Ok(PassOutcome::Covered(covered_until)) => {
                         failures = 0;
                         cursor = covered_until;
+                        self.metrics.set_ready(true);
+                        if at_tip {
+                            last_tip_commit =
+                                Some(tokio::time::Instant::now());
+                        }
                     }
-                    // Fatal, never retried: a flush failed for good.
-                    Err(e) if WriterStopped::is_cause_of(&e) => {
-                        return Err(e)
+                    Ok(PassOutcome::RolledBack(fork_point)) => {
+                        failures = 0;
+                        cursor = cursor.min(fork_point);
+                        continue;
                     }
+                    // Fatal, never retried.
+                    Err(e) if is_fatal(&e) => return Err(e),
                     Err(e) => {
                         failures = failures.saturating_add(1);
+                        self.metrics.stream_error();
                         let wait = pass_backoff(failures);
                         warn!("Sync pass failed: {e:#}. Retrying in {wait:?}.");
                         tokio::time::sleep(wait).await;
                     }
                 }
+            } else if target <= cursor {
+                self.metrics.set_ready(true);
             }
 
             if end_block > 0 && cursor >= end_block {
@@ -303,25 +684,60 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
                 return Ok(());
             }
 
-            if cursor >= target {
+            if cursor >= target || paced {
                 tokio::time::sleep(HEAD_POLL_INTERVAL).await;
             }
 
             match self.source.head().await {
                 // The head never moves backwards for our purposes.
-                Ok(new_head) => head = head.max(new_head),
+                Ok(new_head) => {
+                    head = head.max(new_head);
+                    self.saw_head(head);
+                }
                 Err(e) => warn!("Could not fetch the chain head: {e:#}"),
             }
         }
     }
 
-    /// Indexes every missing block of `range` and returns the block up to
-    /// which the range is now known to be fully stored.
-    async fn pass(&mut self, range: BlockRange) -> Result<u64> {
-        let missing = self.progress.missing_ranges(range).await?;
+    /// Every successful head poll: the idle-time sign of life of
+    /// `/readyz`, and what lets the RPC layer reject nodes that lag.
+    fn saw_head(&self, head: u64) {
+        self.metrics.set_head(head.saturating_sub(1));
+        if let Some(discovery) = &self.discovery {
+            discovery.set_head(head.saturating_sub(1));
+        }
+    }
+
+    /// Indexes every missing block of `range`.
+    async fn pass(&mut self, range: BlockRange) -> Result<PassOutcome> {
+        if let Some(from) = self.purge_stale_flushes().await? {
+            return Ok(PassOutcome::RolledBack(from));
+        }
+
+        let mut missing = self.progress.missing_ranges(range).await?;
+
+        // No read-your-writes: what this process committed is not a gap,
+        // whatever a lagging read says.
+        missing.ranges = subtract_ranges(&missing.ranges, &self.committed);
+
+        // Gap healing (first inspection of a range since startup only):
+        // orphan children of a flush that died before its `blocks` rows
+        // are purged BEFORE the range is streamed, or the aggregates
+        // would count them twice.
+        let gaps: Vec<(u64, u64)> =
+            missing.ranges.iter().map(|r| (r.from, r.to)).collect();
+
+        let healed = self.guard.begin_pass(&gaps, range.to).await?;
+        if healed > 0 {
+            info!(
+                "Chain {}: healed {healed} gap range(s) left by an \
+                 interrupted write.",
+                self.settings.chain_id
+            );
+        }
 
         if missing.ranges.is_empty() {
-            return Ok(missing.covered_until);
+            return Ok(PassOutcome::Covered(missing.covered_until));
         }
 
         let blocks: u64 = missing.ranges.iter().map(BlockRange::len).sum();
@@ -333,11 +749,19 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
             );
         }
 
-        let mut streamed = Ok(());
+        let mut streamed = Ok(None);
+        let mut delivered: Vec<BlockRange> = Vec::new();
 
         for missing_range in &missing.ranges {
-            streamed = self.stream_range(*missing_range).await;
-            if streamed.is_err() {
+            let mut reached = missing_range.from;
+
+            streamed = self
+                .stream_range(*missing_range, range.to, &mut reached)
+                .await;
+
+            delivered.push(BlockRange::new(missing_range.from, reached));
+
+            if !matches!(streamed, Ok(None)) {
                 break;
             }
         }
@@ -349,15 +773,26 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
 
         // The writer's failure wins: it is fatal, a stream error is not.
         flushed?;
-        streamed?;
 
-        Ok(missing.covered_until)
+        for range in delivered {
+            remember(&mut self.committed, range);
+        }
+
+        match streamed? {
+            Some(rollback) => Ok(rollback),
+            None => Ok(PassOutcome::Covered(missing.covered_until)),
+        }
     }
 
-    async fn stream_range(&mut self, range: BlockRange) -> Result<()> {
+    /// Streams `range`. `Ok(Some(..))` when a rollback ended the pass.
+    /// `reached` is the block up to which rows went to the writer.
+    async fn stream_range(
+        &mut self,
+        range: BlockRange,
+        pass_end: u64,
+        reached: &mut u64,
+    ) -> Result<Option<PassOutcome>> {
         debug!("Streaming {range}.");
-
-        self.seed_detector(range.from).await;
 
         let mut responses = self.source.stream(range).await?;
         let mut cursor = range.from;
@@ -378,82 +813,149 @@ impl<S: BlockSource, P: Progress> Indexer<S, P> {
 
             let covered = BlockRange::new(cursor, next_block);
             let chain = self.settings.chain_id;
+            let enabled = self.modules;
             let data = response.data;
+            let mut state = std::mem::take(&mut self.decode_state);
 
-            // CPU bound: keep it off the async workers.
-            let transformed = tokio::task::spawn_blocking(move || {
-                transform::transform(chain, &data, covered)
-            })
-            .await
-            .context("transform task panicked")??;
+            // CPU bound: keep it off the async workers. The decode state
+            // travels with it and comes back, error or not.
+            let (transformed, state) =
+                tokio::task::spawn_blocking(move || {
+                    let transformed = transform::transform_with(
+                        chain, &data, covered, enabled, &mut state,
+                    );
+                    (transformed, state)
+                })
+                .await
+                .context("transform task panicked")?;
 
-            if let Some(guard) = &response.rollback_guard {
-                if let Some(evidence) = self.detector.check_guard(guard) {
-                    warn_reorg(&evidence);
-                }
+            self.decode_state = state;
+            let transformed = transformed?;
+
+            // BEFORE the rows go to the writer: do they build on what is
+            // stored / was streamed? A failing lookup is an error (the
+            // pass is retried), never "no evidence".
+            let headers: Vec<BlockHeader> = transformed
+                .rows
+                .blocks
+                .iter()
+                .map(|block| BlockHeader {
+                    number: block.number,
+                    hash: block.hash,
+                    parent_hash: block.parent_hash,
+                    timestamp: block.timestamp,
+                })
+                .collect();
+
+            let stream_guard =
+                response.rollback_guard.as_ref().map(|guard| {
+                    StreamGuard {
+                        first_block: guard.first_block_number,
+                        first_parent_hash: hash_to_b256(
+                            &guard.first_parent_hash,
+                        ),
+                    }
+                });
+
+            let verdict = self
+                .guard
+                .observe(&headers, stream_guard.as_ref())
+                .await?;
+
+            if let Verdict::Rollback(rollback) = verdict {
+                // The response is dropped: it belongs to the new fork and
+                // is streamed again from the fork point.
+                drop(responses);
+                return self.roll_back(rollback).await.map(Some);
             }
 
-            for evidence in self.detector.observe(&transformed.rows.blocks)
-            {
-                warn_reorg(&evidence);
+            // Never awaits, never blocks: bounded queues, drop-on-full.
+            if let Some(discovery) = &self.discovery {
+                discovery.tokens_seen(&transformed.tokens_seen);
             }
 
-            let mut rows = transformed.rows;
-            rows.tokens =
-                self.resolve_tokens(transformed.tokens_seen).await;
-
-            self.writer.send(rows).await?;
+            self.writer.send(transformed.rows).await?;
 
             cursor = next_block;
+            *reached = cursor;
         }
 
         if cursor != range.to {
             bail!("HyperSync stream for {range} ended early at {cursor}");
         }
 
-        Ok(())
-    }
-
-    /// Makes sure the detector knows the hash of block `from - 1` when that
-    /// block was stored by an earlier run. Best effort.
-    async fn seed_detector(&mut self, from: u64) {
-        if from == 0 || self.detector.knows_parent_of(from) {
-            return;
+        // A gap below stored blocks was filled: is the block right above
+        // it still canonical?
+        if range.to < pass_end {
+            if let Verdict::Rollback(rollback) =
+                self.guard.check_join(range.to).await?
+            {
+                return self.roll_back(rollback).await.map(Some);
+            }
         }
 
-        match self.progress.block_hash(from - 1).await {
-            Ok(Some(hash)) => self.detector.seed(from - 1, hash),
-            Ok(None) => {}
-            Err(e) => debug!("Could not load hash of {}: {e:#}", from - 1),
-        }
+        Ok(None)
     }
 
-    /// Metadata rows for the tokens not known yet. The resolver keeps track
-    /// of what is known / in flight (until `mark_stored` after the flush),
-    /// so the same token is not resolved again for every batch.
-    async fn resolve_tokens(
-        &self,
-        seen: HashMap<Address, TokenStandard>,
-    ) -> Vec<DatabaseToken> {
-        if seen.is_empty() {
-            return Vec::new();
+    async fn roll_back(
+        &mut self,
+        rollback: crate::reorg::Rollback,
+    ) -> Result<PassOutcome> {
+        let started = std::time::Instant::now();
+        let report = self.guard.repair(&rollback).await?;
+
+        self.forget_committed(rollback.fork_point, rollback.purge_to);
+
+        warn!(
+            "Chain {}: rolled back blocks [{}, {}): {} blocks, {} rows, \
+             {} checkpoints tombstoned, aggregates rebuilt from unix time \
+             {}; epoch is now {} ({:?}). Resuming from block {}.",
+            self.settings.chain_id,
+            rollback.fork_point,
+            rollback
+                .purge_to
+                .map_or("head".to_string(), |to| to.to_string()),
+            report.blocks_tombstoned,
+            report.children_tombstoned,
+            report.checkpoints_tombstoned,
+            report.from_ts.unwrap_or_default(),
+            report.epoch,
+            started.elapsed(),
+            rollback.fork_point,
+        );
+
+        Ok(PassOutcome::RolledBack(rollback.fork_point))
+    }
+
+    fn forget_committed(&mut self, from: u64, to: Option<u64>) {
+        let purged = BlockRange::new(from, to.unwrap_or(u64::MAX));
+        self.committed = subtract_ranges(&self.committed, &[purged]);
+    }
+
+    /// See [`ClickhouseSink::stale`]. Returns the lowest purged block.
+    async fn purge_stale_flushes(&mut self) -> Result<Option<u64>> {
+        let stale: Vec<BlockRange> =
+            std::mem::take(&mut *self.stale.lock().unwrap());
+
+        let mut lowest = None;
+
+        for range in stale {
+            self.purger
+                .purge_range(
+                    self.settings.chain_id,
+                    range.from,
+                    Some(range.to),
+                    PurgeReason::GapHeal,
+                )
+                .await?;
+            self.forget_committed(range.from, Some(range.to));
+            lowest = Some(
+                lowest.map_or(range.from, |low: u64| low.min(range.from)),
+            );
         }
 
-        self.tokens.resolve_new(&seen).await
+        Ok(lowest)
     }
-}
-
-fn warn_reorg(evidence: &ReorgEvidence) {
-    warn!(
-        "REORG DETECTED at block {}: its parent hash is {:?} but block {} \
-         was indexed with hash {:?}. Data at or below block {} may belong \
-         to an abandoned fork. No automatic rewind is performed.",
-        evidence.block_number,
-        evidence.actual_parent,
-        evidence.block_number.saturating_sub(1),
-        evidence.expected_parent,
-        evidence.block_number.saturating_sub(1),
-    );
 }
 
 #[cfg(test)]

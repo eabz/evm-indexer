@@ -66,11 +66,20 @@ impl WriterStopped {
 enum Message {
     Rows(Box<RowBatch>),
     Barrier(oneshot::Sender<()>),
+    /// Final flush, then the task ends (handles may still exist).
+    Stop,
 }
 
 pub struct Writer {
-    tx: mpsc::Sender<Message>,
+    handle: WriterHandle,
     task: JoinHandle<Result<()>>,
+}
+
+/// Sending side of the writer. Cheap to clone; the reorg logic holds one
+/// to quiesce the writer before a purge.
+#[derive(Clone)]
+pub struct WriterHandle {
+    tx: mpsc::Sender<Message>,
     metrics: Metrics,
 }
 
@@ -102,9 +111,35 @@ impl Writer {
             flush_interval,
             metrics.clone(),
         ));
-        Self { tx, task, metrics }
+        Self { handle: WriterHandle { tx, metrics }, task }
     }
 
+    pub fn handle(&self) -> WriterHandle {
+        self.handle.clone()
+    }
+
+    /// See [`WriterHandle::send`].
+    pub async fn send(&self, rows: RowBatch) -> Result<()> {
+        self.handle.send(rows).await
+    }
+
+    /// See [`WriterHandle::barrier`].
+    pub async fn barrier(&self) -> Result<()> {
+        self.handle.barrier().await
+    }
+
+    /// Flushes what is left and returns the writer's final result (the
+    /// flush error if it stopped early).
+    pub async fn shutdown(self) -> Result<()> {
+        // Ignored on purpose: a closed channel means the task already
+        // ended, and its result is what is returned below.
+        let _ = self.handle.tx.send(Message::Stop).await;
+        drop(self.handle);
+        self.task.await.context("writer task panicked")?
+    }
+}
+
+impl WriterHandle {
     /// Queues rows (whole blocks). Waits while the writer is busy. Fails
     /// when the writer stopped because a flush failed.
     pub async fn send(&self, rows: RowBatch) -> Result<()> {
@@ -139,13 +174,6 @@ impl Writer {
         // flush failed and the writer task is returning its error.
         done.await.map_err(|_| WriterStopped.into())
     }
-
-    /// Flushes what is left and returns the writer's final result (the
-    /// flush error if it stopped early).
-    pub async fn shutdown(self) -> Result<()> {
-        drop(self.tx);
-        self.task.await.context("writer task panicked")?
-    }
 }
 
 async fn run<S: Sink>(
@@ -170,10 +198,13 @@ async fn run<S: Sink>(
 
         match message {
             // Interval elapsed.
-            None => flush(&sink, &mut buffer, &mut deadline, &metrics).await?,
-            // Every sender is gone: final flush.
-            Some(None) => {
-                return flush(&sink, &mut buffer, &mut deadline, &metrics).await;
+            None => {
+                flush(&sink, &mut buffer, &mut deadline, &metrics).await?
+            }
+            // Shutdown, or every sender is gone: final flush.
+            Some(None) | Some(Some(Message::Stop)) => {
+                return flush(&sink, &mut buffer, &mut deadline, &metrics)
+                    .await;
             }
             Some(Some(Message::Rows(mut rows))) => {
                 buffer.append(&mut rows);
@@ -183,7 +214,8 @@ async fn run<S: Sink>(
                 }
 
                 if buffer.rows() >= flush_rows {
-                    flush(&sink, &mut buffer, &mut deadline, &metrics).await?;
+                    flush(&sink, &mut buffer, &mut deadline, &metrics)
+                        .await?;
                 }
             }
             Some(Some(Message::Barrier(ack))) => {
@@ -224,11 +256,7 @@ async fn flush<S: Sink>(
     }
     .await;
 
-    metrics.flush_observed(
-        started.elapsed(),
-        rows,
-        stored.is_ok(),
-    );
+    metrics.flush_observed(started.elapsed(), rows, stored.is_ok());
 
     if let Err(e) = stored {
         error!("Flush failed, stopping: {e:#}");

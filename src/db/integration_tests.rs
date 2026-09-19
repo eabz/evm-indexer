@@ -517,15 +517,24 @@ async fn stores_and_reads_back_every_table() {
     const CHAIN: u64 = 990_001;
     let database = database(CHAIN).await;
 
-    let mut batch = rows_at(CHAIN, 10, 13, FULL, 3);
-    batch.tokens.push(DatabaseToken {
-        address: Address::from(ERC20),
-        name: "Token".into(),
-        symbol: "TKN".into(),
-        decimals: 18,
-        r#type: "ERC20".into(),
-        chain: CHAIN,
-    });
+    let batch = rows_at(CHAIN, 10, 13, FULL, 3);
+
+    // Token rows are not part of a flush any more: the token worker
+    // inserts them through the same insert path.
+    database
+        .insert_rows(
+            "tokens",
+            &[DatabaseToken {
+                address: Address::from(ERC20),
+                name: "Token".into(),
+                symbol: "TKN".into(),
+                decimals: 18,
+                r#type: "ERC20".into(),
+                chain: CHAIN,
+            }],
+        )
+        .await
+        .unwrap();
 
     database.store(&batch).await.unwrap();
 

@@ -37,7 +37,9 @@ impl std::fmt::Display for BlockRange {
 
 /// Row of `checkpoints`: `[from_block, to_block)` was committed by one
 /// flush (written AFTER its `blocks` rows; docs/design.md, section 3).
-#[derive(Debug, Clone, Copy, Row, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Row, Serialize, Deserialize, PartialEq, Eq,
+)]
 pub struct DatabaseCheckpoint {
     pub chain: u64,
     pub from_block: u64,
@@ -62,10 +64,8 @@ pub fn contiguous_ranges(
     for number in numbers {
         match ranges.last_mut() {
             Some(last) if last.to == number => last.to = number + 1,
-            _ => ranges.push(BlockRange::new(
-                number,
-                number.saturating_add(1),
-            )),
+            _ => ranges
+                .push(BlockRange::new(number, number.saturating_add(1))),
         }
     }
 
@@ -117,8 +117,10 @@ pub fn subtract_ranges(
         result = result
             .into_iter()
             .flat_map(|range| {
-                let left = BlockRange::new(range.from, range.to.min(cut.from));
-                let right = BlockRange::new(range.from.max(cut.to), range.to);
+                let left =
+                    BlockRange::new(range.from, range.to.min(cut.from));
+                let right =
+                    BlockRange::new(range.from.max(cut.to), range.to);
                 [left, right]
             })
             .filter(|range| !range.is_empty())
@@ -317,7 +319,10 @@ mod tests {
             vec![r(0, 3), r(5, 10)]
         );
         assert_eq!(
-            subtract_ranges(&[r(0, 10), r(20, 30)], &[r(8, 25), r(28, 40)]),
+            subtract_ranges(
+                &[r(0, 10), r(20, 30)],
+                &[r(8, 25), r(28, 40)]
+            ),
             vec![r(0, 8), r(25, 28)]
         );
         assert_eq!(

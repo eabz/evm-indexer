@@ -915,7 +915,8 @@ mod tests {
         batch.blocks.push(block_row(6, 6, 5));
         batch.logs.push(log_with(&[], vec![]));
 
-        batch.modules = crate::pipeline::modules::test_support::dex_rows(1, 5);
+        batch.modules =
+            crate::pipeline::modules::test_support::dex_rows(1, 5);
 
         batch.set_version(1_234);
         batch.set_epoch(7);

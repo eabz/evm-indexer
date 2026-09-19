@@ -3,7 +3,11 @@
 //! HyperSync or ClickHouse.
 
 use super::*;
-use crate::db::ranges::{assemble_missing_ranges, GapRow, RangeStats};
+use crate::{
+    db::ranges::{assemble_missing_ranges, GapRow, RangeStats},
+    reorg::{NoHooks, ReorgRecord, ReorgStore},
+};
+use alloy::primitives::B256;
 use hypersync_client::{format::Hash, simple_types::Block};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -90,9 +94,151 @@ impl Progress for MemoryStore {
 
         Ok(assemble_missing_ranges(range, stats, &gaps, 10_000))
     }
+}
 
-    async fn block_hash(&self, number: u64) -> Result<Option<B256>> {
-        Ok(self.blocks.lock().unwrap().get(&number).copied())
+/// The store as the reorg guard sees it: blocks only, never any orphan,
+/// nothing to purge (the purge logic has its own in-memory model and
+/// tests in `crate::reorg`).
+impl ReorgStore for MemoryStore {
+    fn current_epoch(&self, _: u64) -> BoxFuture<'_, Result<u32>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn stored_head(&self, _: u64) -> BoxFuture<'_, Result<Option<u64>>> {
+        Box::pin(async {
+            Ok(self.blocks.lock().unwrap().keys().next_back().copied())
+        })
+    }
+
+    fn stored_hashes(
+        &self,
+        _: u64,
+        from: u64,
+        to: u64,
+    ) -> BoxFuture<'_, Result<Vec<(u64, B256)>>> {
+        Box::pin(async move {
+            Ok(self
+                .blocks
+                .lock()
+                .unwrap()
+                .range(from..to)
+                .map(|(number, hash)| (*number, *hash))
+                .collect())
+        })
+    }
+
+    fn has_orphan_children(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn min_timestamp(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+    ) -> BoxFuture<'_, Result<Option<u32>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn live_children(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn live_blocks(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn live_checkpoints(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn tombstone_checkpoints(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+        _: u64,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn tombstone_children(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+        _: u64,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn insert_reorg<'a>(
+        &'a self,
+        _: &'a ReorgRecord,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn rebuild_derived(
+        &self,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: u64,
+        _: Option<u64>,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn tombstone_blocks(
+        &self,
+        _: u64,
+        _: u64,
+        _: Option<u64>,
+        _: u64,
+    ) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+}
+
+impl CanonicalChain for MockSource {
+    fn headers(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> BoxFuture<'_, Result<Vec<BlockHeader>>> {
+        Box::pin(async move {
+            Ok((from..to)
+                .map(|number| BlockHeader {
+                    number,
+                    hash: B256::new(hash_of(number)),
+                    parent_hash: B256::new(hash_of(
+                        number.wrapping_sub(1),
+                    )),
+                    timestamp: 0,
+                })
+                .collect())
+        })
     }
 }
 
@@ -207,19 +353,42 @@ async fn indexer(
     store: MemoryStore,
     settings: SyncSettings,
 ) -> Indexer<MockSource, MemoryStore> {
+    let writer = Writer::spawn(
+        store.clone(),
+        1_000_000,
+        Duration::from_secs(3_600),
+    );
+
+    let gate = WriterGate {
+        writer: writer.handle(),
+        visible: Box::new(|| Box::pin(async { Ok(()) })),
+        adopt: Box::new(|_| {}),
+    };
+
+    let purger = Purger::new(
+        Arc::new(store.clone()),
+        Arc::new(gate),
+        Arc::new(NoHooks),
+        Arc::new(NoHooks),
+    );
+
     Indexer {
         settings,
-        progress: store.clone(),
-        source,
-        tokens: TokenResolver::new(settings.chain_id, None, None)
-            .await
-            .unwrap(),
-        writer: Writer::spawn(
-            store,
-            1_000_000,
-            Duration::from_secs(3_600),
+        progress: store,
+        guard: ReorgGuard::new(
+            ReorgConfig::new(settings.chain_id, settings.start_block),
+            Arc::new(source.clone()),
+            purger.clone(),
         ),
-        detector: ReorgDetector::default(),
+        purger,
+        source,
+        writer,
+        modules: EnabledModules::default(),
+        decode_state: DecodeState::default(),
+        discovery: None,
+        metrics: Metrics::disabled(),
+        committed: Vec::new(),
+        stale: Default::default(),
     }
 }
 
@@ -230,6 +399,7 @@ fn settings(start_block: u64, end_block: u64) -> SyncSettings {
         end_block,
         confirmations: 0,
         new_blocks_only: false,
+        tip_interval: Duration::ZERO,
     }
 }
 
@@ -324,6 +494,7 @@ async fn new_blocks_only_starts_at_the_current_head() {
             end_block: 110,
             confirmations: 0,
             new_blocks_only: true,
+            tip_interval: Duration::ZERO,
         },
     )
     .await;
