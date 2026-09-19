@@ -60,6 +60,14 @@ fn parse_chain(value: &str) -> Result<u64, String> {
     ))
 }
 
+/// `--start-date` / `--from-date`: `YYYY-MM-DD`, read as midnight UTC.
+///
+/// The whole parser is [`crate::coverage::date::Date::parse`], which is
+/// strict on purpose: this value fixes a chain's coverage floor for good.
+fn parse_date(value: &str) -> Result<crate::coverage::date::Date, String> {
+    crate::coverage::date::Date::parse(value)
+}
+
 /// Boolean flags are driven from the environment by docker-compose, which
 /// passes every variable even when blank. So `DEBUG=false`, `DEBUG=0` and
 /// `DEBUG=` must all mean "off" instead of failing to parse.
@@ -342,8 +350,30 @@ pub struct BackfillArgs {
 
     // No env fallback on purpose: START_BLOCK / END_BLOCK of a compose
     // file describe the sync, not a one-off backfill.
-    #[arg(long, help = "First block to re-decode.", default_value_t = 0)]
+    #[arg(
+        long,
+        visible_alias = "start-block",
+        help = "First block to re-decode. Below the chain's coverage floor this LOWERS the floor, once the range is complete and verified.",
+        default_value_t = 0
+    )]
     pub from_block: u64,
+
+    #[arg(
+        long,
+        visible_alias = "start-date",
+        conflicts_with = "from_block",
+        value_parser = parse_date,
+        help = "First DAY to re-decode, as YYYY-MM-DD in UTC. The block form of --from-block."
+    )]
+    pub from_date: Option<crate::coverage::date::Date>,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        value_parser = parse_flag,
+        help = "Prediction markets only: fetch the metadata and the settlement events of markets created BELOW the coverage floor, from the module's own trusted addresses. No trades are stored outside the covered window."
+    )]
+    pub registry_only: bool,
 
     #[arg(
         long,
@@ -427,10 +457,19 @@ pub struct IndexerArgs {
     #[arg(
         long,
         env = "START_BLOCK",
-        help = "Block to start syncing.",
+        help = "Block to start syncing. Only read on a chain's FIRST start: it sets the coverage floor, which is then fixed (see --start-date and the README).",
         default_value_t = 0
     )]
     pub start_block: u64,
+
+    #[arg(
+        long,
+        env = "START_DATE",
+        conflicts_with = "start_block",
+        value_parser = parse_date,
+        help = "First DAY to index, as YYYY-MM-DD in UTC, resolved to a block by a binary search over block timestamps. Only read on a chain's FIRST start: it sets the coverage floor, which is then fixed. With neither this nor --start-block, an EVM chain starts one year ago and Solana starts at the head."
+    )]
+    pub start_date: Option<crate::coverage::date::Date>,
 
     #[arg(
         long,
@@ -545,6 +584,10 @@ pub struct Config {
     pub rpc_url: Option<String>,
     pub redis_url: Option<String>,
     pub start_block: u64,
+    /// `--start-date`, if it was given instead of `--start-block`. Both are
+    /// read ONLY on a chain's first start; after that the stored coverage
+    /// floor wins (docs/design.md section 16).
+    pub start_date: Option<crate::coverage::date::Date>,
     /// Exclusive. 0 = follow the chain head.
     pub end_block: u64,
     /// Blocks to stay behind the chain head.
@@ -594,9 +637,14 @@ pub struct BackfillConfig {
     pub chain_id: u64,
     pub database_url: String,
     pub from_block: u64,
+    /// `--from-date`, if it was given instead of `--from-block`.
+    pub from_date: Option<crate::coverage::date::Date>,
     /// Exclusive. 0 = up to the highest indexed block.
     pub to_block: u64,
     pub chunk_blocks: u64,
+    /// `--registry-only`: the prediction-markets history pass of
+    /// docs/design.md section 16, not a re-decode of stored logs.
+    pub registry_only: bool,
     pub debug: bool,
 }
 
@@ -650,6 +698,7 @@ impl TryFrom<IndexerArgs> for Config {
             rpc_url: non_empty(args.rpc),
             redis_url: non_empty(args.redis),
             start_block: args.start_block,
+            start_date: args.start_date,
             end_block: args.end_block,
             confirmations: args.confirmations,
             max_reorg_depth: args.max_reorg_depth,
@@ -673,8 +722,10 @@ impl From<BackfillArgs> for BackfillConfig {
             chain_id: args.chain,
             database_url: args.database,
             from_block: args.from_block,
+            from_date: args.from_date,
             to_block: args.to_block,
             chunk_blocks: args.chunk_blocks.max(1),
+            registry_only: args.registry_only,
             debug: args.debug,
         }
     }
@@ -791,7 +842,7 @@ impl TryFrom<Cli> for Command {
 /// `ADMIN_PASSWORD` is deliberately NOT here: it is read directly by
 /// `src/admin`, never by clap, so it cannot end up in a help text, a
 /// `--help` default or a `Debug` print of the parsed arguments.
-const ENV_VARS: [&str; 22] = [
+const ENV_VARS: [&str; 23] = [
     "ADMIN_ADDR",
     "FLEET_MAX_INFLIGHT_MB",
     "SOLANA_QUERIES_PER_MINUTE",
@@ -802,6 +853,7 @@ const ENV_VARS: [&str; 22] = [
     "RPC_URL",
     "REDIS_URL",
     "START_BLOCK",
+    "START_DATE",
     "END_BLOCK",
     "CONFIRMATIONS",
     "MAX_REORG_DEPTH",
@@ -1166,6 +1218,115 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------ the coverage floor (section 16)
+
+    #[test]
+    fn a_start_date_is_read_as_a_utc_day() {
+        let config = parse_with_env(
+            &[],
+            &[&REQUIRED[..], &["--start-date", "2024-03-01"][..]].concat(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.start_date,
+            Some(crate::coverage::date::Date {
+                year: 2024,
+                month: 3,
+                day: 1
+            })
+        );
+        // The block form stays at its default: nothing has been resolved
+        // yet, and nothing here talks to a chain.
+        assert_eq!(config.start_block, 0);
+    }
+
+    /// They are two spellings of one decision, so giving both is a
+    /// question nobody can answer. Refused by clap, not by us.
+    #[test]
+    fn a_start_date_and_a_start_block_are_mutually_exclusive() {
+        let error =
+            parse_with_env(
+                &[],
+                &[
+                    &REQUIRED[..],
+                    &[
+                        "--start-block",
+                        "100",
+                        "--start-date",
+                        "2024-03-01",
+                    ][..],
+                ]
+                .concat(),
+            )
+            .expect_err("both were accepted");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{error}"
+        );
+
+        // And through the environment, which is how a compose file would
+        // do it by accident.
+        assert!(parse_with_env(
+            &[("START_BLOCK", "100"), ("START_DATE", "2024-03-01")],
+            &REQUIRED,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_date_that_is_not_one_is_refused_with_the_format() {
+        for bad in ["2024-3-1", "01/03/2024", "march", "2023-02-29"] {
+            let error = parse_with_env(
+                &[],
+                &[&REQUIRED[..], &["--start-date", bad][..]].concat(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{bad:?} was read as a date"));
+
+            assert!(
+                error.to_string().contains("YYYY-MM-DD"),
+                "{bad:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backfill_can_be_asked_for_by_date_and_for_the_registry_only() {
+        let command = parse_command(
+            &[],
+            &[
+                "backfill",
+                "--module",
+                "predictions",
+                "--database",
+                "http://default:pw@localhost:8123/indexer",
+                "--start-date",
+                "2023-06-01",
+                "--registry-only",
+            ],
+            false,
+        )
+        .unwrap();
+
+        let Command::Backfill(config) = command else {
+            panic!("expected a backfill, got {command:?}");
+        };
+
+        assert_eq!(
+            config.from_date,
+            Some(crate::coverage::date::Date {
+                year: 2023,
+                month: 6,
+                day: 1
+            })
+        );
+        assert!(config.registry_only);
+        assert_eq!(config.from_block, 0);
     }
 
     #[test]

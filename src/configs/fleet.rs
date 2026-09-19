@@ -210,6 +210,11 @@ pub const NOT_PANEL_EDITABLE: &[(&str, &str)] = &[
          first start and never moves silently afterwards",
     ),
     (
+        "start-date",
+        "the other half of --start-block: it fixes the same coverage \
+         floor, and lowering one is `indexer backfill`, not a web page",
+    ),
+    (
         "end-block",
         "it decides what is read, like the start block; a chain that \
          should stop somewhere is started that way",
@@ -529,6 +534,7 @@ mod tests {
             "chain",
             // The coverage floor (design section 16) never moves silently.
             "start-block",
+            "start-date",
             "end-block",
             "new-blocks-only",
         ] {
