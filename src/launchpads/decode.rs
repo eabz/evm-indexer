@@ -230,7 +230,12 @@ const MAX_CHARS: usize = 128;
 /// here and must stay data there. Same rule, and very nearly the same
 /// code, as `crate::predictions::text::sanitize`; the shared home is
 /// `src/utils` once a change may touch it.
-fn sanitize(text: &str) -> String {
+///
+/// Public so the Solana launchpad decoder (`svm::launchpads`) applies the
+/// SAME rule to the same columns: a pump.fun symbol carrying a bidi
+/// override is no less hostile than an EVM one, and two copies of this
+/// would drift.
+pub fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_CHARS * 4));
     let mut kept = 0usize;
     let mut pending_space = false;

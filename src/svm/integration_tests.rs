@@ -816,3 +816,536 @@ async fn a_liquidity_operation_never_reaches_the_swap_table() {
 
     db.drop().await;
 }
+
+// --- the SHARED launchpad_* tables ---------------------------------------
+//
+// These are the point of the module: the same four tables the EVM decoder
+// writes, with 32-byte Solana ids, through the real RowBinary path. A
+// hand-written `INSERT ... VALUES` would not exercise the serializers, and
+// the serializers are where a 32-byte pubkey or a 64-byte signature goes
+// wrong (`models.rs` records one that reached a live ClickHouse).
+
+/// Writes the launchpad rows the way a flush does.
+async fn store_launchpads(db: &Database, rows: &SvmRows) {
+    let pads = &rows.launchpads;
+    let key = FlushKey {
+        chain: CHAIN,
+        span: (
+            rows.slots.iter().map(|s| s.block_number).min().unwrap(),
+            rows.slots.iter().map(|s| s.block_number).max().unwrap(),
+        ),
+        version: rows.slots[0]._version,
+    };
+    // Parents first: a reader must never see a trade of a token whose
+    // launch row is not there yet (`launchpads::INSERT_ORDER`).
+    db.insert_flush("launchpad_tokens", &pads.tokens, &key)
+        .await
+        .expect("insert launchpad_tokens");
+    db.insert_flush("launchpad_trades", &pads.trades, &key)
+        .await
+        .expect("insert launchpad_trades");
+    db.insert_flush("launchpad_graduations", &pads.graduations, &key)
+        .await
+        .expect("insert launchpad_graduations");
+    db.insert_flush("launchpad_creator_fees", &pads.creator_fees, &key)
+        .await
+        .expect("insert launchpad_creator_fees");
+    db.insert_flush("sol_launchpad_configs", &pads.configs, &key)
+        .await
+        .expect("insert sol_launchpad_configs");
+    db.insert_flush("sol_token_balances", &pads.balances, &key)
+        .await
+        .expect("insert sol_token_balances");
+}
+
+/// Migration 0042's own tables and views exist and compose with everything
+/// before them.
+#[tokio::test]
+#[ignore]
+async fn the_launchpad_migration_applies_on_top_of_every_other_module() {
+    let db = TestDb::create().await;
+
+    for table in [
+        "sol_dex_programs",
+        "sol_launchpad_configs",
+        "sol_token_balances",
+        "sol_launchpad_token_holders_v",
+        "sol_launchpad_attribution_v",
+        // And the shared ones it writes into, which 0030 owns.
+        "launchpad_tokens",
+        "launchpad_trades",
+        "launchpad_graduations",
+        "launchpad_creator_fees",
+    ] {
+        let exists = db
+            .count(&format!(
+                "SELECT count() FROM system.tables WHERE database = '{}' \
+                 AND name = '{table}'",
+                db.name
+            ))
+            .await;
+        assert_eq!(exists, 1, "{table} was not created");
+    }
+
+    // The registry is OPERATOR data and migrations seed nothing.
+    assert_eq!(db.count("SELECT count() FROM sol_dex_programs").await, 0);
+
+    db.drop().await;
+}
+
+/// Solana launchpad rows go into the shared tables and come back out with
+/// every one of their 32 bytes.
+///
+/// `toString(FixedString)` and `CAST(id AS String)` TRIM TRAILING ZERO
+/// BYTES, so a pubkey that happens to end in a zero byte silently shortens
+/// - the reason every reader in this schema uses `substring(id, 1, 32)`.
+/// Asserting base58 round trips is what catches it.
+#[tokio::test]
+#[ignore]
+async fn launchpad_rows_round_trip_through_the_shared_tables() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+    let rows = all_rows();
+    assert!(
+        !rows.launchpads.tokens.is_empty()
+            && !rows.launchpads.trades.is_empty()
+            && !rows.launchpads.graduations.is_empty(),
+        "the recorded fixtures must cover all three row kinds"
+    );
+    store(&database, &rows).await;
+    store_launchpads(&database, &rows).await;
+
+    db.settle(
+        "SELECT count() FROM launchpad_tokens FINAL",
+        rows.launchpads.tokens.len() as u64,
+    )
+    .await;
+    db.settle(
+        "SELECT count() FROM launchpad_trades FINAL",
+        rows.launchpads.trades.len() as u64,
+    )
+    .await;
+
+    // A launch, printed the way migration 0006 says to print an 'svm' id.
+    let launch = rows
+        .launchpads
+        .tokens
+        .iter()
+        .find(|row| row.family == "pumpfun")
+        .expect("a pump.fun launch");
+    let token = db
+        .scalar(&format!(
+            "SELECT base58Encode(substring(token, 1, 32)) \
+             FROM launchpad_tokens FINAL \
+             WHERE chain = {CHAIN} AND token = unhex('{}')",
+            hex::encode(launch.token)
+        ))
+        .await;
+    assert_eq!(token, to_base58(&launch.token));
+
+    let curve = db
+        .scalar(&format!(
+            "SELECT base58Encode(substring(curve, 1, 32)) \
+             FROM launchpad_tokens FINAL \
+             WHERE chain = {CHAIN} AND token = unhex('{}')",
+            hex::encode(launch.token)
+        ))
+        .await;
+    assert_eq!(curve, to_base58(&launch.curve));
+
+    // A 64-byte signature in the shared `tx_id String`, which a
+    // FixedString(32) could not have held.
+    let signature = db
+        .scalar(&format!(
+            "SELECT base58Encode(tx_id) FROM launchpad_tokens FINAL \
+             WHERE chain = {CHAIN} AND token = unhex('{}')",
+            hex::encode(launch.token)
+        ))
+        .await;
+    assert_eq!(signature, bs58::encode(&launch.tx_id).into_string());
+    assert_eq!(
+        db.count(&format!(
+            "SELECT length(tx_id) FROM launchpad_tokens FINAL \
+             WHERE chain = {CHAIN} AND token = unhex('{}')",
+            hex::encode(launch.token)
+        ))
+        .await,
+        64
+    );
+
+    db.drop().await;
+}
+
+/// The graduation row's `pool_id` JOINS the swap rows the DEX decoder
+/// wrote. This is the query a token page runs to keep charting after the
+/// curve is gone, and the whole reason the two modules share a database.
+#[tokio::test]
+#[ignore]
+async fn a_graduation_joins_the_pool_the_dex_decoder_wrote() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+    let rows = all_rows();
+    store(&database, &rows).await;
+    store_launchpads(&database, &rows).await;
+    db.settle(
+        "SELECT count() FROM launchpad_graduations FINAL",
+        rows.launchpads.graduations.len() as u64,
+    )
+    .await;
+
+    let graduation = rows
+        .launchpads
+        .graduations
+        .iter()
+        .find(|row| row.pool_id != crate::svm::models::ZERO_PUBKEY)
+        .expect("a graduation naming its destination pool");
+
+    // A pubkey is a NATIVE 32 byte id, so the join is direct: no padding,
+    // no truncation, no cast.
+    let pool = db
+        .scalar(&format!(
+            "SELECT base58Encode(substring(pool_id, 1, 32)) \
+             FROM launchpad_graduations FINAL \
+             WHERE chain = {CHAIN} AND token = unhex('{}')",
+            hex::encode(graduation.token)
+        ))
+        .await;
+    assert_eq!(pool, to_base58(&graduation.pool_id));
+
+    // And the join itself runs, with the swap table on the other side.
+    let joined = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_graduations AS g FINAL \
+             LEFT JOIN sol_dex_swaps AS s FINAL ON s.pool_id = g.pool_id \
+             WHERE g.chain = {CHAIN} AND g.token = unhex('{}')",
+            hex::encode(graduation.token)
+        ))
+        .await;
+    assert!(joined >= 1, "the join produced no row at all");
+
+    db.drop().await;
+}
+
+/// The config account survives the `launch_config_id UInt256` column it
+/// shares with EVM, and the documented SQL brings it back.
+///
+/// `reinterpretAsFixedString` writes the integer's LITTLE ENDIAN memory, so
+/// the `reverse()` is not decoration - without it every config account
+/// comes back byte-reversed and joins nothing.
+#[tokio::test]
+#[ignore]
+async fn a_config_account_survives_the_numeric_column() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+    let rows = all_rows();
+    store(&database, &rows).await;
+    store_launchpads(&database, &rows).await;
+    db.settle(
+        "SELECT count() FROM launchpad_tokens FINAL",
+        rows.launchpads.tokens.len() as u64,
+    )
+    .await;
+
+    let launch = rows
+        .launchpads
+        .tokens
+        .iter()
+        .find(|row| row.family == "meteora_dbc")
+        .expect("a Meteora DBC launch");
+    let expected =
+        crate::svm::launchpads::u256_as_config(launch.launch_config_id);
+
+    let config = db
+        .scalar(&format!(
+            "SELECT base58Encode(reverse(reinterpretAsFixedString(\
+             launch_config_id))) FROM launchpad_tokens FINAL \
+             WHERE chain = {CHAIN} AND token = unhex('{}')",
+            hex::encode(launch.token)
+        ))
+        .await;
+    assert_eq!(
+        config,
+        to_base58(&expected),
+        "the config account did not survive the numeric column; without \
+         reverse() it comes back byte-reversed"
+    );
+
+    db.drop().await;
+}
+
+/// The trust views behave for Solana rows.
+///
+/// On Solana the emitter is the PROGRAM, which cannot be forged, so an
+/// operator lists three rows and every real curve follows:
+/// `launchpad_trusted_curves_v` is the listed singletons UNION every curve
+/// a listed emitter announced. Nothing about the view changes - this
+/// asserts the Solana rows satisfy it.
+#[tokio::test]
+#[ignore]
+async fn the_trust_views_accept_solana_rows() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+    let rows = all_rows();
+    store(&database, &rows).await;
+    store_launchpads(&database, &rows).await;
+    db.settle(
+        "SELECT count() FROM launchpad_tokens FINAL",
+        rows.launchpads.tokens.len() as u64,
+    )
+    .await;
+
+    // With NO trusted emitter, a headline view must yield nothing:
+    // missing numbers, never wrong ones.
+    let before = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_trusted_curves_v \
+             WHERE chain = {CHAIN}"
+        ))
+        .await;
+    assert_eq!(before, 0, "a curve was trusted with no emitter listed");
+
+    // The operator's three rows, exactly as the README ships them.
+    for venue in
+        [Venue::PumpFun, Venue::MeteoraDbc, Venue::RaydiumLaunchlab]
+    {
+        db.client()
+            .query(&format!(
+                "INSERT INTO launchpad_trusted_emitters \
+                 (chain, emitter, family, label) VALUES \
+                 ({CHAIN}, unhex('{}'), '{}', 'live')",
+                hex::encode(pubkey(venue.program_b58())),
+                match venue {
+                    Venue::PumpFun => "pumpfun",
+                    Venue::MeteoraDbc => "meteora_dbc",
+                    _ => "raydium_launchlab",
+                }
+            ))
+            .execute()
+            .await
+            .expect("insert a trusted emitter");
+    }
+
+    // Now every curve a listed program announced is trusted - and that is
+    // the set a forger cannot enter, because it cannot emit as the
+    // program.
+    let trusted = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_trusted_curves_v \
+             WHERE chain = {CHAIN}"
+        ))
+        .await;
+    assert!(
+        trusted >= rows.launchpads.tokens.len() as u64,
+        "only {trusted} curves are trusted for {} launches",
+        rows.launchpads.tokens.len()
+    );
+
+    // And the token page returns the launch rather than nothing.
+    let launch = rows
+        .launchpads
+        .tokens
+        .iter()
+        .find(|row| row.family == "pumpfun")
+        .expect("a pump.fun launch");
+    let rows_for_token = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_token_v(chain = {CHAIN}, \
+             token = '{}')",
+            hex::encode(launch.token)
+        ))
+        .await;
+    assert_eq!(
+        rows_for_token, 1,
+        "the token page returned nothing for a trusted Solana launch"
+    );
+
+    db.drop().await;
+}
+
+/// The Solana holder view answers where the EVM one structurally cannot.
+///
+/// `launchpad_token_holders_v` sums `erc20_transfers`, whose columns are
+/// `FixedString(20)`; it PADS them up to 32 bytes, so a pubkey finds no row
+/// - the right failure, but still no answer. `sol_token_balances` reads the
+/// post balance validator metadata already carries.
+#[tokio::test]
+#[ignore]
+async fn the_solana_holder_view_answers_where_the_evm_one_cannot() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+    let rows = all_rows();
+    store(&database, &rows).await;
+    store_launchpads(&database, &rows).await;
+    db.settle(
+        "SELECT count() FROM sol_token_balances FINAL",
+        rows.launchpads.balances.len() as u64,
+    )
+    .await;
+
+    let balance = rows
+        .launchpads
+        .balances
+        .iter()
+        .find(|row| row.balance > alloy::primitives::U256::ZERO)
+        .expect("a non-zero holder balance");
+    let token = hex::encode(balance.mint);
+
+    // The EVM holder view finds nothing for a pubkey, and that is by
+    // design: it pads a 20-byte address up to 32 rather than truncating a
+    // 32-byte one down, so a Solana mint simply matches no row.
+    let evm = db
+        .count(&format!(
+            "SELECT count() FROM launchpad_token_holders_all_v(\
+             chain = {CHAIN}, token = '{token}', \
+             as_of_block = 18446744073709551615)"
+        ))
+        .await;
+    assert_eq!(evm, 0, "the EVM holder view must not answer for a pubkey");
+
+    // The Solana one does.
+    let holders = db
+        .count(&format!(
+            "SELECT count() FROM sol_launchpad_token_holders_v(\
+             chain = {CHAIN}, token = '{token}', \
+             as_of_block = 18446744073709551615)"
+        ))
+        .await;
+    assert!(holders >= 1, "the Solana holder view returned nothing");
+
+    db.drop().await;
+}
+
+/// `sol_dex_programs` names a program, and the decoder uses that name.
+///
+/// The registry can only ADD knowledge: an unlisted program keeps its
+/// built-in name, so a fresh database decodes exactly as before. Both
+/// halves are asserted, because "configuration that can only help" is a
+/// claim worth testing.
+#[tokio::test]
+#[ignore]
+async fn the_program_registry_renames_a_venue_and_nothing_else() {
+    use crate::svm::registry::{ProgramNames, SolDexProgram, LOAD_SQL};
+
+    let db = TestDb::create().await;
+
+    db.client()
+        .query(&format!(
+            "INSERT INTO sol_dex_programs \
+             (program_id, name, kind, confidence, source) VALUES \
+             (unhex('{}'), 'pumpswap_amm', 'venue', 100, 'its own IDL')",
+            hex::encode(pubkey(Venue::PumpSwap.program_b58()))
+        ))
+        .execute()
+        .await
+        .expect("insert a program");
+
+    let loaded: Vec<SolDexProgram> = db
+        .client()
+        .query(LOAD_SQL)
+        .fetch_all()
+        .await
+        .expect("read sol_dex_programs");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].kind, "venue");
+    assert_eq!(loaded[0].confidence, 100);
+    // The 32 bytes survived the FixedString(32) round trip.
+    assert_eq!(
+        loaded[0].program_id,
+        pubkey(Venue::PumpSwap.program_b58())
+    );
+
+    let names = ProgramNames::new(loaded);
+    let batches: Vec<SvmSlotBatch> = fixtures::all()
+        .iter()
+        .map(|fixture| SvmSlotBatch {
+            slot: fixture.slot,
+            blockhash: fixture.blockhash,
+            parent_slot: fixture.parent_slot,
+            parent_blockhash: fixture.parent_blockhash,
+            block_height: 0,
+            timestamp: fixture.timestamp(),
+            transactions: vec![fixture.transaction.clone()],
+        })
+        .collect();
+    let renamed = svm::decode_with(CHAIN, &batches, &names);
+
+    let pumpswap = renamed
+        .swaps
+        .iter()
+        .filter(|swap| swap.protocol == "pumpswap_amm")
+        .count();
+    assert!(pumpswap > 0, "the operator's name was not applied");
+    assert_eq!(
+        renamed
+            .swaps
+            .iter()
+            .filter(|swap| swap.protocol == Venue::PumpSwap.as_str())
+            .count(),
+        0,
+        "the built-in name survived the override"
+    );
+    // Every other venue is untouched.
+    assert!(
+        renamed
+            .swaps
+            .iter()
+            .any(|swap| swap.protocol == Venue::PumpFun.as_str()),
+        "an unlisted program lost its built-in name"
+    );
+
+    db.drop().await;
+}
+
+/// The front-end attribution join runs end to end, and a launch with no
+/// listed front end still reads perfectly - a front end is attribution,
+/// never a precondition.
+#[tokio::test]
+#[ignore]
+async fn a_launch_is_attributed_to_its_front_end_or_to_nobody() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+    let rows = all_rows();
+    store(&database, &rows).await;
+    store_launchpads(&database, &rows).await;
+    db.settle(
+        "SELECT count() FROM launchpad_tokens FINAL",
+        rows.launchpads.tokens.len() as u64,
+    )
+    .await;
+
+    // Every launch is readable, named front end or not.
+    let all = db
+        .count(&format!(
+            "SELECT count() FROM sol_launchpad_attribution_v \
+             WHERE chain = {CHAIN}"
+        ))
+        .await;
+    assert_eq!(all, rows.launchpads.tokens.len() as u64);
+
+    // Now name one. The fee claimer is chain data (the venue's own
+    // EvtCreateConfig); the NAME is the operator's.
+    if let Some(config) = rows.launchpads.configs.first() {
+        db.client()
+            .query(&format!(
+                "INSERT INTO launchpad_frontends \
+                 (chain, address, name, kind) VALUES \
+                 ({CHAIN}, unhex('{}'), 'a DBC partner', 'fee_recipient')",
+                hex::encode(config.fee_claimer)
+            ))
+            .execute()
+            .await
+            .expect("insert a front end");
+
+        let named = db
+            .count(&format!(
+                "SELECT count() FROM sol_launchpad_attribution_v \
+                 WHERE chain = {CHAIN} AND frontend_name != ''"
+            ))
+            .await;
+        println!(
+            "  {named} launches attributed to a named front end out of {all}"
+        );
+    }
+
+    db.drop().await;
+}

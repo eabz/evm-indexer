@@ -298,13 +298,20 @@ Streamed today, with their 30-day volume share
 | Orca Whirlpools | 10.0% | log line | 100% |
 | Raydium AMM v4 + CPMM + CLMM | 9.5% | log line | 100% / 100% / 100% |
 | Meteora DLMM | 8.0% | self-CPI | 100% |
-| pump.fun curve | 3.2% | self-CPI | 98.2% |
-| Meteora DAMM v2 | 0.4% | self-CPI | 99.3% |
+| pump.fun curve | 3.2% | self-CPI | **100%** (was 98.2%) |
+| Meteora DAMM v2 | 0.4% | self-CPI | 98.7% |
+| Meteora DBC | 0.3% | self-CPI | 99.8% |
+| Raydium LaunchLab | 0.2% | self-CPI | 100% |
 
-Measured over 150 arbitrary recent slots and 14,418 swaps; 99.8% of all rows
+Measured over 150 arbitrary recent slots and ~14,000 swaps; 99.8% of all rows
 were confirmed by their venue's own event. 15 swaps per venue, 120 in total,
 were then recomputed from the public Solana RPC's validator metadata and
 matched exactly.
+
+The two new entries are LAUNCHPADS whose curve is also the market until
+migration, exactly like pump.fun's. They are registered as venues for that
+reason and their launches, trades, graduations and fee sweeps go into the
+shared `launchpad_*` tables as well — see *Launchpads*, below.
 
 **Adding one is still one line in `programs::VENUES` plus a name.** The
 generic layer needs nothing else — that is the whole point of the two-layer
@@ -312,15 +319,235 @@ design, and the Jupiter fixture test proves it by decoding venues that are
 not streamed. A per-program decoder is then optional, and only buys exact
 fees and pool state.
 
-### What is still out of reach, and why
+### The prop AMMs, and `sol_dex_programs`
 
 The prop / "dark" AMMs — BisonFi, HumidiFi, Tessera, Scorch, QuantumAMM,
 GoonFi, AlphaQ, Deriverse, SolFi V2 and the rest, together **~32% of the
 chain** (§1.3) — publish no IDL and, for most of them, no event at all. They
 need no new decoding work: the movement layer already handles them, and
 `BisonFi` is registered in `Venue::ALL` and decodes correctly in the Jupiter
-fixture test. What they need is a judgement about promoting a program to a
-venue, because the generic rule identifies token movement perfectly and "this
-was a trade on a market" only probabilistically (§3.2, last row). Until
-`sol_dex_programs` exists as a curated registry, adding them is a decision
-about false positives, not a decoding problem.
+fixture test.
+
+What they need is a **judgement**, because the generic rule identifies token
+movement perfectly and "this was a trade on a market" only probabilistically
+(§3.2, last row): staking, lending and NFT sales also move two mints across
+one counterparty. Promoting a program to a venue is a false-positive
+decision, and a false positive here is a fabricated market on somebody's
+screen.
+
+`sol_dex_programs` (migration `0042`) is where that judgement lives —
+operator data, with a stated confidence and a stated source, revisable
+without a release, exactly like `quote_tokens` and `dex_trusted_emitters`.
+**Migrations seed nothing**; the rows below are ready to run.
+
+Venues with a per-program decoder in this module. Every id round-trips
+through base58 in `programs.rs`'s own unit test, so a typo here is a test
+failure rather than a filter that silently matches nothing.
+
+```sql
+INSERT INTO sol_dex_programs (program_id, name, kind, confidence, source) VALUES
+  (toFixedString(base58Decode('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA'), 32), 'pumpswap',          'venue', 100, 'public IDL; decoder in svm/events.rs'),
+  (toFixedString(base58Decode('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'), 32), 'pump_fun',          'venue', 100, 'public IDL; decoder in svm/events.rs'),
+  (toFixedString(base58Decode('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'), 32), 'raydium_amm_v4',    'venue', 100, 'raydium-io/raydium-amm'),
+  (toFixedString(base58Decode('CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C'), 32), 'raydium_cpmm',      'venue', 100, 'raydium-io/raydium-cp-swap'),
+  (toFixedString(base58Decode('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK'), 32), 'raydium_clmm',      'venue', 100, 'raydium-io/raydium-clmm'),
+  (toFixedString(base58Decode('whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc'), 32), 'orca_whirlpool',    'venue', 100, 'orca-so/whirlpools'),
+  (toFixedString(base58Decode('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo'), 32), 'meteora_dlmm',      'venue', 100, 'MeteoraAg/dlmm-sdk'),
+  (toFixedString(base58Decode('cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG'), 32), 'meteora_damm_v2',   'venue', 100, 'MeteoraAg/damm-v2'),
+  (toFixedString(base58Decode('dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN'), 32), 'meteora_dbc',       'venue', 100, 'MeteoraAg/dynamic-bonding-curve v0.2.1 SOURCE - its on-chain IDL is STALE'),
+  (toFixedString(base58Decode('LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj'), 32), 'raydium_launchlab', 'venue', 100, 'the deployed program on-chain IDL 0.2.0 - raydium-io/raydium-idl is STALE');
+```
+
+Prop AMMs: real markets, no IDL, decoded by the movement layer alone.
+Confidence below 100 because "this program is a market" rests on observation
+rather than on a published format — which is exactly what the column is for.
+
+```sql
+INSERT INTO sol_dex_programs (program_id, name, kind, confidence, source) VALUES
+  (toFixedString(base58Decode('BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi'), 32), 'bisonfi',   'prop_amm', 90, 'docs/solana-research.md appendix B; decodes in the Jupiter fixture test'),
+  (toFixedString(base58Decode('9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp'), 32), 'humidifi',  'prop_amm', 80, 'docs/solana-research.md section 2; obfuscated data, 2 SPL transfers a swap'),
+  (toFixedString(base58Decode('TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH'), 32), 'tessera_v', 'prop_amm', 80, 'docs/solana-research.md section 2; free-text S-00 log only');
+```
+
+Routers. **Attribution only**: 40% of Solana DEX volume is routed, so
+counting a router's instruction as a trade would double count almost half
+the chain.
+
+```sql
+INSERT INTO sol_dex_programs (program_id, name, kind, confidence, source) VALUES
+  (toFixedString(base58Decode('JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'), 32), 'jupiter_v6', 'router', 100, 'docs/solana-research.md section 1.2'),
+  (toFixedString(base58Decode('FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9'), 32), 'axiom',      'router',  90, 'docs/launchpads-research.md section 2.1');
+```
+
+A row sets the `protocol` NAME a swap of that program is stored under. It
+does **not** add the program to the streaming query — that is still one line
+in `programs::VENUES`, because a streamed program costs bandwidth on every
+slot for ever and that is a different decision from naming one. An unlisted
+program keeps its built-in name, so the table can only ever ADD knowledge:
+`the_program_registry_renames_a_venue_and_nothing_else` asserts both halves.
+
+## Launchpads
+
+pump.fun, Meteora DBC and Raydium LaunchLab write into the **same**
+`launchpad_tokens` / `launchpad_trades` / `launchpad_graduations` /
+`launchpad_creator_fees` as every EVM chain (docs/design.md §11). One UI
+screen shows a launch, its curve trades, its graduation and then its
+PumpSwap candles continuously, because the graduation row's `pool_id` IS
+the `sol_dex_swaps.pool_id` the DEX decoder writes.
+
+Nothing in `src/launchpads/**` changed shape to make that work. Those tables
+have been `FixedString(32)` with a raw `tx_id String` and a
+`(chain, block_number, tx_index, ordinal)` position key since migration
+`0030`, so a pubkey, a 64-byte signature and a packed instruction path fit
+as they are.
+
+| Family | Program | Launch | Trades | Graduation | Fees |
+|---|---|---|---|---|---|
+| `pumpfun` | `6EF8rrec…F6P` | `CreateEvent` | `TradeEvent` | `CompletePumpAmmMigrationEvent`, **names the pool** | `CollectCreatorFeeEvent` |
+| `meteora_dbc` | `dbcij3LW…aqN` | `EvtInitializePool` | `EvtSwap2`, **carries curve progress** | `EvtCurveComplete`, names no pool | `EvtClaim*TradingFee`, `Evt*WithdrawSurplus` |
+| `raydium_launchlab` | `LanMV9sA…3uj` | `PoolCreateEvent` | `TradeEvent` | `pool_status = Migrate` on the trade | — |
+
+### Trust on Solana is STRUCTURAL, not a registry
+
+On EVM anyone can deploy a contract that emits `TokenLaunched`, which is why
+`launchpad_trusted_emitters` exists. On Solana the emitter is the **program
+id**, which the runtime stamps on every instruction and which cannot be
+forged. So:
+
+* `launchpad_tokens.emitter` is the **program**, and an operator lists
+  exactly three of them;
+* `launchpad_tokens.curve` — and `launchpad_trades.emitter` — is the **curve
+  account**: the bonding curve, the DBC virtual pool, the LaunchLab pool
+  state. `launchpad_trusted_curves_v` is the listed singletons UNION every
+  curve a listed emitter announced, so it works unchanged and a trade joins
+  its token exactly as it does on EVM.
+
+```sql
+INSERT INTO launchpad_trusted_emitters (chain, emitter, family, label) VALUES
+  (1399811149, toFixedString(base58Decode('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'), 32), 'pumpfun',           'pump.fun bonding curve'),
+  (1399811149, toFixedString(base58Decode('dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN'), 32), 'meteora_dbc',       'Meteora Dynamic Bonding Curve'),
+  (1399811149, toFixedString(base58Decode('LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj'), 32), 'raydium_launchlab', 'Raydium LaunchLab');
+```
+
+Three rows, and every real curve on the chain follows from them.
+`the_trust_views_accept_solana_rows` asserts both directions: with none of
+them listed a headline view yields **nothing** — missing numbers, never
+wrong ones — and with all three the token page returns its launch.
+
+And there is something EVM has no equivalent of. Every curve account is a
+**Program Derived Address of the launch's own fields**, so the decoder
+re-derives it and compares:
+
+| Family | Seeds |
+|---|---|
+| pump.fun | `["bonding-curve", mint]` |
+| Raydium LaunchLab | `["pool", base_mint, quote_mint]` |
+| Meteora DBC | `["pool", config, max(mints), min(mints)]` |
+
+A launch whose curve does not re-derive is **refused and counted**
+(`LaunchpadDiagnostics::curve_not_derived`), never written. That is also
+what makes reading LaunchLab's mint out of an account META safe: the event
+names neither mint, so the index is proposed and then *proved*. Live over
+400 slots the counter is 0.
+
+One thing that is NOT program derived: a **Meteora DBC config**, because
+`create_config` takes it as a signer keypair. Nothing may use the off-curve
+test to decide whether an account belongs to a venue — that rule holds for
+pools and curves only, and a unit test pins it.
+
+### Front ends are attribution, never venues
+
+bags.fm, StonkFun, BONK.fun / LetsBonk, Jupiter Studio and the rest are not
+programs. They are **configurations** of one of these three
+(docs/launchpads-research.md §4.2), and the only thing on chain that names
+one is the config account's fee claimer.
+
+* A DBC launch names its `config`, a LaunchLab launch its `platform_config`
+  — **not** the `config` field of `PoolCreateEvent`, which is the GLOBAL
+  config and identical for every launch. Using that one would attribute the
+  whole venue to a single front end.
+* Both go into `launchpad_tokens.launch_config_id`, as 32 big-endian bytes
+  in the `UInt256` column the schema shares with EVM. Read it back with
+  `reverse(reinterpretAsFixedString(launch_config_id))` — the `reverse()`
+  is not decoration, because `reinterpretAsFixedString` writes the
+  integer's little-endian memory.
+* `sol_launchpad_configs` maps a DBC config to its `fee_claimer`, filled
+  from the venue's own `EvtCreateConfig(V2)`. An operator gives that
+  address a NAME in `launchpad_frontends`, and
+  `sol_launchpad_attribution_v` is the join.
+
+A launch with no listed front end still reads perfectly: attribution is
+never a precondition, and front-end volume PARTITIONS a venue's rather than
+adding to it.
+
+### The pump.fun disagreement, and what it turned out to be
+
+Phase 2 reported 98.2% agreement on the pump.fun curve and left the rest
+unexplained. Measured per INSTRUCTION rather than per row — the interesting
+cases produced no row at all and so never reached the statistic — it was
+**two** things, and neither was fee accounting:
+
+1. **Non-SOL quote mints.** pump.fun now runs curves quoted in USDC, BONK
+   and other pump tokens. `TradeEvent.sol_amount` is then **0** and the real
+   leg is `quote_mint` / `quote_amount`, which sit behind two
+   variable-length Borsh fields (`ix_name: String`, `shareholders:
+   Vec<Shareholder>`, 34 bytes an element) — exactly the fields the decoder
+   refused to parse past. 4.3–11.5% of curve instructions.
+2. **Both sides of the trade are PDAs.** When a bot VAULT buys, the taker is
+   off the ed25519 curve too, so `resolve_pool`'s curve test cannot break a
+   swap's local symmetry and the row was dropped `unclassified`. 9.7–13.3%.
+
+Both are fixed. `PumpFunTrade` walks the tail and `quote_leg()` returns WSOL
+and `sol_amount` on a SOL curve or the tail's own mint and amount otherwise;
+the tail is OPTIONAL, because pump.fun appends fields and an older event is
+simply shorter. The two-sided path now proposes both readings and lets the
+venue's event pick, as the native-leg path always did — and still refuses
+the row when no event settles it, counting it in the new
+`Diagnostics::ambiguous_pool`.
+
+**Result, live: 100.00% agreement, zero disagreements.** Per curve
+instruction over 150 slots: 911 agreed, 4 dropped (0.32%, all ambiguous
+native legs), 351 genuinely not trades (`extend_account`,
+`close_user_volume_accumulator`, `claim_cashback_v2`, `create_v2`).
+
+### What in the launchpads module assumed EVM
+
+Everything found, and what happened to it:
+
+| Assumption | Where | Status |
+|---|---|---|
+| Identity columns are 20-byte addresses padded by `SerId32` | `launchpads/models.rs` row structs | **Rust only.** The COLUMNS were always `FixedString(32)`. `svm/launchpads.rs` has twin structs with `Pubkey` ids and identical column NAMES; `the_solana_rows_have_the_evm_columns` asserts the two lists are equal |
+| `Family` is a closed enum of EVM decoders | `launchpads/models.rs` | Left alone. `SolFamily` is its Solana counterpart and a test keeps the two vocabularies disjoint, so no EVM test moves |
+| `tx_id` is a 32-byte hash, read with `tx_hash_of` | `LaunchpadRows::attach_transactions` | Not used on Solana: the fee payer is in the transaction the decoder already has, so nothing needs a second lookup |
+| Holders come from `erc20_transfers` | `launchpad_token_holders_v` (0032) | **The one real gap.** That view pads a 20-byte address up to 32, so a pubkey finds no row — the right failure, but no answer. `sol_token_balances` + `sol_launchpad_token_holders_v` (0042) answer it from `account_activity` post balances, which are validator metadata, so a balance is READ rather than accumulated |
+| A `pool_kind` of `pool_address` means "strip 12 bytes" | `launchpad_graduations` | Solana rows always say `pool_id`: a pubkey is a native 32-byte id and a reader must never strip anything |
+| `launch_config_id` is a number | `launchpad_tokens` | Holds a 32-byte account big-endian. Documented above, pinned by a ClickHouse test |
+| Printing an id as `0x…` | every view | Already handled: the views take the format from `chains.family`, and this module registers `(1399811149, 'solana', 'svm')` |
+
+The only change made inside `src/launchpads/**` is that `decode::sanitize`
+is now `pub`, so the Solana decoder applies the same hostile-text rule to
+the same columns instead of growing a second copy. No EVM behaviour moves
+and its tests are untouched.
+
+### What is still missing, and why
+
+* **A DBC or LaunchLab graduation names no destination pool.** Both
+  programs' migration instructions emit *nothing at all* — verified against
+  DBC's source at the deployed commit and LaunchLab's own on-chain IDL. The
+  row is written with `pool_id` zero, which the schema already means as "not
+  known", rather than guessing at an account meta index. pump.fun's
+  `CompletePumpAmmMigrationEvent` does name its pool, so the join is proven
+  there.
+* **DBC launches carry no name, symbol or URI.** They live in a Metaplex
+  metadata account, and this pipeline serves no account reads. Empty, never
+  guessed.
+* **A DBC trade's `trader` is the fee payer.** Its event names no user at
+  all, so the row puts the fee payer in both `trader` and `caller` and says
+  so. pump.fun names the beneficiary and is exact.
+* **pump.fun's graduation threshold** is a curve parameter in the program,
+  not a field of any event, so `graduation_threshold` is 0 for that family.
+  LaunchLab states its own; DBC's is in the config.
+* **Nothing is wired to the pipeline yet** — same as the rest of this
+  module (docs/solana-research.md §11.5). `svm::decode` produces the rows;
+  `svm::SHARED_BASE_TABLES` and `launchpads::INSERT_ORDER` say how to write
+  them.

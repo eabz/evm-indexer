@@ -41,6 +41,18 @@ const RECORDED: &str = include_str!("fixtures/recorded.json");
 /// phase 2 venues publish their swap event only as a log line.
 const PHASE2: &str = include_str!("fixtures/phase2.json");
 
+/// The launchpad recordings, in the same shape again.
+///
+/// | Name | Why it is here |
+/// |---|---|
+/// | `pumpfun_create` | a pump.fun LAUNCH. Three Borsh `String`s at the FRONT of `CreateEvent`, so nothing in it is at a fixed offset, and a bonding curve that must re-derive as the program's own PDA of the mint |
+/// | `pumpfun_multi_buy` | ONE transaction holding SEVERAL curve trades - a sniper's bundle. Each must stay its own row |
+/// | `pumpfun_graduation` | the curve moving into PumpSwap. Its `CompletePumpAmmMigrationEvent` NAMES the destination pool, which is the join key that keeps a token's chart going after the curve is gone |
+/// | `pumpfun_quote_curve` | a curve quoted in something other than SOL: `sol_amount` is 0 and the real leg is in the `TradeEvent` TAIL, behind a Borsh `String` and a `Vec` |
+/// | `dbc_launch` | a Meteora DBC launch, naming the partner CONFIG that attributes the front end |
+/// | `launchlab_launch` | a Raydium LaunchLab launch. `PoolCreateEvent` names NEITHER mint, so they come from account metas and are proved against the pool's PDA seeds |
+const LAUNCHPADS: &str = include_str!("fixtures/launchpads.json");
+
 #[derive(Debug, Deserialize)]
 struct RawFixture {
     name: String,
@@ -168,6 +180,10 @@ fn parse() -> Vec<Fixture> {
     raw.extend(
         serde_json::from_str::<Vec<RawFixture>>(PHASE2)
             .expect("fixtures/phase2.json parses"),
+    );
+    raw.extend(
+        serde_json::from_str::<Vec<RawFixture>>(LAUNCHPADS)
+            .expect("fixtures/launchpads.json parses"),
     );
 
     raw.into_iter()
@@ -318,7 +334,8 @@ mod tests {
     #[test]
     fn every_fixture_parses() {
         let fixtures = all();
-        assert_eq!(fixtures.len(), 9, "a fixture went missing");
+        // 5 phase 1 + 4 phase 2 + 6 launchpads.
+        assert_eq!(fixtures.len(), 15, "a fixture went missing");
         for fixture in fixtures {
             assert!(
                 !fixture.transaction.instructions.is_empty(),

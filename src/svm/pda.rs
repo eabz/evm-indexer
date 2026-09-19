@@ -212,10 +212,131 @@ fn sub_mod(a: U256, b: U256, modulus: U256) -> U256 {
     }
 }
 
+// --- deriving a PDA ------------------------------------------------------
+
+/// The suffix `create_program_address` hashes, which is what stops a PDA
+/// from ever colliding with a real ed25519 key derivation.
+const PDA_MARKER: &[u8] = b"ProgramDerivedAddress";
+
+/// `create_program_address`: `sha256(seeds || bump || program || marker)`,
+/// accepted only when the result is OFF the ed25519 curve.
+pub fn create_program_address(
+    seeds: &[&[u8]],
+    bump: u8,
+    program: &crate::svm::models::Pubkey,
+) -> Option<crate::svm::models::Pubkey> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for seed in seeds {
+        // The runtime refuses a seed longer than 32 bytes, so a caller
+        // that built one has a bug rather than an exotic address.
+        if seed.len() > 32 {
+            return None;
+        }
+        hasher.update(seed);
+    }
+    hasher.update([bump]);
+    hasher.update(program);
+    hasher.update(PDA_MARKER);
+
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    (!is_on_curve(&out)).then_some(out)
+}
+
+/// `find_program_address`: the canonical address for these seeds, i.e. the
+/// first bump counting DOWN from 255 that lands off the curve.
+///
+/// # Why a decoder wants this
+///
+/// It turns a launch from a CLAIM into a PROOF. A pump.fun bonding curve is
+/// `["bonding-curve", mint]`, a Raydium LaunchLab pool is
+/// `["pool", base_mint, quote_mint]`, a Meteora DBC pool is
+/// `["pool", config, max(mints), min(mints)]` - every one of them derived
+/// from the launch's own fields under a program id that cannot be forged.
+/// Re-deriving it and comparing against the account the instruction
+/// actually used says the row is internally consistent, with no registry
+/// and no RPC call. On EVM there is no equivalent: an address there carries
+/// no evidence of how it was made.
+pub fn find_program_address(
+    seeds: &[&[u8]],
+    program: &crate::svm::models::Pubkey,
+) -> Option<(crate::svm::models::Pubkey, u8)> {
+    for bump in (0..=255u8).rev() {
+        if let Some(address) = create_program_address(seeds, bump, program)
+        {
+            return Some((address, bump));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::svm::programs::pubkey;
+    use crate::svm::programs::{pubkey, to_base58};
+
+    /// Re-deriving the recorded fixture's bonding curve from its MINT is
+    /// the whole reason this function exists: it turns "the instruction
+    /// named this account" into "this account is the one the program's own
+    /// seeds produce for this mint".
+    #[test]
+    fn the_recorded_bonding_curve_is_the_pda_of_its_own_mint() {
+        let mint = pubkey(crate::svm::fixtures::PUMPFUN_SELL_MINT);
+        let program =
+            pubkey(crate::svm::programs::Venue::PumpFun.program_b58());
+
+        let (derived, bump) =
+            find_program_address(&[b"bonding-curve", &mint], &program)
+                .expect("a bump exists");
+
+        assert_eq!(
+            to_base58(&derived),
+            "HaJwBJYmFyBRxuVQe4Yr53wkkDQbWsDH8uC7S362y1Ew",
+            "the derived curve is not the one the transaction used"
+        );
+        // And the canonical bump really is the first one off the curve,
+        // counting down from 255.
+        for higher in (u16::from(bump) + 1)..=255 {
+            let higher = higher as u8;
+            assert!(
+                create_program_address(
+                    &[b"bonding-curve", &mint],
+                    higher,
+                    &program
+                )
+                .is_none(),
+                "bump {higher} is also valid, so {bump} is not canonical"
+            );
+        }
+    }
+
+    /// A derived address is always off the curve - that is the definition,
+    /// and it is what makes `is_on_curve` a usable classifier at all.
+    #[test]
+    fn a_derived_address_is_never_on_the_curve() {
+        let program =
+            pubkey(crate::svm::programs::Venue::PumpSwap.program_b58());
+        for seed in 0..16u8 {
+            let (address, _) =
+                find_program_address(&[b"pool", &[seed]], &program)
+                    .expect("a bump exists");
+            assert!(!is_on_curve(&address));
+        }
+    }
+
+    /// A seed the runtime itself would refuse must be refused here, not
+    /// hashed into a plausible looking address.
+    #[test]
+    fn an_over_long_seed_is_refused() {
+        let program = pubkey(crate::svm::programs::SYSTEM_B58);
+        assert!(
+            create_program_address(&[&[0u8; 33]], 255, &program).is_none()
+        );
+        assert!(find_program_address(&[&[0u8; 33]], &program).is_none());
+    }
 
     /// The two accounts the pump.fun fixture cannot tell apart by shape.
     ///
