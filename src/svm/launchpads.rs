@@ -339,8 +339,12 @@ pub struct SolLaunchpadConfig {
 /// is READ rather than accumulated, and a missed transfer cannot make it
 /// drift.
 ///
-/// `_version` is the POSITION, so the newest observation of an account wins
-/// a merge on its own and a replayed range cannot move a balance backwards.
+/// AN OBSERVATION, not a current balance: the row is keyed on the token
+/// account AND the position, so a batch adds observations and never
+/// overwrites one, and `sol_launchpad_token_holders_v` reads the newest at
+/// or below the block it is asked about. `_version` is the ordinary flush
+/// clock, which is what lets a purge tombstone these rows like any other
+/// child's (review round 4, MAJOR 12; the reasoning is in the migration).
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct SolTokenBalance {
@@ -358,16 +362,6 @@ pub struct SolTokenBalance {
     pub epoch: u32,
     pub _version: u64,
     pub is_deleted: u8,
-}
-
-/// `_version` for a balance: the slot in the high bits and the transaction
-/// index in the low ones, so a later observation always wins a merge.
-///
-/// 32 bits of transaction index is far more than Solana's ~5,000 per block
-/// needs, and a slot fits the remaining 32 until slot 4.29 billion - about
-/// 35 years at the current 0.266 s a slot.
-pub fn balance_version(slot: u64, tx_index: u32) -> u64 {
-    (slot << 32) | u64::from(tx_index)
 }
 
 /// A 32-byte account as the `UInt256` the shared `launch_config_id` column
@@ -452,9 +446,12 @@ impl SolLaunchpadRows {
         self.graduations.iter_mut().for_each(|r| r._version = version);
         self.creator_fees.iter_mut().for_each(|r| r._version = version);
         self.configs.iter_mut().for_each(|r| r._version = version);
-        // NOT stamped with the flush version: a balance's `_version` is its
-        // POSITION, so a replay of an older range can never overwrite a
-        // newer balance with a stale one.
+        // Balances too. They used to carry their POSITION instead, so that
+        // a latest-value projection could not be moved backwards by a
+        // replay; the table is an append log now, the position is in its
+        // sorting key, and the flush clock is what a purge's tombstones
+        // have to outrank (review round 4, MAJOR 12).
+        self.balances.iter_mut().for_each(|r| r._version = version);
     }
 
     pub fn set_epoch(&mut self, epoch: u32) {
@@ -1139,8 +1136,6 @@ fn collect_balances(position: &Position<'_>, rows: &mut SolLaunchpadRows) {
     mints.sort_unstable();
     mints.dedup();
 
-    let version = balance_version(position.tx.slot, position.tx.tx_index);
-
     for row in &position.tx.activity {
         let (Some(mint), Some(balance)) =
             (row.mint, row.post_token_balance)
@@ -1165,7 +1160,9 @@ fn collect_balances(position: &Position<'_>, rows: &mut SolLaunchpadRows) {
             tx_index: position.tx.tx_index,
             timestamp: position.timestamp,
             epoch: 0,
-            _version: version,
+            // Stamped by `set_version` with the flush's clock, like every
+            // other row of the batch.
+            _version: 0,
             is_deleted: 0,
         });
     }

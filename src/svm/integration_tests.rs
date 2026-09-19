@@ -273,15 +273,24 @@ async fn the_migrations_apply_on_top_of_every_other_module() {
 #[test]
 fn every_solana_table_with_a_block_number_is_classified() {
     let sql = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         include_str!("../../migrations/0040_solana_core.sql"),
-        include_str!("../../migrations/0041_solana_dex.sql")
+        include_str!("../../migrations/0041_solana_dex.sql"),
+        // 0043's `sol_token_balances` is block scoped too, and a purge
+        // has to reach it (review round 4, MAJOR 12).
+        include_str!("../../migrations/0043_solana_launchpads.sql")
     );
     let listed: std::collections::HashSet<&str> =
         svm::BASE_TABLES.iter().chain(svm::SIDE_TABLES).copied().collect();
 
     let mut found = 0;
     for table in crate::db::schema::tables_with_block_number(&sql) {
+        // `sol_launchpad_configs` records the block it learned a curve
+        // config at, but a config is CHAIN STATE that no fork changes -
+        // it is in `svm::UNSCOPED_TABLES` on purpose, like `sol_tokens`.
+        if svm::UNSCOPED_TABLES.contains(&table.as_str()) {
+            continue;
+        }
         assert!(
             listed.contains(table.as_str()),
             "{table} has a block_number column but is in neither \
@@ -624,9 +633,8 @@ async fn a_dust_swap_does_not_set_the_candle() {
         .swaps
         .iter()
         .find(|swap| {
-            let size = |amount: I256| {
-                amount.unsigned_abs().to::<u128>() >= 1_000
-            };
+            let size =
+                |amount: I256| amount.unsigned_abs().to::<u128>() >= 1_000;
             size(swap.amount0) && size(swap.amount1)
         })
         .expect("a recorded swap with two real legs")
@@ -1293,6 +1301,222 @@ async fn the_solana_holder_view_answers_where_the_evm_one_cannot() {
         ))
         .await;
     assert!(holders >= 1, "the Solana holder view returned nothing");
+
+    db.drop().await;
+}
+
+/// One wallet holding a mint in two SPL token accounts is ONE holder, and
+/// its holding is the sum of the two.
+///
+/// One owner can hold the same mint in as many token accounts as they like
+/// (a plain associated account, a second one opened by a bot, an escrow
+/// they own). The view used to `GROUP BY owner, balance`, which counts
+/// ACCOUNTS, not owners: two accounts became two holders with an
+/// understated position each - and two accounts holding the SAME amount
+/// collapsed into one row, losing half the holding outright (review round
+/// 4, MAJOR 11a).
+#[tokio::test]
+#[ignore]
+async fn one_owner_with_two_token_accounts_is_one_holder() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+
+    let mint = [0x11u8; 32];
+    let owner = [0x22u8; 32];
+    let other = [0x33u8; 32];
+    let balance = |account: Pubkey,
+                   owner: Pubkey,
+                   amount: u64,
+                   slot: u64|
+     -> crate::svm::launchpads::SolTokenBalance {
+        crate::svm::launchpads::SolTokenBalance {
+            chain: CHAIN,
+            mint,
+            owner,
+            account,
+            balance: alloy::primitives::U256::from(amount),
+            block_number: slot,
+            tx_index: 0,
+            timestamp: 1_800_000_000,
+            epoch: 0,
+            _version: next_version(),
+            is_deleted: 0,
+        }
+    };
+
+    // Two accounts of one owner holding the SAME amount - the case that
+    // used to lose half the position - plus a second owner.
+    let rows = vec![
+        balance([0xa1; 32], owner, 500, 100),
+        balance([0xa2; 32], owner, 500, 101),
+        balance([0xb1; 32], other, 250, 102),
+    ];
+    let key = FlushKey {
+        chain: CHAIN,
+        span: (100, 102),
+        version: rows[0]._version,
+    };
+    database
+        .insert_flush("sol_token_balances", &rows, &key)
+        .await
+        .expect("insert sol_token_balances");
+    db.settle("SELECT count() FROM sol_token_balances FINAL", 3).await;
+
+    let holders = format!(
+        "sol_launchpad_token_holders_v(chain = {CHAIN}, \
+         token = '{}', as_of_block = 18446744073709551615)",
+        hex::encode(mint)
+    );
+
+    assert_eq!(
+        db.count(&format!("SELECT count() FROM {holders}")).await,
+        2,
+        "the view counts token accounts rather than wallets"
+    );
+    assert_eq!(
+        db.number(&format!(
+            "SELECT balance_raw FROM {holders} ORDER BY balance_raw DESC \
+             LIMIT 1"
+        ))
+        .await,
+        1000.0,
+        "the two accounts of one wallet are not added up"
+    );
+
+    db.drop().await;
+}
+
+/// A holder list `as_of_block` is the list AS OF that block.
+///
+/// The old table kept one row per token account - the latest observation -
+/// and the view applied `block_number <= {as_of_block}` AFTER `FINAL`, so
+/// asking for a past block DROPPED every account that has traded since
+/// instead of showing what it held then (review round 4, MAJOR 11b).
+#[tokio::test]
+#[ignore]
+async fn the_holder_view_reads_the_balance_as_of_a_past_block() {
+    let db = TestDb::create().await;
+    let database = db.database().await;
+
+    let mint = [0x44u8; 32];
+    let owner = [0x55u8; 32];
+    let account = [0x66u8; 32];
+    let at =
+        |amount: u64, slot: u64| crate::svm::launchpads::SolTokenBalance {
+            chain: CHAIN,
+            mint,
+            owner,
+            account,
+            balance: alloy::primitives::U256::from(amount),
+            block_number: slot,
+            tx_index: 0,
+            timestamp: 1_800_000_000,
+            epoch: 0,
+            _version: next_version(),
+            is_deleted: 0,
+        };
+
+    // Bought at slot 100, sold out at slot 200.
+    let rows = vec![at(900, 100), at(0, 200)];
+    let key = FlushKey {
+        chain: CHAIN,
+        span: (100, 200),
+        version: rows[0]._version,
+    };
+    database
+        .insert_flush("sol_token_balances", &rows, &key)
+        .await
+        .expect("insert sol_token_balances");
+    db.settle("SELECT count() FROM sol_token_balances FINAL", 2).await;
+
+    let holders = |as_of: u64| {
+        format!(
+            "sol_launchpad_token_holders_v(chain = {CHAIN}, token = '{}', \
+             as_of_block = {as_of})",
+            hex::encode(mint)
+        )
+    };
+
+    // As of slot 150 the wallet held 900.
+    assert_eq!(
+        db.number(&format!(
+            "SELECT ifNull(max(balance_raw), 0.) FROM {}",
+            holders(150)
+        ))
+        .await,
+        900.0,
+        "a historical holder list does not show the balance of that block"
+    );
+    // Today it holds nothing and is not a holder at all.
+    assert_eq!(
+        db.count(&format!("SELECT count() FROM {}", holders(u64::MAX)))
+            .await,
+        0,
+        "a wallet that sold out is still listed"
+    );
+
+    db.drop().await;
+}
+
+/// WHY the balance table is an append log and not a latest-value
+/// projection with the POSITION as `_version`.
+///
+/// Review round 4 (MAJOR 12) proposed keeping the projection and
+/// tombstoning it in POSITION space: for a purge of `[A, B)` a tombstone at
+/// `(B << 32) - 1`, which outranks every position inside the range. It
+/// cannot work, and this is the proof on the real engine: the re-stream
+/// that FOLLOWS a gap-heal purge writes the very same observations at the
+/// very same positions, so they are outranked by that tombstone too and the
+/// balances stay dead for ever. No single version in position space can
+/// beat a row and lose to the identical row written again - which is why
+/// the table is now keyed on the observation instead.
+#[tokio::test]
+#[ignore]
+async fn a_position_space_tombstone_cannot_survive_the_re_stream() {
+    let db = TestDb::create().await;
+
+    // A scratch copy of the OLD shape, in this test's own database.
+    db.client()
+        .query(
+            "CREATE TABLE projection (mint FixedString(32), \
+             account FixedString(32), balance UInt256, \
+             block_number UInt64, _version UInt64, is_deleted UInt8) \
+             ENGINE = ReplacingMergeTree(_version, is_deleted) \
+             ORDER BY (mint, account)",
+        )
+        .execute()
+        .await
+        .expect("create the projection");
+
+    // Slot 100, one account. `_version` is the position (slot << 32).
+    let observe = "INSERT INTO projection VALUES \
+                   (unhex('11'), unhex('22'), 7, 100, 429496729600, 0)";
+    db.client().query(observe).execute().await.unwrap();
+
+    // The purge of [100, 200) tombstones it at (200 << 32) - 1.
+    db.client()
+        .query(
+            "INSERT INTO projection VALUES \
+             (unhex('11'), unhex('22'), 7, 100, 858993459199, 1)",
+        )
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        db.count("SELECT count() FROM projection FINAL").await,
+        0,
+        "the tombstone did not take"
+    );
+
+    // The re-stream writes the same observation again, at its own
+    // position - and loses.
+    db.client().query(observe).execute().await.unwrap();
+    assert_eq!(
+        db.count("SELECT count() FROM projection FINAL").await,
+        0,
+        "a position-space tombstone that a re-stream CAN outrank would \
+         not have removed the row in the first place"
+    );
 
     db.drop().await;
 }

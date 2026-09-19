@@ -12,9 +12,7 @@ use alloy::primitives::U256;
 use crate::svm::{
     decode::decode_transaction,
     fixtures,
-    launchpads::{
-        balance_version, config_as_u256, u256_as_config, SolLaunchpadRows,
-    },
+    launchpads::{config_as_u256, u256_as_config, SolLaunchpadRows},
     models::{SOLANA_CHAIN, ZERO_PUBKEY},
     pda::{find_program_address, is_on_curve},
     programs::{pubkey, registry, Venue},
@@ -274,13 +272,16 @@ fn holder_balances_are_recorded_for_launchpad_tokens_only() {
             "a balance was written for a mint no launchpad row named"
         );
         assert_ne!(balance.owner, ZERO_PUBKEY);
-        // The version is the POSITION, so replaying an older range can
-        // never move a balance backwards.
-        assert_eq!(
-            balance._version,
-            balance_version(balance.block_number, balance.tx_index)
-        );
+        // An OBSERVATION: it carries the position it was made at, and its
+        // `_version` is the flush's, stamped by `set_version` like every
+        // other row of the batch (review round 4, MAJOR 12).
+        assert_eq!(balance.block_number, rows.balances[0].block_number);
+        assert_eq!(balance._version, 0, "the decoder does not stamp it");
     }
+
+    let mut stamped = rows;
+    stamped.set_version(77);
+    assert!(stamped.balances.iter().all(|row| row._version == 77));
 }
 
 /// Every recorded launchpad transaction decodes without tripping either

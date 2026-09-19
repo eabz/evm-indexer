@@ -395,9 +395,7 @@ mod tests {
         let solana = (
             ["amount0", "amount1"],
             crate::svm::derived::SOL_DERIVED,
-            include_str!(
-                "../../migrations/0042_solana_aggregates.sql"
-            ),
+            include_str!("../../migrations/0042_solana_aggregates.sql"),
         );
         let launchpads = (
             ["token_amount", "quote_amount"],

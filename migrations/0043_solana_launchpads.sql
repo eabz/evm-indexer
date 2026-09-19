@@ -147,9 +147,48 @@ ORDER BY (chain, config);
 -- what the "top holders" screen of one launchpad token needs and it is not
 -- a chain-wide balance table. There must never be one built on it.
 --
---   _version is the POSITION (slot, tx_index packed), so the newest
---   observation of an account wins a merge on its own and a replayed range
---   cannot move a balance backwards.
+-- AN APPEND LOG OF OBSERVATIONS, not a latest-value projection. One row
+-- per (token account, transaction that touched it), and the reader takes
+-- the newest observation at or below the block it asks about.
+--
+-- It was a projection keyed on (chain, mint, owner, account) whose
+-- _version was the POSITION (slot and tx_index packed), so that the newest
+-- observation won a merge on its own. That is correct for replays and for
+-- out-of-order batches, and it has two defects a holder screen cannot
+-- live with (review round 4, MAJOR 11b and 12):
+--
+--   * A PURGE COULD NOT CORRECT IT. A tombstone must outrank the row it
+--     kills and lose to the same row written again by the re-stream that
+--     follows the purge - and no single value in position space can do
+--     both, whatever it is set to. The heal path got away with it because
+--     it always re-streams; a purge for any other reason (the source data
+--     was wrong, the operator re-indexes with --no-launchpads) left the
+--     wrong balance live with no statement in the codebase able to remove
+--     it. `a_position_space_tombstone_cannot_survive_the_re_stream`
+--     (src/svm/integration_tests.rs) is that proof on a real ClickHouse.
+--   * A HISTORICAL HOLDER LIST WAS IMPOSSIBLE. Only the newest
+--     observation was kept, so `as_of_block` in the past dropped every
+--     account that has traded since instead of showing what it held then.
+--
+-- As a log, `_version` is the ordinary flush clock and every property the
+-- position bought comes back for free: an out-of-order batch adds an
+-- observation rather than overwriting one, a replay writes the same key
+-- again (the key ends in the position, so the ReplacingMergeTree collapses
+-- it), and the purge is the ordinary one - the table is in
+-- `solana_store::child_tables()` and in `versioned_tables()` like every
+-- other child.
+--
+-- The cost is rows: roughly two per curve trade instead of one per holder.
+-- The SCOPE above is what bounds it.
+--
+-- PARTITION BY month, like the other event streams. It was `PARTITION BY
+-- chain`, i.e. ONE partition holding all of Solana, which every insert
+-- then merged against - measured as the dominant cost of the Solana flush
+-- (docs/CHECKPOINT.md, "Known open items").
+-- `do_not_merge_across_partitions_select_final` stays correct because the
+-- sorting key ends in the position: a key belongs to one slot, so it
+-- belongs to one month and can never have a duplicate in another
+-- partition.
 CREATE TABLE IF NOT EXISTS sol_token_balances (
   chain UInt64,
   mint FixedString(32),
@@ -163,11 +202,15 @@ CREATE TABLE IF NOT EXISTS sol_token_balances (
   timestamp DateTime CODEC(DoubleDelta, ZSTD),
   epoch UInt32 DEFAULT 0,
   _version UInt64,
-  is_deleted UInt8 DEFAULT 0
+  is_deleted UInt8 DEFAULT 0,
+  -- The holder screen reads by mint, so the sorting key starts there and
+  -- a purge's `block_number >= x` would scan the mints. This is what
+  -- makes the purge skip the parts that hold no slot of its range.
+  INDEX sol_token_balances_slot block_number TYPE minmax GRANULARITY 4
 )
 ENGINE = ReplacingMergeTree(_version, is_deleted)
-PARTITION BY chain
-ORDER BY (chain, mint, owner, account)
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (chain, mint, owner, account, block_number, tx_index)
 SETTINGS do_not_merge_across_partitions_select_final = 1;
 
 -- The Solana twin of launchpad_token_holders_v (0032).
@@ -182,25 +225,48 @@ SETTINGS do_not_merge_across_partitions_select_final = 1;
 -- pubkey. The `length(...) = 64` conjunct is the empty-parameter guard of
 -- 0032: unhex('') is the empty string and toFixedString('', 32) is 32 zero
 -- bytes, which is a REAL bucket here, so an unset field in a UI would
--- otherwise return it.
+-- otherwise return it. `match(..., '^[0-9a-fA-F]+$')` is beside it because
+-- unhex does NOT error on a non-hex character of the right count - it
+-- returns 0xEF bytes - so without it a malformed id would silently select
+-- some other bucket rather than nothing (review round 4, MINOR 23).
+--
+-- ONE ROW PER WALLET, summed over its token accounts. An owner can hold
+-- the same mint in several SPL token accounts, and it is one holder with
+-- one position: this used to `GROUP BY owner, balance`, which counts
+-- ACCOUNTS - and collapsed two accounts holding the SAME amount into one
+-- row, losing half the position (review round 4, MAJOR 11a).
+--
+-- `as_of_block` really is as of that block: the inner argMax takes each
+-- account's newest observation AT OR BELOW it. The old view applied the
+-- bound AFTER `FINAL` over a latest-value table, so a past block dropped
+-- every account that had traded since (MAJOR 11b).
 CREATE VIEW IF NOT EXISTS sol_launchpad_token_holders_v AS
 WITH toFixedString(unhex({token:String}), 32) AS token_id
 SELECT
   owner AS account,
-  toFloat64(balance) AS balance_raw,
-  toFloat64(balance) / greatest(
+  sum(balance_at) AS balance_raw,
+  sum(balance_at) / greatest(
     (SELECT max(toFloat64(initial_supply)) FROM launchpad_tokens FINAL
      WHERE chain = {chain:UInt64} AND token = token_id
        AND is_deleted = 0
        AND emitter IN (
          SELECT curve FROM launchpad_trusted_curves_v
          WHERE chain = {chain:UInt64})), 1.) AS share_of_initial_supply,
-  max(block_number) AS last_block
-FROM sol_token_balances FINAL
-WHERE chain = {chain:UInt64} AND mint = token_id
-  AND is_deleted = 0 AND block_number <= {as_of_block:UInt64}
-  AND length({token:String}) = 64
-GROUP BY owner, balance
+  max(seen_at) AS last_block
+FROM
+(
+  SELECT
+    owner,
+    argMax(toFloat64(balance), (block_number, tx_index)) AS balance_at,
+    max(block_number) AS seen_at
+  FROM sol_token_balances FINAL
+  WHERE chain = {chain:UInt64} AND mint = token_id
+    AND is_deleted = 0 AND block_number <= {as_of_block:UInt64}
+    AND length({token:String}) = 64
+    AND match({token:String}, '^[0-9a-fA-F]+$')
+  GROUP BY owner, account
+)
+GROUP BY owner
 HAVING balance_raw > 0
 ORDER BY balance_raw DESC;
 
