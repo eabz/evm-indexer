@@ -20,7 +20,7 @@ use crate::{
         multicall::EthCaller, MissingTokenSource, TokenSink,
         TokenStandard, TokenWorker, TokenWorkerOptions, TokenWorkerStats,
     },
-    utils::format::{SerAddress, SerB256},
+    utils::format::{id32, SerAddress, SerB256, SerId32},
 };
 use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result};
@@ -55,10 +55,18 @@ impl ClickhouseWorkerStore {
     }
 }
 
-fn after_predicate(after: Option<Address>) -> String {
+/// `AND <column> > <cursor>`, where `column` is an EXPRESSION yielding the
+/// 20 address bytes (a `FixedString(20)` column, or `substring(id, 13, 20)`
+/// of a 32 byte identity column). Comparing a padded 32 byte id with a 20
+/// byte literal is always false, which silently dropped every page after
+/// the first.
+fn after_predicate(column: &str, after: Option<Address>) -> String {
     after
         .map(|after| {
-            format!(" AND address > unhex('{}')", hex_of(after.as_slice()))
+            format!(
+                " AND {column} > unhex('{}')",
+                hex_of(after.as_slice())
+            )
         })
         .unwrap_or_default()
 }
@@ -84,14 +92,30 @@ pub fn missing_tokens_sql(
     after: Option<Address>,
     limit: usize,
 ) -> String {
-    let after = after_predicate(after);
+    let seen_after = after_predicate("address", after);
 
+    // `dex_pools_by_token.token` is a 32 byte identity column
+    // (docs/design.md section 13) while `seen_tokens.address` and
+    // `tokens.address` are `FixedString(20)`. A `UNION ALL` of the two
+    // does not error - ClickHouse widens both to `String` - and everything
+    // downstream then breaks quietly: the anti-join against `tokens` never
+    // matches, the zero / 0xee..ee exclusions miss, the cursor comparison
+    // is always false, and the rows arrive length prefixed while the Rust
+    // row reads 20 raw bytes (the RowBinary stream desynchronises).
+    //
+    // So the DEX leg is narrowed to the EVM ids (12 leading zero bytes)
+    // and unpadded here. A Solana mint is NOT truncated into an address:
+    // it is left out, and its decimals arrive with the SVM data.
     let pools = if dex {
         format!(
-            " UNION ALL SELECT token AS address, 'ERC20' AS type \
-             FROM dex_pools_by_token WHERE chain = {chain} \
-             AND source != 'unresolved'{}",
-            after.replace("address", "token")
+            " UNION ALL SELECT toFixedString(substring(token, 13, 20), \
+             20) AS address, 'ERC20' AS type FROM dex_pools_by_token \
+             WHERE chain = {chain} AND source != 'unresolved' \
+             AND substring(token, 1, 12) = toFixedString('', 12){}",
+            after_predicate(
+                "toFixedString(substring(token, 13, 20), 20)",
+                after,
+            )
         )
     } else {
         String::new()
@@ -100,9 +124,9 @@ pub fn missing_tokens_sql(
     format!(
         "SELECT address, any(type) AS type FROM (\
          SELECT address, toString(type) AS type FROM seen_tokens \
-         WHERE chain = {chain}{after}{pools}) \
+         WHERE chain = {chain}{seen_after}{pools}) \
          WHERE address NOT IN (\
-         SELECT address FROM tokens WHERE chain = {chain}{after}) \
+         SELECT address FROM tokens WHERE chain = {chain}{seen_after}) \
          AND address NOT IN (\
          unhex('0000000000000000000000000000000000000000'), \
          unhex('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee')) \
@@ -126,7 +150,7 @@ pub fn blank_tokens_sql(
          WHERE chain = {chain}{} AND name = '' AND symbol = '' \
          AND decimals = 0 AND _version < {older_than_ms} \
          ORDER BY address ASC LIMIT {limit}",
-        after_predicate(after)
+        after_predicate("address", after)
     )
 }
 
@@ -234,7 +258,8 @@ struct PoolIdRow {
 struct MissingPoolRow {
     #[serde_as(as = "SerB256")]
     pool_id: B256,
-    #[serde_as(as = "SerAddress")]
+    // `dex_pools.emitter` is FixedString(32) (docs/design.md section 13).
+    #[serde_as(as = "SerId32")]
     emitter: Address,
     protocol: String,
     attempts: u32,
@@ -325,14 +350,16 @@ impl MissingPoolSource for ClickhouseWorkerStore {
 #[serde_with::serde_as]
 #[derive(Debug, Row, Deserialize)]
 struct ExchangeRow {
-    #[serde_as(as = "SerAddress")]
+    // `prediction_venues.exchange` is FixedString(32).
+    #[serde_as(as = "SerId32")]
     exchange: Address,
 }
 
 #[serde_with::serde_as]
 #[derive(Debug, Row, Deserialize)]
 struct MissingVenueRow {
-    #[serde_as(as = "SerAddress")]
+    // `prediction_trades.exchange` is FixedString(32).
+    #[serde_as(as = "SerId32")]
     exchange: Address,
     protocol: String,
 }
@@ -346,9 +373,13 @@ impl VenueSink for ClickhouseWorkerStore {
             let mut known = HashSet::new();
 
             for chunk in exchanges.chunks(KNOWN_POOLS_CHUNK) {
+                // The column is FixedString(32): a 40 hex literal is a
+                // 20 byte value and never matches.
                 let ids: Vec<String> = chunk
                     .iter()
-                    .map(|a| format!("unhex('{}')", hex_of(a.as_slice())))
+                    .map(|a| {
+                        format!("unhex('{}')", hex_of(id32(*a).as_slice()))
+                    })
                     .collect();
 
                 let sql = format!(
@@ -720,7 +751,17 @@ mod tests {
 
         let sql = missing_tokens_sql(1, true, Some(after), 10);
         assert_eq!(sql.matches(&format!("address {cursor}")).count(), 2);
-        assert_eq!(sql.matches(&format!("token {cursor}")).count(), 1);
+        // The DEX leg reads a 32 byte identity column: the cursor compares
+        // the UNPADDED 20 bytes, or it would never match.
+        assert_eq!(
+            sql.matches(&format!(
+                "toFixedString(substring(token, 13, 20), 20) {cursor}"
+            ))
+            .count(),
+            1
+        );
+        assert!(sql
+            .contains("substring(token, 1, 12) = toFixedString('', 12)"));
 
         let sql = blank_tokens_sql(1, Some(after), 10, 1_700_000_000_000);
         assert!(sql.contains(&format!("address {cursor}")));

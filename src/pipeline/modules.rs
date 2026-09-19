@@ -395,7 +395,8 @@ pub async fn known_registries(
     #[serde_with::serde_as]
     #[derive(clickhouse::Row, serde::Deserialize)]
     struct RegistryRow {
-        #[serde_as(as = "crate::utils::format::SerAddress")]
+        // `prediction_*.registry` is FixedString(32) (design section 13).
+        #[serde_as(as = "crate::utils::format::SerId32")]
         registry: Address,
     }
 
