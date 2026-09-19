@@ -34,6 +34,14 @@
 //! Native-coin legs have no log and can NEVER be verified this way. See
 //! [`LaunchpadTrade::sole_unverified_quote`] and README §3 for exactly
 //! what `transactions.value` adds and what it does not.
+//!
+//! # The text these events carry is HOSTILE
+//!
+//! `name`, `symbol` and `metadata_uri` are bytes chosen by whoever emitted
+//! the log, and they come back out of every feed onto a screen.
+//! [`sanitize`] strips the control AND the Unicode format characters (the
+//! bidi overrides, the zero width and tag blocks) and caps the length. It
+//! does not escape for any output format: **the UI escapes them**.
 
 use std::collections::HashMap;
 
@@ -139,9 +147,9 @@ impl<'a> Data<'a> {
         }
     }
 
-    /// A dynamic `string` whose head word is at `index`. Empty on any
-    /// malformed offset / length - never a panic, never an allocation
-    /// bigger than [`MAX_TEXT`].
+    /// A dynamic `string` whose head word is at `index`, [`sanitize`]d.
+    /// Empty on any malformed offset / length - never a panic, never an
+    /// allocation bigger than [`MAX_TEXT`].
     fn text(&self, index: usize) -> String {
         let offset: usize = match self.u256(index).try_into() {
             Ok(offset) => offset,
@@ -161,12 +169,101 @@ impl<'a> Data<'a> {
             _ => return String::new(),
         };
 
-        let bytes = &self.0[start..end.min(start + MAX_TEXT)];
-        String::from_utf8_lossy(bytes)
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect()
+        sanitize(&String::from_utf8_lossy(
+            &self.0[start..end.min(start + MAX_TEXT)],
+        ))
     }
+}
+
+/// Unicode FORMAT characters (general category `Cf`) as of Unicode 16,
+/// plus the two separators `Zl` / `Zp`. `char::is_control()` is `Cc`
+/// ONLY, so on its own it lets `U+202E RIGHT-TO-LEFT OVERRIDE` and the
+/// rest of this list through.
+const HIDDEN: &[(u32, u32)] = &[
+    (0x00ad, 0x00ad),
+    (0x0600, 0x0605),
+    (0x061c, 0x061c),
+    (0x06dd, 0x06dd),
+    (0x070f, 0x070f),
+    (0x0890, 0x0891),
+    (0x08e2, 0x08e2),
+    (0x180e, 0x180e),
+    // Zero width space / non-joiner / joiner, LRM, RLM.
+    (0x200b, 0x200f),
+    // Line and paragraph separator (Zl / Zp).
+    (0x2028, 0x2029),
+    // The bidi overrides and embeddings - "Trojan Source".
+    (0x202a, 0x202e),
+    // Word joiner, the invisible operators, and the bidi isolates.
+    (0x2060, 0x206f),
+    (0xfeff, 0xfeff),
+    // Interlinear annotation.
+    (0xfff9, 0xfffb),
+    (0x110bd, 0x110bd),
+    (0x110cd, 0x110cd),
+    (0x13430, 0x1343f),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    // The tag characters: a whole second string, invisible.
+    (0xe0001, 0xe0001),
+    (0xe0020, 0xe007f),
+];
+
+/// Longest text kept, in CHARACTERS (the byte cap of [`MAX_TEXT`] runs
+/// first, so this only ever shortens further).
+const MAX_CHARS: usize = 128;
+
+/// Strips the characters that let on-chain text lie about what it is, and
+/// collapses the whitespace runs a removed character leaves behind.
+///
+/// `name`, `symbol` and `metadata_uri` are chosen by whoever emitted the
+/// log - the decoder has no registry - and they come back out of every
+/// feed onto a screen. Removed: the `Cc` controls (a newline forges a
+/// second row in a log line or a CSV export), the `Cf` format characters
+/// including the bidi overrides and the invisible tag block, and the two
+/// Unicode separators. A symbol is also one line, so every remaining
+/// whitespace character becomes a plain space and runs of them collapse.
+///
+/// This does NOT escape for any output format: the strings are stored as
+/// TEXT and **the UI escapes them** for whatever it renders into (the
+/// README says so next to the cookbook). A `<script>` in a symbol is data
+/// here and must stay data there. Same rule, and very nearly the same
+/// code, as `crate::predictions::text::sanitize`; the shared home is
+/// `src/utils` once a change may touch it.
+fn sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(MAX_CHARS * 4));
+    let mut kept = 0usize;
+    let mut pending_space = false;
+
+    for c in text.chars() {
+        // Whitespace FIRST, so a newline or a tab becomes the one space
+        // that keeps two words apart instead of vanishing as a control.
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        // A hidden character is dropped without a space: it was put
+        // INSIDE a word precisely so a reader would not see the join.
+        let code = u32::from(c);
+        if c.is_control()
+            || HIDDEN.iter().any(|(lo, hi)| (*lo..=*hi).contains(&code))
+        {
+            continue;
+        }
+
+        let width = usize::from(pending_space && kept > 0) + 1;
+        if kept + width > MAX_CHARS {
+            break;
+        }
+        if pending_space && kept > 0 {
+            out.push(' ');
+        }
+        out.push(c);
+        kept += width;
+        pending_space = false;
+    }
+
+    out
 }
 
 /// Does the log have exactly the shape the definition declares?
@@ -1026,5 +1123,57 @@ mod tests {
     #[test]
     fn no_logs_no_rows() {
         assert!(decode(1, &[]).is_empty());
+    }
+
+    /// A name / symbol is chosen by whoever emitted the log. None of it
+    /// may reach a screen as anything but one line of visible characters.
+    #[test]
+    fn hostile_text_loses_its_controls_and_format_characters() {
+        // Trojan Source: the override makes the rendering lie.
+        assert_eq!(
+            sanitize("Will \u{202e}SEY evloser\u{202c} happen?"),
+            "Will SEY evloser happen?"
+        );
+        // A newline forges a second row in a log line or a CSV export.
+        assert_eq!(
+            sanitize("Real\nFAKE: verified"),
+            "Real FAKE: verified"
+        );
+        // Zero width characters smuggle a different word past a reader.
+        assert_eq!(sanitize("PEP\u{200b}E"), "PEPE");
+        // The tag block is a whole second string, invisible.
+        assert_eq!(sanitize("OK\u{e0041}\u{e0042}"), "OK");
+        // Every listed range is actually removed. A separator is
+        // whitespace and keeps the words apart; the rest vanish.
+        for (lo, hi) in HIDDEN {
+            for code in [*lo, *hi] {
+                let c = char::from_u32(code).unwrap();
+                let want = if c.is_whitespace() { "a b" } else { "ab" };
+                assert_eq!(sanitize(&format!("a{c}b")), want, "{code:#x}");
+            }
+        }
+        // Nothing but hidden characters leaves nothing.
+        assert_eq!(sanitize("\u{202e}\u{200b}\n\t "), "");
+        // HTML is NOT escaped here - it is data, and the UI escapes it.
+        assert_eq!(
+            sanitize("<script>alert(1)</script>"),
+            "<script>alert(1)</script>"
+        );
+        // Capped, and a multi byte character survives the cap.
+        assert_eq!(sanitize(&"é".repeat(600)).chars().count(), MAX_CHARS);
+    }
+
+    /// The decoder's own path, not just the helper.
+    #[test]
+    fn a_decoded_symbol_carries_no_bidi_override() {
+        // One dynamic `string` at head slot 0: offset, length, bytes.
+        let text = "PE\u{202e}PE";
+        let mut data = vec![0u8; 64];
+        data[31] = 32;
+        data[32 + 31] = text.len() as u8;
+        data.extend_from_slice(text.as_bytes());
+        data.resize(64 + 32, 0);
+
+        assert_eq!(Data(&data).text(0), "PEPE");
     }
 }

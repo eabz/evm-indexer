@@ -293,6 +293,28 @@ not listed one by one: `launchpad_trusted_curves_v` is the listed
 singletons UNION every `launchpad_tokens.curve` a listed emitter
 announced, which is exactly the set a forger cannot enter.
 
+**Picking a token is NOT a trust decision.** The first cut of these views
+filtered the feeds and left the token page, the chart, the tape, the
+snipers and the holders unfiltered, on the theory that the caller had
+already chosen the token. That was wrong, and it was the worst place to be
+wrong: the caller chooses the token, an attacker chooses the rows. Anyone
+can emit a `CurveBuy` naming a REAL token - with a real movement behind
+it, so the corroboration passes - and move that token's `trades`, `buys`,
+`unique_traders`, volume, first / last price, `raised_raw` and therefore
+`curve_progress`; one forged buy of at least the graduation threshold
+makes a real token read "about to graduate". A forger who predicts the
+token address (V2 / V3 addresses are predictable) can also emit a
+`TokenLaunched` for it EARLIER than the real venue, win the `argMin` and
+make the real launch read `trusted = 0`. So every token-scoped `*_v` view
+now restricts ALL of its sources - launches, trades, graduations, candles
+- to `launchpad_trusted_curves_v`, and each one has an `*_all_v` twin that
+keeps the unfiltered picture for exploration. A token with no trusted
+launch yields no rows at all: missing numbers, never wrong ones.
+`integration_tests::a_forged_curve_moves_no_token_page_number` asserts
+every one of those screens is byte for byte identical before and after the
+forged rows exist, including the earlier-launch case, and that every
+`_all_v` twin does show them.
+
 **Why trusted-by-default-off is the right default.** The alternative -
 counting everything and hoping the corroboration filters it - fails against
 the cheapest attack there is: deploy a token, deploy a fake curve, move
@@ -339,14 +361,53 @@ INSERT INTO launchpad_frontends (chain, address, name, kind) VALUES
   (56,   unhex('000000000000000000000000a02a848143d20bc2c14821efc36d0345351a8ccd'), 'Flap router', 'router');
 ```
 
+### 3.4 The text is hostile too
+
+`name`, `symbol` and `metadata_uri` are bytes chosen by whoever emitted
+the log - there is no registry - and they come back out of every feed onto
+a screen. `decode::sanitize` removes, at decode time:
+
+* the `Cc` control characters, including newline and tab (a name is one
+  line: a newline forges a second row in a log line or a CSV export),
+* every Unicode `Cf` FORMAT character. `char::is_control()` is `Cc` only,
+  so on its own it lets through the bidi overrides and isolates
+  (`U+202A..U+202E`, `U+2066..U+2069`) that make a name render as text it
+  does not contain - the "Trojan Source" class - the zero width
+  characters, `U+FEFF`, and the tag block `U+E0020..U+E007F`, which is a
+  whole second invisible string,
+* the `U+2028` / `U+2029` separators,
+
+collapses the whitespace runs that leaves behind, and caps the result at
+128 characters. A hidden character inside a word is dropped WITHOUT a
+space, because that is exactly where it was put to hide a join.
+
+It does NOT escape HTML, and it must not: the strings are stored as text,
+so **the UI escapes them** for whatever it renders into. A `<script>` in a
+symbol is data here and has to stay data there.
+
 ## 4. The query cookbook
 
 One query per screen. Every query below is also a `Recipe` in
 `cookbook.rs` (a unit test asserts the two texts are identical) and is run
 by the ClickHouse integration tests with hand-computed assertions.
-Placeholders `{chain}`, `{token}` ... are request parameters; ids are 32
-bytes, so an EVM address is 24 zeros plus its 40 hex characters. `tx_id`
-comes back as the raw transaction bytes - `hex(tx_id)` to print it.
+
+Every `{name:Type}` is a ClickHouse **bound parameter**, sent beside the
+statement (`param_name=` over HTTP, `.param(..)` with the `clickhouse`
+crate) and NEVER pasted into its text - which is why no placeholder is
+inside quotes. Ids are plain hex without `0x`: 64 characters for a 32 byte
+id, or the 40 of an EVM address, which the parameterized views left pad
+themselves (a constant expression, so the primary key range read
+survives). Anything else can only fail to match, with one exception worth
+knowing: an EMPTY string pads to the 32 zero bytes, which here is the real
+bucket holding the trades whose token leg stayed unverified. `tx_id` comes
+back as the raw transaction bytes - `hex(tx_id)` to print it.
+
+Every screen below reads a trust-filtered view; the `*_all_v` twins
+(§3.2) are the exploration tool, and only the launch feed ships one as a
+recipe, labelled as such. **`name` and `symbol` are hostile text**: the
+decoder has stripped the control, bidi, zero width and tag characters
+(§3.4), but they are stored as text and the UI must escape them for
+whatever it renders into.
 
 ### New launch feed
 
@@ -355,7 +416,7 @@ SELECT launch_time, token, family, emitter, creator, name, symbol,
        quote_token, initial_price_raw, first_minute_trades,
        first_minute_buys, first_minute_volume_raw, first_minute_traders,
        graduation_threshold_raw
-FROM launchpad_new_launches_v(chain = {chain}, since = {since})
+FROM launchpad_new_launches_v(chain = {chain:UInt64}, since = {since:UInt32})
 LIMIT 50
 ```
 
@@ -369,7 +430,7 @@ of the trades. `initial_price_raw` is the OPEN of the launch minute.
 ```sql
 SELECT launch_time, token, family, emitter, trusted, name, symbol,
        first_minute_trades, first_minute_volume_raw
-FROM launchpad_new_launches_all_v(chain = {chain}, since = {since})
+FROM launchpad_new_launches_all_v(chain = {chain:UInt64}, since = {since:UInt32})
 LIMIT 50
 ```
 
@@ -380,7 +441,7 @@ what to put in `launchpad_trusted_emitters`.
 
 ```sql
 SELECT *
-FROM launchpad_token_v(chain = {chain}, token = unhex('{token}'))
+FROM launchpad_token_v(chain = {chain:UInt64}, token = {token:String})
 ```
 
 One row: the launch, whether its emitter is trusted, the traded volume and
@@ -398,8 +459,7 @@ over the 32 real buys of the token that graduated this gives
 ```sql
 SELECT bucket, open_raw, high_raw, low_raw, close_raw, volume_quote_raw,
        volume_token_raw, trades, unique_traders, curve_progress
-FROM launchpad_candles_1m_v
-WHERE chain = {chain} AND token = unhex('{token}')
+FROM launchpad_candles_1m_v(chain = {chain:UInt64}, token = {token:String})
 ORDER BY bucket
 ```
 
@@ -415,8 +475,8 @@ curve can never be added into a real token's candle.
 SELECT timestamp, side, trader, caller, token_amount_raw, quote_amount_raw,
        price_raw, fee_amount_raw, token_verified, quote_verified,
        tx_id
-FROM launchpad_token_trades_v(chain = {chain}, token = unhex('{token}'),
-                              from_block = {from_block})
+FROM launchpad_token_trades_v(chain = {chain:UInt64}, token = {token:String},
+                              from_block = {from_block:UInt64})
 LIMIT 50
 ```
 
@@ -427,8 +487,8 @@ came through. `price_raw` is NULL, never 0, when a leg is zero.
 
 ```sql
 SELECT account, balance_raw, share_of_initial_supply, received, sent
-FROM launchpad_token_holders_v(chain = {chain}, token = unhex('{token}'),
-                               as_of_block = {as_of_block})
+FROM launchpad_token_holders_v(chain = {chain:UInt64}, token = {token:String},
+                               as_of_block = {as_of_block:UInt64})
 LIMIT 50
 ```
 
@@ -444,7 +504,7 @@ block gives the top-holder concentration AT graduation.
 ```sql
 SELECT graduation_time, token, family, pool_id, pool_kind, pool_status,
        pool_protocol, token_amount_raw, quote_amount_raw, graduation_tx
-FROM launchpad_graduations_v(chain = {chain}, since = {since})
+FROM launchpad_graduations_v(chain = {chain:UInt64}, since = {since:UInt32})
 LIMIT 50
 ```
 
@@ -462,8 +522,8 @@ pair `0x91b8bdf2...`, whose left-padded address is its `dex_pools.pool_id`.
 ```sql
 SELECT launches, graduated, died, graduation_rate, first_launch,
        last_launch, volume_quote_raw, realised_creator_fees_raw
-FROM launchpad_creator_v(chain = {chain}, creator = unhex('{creator}'),
-                         as_of = {now}, dead_after = {dead_after})
+FROM launchpad_creator_v(chain = {chain:UInt64}, creator = {creator:String},
+                         as_of = {now:UInt32}, dead_after = {dead_after:UInt32})
 ```
 
 The serial-rugger signal in one row. `died` = never graduated and no trade
@@ -476,8 +536,8 @@ that provably moved, not a fee policy read over RPC.
 ```sql
 SELECT launch_time, token, symbol, graduated, died, trades,
        volume_quote_raw, last_trade_time, pool_id
-FROM launchpad_creator_tokens_v(chain = {chain}, creator = unhex('{creator}'),
-                                as_of = {now}, dead_after = {dead_after})
+FROM launchpad_creator_tokens_v(chain = {chain:UInt64}, creator = {creator:String},
+                                as_of = {now:UInt32}, dead_after = {dead_after:UInt32})
 LIMIT 200
 ```
 
@@ -487,8 +547,8 @@ LIMIT 200
 SELECT trader, blocks_after_launch, buys, token_amount_raw,
        quote_amount_raw, share_of_initial_supply, funder, bundle_size,
        is_creator
-FROM launchpad_snipers_v(chain = {chain}, token = unhex('{token}'),
-                         blocks = {blocks})
+FROM launchpad_snipers_v(chain = {chain:UInt64}, token = {token:String},
+                         blocks = {blocks:UInt64})
 LIMIT 100
 ```
 
@@ -506,7 +566,7 @@ launch transaction.
 SELECT family, bucket, launches, graduations, graduation_rate,
        trades, volume_quote_raw, volume_quote_verified_raw, fees_raw,
        unique_traders, unique_creators
-FROM launchpad_venues_1d_v(chain = {chain})
+FROM launchpad_venues_1d_v(chain = {chain:UInt64})
 LIMIT 100
 ```
 
@@ -526,7 +586,7 @@ on Tuesday, so the cohort answer per token is
 ```sql
 SELECT family, emitter, frontend, trades, volume_quote_raw,
        volume_quote_verified_raw, unique_traders
-FROM launchpad_frontend_volume_v(chain = {chain}, since = {since})
+FROM launchpad_frontend_volume_v(chain = {chain:UInt64}, since = {since:UInt32})
 LIMIT 100
 ```
 
@@ -565,17 +625,21 @@ and the launch feed joins the 1-minute candles.
 
 ## 6. Tests
 
-* `cargo test --lib launchpads` - 27 unit tests: every `topic0` against
+* `cargo test --lib launchpads` - 32 unit tests: every `topic0` against
   `keccak256(signature)`, the canonical-signature rules, the decoder's
   bounds checks against malformed data, `set_version` / `set_epoch` /
   `attach_transactions` over all 32 real transactions, the schema rules of
-  docs/design.md §1-§2 over the migrations (engine, epoch, partitioning,
-  no DELETE, no dedup window in a CREATE), the chain-neutral identity
-  rules, every `rebuild_sql` against the `SELECT` of its materialized view,
-  month chunking, "no `sum()` over a 256-bit column", and the README
+  docs/design.md §1-§2 over the migrations (engine, epoch, partitioning -
+  including WHICH base table may escape month partitioning and why - no
+  DELETE, no dedup window in a CREATE), the chain-neutral identity rules
+  (including that no table keeps a `transaction_hash` column), hostile
+  text losing its control / bidi / zero width / tag characters, every
+  cookbook placeholder being a typed BOUND parameter that is not inside
+  quotes, every `rebuild_sql` against the `SELECT` of its materialized
+  view, month chunking, "no `sum()` over a 256-bit column", and the README
   printing every cookbook query verbatim.
 * `TEST_DATABASE_URL=... cargo test launchpads::integration -- --ignored` -
-  5 tests against a real ClickHouse, each in its own `_test` database
+  6 tests against a real ClickHouse, each in its own `_test` database
   created by the real migration runner, green in parallel over repeated
   runs:
   1. every row round-trips (including `1e27` as an exact integer) and each

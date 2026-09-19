@@ -39,9 +39,27 @@
 -- rows by itself.
 --
 -- Partitioning: the three event-stream tables by month, the launch
--- registry and every side table by chain (lookups must not fan out per
--- month). Deduplication windows are turned on by 0033, which is this
--- module's own copy of 0090 (an applied migration never changes).
+-- registry and every side table by chain. Deduplication windows are
+-- turned on by 0033, which is this module's own copy of 0090 (an applied
+-- migration never changes).
+--
+-- WHY launchpad_tokens is PARTITION BY chain and not by month, which is
+-- design section 1's default for a base table. It is a REGISTRY, read by
+-- IDENTITY and never by time: the token page, the price chart, the sniper
+-- view, the holder list and the curve -> token join every fee row needs
+-- all ask `WHERE chain = ? AND token = ?`, and its sorting key starts
+-- (chain, token, ...) for exactly that. Month partitioning would fan a
+-- single token's FINAL over every month that token was ever touched, on
+-- the module's most-read screen. The partition budget is unaffected
+-- because there is one partition per chain (the ~50 the design budgets
+-- for), not chain x months. Same table shape, same reason and same
+-- exception as dex_pools (0010) and prediction_markets / _resolutions /
+-- _questions (0020). The three event streams - trades, graduations,
+-- creator_fees - are written and purged by block range, so they keep the
+-- month partitioning the design asks for. src/launchpads/mod.rs's
+-- `migrations_follow_the_schema_rules` pins this table by name: a new
+-- block-scoped table gets month partitioning unless it is added there
+-- with a reason.
 --
 -- NOTHING HERE IS TRUSTED. Any contract can emit a TokenLaunched or a
 -- CurveBuy: read through the views of 0032, which count only emitters an

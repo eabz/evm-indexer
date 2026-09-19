@@ -114,6 +114,15 @@ pub const BLOCK_SCOPED_TABLES: &[&str] = &[
 pub const UNSCOPED_TABLES: &[&str] =
     &["launchpad_trusted_emitters", "launchpad_frontends"];
 
+/// Block scoped BASE tables that are `PARTITION BY chain` instead of the
+/// `PARTITION BY toYYYYMM(timestamp)` design §1 asks for. One entry, and
+/// the header of `0030` says why: `launchpad_tokens` is a registry read
+/// by `(chain, token)` on every token-scoped screen, never by time, so
+/// month partitioning would fan one token's `FINAL` over every month it
+/// was touched - the same exception `dex_pools` and the prediction
+/// registries make. A test pins the list.
+pub const BY_CHAIN_BASE_TABLES: &[&str] = &["launchpad_tokens"];
+
 /// The order the pipeline inserts in: a reader must never see a trade of a
 /// token whose launch row is not there yet.
 pub const INSERT_ORDER: &[&str] = &[
@@ -444,13 +453,24 @@ mod tests {
                     "{name}"
                 );
 
+                // Design §1: a block scoped BASE table is partitioned by
+                // month, a lookup / side table by chain. Every exception
+                // is named here and justified in the migration header, so
+                // a new table can not quietly pick either one.
                 let by_month =
                     body.contains("PARTITION BY toYYYYMM(timestamp)");
                 let by_chain = body.contains("PARTITION BY chain ");
                 assert!(by_month != by_chain, "{name}");
-                if SIDE_TABLES.contains(&name.as_str()) {
-                    assert!(by_chain, "{name}");
-                }
+
+                let wants_chain = SIDE_TABLES.contains(&name.as_str())
+                    || BY_CHAIN_BASE_TABLES.contains(&name.as_str());
+                assert_eq!(
+                    by_chain,
+                    wants_chain,
+                    "{name}: partitioned by {}, expected by {}",
+                    if by_chain { "chain" } else { "month" },
+                    if wants_chain { "chain" } else { "month" }
+                );
             }
 
             if aggregate {
@@ -530,6 +550,18 @@ mod tests {
         expected.sort();
 
         assert_eq!(altered, expected);
+    }
+
+    /// The month-partitioning exception is exactly one table, it is a
+    /// base table, and it is not a side table (those are by chain for
+    /// their own reason).
+    #[test]
+    fn only_the_launch_registry_escapes_month_partitioning() {
+        assert_eq!(BY_CHAIN_BASE_TABLES, ["launchpad_tokens"]);
+        for table in BY_CHAIN_BASE_TABLES {
+            assert!(BASE_TABLES.contains(table), "{table}");
+            assert!(!SIDE_TABLES.contains(table), "{table}");
+        }
     }
 
     #[test]
