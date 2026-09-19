@@ -219,7 +219,7 @@ redaction) stays as the engine underneath.
 
 Principle: **decode by event family from `logs`, never by router/factory registry.** A
 fork of Uniswap V2 on a chain nobody has heard of works on day one. Module `src/dex/`,
-enabled by `--dex`, pure function `decode(&[DatabaseLog]) -> DexRows` inside transform.
+**ON by default** (owner decision; opt out with `--no-dex` / env `NO_DEX=true`), pure function `decode(&[DatabaseLog]) -> DexRows` inside transform.
 
 Families (topic0 + shape validated; wrong shape → not decoded, never panic):
 `uniswap_v2` (PairCreated, Swap, Sync, Mint, Burn), `solidly` (its own Swap/Sync
@@ -294,7 +294,8 @@ table are superseded by this section.
 
 ## 10. Prediction markets — display-first
 
-Module `src/predictions/`, flag `--predictions`, same shape as `src/dex/` (pure decoders
+Module `src/predictions/`, ON by default like DEX (opt out with `--no-predictions` /
+env `NO_PREDICTIONS=true`), same shape as `src/dex/` (pure decoders
 by event family, tables under the §1–§2 storage rules incl. tombstones + epochs,
 aggregates as `DerivedTable`s, background resolver off the commit path, re-decodable
 from stored `logs`). Migrations `0020`–`0029`.
