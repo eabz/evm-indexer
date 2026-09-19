@@ -16,7 +16,11 @@ use crate::{
         ranges::{checkpoints_sql, contiguous_until, BlockRange},
         Database,
     },
-    pipeline::modules::{range_predicate, ALL_MODULES},
+    pipeline::{
+        modules::{range_predicate, ALL_MODULES},
+        store::{ClickhouseReorgStore, Scope},
+    },
+    reorg::ReorgStore,
 };
 use anyhow::{Context, Result};
 use std::fmt;
@@ -36,6 +40,73 @@ pub struct OrphanReport {
     pub last_block: u64,
 }
 
+/// One aggregate that disagrees with the base table it is built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateReport {
+    pub view: &'static str,
+    pub base: &'static str,
+    pub days_checked: u64,
+    pub days_wrong: u64,
+    /// Start of the first UTC day that disagrees (unix seconds).
+    pub first_wrong_day: u32,
+    /// What the view says, and what the base table says, over the days
+    /// that disagree.
+    pub view_rows: i64,
+    pub base_rows: i64,
+}
+
+/// An aggregate whose row count must equal a plain count over its base
+/// table, per UTC day: the check that catches a DOUBLED aggregate, which
+/// is what the whole epoch machinery exists to prevent and what nothing
+/// verified.
+///
+/// Only aggregates whose grouping PARTITIONS the base rows qualify (every
+/// row contributes to exactly one bucket of exactly one group). Bucket
+/// width must be one day, so the comparison needs no bucket arithmetic.
+struct AggregateCheck {
+    view: &'static str,
+    /// Column of the view holding the row count.
+    count: &'static str,
+    bucket: &'static str,
+    base: &'static str,
+    /// The same restriction the materialized view applies, if any.
+    filter: Option<&'static str>,
+}
+
+const AGGREGATE_CHECKS: &[AggregateCheck] = &[
+    AggregateCheck {
+        view: "daily_block_stats_v",
+        count: "blocks",
+        bucket: "day",
+        base: "blocks",
+        filter: None,
+    },
+    AggregateCheck {
+        view: "daily_transaction_stats_v",
+        count: "transactions",
+        bucket: "day",
+        base: "transactions",
+        filter: None,
+    },
+    AggregateCheck {
+        view: "daily_erc20_transfer_stats_v",
+        count: "transfers",
+        bucket: "day",
+        base: "erc20_transfers",
+        filter: None,
+    },
+    // MODULE: one aggregate per module whose grouping partitions its base
+    // table. `dex_candles_1d` groups by (pool, emitter) and skips the two
+    // protocols whose amounts are not a price.
+    AggregateCheck {
+        view: "dex_candles_1d_v",
+        count: "swaps",
+        bucket: "bucket",
+        base: "dex_swaps",
+        filter: Some("protocol NOT IN ('balancer_v2', 'curve')"),
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
     pub chain: u64,
@@ -50,6 +121,16 @@ pub struct VerifyReport {
     pub checkpoint_conflicts: Vec<BlockRange>,
     /// Block up to which the checkpoints cover the range without a hole.
     pub checkpoint_resume: u64,
+    /// Aggregates that disagree with their base table. Only filled when
+    /// the range has no gaps (an incomplete day is not a wrong day).
+    pub aggregates: Vec<AggregateReport>,
+    /// The aggregate cross-check did not run, and why.
+    pub aggregates_skipped: Option<&'static str>,
+    /// The next `indexer run` will purge and re-index something: exactly
+    /// what the gap heal looks for, asked with the SAME query. The orphan
+    /// list above reads live rows (`FINAL`) only, so a heal that died half
+    /// way - tombstoned rows nothing has settled - is invisible there.
+    pub heal_pending: bool,
     pub epoch: u32,
 }
 
@@ -58,6 +139,7 @@ impl VerifyReport {
         self.gaps.is_empty()
             && self.orphans.is_empty()
             && self.checkpoint_conflicts.is_empty()
+            && self.aggregates.is_empty()
     }
 }
 
@@ -92,7 +174,15 @@ impl fmt::Display for VerifyReport {
         }
 
         if self.orphans.is_empty() {
-            writeln!(f, "Orphan rows (rows without their block): none.")?;
+            writeln!(
+                f,
+                "Orphan rows (rows without their block): none{}.",
+                if self.heal_pending {
+                    " that are still live, but a gap heal is pending                      (tombstoned rows of a purge that did not finish)"
+                } else {
+                    ""
+                }
+            )?;
         } else {
             writeln!(
                 f,
@@ -108,6 +198,35 @@ impl fmt::Display for VerifyReport {
                     orphan.first_block,
                     orphan.last_block
                 )?;
+            }
+        }
+
+        match (&self.aggregates_skipped, self.aggregates.is_empty()) {
+            (Some(why), _) => {
+                writeln!(f, "Aggregates: not checked ({why}).")?
+            }
+            (None, true) => writeln!(
+                f,
+                "Aggregates: they agree with the base tables."
+            )?,
+            (None, false) => {
+                writeln!(
+                    f,
+                    "Aggregates DISAGREE with the base tables (a range                      counted twice, or a repair that did not finish).                      Re-run the affected days with `indexer backfill`, or                      re-index them:"
+                )?;
+                for wrong in &self.aggregates {
+                    writeln!(
+                        f,
+                        "  {}: {} of {} day(s) wrong, first at unix time                          {}; those days say {} instead of {} ({})",
+                        wrong.view,
+                        wrong.days_wrong,
+                        wrong.days_checked,
+                        wrong.first_wrong_day,
+                        wrong.view_rows,
+                        wrong.base_rows,
+                        wrong.base
+                    )?;
+                }
             }
         }
 
@@ -310,6 +429,45 @@ pub async fn verify(
 
     let checkpoint_resume = resume_point(db, range.from).await?;
 
+    // 3b. What will the next start do? The orphan list above is over LIVE
+    //     rows; the heal detector deliberately also counts tombstoned ones
+    //     that no completed purge settled, so a purge can be pending while
+    //     the list is empty.
+    let heal_pending = ClickhouseReorgStore::new(db.clone(), Scope::Chain)
+        .has_orphan_children(chain, range.from, None)
+        .await
+        .context("gap heal check")?;
+
+    // 4. Do the aggregates still say what the base tables say?
+    //
+    //    This is the corruption the epoch machinery exists to prevent - a
+    //    materialized view only ever ADDS, so a range written twice counts
+    //    twice - and nothing checked it: the base tables read perfectly
+    //    while every total is wrong, which is worse than missing data.
+    //
+    //    Only over days that are COMPLETE in the range: a partial day
+    //    disagrees for a legitimate reason. That means no gaps, and the
+    //    edge days of the range are left out.
+    let (mut aggregates, mut aggregates_skipped) = (Vec::new(), None);
+
+    if !gaps.is_empty() {
+        aggregates_skipped =
+            Some("the range has gaps, so no day in it is complete");
+    } else if let Some((first_day, last_day)) =
+        complete_days(db, range).await?
+    {
+        for check in AGGREGATE_CHECKS {
+            if let Some(report) =
+                check.run(db, range, first_day, last_day).await?
+            {
+                aggregates.push(report);
+            }
+        }
+    } else {
+        aggregates_skipped =
+            Some("the range holds less than one complete UTC day");
+    }
+
     Ok(VerifyReport {
         chain,
         range,
@@ -319,8 +477,99 @@ pub async fn verify(
         orphans,
         checkpoint_conflicts,
         checkpoint_resume,
+        aggregates,
+        aggregates_skipped,
+        heal_pending,
         epoch: db.current_epoch().await?,
     })
+}
+
+/// `[first, last)`: the UTC days the verified range covers COMPLETELY.
+/// The day of the first stored block and the day of the last one are left
+/// out - the range starts and ends inside them.
+async fn complete_days(
+    db: &Database,
+    range: BlockRange,
+) -> Result<Option<(u32, u32)>> {
+    const DAY: u32 = 86_400;
+
+    let (blocks, low, high): (u64, u32, u32) = db
+        .db
+        .query(&format!(
+            "SELECT toUInt64(count()), toUInt32(min(timestamp)),              toUInt32(max(timestamp)) FROM blocks FINAL WHERE chain = {}              AND number >= {} AND number < {}",
+            db.chain_id, range.from, range.to
+        ))
+        .fetch_one()
+        .await
+        .context("timestamp span of the verified range")?;
+
+    if blocks == 0 {
+        return Ok(None);
+    }
+
+    // The first day is complete only when the range starts at block 0:
+    // otherwise the blocks before `range.from` belong to it too.
+    let first = if range.from == 0 && low % DAY == 0 {
+        low
+    } else {
+        low - low % DAY + DAY
+    };
+    let last = high - high % DAY;
+
+    Ok((first < last).then_some((first, last)))
+}
+
+impl AggregateCheck {
+    /// `None` when the aggregate and its base table agree on every
+    /// complete day.
+    async fn run(
+        &self,
+        db: &Database,
+        range: BlockRange,
+        first_day: u32,
+        last_day: u32,
+    ) -> Result<Option<AggregateReport>> {
+        let chain = db.chain_id;
+        let block_column =
+            if self.base == "blocks" { "number" } else { "block_number" };
+        let filter = self
+            .filter
+            .map(|filter| format!(" AND {filter}"))
+            .unwrap_or_default();
+
+        // One row per day from each side, subtracted. Cheap: both sides
+        // are keyed by chain and read one day range.
+        let sql = format!(
+            "SELECT toUInt64(count()), toUInt64(countIf(delta != 0)),              toUInt32(ifNull(min(if(delta != 0, day, NULL)), 0)),              toInt64(sumIf(in_view, delta != 0)),              toInt64(sumIf(in_base, delta != 0)) FROM (             SELECT day, sum(agg) AS in_view, sum(base) AS in_base,              sum(agg) - sum(base) AS delta FROM (             SELECT toUInt32(`{bucket}`) AS day, toInt64(`{count}`) AS agg,              toInt64(0) AS base FROM `{view}`              WHERE chain = {chain} AND `{bucket}` >= toDateTime({first_day})              AND `{bucket}` < toDateTime({last_day})              UNION ALL              SELECT intDiv(toUInt32(timestamp), 86400) * 86400 AS day,              toInt64(0) AS agg, toInt64(count()) AS base FROM `{base}` FINAL              WHERE chain = {chain} AND is_deleted = 0              AND timestamp >= toDateTime({first_day})              AND timestamp < toDateTime({last_day})              AND `{block_column}` >= {from} AND `{block_column}` < {to}             {filter} GROUP BY day) GROUP BY day)",
+            bucket = self.bucket,
+            count = self.count,
+            view = self.view,
+            base = self.base,
+            from = range.from,
+            to = range.to,
+        );
+
+        let (
+            days_checked,
+            days_wrong,
+            first_wrong_day,
+            view_rows,
+            base_rows,
+        ): (u64, u64, u32, i64, i64) =
+            db.db.query(&sql).fetch_one().await.with_context(|| {
+                format!("aggregate check of '{}'", self.view)
+            })?;
+
+        Ok((days_wrong > 0).then_some(AggregateReport {
+            view: self.view,
+            base: self.base,
+            days_checked,
+            days_wrong,
+            first_wrong_day,
+            view_rows,
+            base_rows,
+        }))
+    }
 }
 
 /// Block up to which the live checkpoints cover `start` onwards without a
@@ -362,7 +611,69 @@ mod tests {
             orphans: vec![],
             checkpoint_conflicts: vec![],
             checkpoint_resume: 100,
+            aggregates: vec![],
+            aggregates_skipped: None,
+            heal_pending: false,
             epoch: 0,
+        }
+    }
+
+    #[test]
+    fn a_doubled_aggregate_is_inconsistent_and_says_which_days() {
+        let mut report = report();
+        report.aggregates.push(AggregateReport {
+            view: "daily_transaction_stats_v",
+            base: "transactions",
+            days_checked: 30,
+            days_wrong: 2,
+            first_wrong_day: 1_700_000_000,
+            view_rows: 120,
+            base_rows: 60,
+        });
+
+        assert!(!report.is_consistent());
+        let text = report.to_string();
+        assert!(text.contains("Aggregates DISAGREE"), "{text}");
+        assert!(text.contains("2 of 30 day(s) wrong"), "{text}");
+        assert!(text.contains("120 instead of 60"), "{text}");
+        assert!(text.ends_with("Result: PROBLEMS FOUND"));
+    }
+
+    #[test]
+    fn a_partial_range_says_the_aggregates_were_not_checked() {
+        let mut report = report();
+        report.aggregates_skipped = Some("the range has gaps");
+
+        assert!(report.is_consistent());
+        assert!(report
+            .to_string()
+            .contains("Aggregates: not checked (the range has gaps)"));
+    }
+
+    /// Only aggregates whose grouping partitions their base table can be
+    /// compared row for row, and the comparison is per UTC day.
+    #[test]
+    fn every_aggregate_check_names_a_daily_view_of_a_known_base_table() {
+        use crate::pipeline::modules::ALL_MODULES;
+
+        let bases: Vec<&str> = db::BASE_TABLES
+            .iter()
+            .copied()
+            .chain(
+                ALL_MODULES
+                    .iter()
+                    .flat_map(|spec| spec.base_tables.iter().copied()),
+            )
+            .collect();
+
+        for check in AGGREGATE_CHECKS {
+            assert!(bases.contains(&check.base), "{}", check.base);
+            assert!(check.view.ends_with("_v"), "{}", check.view);
+            assert!(
+                crate::db::schema::has_column(check.base, "timestamp"),
+                "{}",
+                check.base
+            );
         }
     }
 

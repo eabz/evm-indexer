@@ -10,7 +10,6 @@ mod tests {
     use crate::{
         db::{self, schema::split_sql_statements},
         pipeline::modules::ALL_MODULES,
-        predictions,
     };
     use std::collections::BTreeSet;
 
@@ -67,13 +66,16 @@ mod tests {
         let mut required: BTreeSet<String> = view_targets(&statements);
         required.extend(db::BASE_TABLES.iter().map(|t| t.to_string()));
         required.insert("checkpoints".to_string());
+        // Every table a flush writes, of every module: its block scoped
+        // tables AND its insert order, which may hold more (a module can
+        // write rows that are not block scoped, like
+        // `prediction_outcome_tokens`).
         for spec in ALL_MODULES {
             required
                 .extend(spec.base_tables.iter().map(|t| t.to_string()));
+            required
+                .extend(spec.insert_order.iter().map(|t| t.to_string()));
         }
-        required.extend(
-            predictions::INSERT_ORDER.iter().map(|t| t.to_string()),
-        );
 
         let missing: Vec<&String> =
             required.difference(&protected).collect();
