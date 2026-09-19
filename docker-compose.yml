@@ -1,5 +1,56 @@
 # Configuration comes from `.env` (copy `.env.example` to `.env` first).
 # `ENVIO_API_TOKEN` is the only value without a default.
+#
+# One ClickHouse database holds every chain; there is ONE indexer process per
+# chain. `x-indexer` below is the shared definition, `indexer` is the first
+# chain and `indexer-base` (commented out) shows how to add another one.
+
+# Shared by every indexer service (YAML merge key: `<<: *indexer`).
+x-indexer: &indexer
+  build:
+    context: .
+    dockerfile: Dockerfile
+  # One image for all chains: the first service builds it, the others reuse it.
+  image: evm-indexer:local
+  depends_on:
+    clickhouse:
+      condition: service_healthy
+    dragonfly:
+      condition: service_healthy
+  # Every indexer setting (START_BLOCK, CONFIRMATIONS, RPC_URL, FLUSH_ROWS, ...)
+  # is read from `.env`. Variables that are commented out there are simply not
+  # set, so the indexer falls back to its defaults.
+  env_file:
+    - path: .env
+      required: false
+  healthcheck:
+    # GET /healthz on the metrics port. The runtime image has no curl / wget,
+    # bash's /dev/tcp does the job without adding packages.
+    test:
+      - CMD
+      - bash
+      - -c
+      - exec 3<>/dev/tcp/127.0.0.1/9090 && printf 'GET /healthz HTTP/1.0\r\n\r\n' >&3 && head -n 1 <&3 | grep -q ' 200 '
+    interval: 15s
+    timeout: 5s
+    retries: 4
+    # Startup applies pending schema migrations before the endpoint is served.
+    start_period: 60s
+  networks:
+    - indexer-network
+  restart: unless-stopped
+
+# `environment` wins over `.env`: inside compose the indexer always talks to
+# the bundled ClickHouse and Dragonfly services. The indexer creates the
+# database named in DATABASE_URL and all of its tables itself (embedded,
+# versioned migrations), nothing is mounted into ClickHouse.
+x-indexer-environment: &indexer-environment
+  ENVIO_API_TOKEN: ${ENVIO_API_TOKEN:?Set ENVIO_API_TOKEN in .env - get one at https://docs.envio.dev/docs/HyperSync/api-tokens}
+  DATABASE_URL: http://${CLICKHOUSE_USER:-indexer}:${CLICKHOUSE_PASSWORD:-indexer}@clickhouse:8123/${CLICKHOUSE_DB:-indexer}
+  REDIS_URL: redis://dragonfly:6379
+  # Same port inside every container; each service publishes it on its own
+  # host port below.
+  METRICS_ADDR: 0.0.0.0:9090
 
 services:
   clickhouse:
@@ -12,11 +63,9 @@ services:
       - "127.0.0.1:9000:9000" # native protocol (clickhouse-client)
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-      # Executed once, on first start with an empty data volume.
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     environment:
-      # The migrations create their tables in the `indexer` database.
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-indexer}
+      # Only the account. The database (CLICKHOUSE_DB, used in DATABASE_URL)
+      # and the tables are created by the indexer.
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-indexer}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-indexer}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
@@ -25,9 +74,9 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      # While the init scripts run, the entrypoint's temporary server only
-      # listens on 127.0.0.1. Pinging through the container hostname makes the
-      # service healthy only once the real server (migrations applied) is up.
+      # Pinged through the container hostname, not 127.0.0.1: a temporary
+      # bootstrap server of the image's entrypoint (localhost only) can then
+      # never be mistaken for the real one.
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):8123/ping || exit 1"]
       interval: 5s
       timeout: 5s
@@ -38,8 +87,9 @@ services:
     restart: unless-stopped
 
   dragonfly:
-    # Redis-compatible cache for token metadata (name / symbol / decimals).
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.40.2
+    # Redis-compatible cache for token metadata (name / symbol / decimals),
+    # shared by all chains (keys are namespaced by chain id).
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.0
     container_name: evm-indexer-dragonfly
     # Dragonfly needs 256MB of maxmemory per thread, so keep both in step.
     command:
@@ -60,31 +110,35 @@ services:
       - indexer-network
     restart: unless-stopped
 
+  # First chain. CHAIN_ID and the block range come from `.env`.
   indexer:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *indexer
     container_name: evm-indexer
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-      dragonfly:
-        condition: service_healthy
-    # Every indexer setting (CHAIN_ID, START_BLOCK, END_BLOCK, RPC_URL, TRACES,
-    # FLUSH_ROWS, ...) is read from `.env`. Variables that are commented out
-    # there are simply not set, so the indexer falls back to its defaults.
-    env_file:
-      - path: .env
-        required: false
-    # These take precedence over `.env`: inside compose the indexer always
-    # talks to the bundled ClickHouse and Dragonfly services.
     environment:
-      ENVIO_API_TOKEN: ${ENVIO_API_TOKEN:?Set ENVIO_API_TOKEN in .env - get one at https://docs.envio.dev/docs/HyperSync/api-tokens}
-      DATABASE_URL: http://${CLICKHOUSE_USER:-indexer}:${CLICKHOUSE_PASSWORD:-indexer}@clickhouse:8123/${CLICKHOUSE_DB:-indexer}
-      REDIS_URL: redis://dragonfly:6379
-    networks:
-      - indexer-network
-    restart: unless-stopped
+      <<: *indexer-environment
+    ports:
+      # Prometheus metrics, /healthz and /readyz. Localhost only.
+      - "127.0.0.1:${METRICS_PORT:-9101}:9090"
+
+  # A second chain in the same database: copy this block per chain, give it
+  # its own service name, container name, CHAIN_ID and metrics host port.
+  # Values set here win over `.env`, so anything chain specific that `.env`
+  # sets for the first chain (START_BLOCK, END_BLOCK, CONFIRMATIONS, RPC_URL,
+  # HYPERSYNC_URL) must be set again here.
+  #
+  # indexer-base:
+  #   <<: *indexer
+  #   container_name: evm-indexer-base
+  #   environment:
+  #     <<: *indexer-environment
+  #     CHAIN_ID: 8453
+  #     START_BLOCK: 0
+  #     END_BLOCK: 0
+  #     CONFIRMATIONS: 0
+  #     RPC_URL: auto
+  #     HYPERSYNC_URL: ""
+  #   ports:
+  #     - "127.0.0.1:9102:9090"
 
 volumes:
   clickhouse_data:

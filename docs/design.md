@@ -191,6 +191,18 @@ MV-fed side table and aggregate all correct after a simulated reorg.)
    A crash anywhere re-runs the whole thing under a newer epoch; the validity rule makes
    the abandoned partial epoch invisible.
 
+**Disk hygiene (operator note).** Tombstones and the rows they hide stay on disk until
+ClickHouse merges them away; the indexer never issues `OPTIMIZE ... FINAL CLEANUP`.
+Volume is negligible (only reorged/orphaned rows). An operator may run a cleanup during
+maintenance; it is never required for correctness.
+
+**Retried inserts must not double count.** A timed-out insert that was actually applied
+and is retried would fire the MVs twice. Every insert therefore carries a deterministic
+`insert_deduplication_token` (table, chain, block span, `_version`), base tables set
+`non_replicated_deduplication_window`, and inserts run with
+`deduplicate_blocks_in_dependent_materialized_views = 1`; if an insert outcome stays
+ambiguous after retries, the affected range is purged (`gap_heal`) rather than trusted.
+
 Gap queries, checkpoint reads and `block_hash` lookups use `FINAL` so tombstoned blocks
 count as missing.
 
@@ -213,7 +225,7 @@ ARE purged when created inside the purged range.
 `checkpoints (chain, from_block, to_block, _version)` — one row per contiguous committed
 range per flush, written after `blocks`. Resume = max contiguous `to_block` from
 `start_block`. The gap query over `blocks` remains as the first-pass verifier/repair and
-as `indexer verify`. `purge_range` deletes/truncates overlapping checkpoints first.
+as `indexer verify`. `purge_range` tombstones overlapping checkpoints (insert-only, like everything else).
 
 ## 4. Token metadata without trusting one RPC (F3)
 
