@@ -418,3 +418,42 @@ HyperSync serves; two verified event families cover ~86% of that). Module
   `launchpad_frontends` table. Never add front-end volume to venue volume.
 - Forgery rules from the DEX review apply: curve trades are valued only when
   corroborated by the token/quote ERC-20 (or native value) movement in the same tx.
+
+## 12. Code layout - ONE structure: feature modules
+
+The codebase must not mix "by layer" (`db/models`, `utils`) and "by feature" (`dex/`,
+`predictions/`). **Feature modules win.** Rule: *a dataset owns everything about itself;
+infrastructure owns nothing about any dataset.*
+
+```
+src/
+  configs/        CLI + env parsing
+  source/         HyperSync client wrapper (ingest only)
+  pipeline/       orchestration: stream -> transform -> writer, module seam, workers
+  db/             INFRASTRUCTURE ONLY: client + insert path, migrate, schema helpers
+                  (tombstone_sql...), ranges/checkpoints, the DerivedTable TYPE, format.rs
+                  (ClickHouse serializers). No row models, no dataset constants.
+  reorg/          fork-point search + purge orchestration (traits, no ClickHouse)
+  tokens/         token metadata worker + RPC endpoints
+  metrics/
+  core/           DATA MODULE: blocks, transactions, logs, withdrawals, ERC-20/721/1155 transfers
+  dex/            DATA MODULE
+  predictions/    DATA MODULE
+  launchpads/     DATA MODULE
+```
+
+Every DATA MODULE has the same files and the same public surface, so the pipeline seam
+treats them uniformly: `mod.rs` (API + `BASE_TABLES`, `SIDE_TABLES`, `*_DERIVED`),
+`models.rs` (row structs), `events.rs` (keccak-checked signatures), `decode.rs` (pure, no
+I/O: source rows/logs -> module rows), `derived.rs`, optional `worker.rs`/`resolve.rs`,
+`integration_tests.rs`, `README.md`; and owns a migration range (`0001-0009` core,
+`0010-0019` dex, `0020-0029` predictions, `0030-0039` launchpads, `0090+` cross-module).
+
+Moves this implies (mechanical, `git mv`, no behaviour change): `src/db/models/*` ->
+`src/core/models.rs` (or `core/models/`); HyperSync -> row conversions and transfer
+decoding out of `src/pipeline/transform.rs` -> `src/core/decode.rs` (transform keeps only
+orchestration); `src/utils/events.rs`, `convert.rs` -> `src/core/`; `src/utils/format.rs`
+-> `src/db/format.rs`; `CORE_DERIVED` + core table constants -> `src/core/`; `src/utils/`
+disappears. **Timing:** one dedicated refactor right after the pipeline wiring lands and
+before the final gate and review round 2 - never while another engineer has those files
+open. Until then: new code follows this layout; nobody moves existing files.
