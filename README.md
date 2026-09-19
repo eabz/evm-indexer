@@ -538,6 +538,8 @@ In compose, it is one more service in the `x-indexer` block:
 
 `indexer verify --chain solana` runs the Solana checks (cursor tiling, height chain, parent chain, orphan rows, candles against `sol_dex_swaps`) and reports skipped slots as skipped rather than missing.
 
+Give it the slot you actually started from — `indexer verify --chain solana --start-block 448378313`. It defaults to 0, and after a `--new-blocks-only` run that is honest but unhelpful: everything below the start really was never asked for, so the report is one enormous hole.
+
 ### Cost and rate limit
 
 The free Envio token is **30 queries per 60 seconds per endpoint** (a flat cost per query, whatever it returns), and the Solana endpoint has its own budget — adding Solana does not eat the EVM chains'. Following the head needs 5 to 15 of those, so the follower caps itself at 25 and additionally honours the `x-ratelimit-*` headers of every response. `GET /height` is free and unmetered, so discovering that nothing happened never costs a query.
