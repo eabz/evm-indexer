@@ -307,6 +307,11 @@ pub struct Diagnostics {
     pub decoder_disagreed: u64,
     /// A native SOL leg was needed but could not be attributed unambiguously.
     pub ambiguous_native: u64,
+    /// Both legs were real token transfers, but every candidate for the
+    /// pool survived all three tests of `resolve_pool` and no venue event
+    /// settled it - live, a bot VAULT trading against a bonding curve,
+    /// where taker and pool are both program derived addresses.
+    pub ambiguous_pool: u64,
     /// Swaps per venue, indexed by [`Venue::index`].
     pub swaps_by_venue: [u64; Venue::ALL.len()],
     /// Of those, how many the venue's own event CONFIRMED.
@@ -328,6 +333,7 @@ impl Diagnostics {
         self.unclassified += other.unclassified;
         self.decoder_disagreed += other.decoder_disagreed;
         self.ambiguous_native += other.ambiguous_native;
+        self.ambiguous_pool += other.ambiguous_pool;
         self.kind_disagreed += other.kind_disagreed;
         for index in 0..Venue::ALL.len() {
             self.swaps_by_venue[index] += other.swaps_by_venue[index];
@@ -714,11 +720,11 @@ pub fn decode_transaction_with(
                 );
                 outcome.swaps.push(row);
             }
-            // The movement layer proposed both sides of a symmetric
-            // native-leg trade; the venue's own event decides which is the
-            // pool. Exactly one reading can validate, because the event
-            // names the user and the direction.
-            Classified::NativeCandidates(proposals) => {
+            // The movement layer proposed both sides of a symmetric trade;
+            // the venue's own event decides which is the pool. Exactly one
+            // reading can validate, because the event names the user and
+            // the direction.
+            Classified::Candidates(proposals) => {
                 let only_one = proposals.len() == 1;
                 let mut accepted = None;
                 let mut verdict = crate::svm::events::Enrichment::None;
@@ -759,7 +765,17 @@ pub fn decode_transaction_with(
                         );
                         outcome.swaps.push(row);
                     }
-                    None => outcome.diagnostics.ambiguous_native += 1,
+                    // No reading validated, so the trade is real but its
+                    // direction is unknown. Never guessed: which of the two
+                    // counters it lands in says whether a SOL leg or a
+                    // symmetric pair of PDAs was the cause.
+                    None if proposals
+                        .first()
+                        .is_some_and(|s| s.native_leg) =>
+                    {
+                        outcome.diagnostics.ambiguous_native += 1
+                    }
+                    None => outcome.diagnostics.ambiguous_pool += 1,
                 }
             }
             Classified::Liquidity => {
@@ -823,10 +839,17 @@ fn record(
 
 enum Classified {
     Swap(MovementSwap),
-    /// A native-leg trade whose pool side the movement layer cannot pick on
-    /// its own. Each entry is the same trade read from one candidate's point
-    /// of view, so at most ONE can be right; the per-program decoder picks.
-    NativeCandidates(Vec<MovementSwap>),
+    /// A trade whose pool side the movement layer cannot pick on its own.
+    /// Each entry is the same trade read from one candidate's point of
+    /// view, so at most ONE can be right; the per-program decoder picks.
+    ///
+    /// Two shapes reach this. A native-leg trade is symmetric by
+    /// construction. A two-sided trade gets here when EVERY candidate
+    /// survives all three steps of [`resolve_pool`] - measured live, that
+    /// is a bot VAULT buying on a bonding curve: the vault is a program
+    /// derived address too, so the off-curve test cannot tell it from the
+    /// pool, and before this the row was dropped as unclassified.
+    Candidates(Vec<MovementSwap>),
     Liquidity,
     Unclassified,
     AmbiguousNative,
@@ -1007,6 +1030,31 @@ fn classify(
         return classify_two_sided(venue, instruction, owned, authority);
     }
 
+    // Two or more candidates survived every test, so the movement layer
+    // genuinely cannot tell the pool from the taker. Rather than drop the
+    // trade, propose each reading and let the venue's own event pick -
+    // exactly what the native-leg path below has always done. The readings
+    // differ in DIRECTION, which is precisely what an event states.
+    if pools.len() > 1 {
+        let proposals: Vec<MovementSwap> = pools
+            .iter()
+            .filter_map(|authority| {
+                match classify_two_sided(
+                    venue,
+                    instruction,
+                    owned,
+                    *authority,
+                ) {
+                    Classified::Swap(swap) => Some(swap),
+                    _ => None,
+                }
+            })
+            .collect();
+        if !proposals.is_empty() {
+            return Classified::Candidates(proposals);
+        }
+    }
+
     // One mint only: the other leg may be native SOL moved without an
     // instruction (a bonding curve decrements its own lamports).
     let mints: Vec<Pubkey> = {
@@ -1043,7 +1091,7 @@ fn classify(
 
     match swaps.len() {
         0 => Classified::AmbiguousNative,
-        _ => Classified::NativeCandidates(swaps),
+        _ => Classified::Candidates(swaps),
     }
 }
 
