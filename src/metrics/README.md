@@ -1,0 +1,125 @@
+# metrics
+
+`--metrics-addr <ip:port>` (default off) serves:
+
+| Endpoint | Answer |
+|---|---|
+| `GET /metrics` | Prometheus text format 0.0.4 |
+| `GET /healthz` | `200 ok` while the process is alive |
+| `GET /readyz` | `200 ready` when `set_ready(true)` was called **and** the last successful flush or head poll is younger than the staleness limit; otherwise `503` and a one-line reason |
+
+Hand-rolled: atomics behind a clonable `Metrics` handle and a ~250 line
+HTTP/1.1 responder on a tokio `TcpListener`. No new dependencies, no
+metrics-crate types outside this module. One request per connection
+(`Connection: close`), request head limited to 8 KiB and 5 s, at most 64
+concurrent connections, bodies never read.
+
+## Metric reference
+
+Every series is prefixed `evm_indexer_` and carries the constant label
+`chain="<chain id>"`. Series marked *(when known)* are absent until the
+first value is recorded.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `build_info` | gauge | `version`, `commit` | Always 1 |
+| `start_time_seconds` | gauge | | Process start, unix time |
+| `ready` | gauge | | 1 when `/readyz` answers 200 |
+| `head_block` | gauge | | Chain head reported by the source *(when known)* |
+| `indexed_block` | gauge | | Highest block durably stored *(when known)* |
+| `lag_blocks` | gauge | | `head_block - indexed_block`, never negative |
+| `head_timestamp_seconds` | gauge | | Timestamp of the head block *(when known)* |
+| `indexed_timestamp_seconds` | gauge | | Timestamp of the indexed block *(when known)* |
+| `lag_seconds` | gauge | | Head timestamp (wall clock when unknown) minus indexed timestamp |
+| `rows_inserted_total` | counter | `table` | Rows durably inserted; `rate()` gives rows/s |
+| `flushes_total` | counter | `result` = `ok` \| `error` | Flushes (one multi-table batch each) |
+| `flush_duration_seconds` | histogram | `le` | Flush latency, retries included; 10 ms to 300 s |
+| `last_flush_rows` | gauge | | Rows in the most recent flush |
+| `last_successful_flush_timestamp_seconds` | gauge | | Unix time of the last successful flush |
+| `flush_retries_total` | counter | `table` | Inserts that failed and were retried |
+| `channel_len`, `channel_capacity` | gauge | | Fill of the transformer to writer channel |
+| `stream_errors_total` | counter | | Sync passes that failed and were retried |
+| `reorgs_total` | counter | | Reorganizations detected |
+| `reorg_blocks_total` | counter | | Sum of the depths of all reorganizations |
+| `reorg_last_depth` | gauge | | Depth of the most recent reorganization |
+| `purge_duration_seconds` | histogram | `le` | `purge_range` latency (rollback, gap healing); 50 ms to 900 s |
+| `purged_blocks_total` | counter | | Blocks removed by `purge_range` |
+| `resolver_queue_depth` | gauge | `worker` = `tokens` \| `pools` | Addresses waiting for the background resolver |
+| `resolver_resolved_total` | counter | `worker` | Resolved with metadata |
+| `resolver_negative_total` | counter | `worker` | Resolved to nothing (reverts, garbage) |
+| `resolver_dropped_total` | counter | `worker` | Discoveries dropped on a full queue (healed by the backfill) |
+| `resolver_cache_hits_total`, `resolver_cache_misses_total` | counter | `worker` | Resolver cache |
+| `resolver_breaker_open` | gauge | `worker` | 1 when every RPC endpoint's breaker is open |
+| `resolver_endpoints_healthy` | gauge | `worker` | Healthy RPC endpoints |
+
+Cache hit rate:
+
+```promql
+rate(evm_indexer_resolver_cache_hits_total[5m])
+  / (rate(evm_indexer_resolver_cache_hits_total[5m])
+     + rate(evm_indexer_resolver_cache_misses_total[5m]))
+```
+
+## Alerts
+
+```yaml
+groups:
+  - name: evm-indexer
+    rules:
+      # Falling behind the chain, or stalled: the lag grows while nothing
+      # is being committed. (During a historical sync the lag is large but
+      # shrinking, which does not fire.)
+      - alert: IndexerLagging
+        expr: |
+          evm_indexer_lag_seconds > 300
+            and delta(evm_indexer_indexed_block[10m]) <= 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "chain {{ $labels.chain }}: {{ $value }}s behind and not advancing"
+
+      # A failed flush is fatal for the process (it exits and resumes), so
+      # a single one deserves a look; retries are the early warning.
+      - alert: IndexerFlushFailing
+        expr: |
+          increase(evm_indexer_flushes_total{result="error"}[15m]) > 0
+            or sum by (chain) (increase(evm_indexer_flush_retries_total[15m])) > 5
+            or changes(evm_indexer_start_time_seconds[30m]) > 2
+        labels: { severity: page }
+        annotations:
+          summary: "chain {{ $labels.chain }}: ClickHouse inserts are failing"
+
+      # Deep reorg: beyond what the chain's finality should allow. Tune
+      # the depth per chain; `--max-reorg-depth` (512) is fatal.
+      - alert: IndexerDeepReorg
+        expr: |
+          evm_indexer_reorg_last_depth > 32
+            and increase(evm_indexer_reorgs_total[10m]) > 0
+        labels: { severity: warn }
+        annotations:
+          summary: "chain {{ $labels.chain }}: reorg of {{ $value }} blocks"
+```
+
+## Wiring (for the pipeline)
+
+```rust
+let metrics = match args.metrics_addr {
+    Some(addr) => {
+        let metrics = Metrics::new(chain_id, Duration::from_secs(120));
+        let server = metrics::bind(addr, metrics.clone()).await?; // fails fast
+        tokio::spawn(server.run(shutdown_signal()));
+        metrics
+    }
+    None => Metrics::disabled(),
+};
+```
+
+- `set_head` on **every** successful head poll (it is the idle-time sign
+  of life for `/readyz`), `set_indexed_height` / `set_indexed_timestamp`
+  after each successful flush, `flush_observed` around `Sink::store`
+  (failures too), `rows_inserted` per table inside the sink,
+  `flush_retry(table)` in the insert retry loop.
+- `table` labels are `&'static str`: pass table-name literals.
+- `set_token_stats` / `set_pool_stats` take `WorkerStatsSnapshot`
+  (aliased as `TokenStatsSnapshot` / `PoolStatsSnapshot`); map the
+  workers' own stats into it on a timer or after each flush.

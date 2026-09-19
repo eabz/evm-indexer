@@ -6,7 +6,7 @@
 //! bounded, so a slow database slows the HyperSync stream down instead of
 //! growing memory.
 
-use crate::db::RowBatch;
+use crate::db::{next_version, RowBatch};
 use anyhow::{Context, Result};
 use log::{error, info};
 use std::{future::Future, time::Duration};
@@ -168,7 +168,9 @@ async fn flush<S: Sink>(
         return Ok(());
     }
 
-    let batch = std::mem::take(buffer);
+    let mut batch = std::mem::take(buffer);
+    // One `_version` per flush: a re-inserted block replaces itself.
+    batch.set_version(next_version());
     let started = Instant::now();
 
     if let Err(e) = sink.store(&batch).await {

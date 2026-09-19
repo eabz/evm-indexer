@@ -82,12 +82,7 @@ impl Progress for Database {
     }
 
     async fn block_hash(&self, number: u64) -> Result<Option<B256>> {
-        match Database::block_hash(self, number).await? {
-            Some(hash) => Ok(Some(
-                hash.parse::<B256>().context("parse stored block hash")?,
-            )),
-            None => Ok(None),
-        }
+        Database::block_hash(self, number).await
     }
 }
 

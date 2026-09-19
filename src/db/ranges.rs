@@ -59,7 +59,7 @@ pub struct GapRow {
 fn indexed_numbers_sql(chain: u64, range: BlockRange) -> String {
     format!(
         "SELECT DISTINCT number FROM blocks \
-         WHERE chain = {chain} AND is_uncle = false \
+         WHERE chain = {chain} \
          AND number >= {from} AND number < {to}",
         from = range.from,
         to = range.to,
@@ -317,12 +317,11 @@ mod tests {
     }
 
     #[test]
-    fn sql_is_scoped_to_chain_canonical_blocks_and_range() {
+    fn sql_is_scoped_to_chain_and_range() {
         let range = BlockRange::new(0, 500);
         let sql = gaps_sql(56, range, 1000);
 
         assert!(sql.contains("chain = 56"));
-        assert!(sql.contains("is_uncle = false"));
         assert!(sql.contains("number >= 0 AND number < 500"));
         // First row compares against `from - 1` (signed, from may be 0).
         assert!(sql.contains("toInt64(0) - 1"));

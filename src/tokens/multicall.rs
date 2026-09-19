@@ -6,9 +6,9 @@ use std::{
     future::{Future, IntoFuture},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use alloy::{
@@ -24,8 +24,11 @@ use alloy::{
 use anyhow::Context;
 use futures::{future::BoxFuture, stream, StreamExt};
 use log::{debug, error, info, warn};
+use tokio::time::Instant;
 
-use super::{decode, redact::Redactor, TokenStandard};
+use super::{
+    breaker::CircuitBreaker, decode, redact::Redactor, TokenStandard,
+};
 
 /// Multicall3, deployed at the same address on every chain.
 pub const MULTICALL3_ADDRESS: Address =
@@ -69,6 +72,28 @@ pub enum CallError {
     Execution(String),
 }
 
+/// Answer of [`EthCaller::confirm_empty`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmptyCheck {
+    /// Enough independent backends agree: the call returns no data.
+    Confirmed,
+    /// Another backend returned data for the very same call (attached):
+    /// the empty answer came from a lagging / broken node.
+    Refuted(Bytes),
+    /// Not enough backends could be asked to tell.
+    Undecided,
+}
+
+/// Point in time health of an [`EthCaller`] (for metrics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallerHealth {
+    pub endpoints_total: usize,
+    /// Endpoints on the right chain whose last request succeeded.
+    pub endpoints_healthy: usize,
+    /// Endpoints disabled for good because they serve another chain.
+    pub endpoints_wrong_chain: usize,
+}
+
 /// Minimal RPC backend so the fetcher can be tested without a node.
 pub trait EthCaller: Send + Sync + 'static {
     /// `eth_call` at the latest block.
@@ -80,6 +105,25 @@ pub trait EthCaller: Send + Sync + 'static {
 
     /// `eth_chainId`.
     fn chain_id(&self) -> BoxFuture<'_, Result<u64, CallError>>;
+
+    /// Called after [`call`](Self::call) answered `to` / `data` with zero
+    /// bytes and the caller is about to draw a *lasting* conclusion from
+    /// it ("there is no contract there"). A backend made of several
+    /// independent nodes cross-checks the answer; the default (a single
+    /// node) has nobody else to ask.
+    fn confirm_empty(
+        &self,
+        to: Address,
+        data: Bytes,
+    ) -> BoxFuture<'_, EmptyCheck> {
+        let _ = (to, data);
+        Box::pin(async { EmptyCheck::Confirmed })
+    }
+
+    /// Health of the backend, `None` when it does not track any.
+    fn health(&self) -> Option<CallerHealth> {
+        None
+    }
 }
 
 /// [`EthCaller`] over an alloy HTTP provider.
@@ -307,6 +351,12 @@ pub struct FetchOptions {
     pub breaker_cooldown: Duration,
     /// Upper bound of the doubling cool-down.
     pub breaker_max_cooldown: Duration,
+    /// A confirmed "Multicall3 is not deployed" is checked again after
+    /// this long (it may get deployed, the nodes may all have lagged).
+    pub multicall_recheck: Duration,
+    /// How long individual calls are used when the absence of Multicall3
+    /// could not be cross-checked (see [`EthCaller::confirm_empty`]).
+    pub multicall_undecided_ttl: Duration,
 }
 
 impl Default for FetchOptions {
@@ -320,6 +370,8 @@ impl Default for FetchOptions {
             call_timeout: Duration::from_secs(10),
             breaker_cooldown: Duration::from_secs(30),
             breaker_max_cooldown: Duration::from_secs(300),
+            multicall_recheck: Duration::from_secs(3_600),
+            multicall_undecided_ttl: Duration::from_secs(60),
         }
     }
 }
@@ -338,11 +390,6 @@ const CHAIN_UNCHECKED: u8 = 0;
 const CHAIN_VERIFIED: u8 = 1;
 const CHAIN_MISMATCH: u8 = 2;
 
-struct Breaker {
-    open_until: Option<Instant>,
-    next_cooldown: Duration,
-}
-
 /// Fetches token metadata through Multicall3 (or plain calls when the chain
 /// has no Multicall3).
 ///
@@ -353,11 +400,13 @@ struct Breaker {
 pub struct MetadataFetcher {
     caller: Arc<dyn EthCaller>,
     options: FetchOptions,
-    multicall_missing: AtomicBool,
+    /// Individual calls are used instead of Multicall3 until then.
+    multicall_missing_until: Mutex<Option<Instant>>,
+    multicall_missing_logged: AtomicBool,
     expected_chain_id: Option<u64>,
     chain_state: AtomicU8,
     observed_chain_id: AtomicU64,
-    breaker: Mutex<Breaker>,
+    breaker: CircuitBreaker,
     rpc_down: AtomicBool,
 }
 
@@ -386,21 +435,27 @@ impl FetchRun {
 
 impl MetadataFetcher {
     pub fn new(caller: Arc<dyn EthCaller>, options: FetchOptions) -> Self {
-        let breaker = Breaker {
-            open_until: None,
-            next_cooldown: options.breaker_cooldown,
-        };
+        let breaker = CircuitBreaker::new(
+            options.breaker_cooldown,
+            options.breaker_max_cooldown,
+        );
 
         Self {
             caller,
             options,
-            multicall_missing: AtomicBool::new(false),
+            multicall_missing_until: Mutex::new(None),
+            multicall_missing_logged: AtomicBool::new(false),
             expected_chain_id: None,
             chain_state: AtomicU8::new(CHAIN_UNCHECKED),
             observed_chain_id: AtomicU64::new(0),
-            breaker: Mutex::new(breaker),
+            breaker,
             rpc_down: AtomicBool::new(false),
         }
+    }
+
+    /// The backend the metadata is fetched from.
+    pub fn caller(&self) -> &Arc<dyn EthCaller> {
+        &self.caller
     }
 
     /// Requires the node to serve `chain_id`: nothing is fetched until
@@ -458,33 +513,41 @@ impl MetadataFetcher {
             && !self.breaker_open()
     }
 
-    fn breaker(&self) -> MutexGuard<'_, Breaker> {
-        self.breaker.lock().unwrap_or_else(|e| e.into_inner())
+    /// `true` while the RPC circuit breaker is open.
+    pub fn breaker_open(&self) -> bool {
+        self.breaker.is_open()
     }
 
-    fn breaker_open(&self) -> bool {
-        self.breaker()
-            .open_until
+    /// When the open circuit breaker lets the next probe through.
+    pub fn breaker_open_until(&self) -> Option<Instant> {
+        self.breaker.open_until()
+    }
+
+    /// `true` when the RPC is known to serve another chain (permanent).
+    pub fn wrong_chain(&self) -> bool {
+        self.chain_state.load(Ordering::Relaxed) == CHAIN_MISMATCH
+    }
+
+    /// Whether individual calls are currently used instead of Multicall3.
+    pub fn multicall_missing(&self) -> bool {
+        self.multicall_missing_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .is_some_and(|until| Instant::now() < until)
     }
 
+    fn set_multicall_missing(&self, ttl: Duration) {
+        *self
+            .multicall_missing_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some(Instant::now() + ttl);
+    }
+
     fn trip_breaker(&self, error: &str) {
-        let cooldown = {
-            let mut breaker = self.breaker();
-            let now = Instant::now();
-
-            // A concurrent fetch already opened it for this failure.
-            if breaker.open_until.is_some_and(|until| now < until) {
-                return;
-            }
-
-            let cooldown = breaker.next_cooldown;
-            breaker.open_until = Some(now + cooldown);
-            breaker.next_cooldown = cooldown
-                .saturating_mul(2)
-                .min(self.options.breaker_max_cooldown)
-                .max(self.options.breaker_cooldown);
-            cooldown
+        // `None`: a concurrent fetch already opened it for this failure.
+        let Some(cooldown) = self.breaker.trip() else {
+            return;
         };
 
         if !self.rpc_down.swap(true, Ordering::Relaxed) {
@@ -502,11 +565,7 @@ impl MetadataFetcher {
     }
 
     fn reset_breaker(&self) {
-        {
-            let mut breaker = self.breaker();
-            breaker.open_until = None;
-            breaker.next_cooldown = self.options.breaker_cooldown;
-        }
+        self.breaker.reset();
 
         if self.rpc_down.swap(false, Ordering::Relaxed) {
             info!("Token metadata RPC recovered");
@@ -593,7 +652,7 @@ impl MetadataFetcher {
             return Vec::new();
         }
 
-        if self.multicall_missing.load(Ordering::Relaxed) {
+        if self.multicall_missing() {
             return self.fetch_individually(chunk, run).await;
         }
 
@@ -610,8 +669,8 @@ impl MetadataFetcher {
         let expected = calls.len();
         let calldata: Bytes = aggregate3Call { calls }.abi_encode().into();
 
-        let returned = match self
-            .call_with_retry(MULTICALL3_ADDRESS, calldata, run)
+        let mut returned = match self
+            .call_with_retry(MULTICALL3_ADDRESS, calldata.clone(), run)
             .await
         {
             Ok(returned) => returned,
@@ -638,14 +697,50 @@ impl MetadataFetcher {
 
         if returned.is_empty() {
             // eth_call to an address without code succeeds with no data.
-            if !self.multicall_missing.swap(true, Ordering::Relaxed) {
-                warn!(
-                    "Multicall3 is not deployed at {MULTICALL3_ADDRESS} on \
-                     this chain, falling back to individual eth_calls for \
-                     token metadata"
-                );
+            // Multicall3 presence is a property of the chain, not of the
+            // node that answered: a lagging / pruned / broken endpoint
+            // must not switch everybody to individual calls, so the
+            // backend is asked to cross-check before it is remembered.
+            match self
+                .caller
+                .confirm_empty(MULTICALL3_ADDRESS, calldata)
+                .await
+            {
+                EmptyCheck::Refuted(data) if !data.is_empty() => {
+                    debug!(
+                        "An RPC endpoint answered empty for Multicall3 \
+                         while another one has it, using the latter"
+                    );
+                    returned = data;
+                }
+                EmptyCheck::Confirmed => {
+                    self.set_multicall_missing(
+                        self.options.multicall_recheck,
+                    );
+                    if !self
+                        .multicall_missing_logged
+                        .swap(true, Ordering::Relaxed)
+                    {
+                        warn!(
+                            "Multicall3 is not deployed at \
+                             {MULTICALL3_ADDRESS} on this chain, falling \
+                             back to individual eth_calls for token \
+                             metadata"
+                        );
+                    }
+                    return self.fetch_individually(chunk, run).await;
+                }
+                EmptyCheck::Refuted(_) | EmptyCheck::Undecided => {
+                    debug!(
+                        "Unable to cross-check whether Multicall3 is \
+                         deployed, using individual eth_calls for a while"
+                    );
+                    self.set_multicall_missing(
+                        self.options.multicall_undecided_ttl,
+                    );
+                    return self.fetch_individually(chunk, run).await;
+                }
             }
-            return self.fetch_individually(chunk, run).await;
         }
 
         let results = match aggregate3Call::abi_decode_returns(&returned) {
@@ -1345,7 +1440,7 @@ mod tests {
         assert!(outcome.resolved.is_empty());
         assert!(outcome.empty.is_empty());
         // No multicall-missing misdetection because of the outage.
-        assert!(!fetcher.multicall_missing.load(Ordering::SeqCst));
+        assert!(!fetcher.multicall_missing());
 
         chain.offline.store(false, Ordering::SeqCst);
         assert_eq!(fetcher.fetch(&tokens).await.resolved.len(), 500);
@@ -1417,7 +1512,7 @@ mod tests {
         assert!(fetcher.is_available());
         assert_eq!(fetcher.fetch(&tokens).await.resolved.len(), 1);
         assert!(!fetcher.rpc_down.load(Ordering::SeqCst));
-        assert_eq!(fetcher.breaker().next_cooldown, cooldown);
+        assert_eq!(fetcher.breaker.next_cooldown(), cooldown);
     }
 
     #[tokio::test]
@@ -1438,13 +1533,13 @@ mod tests {
         // First failure: full retry cycle, breaker opens for `cooldown`.
         fetcher.fetch(&tokens).await;
         assert_eq!(chain.attempts.load(Ordering::SeqCst), 4);
-        assert_eq!(fetcher.breaker().next_cooldown, cooldown * 2);
+        assert_eq!(fetcher.breaker.next_cooldown(), cooldown * 2);
 
         // Following probes: a single attempt each, cool-down doubles up
         // to the maximum.
         let mut expected_attempts = 4;
         for expected_next in [cooldown * 4, cooldown * 4, cooldown * 4] {
-            let wait = fetcher.breaker().next_cooldown;
+            let wait = fetcher.breaker.next_cooldown();
             tokio::time::sleep(wait + Duration::from_millis(20)).await;
             fetcher.fetch(&tokens).await;
             expected_attempts += 1;
@@ -1452,7 +1547,7 @@ mod tests {
                 chain.attempts.load(Ordering::SeqCst),
                 expected_attempts
             );
-            assert_eq!(fetcher.breaker().next_cooldown, expected_next);
+            assert_eq!(fetcher.breaker.next_cooldown(), expected_next);
         }
     }
 

@@ -3,11 +3,14 @@
 use crate::{
     db::{
         models::{
-            block::DatabaseBlock, contract::DatabaseContract,
+            block::DatabaseBlock,
+            contract::DatabaseContract,
             erc1155_transfer::DatabaseERC1155Transfer,
             erc20_transfer::DatabaseERC20Transfer,
-            erc721_transfer::DatabaseERC721Transfer, log::DatabaseLog,
-            trace::DatabaseTrace, transaction::DatabaseTransaction,
+            erc721_transfer::DatabaseERC721Transfer,
+            log::DatabaseLog,
+            trace::DatabaseTrace,
+            transaction::{DatabaseTransaction, STATUS_FAILURE},
             withdrawal::DatabaseWithdrawal,
         },
         ranges::BlockRange,
@@ -19,7 +22,7 @@ use crate::{
         ERC1155_TRANSFER_SINGLE_EVENT_SIGNATURE, TRANSFER_EVENT_SIGNATURE,
     },
 };
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use anyhow::{bail, Context, Result};
 use hypersync_client::simple_types::{Block, Log, Trace, Transaction};
 use std::collections::{HashMap, HashSet};
@@ -42,10 +45,10 @@ pub struct ResponseRows {
     pub traces: Vec<Vec<Trace>>,
 }
 
-/// Per block values joined into the transaction / log / withdrawal rows.
+/// Per block values joined into the rows of the block's children.
 struct BlockContext {
     timestamp: u32,
-    base_fee_per_gas: Option<u64>,
+    base_fee_per_gas: Option<U256>,
 }
 
 /// Converts a response covering exactly the blocks of `covered`.
@@ -153,24 +156,47 @@ pub fn transform(
         .transactions
         .iter()
         .filter(|transaction| {
-            transaction.status.as_deref() == Some("failure")
+            transaction.status.as_deref() == Some(STATUS_FAILURE)
         })
         .map(|transaction| transaction.hash)
         .collect();
 
-    rows.traces = data
-        .traces
+    // Fallback for traces that name their transaction but not its
+    // position (the position is part of the sorting key of `traces`).
+    let transaction_indexes: HashMap<B256, u32> = rows
+        .transactions
         .iter()
-        .flatten()
-        .map(|trace| DatabaseTrace::from_hypersync(trace, chain))
-        .collect::<Result<_>>()?;
+        .map(|transaction| {
+            (transaction.hash, transaction.transaction_index)
+        })
+        .collect();
+
+    for trace in data.traces.iter().flatten() {
+        let number =
+            trace.block_number.context("trace without a block number")?;
+
+        let context = context_of(number, "trace")?;
+
+        let transaction_index = trace
+            .transaction_hash
+            .as_ref()
+            .and_then(|hash| transaction_indexes.get(&B256::new(***hash)))
+            .copied();
+
+        rows.traces.push(DatabaseTrace::from_hypersync(
+            trace,
+            chain,
+            context.timestamp,
+            transaction_index,
+        )?);
+    }
 
     // Calls that reverted, per transaction: a create below one of them was
     // rolled back even though the create trace itself reports no error.
-    let mut reverted_calls: HashMap<B256, Vec<&[u16]>> = HashMap::new();
+    let mut reverted_calls: HashMap<B256, Vec<&[u32]>> = HashMap::new();
     for trace in &rows.traces {
-        if let (Some(hash), Some(_)) =
-            (trace.transaction_hash, &trace.error)
+        if let (Some(hash), true) =
+            (trace.transaction_hash(), trace.failed())
         {
             reverted_calls
                 .entry(hash)
@@ -223,7 +249,7 @@ pub fn transform(
 
 /// True when `ancestor` is a strict prefix of `path`, i.e. the trace at
 /// `ancestor` is a (transitive) parent of the trace at `path`.
-fn is_proper_prefix(ancestor: &[u16], path: &[u16]) -> bool {
+fn is_proper_prefix(ancestor: &[u32], path: &[u32]) -> bool {
     ancestor.len() < path.len() && path.starts_with(ancestor)
 }
 
@@ -266,8 +292,9 @@ fn decode_transfers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::log::test_support::word;
-    use alloy::primitives::U256;
+    use crate::db::models::{
+        log::test_support::word, trace::REWARD_TRANSACTION_POSITION,
+    };
     use hypersync_client::format::{
         Address as HsAddress, Data, Hash, LogArgument, Quantity,
         TransactionStatus, UInt, Withdrawal,
@@ -359,12 +386,14 @@ mod tests {
         );
         assert_eq!(rows.blocks[0].transactions, 2);
         assert_eq!(rows.blocks[1].transactions, 1);
-        assert!(rows.blocks.iter().all(|b| !b.is_uncle));
 
         // Timestamp / base fee joined by block number.
         assert_eq!(rows.transactions[0].timestamp, 1_000);
         assert_eq!(rows.transactions[2].timestamp, 2_000);
-        assert_eq!(rows.transactions[0].base_fee_per_gas, Some(7));
+        assert_eq!(
+            rows.transactions[0].base_fee_per_gas,
+            Some(U256::from(7u64))
+        );
         assert_eq!(rows.logs[0].timestamp, 1_000);
         assert_eq!(rows.logs[1].timestamp, 2_000);
 
@@ -453,6 +482,7 @@ mod tests {
             from: Some(HsAddress::from([0xfa; 20])),
             address: Some(HsAddress::from([address; 20])),
             transaction_hash: Some(Hash::from([0xd3; 32])),
+            transaction_position: Some(2),
             error: error.map(str::to_string),
             ..Default::default()
         };
@@ -492,6 +522,103 @@ mod tests {
     }
 
     #[test]
+    fn traces_get_the_block_timestamp_and_a_sortable_position() {
+        let data = ResponseRows {
+            blocks: vec![vec![block(1, 1_234)]],
+            transactions: vec![vec![transaction(1, 5, 0xe1)]],
+            traces: vec![vec![
+                // Position reported by the node.
+                Trace {
+                    transaction_position: Some(9),
+                    ..call_trace(0xe1, &[], None)
+                },
+                // Not reported: taken from the transaction of the response.
+                Trace {
+                    transaction_position: None,
+                    ..call_trace(0xe1, &[0], None)
+                },
+                // Block reward: no transaction at all.
+                Trace {
+                    block_number: Some(1),
+                    type_: Some("reward".to_string()),
+                    ..Default::default()
+                },
+            ]],
+            ..Default::default()
+        };
+
+        let rows =
+            transform(CHAIN, &data, BlockRange::new(1, 2)).unwrap().rows;
+
+        assert!(rows.traces.iter().all(|t| t.timestamp == 1_234));
+        assert_eq!(rows.traces[0].transaction_position, 9);
+        assert_eq!(rows.traces[1].transaction_position, 5);
+        assert_eq!(
+            rows.traces[2].transaction_position,
+            REWARD_TRANSACTION_POSITION
+        );
+        assert_eq!(rows.traces[2].transaction_position, 4_294_967_295);
+
+        // Contracts carry the timestamp too.
+        let mut deployment = transaction(1, 0, 0xd1);
+        deployment.contract_address = Some(HsAddress::from([0xc1; 20]));
+        let data = ResponseRows {
+            blocks: vec![vec![block(1, 1_234)]],
+            transactions: vec![vec![deployment]],
+            ..Default::default()
+        };
+        let rows =
+            transform(CHAIN, &data, BlockRange::new(1, 2)).unwrap().rows;
+        assert_eq!(rows.contracts[0].timestamp, 1_234);
+    }
+
+    #[test]
+    fn a_trace_of_an_unknown_block_or_position_is_rejected() {
+        let data = ResponseRows {
+            blocks: vec![vec![block(1, 1)]],
+            traces: vec![vec![Trace {
+                block_number: Some(2),
+                type_: Some("call".to_string()),
+                ..Default::default()
+            }]],
+            ..Default::default()
+        };
+        assert!(transform(CHAIN, &data, BlockRange::new(1, 2)).is_err());
+
+        // Names a transaction that is not in the response and carries no
+        // position: the sorting key can not be built.
+        let data = ResponseRows {
+            blocks: vec![vec![block(1, 1)]],
+            traces: vec![vec![Trace {
+                transaction_position: None,
+                ..call_trace(0xe1, &[], None)
+            }]],
+            ..Default::default()
+        };
+        assert!(transform(CHAIN, &data, BlockRange::new(1, 2)).is_err());
+    }
+
+    #[test]
+    fn erc721_transfer_of_token_id_zero_is_not_an_erc20_transfer() {
+        let mut log = transfer_log(10, 0, 0x21, 4);
+        log.topics[3] = Some(LogArgument::from([0u8; 32]));
+
+        let data = ResponseRows {
+            blocks: vec![vec![block(10, 1)]],
+            logs: vec![vec![log]],
+            ..Default::default()
+        };
+
+        let rows =
+            transform(CHAIN, &data, BlockRange::new(10, 11)).unwrap().rows;
+
+        assert_eq!(rows.logs[0].topic_count, 4);
+        assert_eq!(rows.erc721_transfers.len(), 1);
+        assert_eq!(rows.erc721_transfers[0].id, U256::ZERO);
+        assert!(rows.erc20_transfers.is_empty());
+    }
+
+    #[test]
     fn proper_prefix() {
         assert!(is_proper_prefix(&[], &[0]));
         assert!(is_proper_prefix(&[0], &[0, 1]));
@@ -511,6 +638,7 @@ mod tests {
             from: Some(HsAddress::from([0xfa; 20])),
             address: Some(HsAddress::from([address; 20])),
             transaction_hash: Some(Hash::from([tx; 32])),
+            transaction_position: Some(u64::from(tx)),
             trace_address: Some(path.to_vec()),
             ..Default::default()
         }
@@ -521,6 +649,7 @@ mod tests {
             block_number: Some(1),
             type_: Some("call".to_string()),
             transaction_hash: Some(Hash::from([tx; 32])),
+            transaction_position: Some(u64::from(tx)),
             trace_address: Some(path.to_vec()),
             error: error.map(str::to_string),
             ..Default::default()

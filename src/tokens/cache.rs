@@ -127,6 +127,15 @@ impl RedisTokenCache {
         chain_id: u64,
         url: &str,
     ) -> anyhow::Result<Self> {
+        let cache = Self::lazy(chain_id, url)?;
+        cache.ping().await;
+        Ok(cache)
+    }
+
+    /// Same as [`connect`](Self::connect) without any I/O: the server is
+    /// contacted on first use (or by [`ping`](Self::ping)). Must be called
+    /// from within a tokio runtime.
+    pub fn lazy(chain_id: u64, url: &str) -> anyhow::Result<Self> {
         let redactor = Redactor::for_url(url);
 
         let client = redis::Client::open(url)
@@ -151,16 +160,20 @@ impl RedisTokenCache {
                     "unable to create the redis connection manager",
                 )?;
 
-        let cache = Self {
+        Ok(Self {
             chain_id,
             connection,
             down_until: Mutex::new(None),
             is_down: AtomicBool::new(false),
             redactor,
-        };
+        })
+    }
 
-        let mut conn = cache.connection.clone();
-        let ping = cache
+    /// Checks the connection; a failure is logged (once) and otherwise
+    /// harmless. Returns whether the server answered.
+    pub async fn ping(&self) -> bool {
+        let mut conn = self.connection.clone();
+        let ping = self
             .guarded(async move {
                 redis::cmd("PING").query_async::<String>(&mut conn).await
             })
@@ -170,7 +183,7 @@ impl RedisTokenCache {
             info!("Token cache connected to redis");
         }
 
-        Ok(cache)
+        ping.is_ok()
     }
 
     fn in_cooldown(&self) -> bool {
@@ -317,6 +330,8 @@ pub struct KnownTokens {
     prune_at: usize,
     empty: LruCache<Address, Instant>,
     empty_ttl: Duration,
+    /// How many fetches in a row found no code at an address.
+    empty_strikes: LruCache<Address, u32>,
 }
 
 const MIN_PRUNE_AT: usize = 1_024;
@@ -340,6 +355,10 @@ impl KnownTokens {
                     .unwrap_or(NonZeroUsize::MIN),
             ),
             empty_ttl: DEFAULT_EMPTY_TTL,
+            empty_strikes: LruCache::new(
+                NonZeroUsize::new(DEFAULT_EMPTY_CAPACITY)
+                    .unwrap_or(NonZeroUsize::MIN),
+            ),
         }
     }
 
@@ -349,11 +368,51 @@ impl KnownTokens {
         capacity: usize,
         ttl: Duration,
     ) -> Self {
-        self.empty = LruCache::new(
-            NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN),
-        );
+        let capacity =
+            NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+        self.empty = LruCache::new(capacity);
+        self.empty_strikes = LruCache::new(capacity);
         self.empty_ttl = ttl;
         self
+    }
+
+    /// Whether `claim` would hand this address out: it is neither known,
+    /// nor being worked on, nor recently seen without code. Does not
+    /// claim anything.
+    pub fn needs_resolution(
+        &mut self,
+        address: &Address,
+        now: Instant,
+    ) -> bool {
+        if self.known.get(address).is_some() {
+            return false;
+        }
+
+        if self.empty.peek(address).is_some_and(|since| {
+            now.saturating_duration_since(*since) < self.empty_ttl
+        }) {
+            return false;
+        }
+
+        !self.in_flight.get(address).is_some_and(|since| {
+            now.saturating_duration_since(*since) < self.in_flight_ttl
+        })
+    }
+
+    /// Forgets that tokens are stored (the database says they are not).
+    pub fn forget<'a, I>(&mut self, addresses: I)
+    where
+        I: IntoIterator<Item = &'a Address>,
+    {
+        for address in addresses {
+            self.known.pop(address);
+            self.empty.pop(address);
+        }
+    }
+
+    /// How many consecutive fetches found no code at `address`.
+    pub fn empty_strikes(&self, address: &Address) -> u32 {
+        self.empty_strikes.peek(address).copied().unwrap_or(0)
     }
 
     /// Atomically claims every address that is neither known nor already
@@ -419,6 +478,7 @@ impl KnownTokens {
         for address in addresses {
             self.in_flight.remove(address);
             self.empty.pop(address);
+            self.empty_strikes.pop(address);
             self.known.put(*address, ());
         }
     }
@@ -433,6 +493,8 @@ impl KnownTokens {
         for address in addresses {
             self.in_flight.remove(address);
             self.empty.put(*address, now);
+            let strikes = self.empty_strikes(address).saturating_add(1);
+            self.empty_strikes.put(*address, strikes);
         }
     }
 

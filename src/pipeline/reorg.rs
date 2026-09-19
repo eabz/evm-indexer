@@ -48,7 +48,7 @@ impl ReorgDetector {
         let mut evidence = Vec::new();
 
         for block in blocks {
-            let number = u64::from(block.number);
+            let number = block.number;
 
             if let Some((last_number, last_hash)) = self.last {
                 if last_number.checked_add(1) == Some(number)
@@ -95,33 +95,10 @@ mod tests {
     use super::*;
     use hypersync_client::format::Hash;
 
-    fn block(number: u32, hash: u8, parent: u8) -> DatabaseBlock {
-        DatabaseBlock {
-            base_fee_per_gas: None,
-            chain: 1,
-            difficulty: Default::default(),
-            extra_data: Default::default(),
-            gas_limit: 0,
-            gas_used: 0,
-            hash: B256::repeat_byte(hash),
-            is_uncle: false,
-            logs_bloom: Default::default(),
-            miner: Default::default(),
-            mix_hash: None,
-            nonce: Default::default(),
-            number,
-            parent_hash: B256::repeat_byte(parent),
-            receipts_root: Default::default(),
-            sha3_uncles: Default::default(),
-            size: 0,
-            state_root: Default::default(),
-            timestamp: 0,
-            total_difficulty: None,
-            transactions: 0,
-            transactions_root: Default::default(),
-            uncles: vec![],
-            withdrawals_root: None,
-        }
+    fn block(number: u64, hash: u8, parent: u8) -> DatabaseBlock {
+        crate::db::models::block::test_support::block_row(
+            number, hash, parent,
+        )
     }
 
     #[test]
