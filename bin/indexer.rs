@@ -1,160 +1,463 @@
+use anyhow::{Context, Result};
 use evm_indexer::{
-    configs::Config,
-    db::{BlockFetchedData, Database},
-    rpc::Rpc,
+    configs::{
+        BackfillConfig, Command, Config, FleetConfig, MigrateConfig,
+        VerifyConfig,
+    },
+    db::{migrate, Database},
+    fleet, pipeline,
 };
-use futures::future::join_all;
-use log::*;
+use log::{error, info, LevelFilter};
 use simple_logger::SimpleLogger;
-use std::time::Duration;
-use tokio::time::sleep;
+use std::process::ExitCode;
 
-#[tokio::main()]
-async fn main() {
-    let log = SimpleLogger::new().with_level(LevelFilter::Info);
+/// Exit code of `indexer verify` when it found problems.
+const EXIT_PROBLEMS_FOUND: u8 = 1;
 
-    let config = Config::new();
+fn main() -> ExitCode {
+    // Parsed before the runtime exists: it scrubs blank environment
+    // variables, which must not race with other threads.
+    let command = Command::parse();
 
-    if config.debug {
-        log.with_level(LevelFilter::Debug).init().unwrap();
-    } else {
-        log.init().unwrap();
-    }
-
-    info!("Starting EVM Indexer.");
-
-    info!("Syncing chain id {}.", config.chain_id);
-
-    let rpc = Rpc::new(&config).await;
-
-    let db = Database::new(&config.database_url, config.chain_id).await;
-
-    if config.ws_url.is_some() && config.end_block == 0
-        || config.end_block == -1
-    {
-        tokio::spawn({
-            let rpc: Rpc = rpc.clone();
-            let db: Database = db.clone();
-
-            async move {
-                loop {
-                    rpc.listen_blocks(&db).await;
-
-                    sleep(Duration::from_millis(500)).await;
-                }
+    match execute(command) {
+        Ok(code) => code,
+        Err(e) => {
+            if log::max_level() == LevelFilter::Off {
+                // The logger itself is what failed.
+                eprintln!("Fatal: {e:#}");
             }
-        });
-    }
-
-    loop {
-        if !config.new_blocks_only {
-            sync_chain(&rpc, &db, &config).await;
+            error!("Fatal: {e:#}");
+            ExitCode::FAILURE
         }
-        sleep(Duration::from_secs(30)).await;
     }
 }
 
-async fn sync_chain(rpc: &Rpc, db: &Database, config: &Config) {
-    let mut indexed_blocks = db.get_indexed_blocks().await;
-
-    let last_block = if config.end_block != 0 {
-        config.end_block as u32
+fn execute(command: Command) -> Result<ExitCode> {
+    let level = if command.debug() {
+        LevelFilter::Debug
     } else {
-        rpc.get_last_block().await
+        LevelFilter::Info
     };
 
-    let full_block_range: Vec<u32> =
-        (config.start_block..last_block).collect();
+    SimpleLogger::new()
+        .with_level(level)
+        .init()
+        .context("initialize logger")?;
 
-    let missing_blocks: Vec<&u32> = full_block_range
-        .iter()
-        .filter(|block| !indexed_blocks.contains(block))
-        .collect();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
 
-    let total_missing_blocks = missing_blocks.len();
-
-    // If the program uses a block range and finishes shutdown gracefully
-    if config.end_block != 0 && total_missing_blocks == 0 {
-        info!("Finished syncing blocks");
-        std::process::exit(0);
+    match command {
+        Command::Run(config) => runtime.block_on(run(*config))?,
+        Command::Migrate(config) => {
+            runtime.block_on(run_migrate(config))?
+        }
+        Command::Verify(config) => {
+            return runtime.block_on(run_verify(config));
+        }
+        Command::Backfill(config) => {
+            runtime.block_on(run_backfill(config))?
+        }
+        Command::Fleet(config) => runtime.block_on(run_fleet(*config))?,
     }
 
-    info!("Syncing {} blocks.", total_missing_blocks);
+    Ok(ExitCode::SUCCESS)
+}
 
-    let missing_blocks_chunks = missing_blocks.chunks(config.batch_size);
+/// Is this chain the Solana one? The only family switch in the binary.
+///
+/// One id, compared once, rather than a `chains` lookup: the registry row
+/// is written BY the run that is starting, so it can not be the thing that
+/// decides which pipeline to start.
+fn is_solana(chain_id: u64) -> bool {
+    chain_id == pipeline::solana::SOLANA_CHAIN_ID
+}
 
-    for missing_blocks_chunk in missing_blocks_chunks {
-        let mut work = vec![];
+async fn run(config: Config) -> Result<()> {
+    let solana = is_solana(config.chain_id);
 
-        for block_number in missing_blocks_chunk {
-            work.push(rpc.fetch_block(block_number))
-        }
+    info!("Starting EVM Indexer.");
+    if solana {
+        info!(
+            "Syncing Solana (chain id {}): slots, not blocks.",
+            config.chain_id
+        );
+    } else {
+        info!("Syncing chain id {}.", config.chain_id);
+    }
 
-        let results = join_all(work).await;
+    // Before the pipeline connects: the database itself may not exist yet.
+    if config.no_migrate {
+        info!("Skipping schema migrations (--no-migrate).");
+    } else {
+        migrate::run(&config.database_url)
+            .await
+            .context("apply schema migrations")?;
+    }
 
-        let mut fetched_data = BlockFetchedData {
-            blocks: Vec::new(),
-            contracts: Vec::new(),
-            logs: Vec::new(),
-            traces: Vec::new(),
-            transactions: Vec::new(),
-            withdrawals: Vec::new(),
-            erc20_transfers: Vec::new(),
-            erc721_transfers: Vec::new(),
-            erc1155_transfers: Vec::new(),
-            dex_trades: Vec::new(),
-            dex_pairs: Vec::new(),
-            dex_liquidity_updates: Vec::new(),
-            tokens: Vec::new(),
-        };
+    if solana {
+        pipeline::solana::run(config).await
+    } else {
+        pipeline::run(config).await
+    }
+}
 
-        for result in results {
-            match result {
-                Some((
-                    mut blocks,
-                    mut transactions,
-                    mut logs,
-                    mut contracts,
-                    mut traces,
-                    mut withdrawals,
-                    mut erc20_transfers,
-                    mut erc721_transfers,
-                    mut erc1155_transfers,
-                    mut dex_trades,
-                    mut dex_pairs,
-                    mut dex_liquidity_updates,
-                    mut tokens,
-                )) => {
-                    fetched_data.blocks.append(&mut blocks);
-                    fetched_data.transactions.append(&mut transactions);
-                    fetched_data.logs.append(&mut logs);
-                    fetched_data.contracts.append(&mut contracts);
-                    fetched_data.traces.append(&mut traces);
-                    fetched_data.withdrawals.append(&mut withdrawals);
-                    fetched_data
-                        .erc20_transfers
-                        .append(&mut erc20_transfers);
-                    fetched_data
-                        .erc721_transfers
-                        .append(&mut erc721_transfers);
-                    fetched_data
-                        .erc1155_transfers
-                        .append(&mut erc1155_transfers);
-                    fetched_data.dex_trades.append(&mut dex_trades);
-                    fetched_data.dex_pairs.append(&mut dex_pairs);
-                    fetched_data
-                        .dex_liquidity_updates
-                        .append(&mut dex_liquidity_updates);
-                    fetched_data.tokens.append(&mut tokens);
+/// `indexer fleet`: one process, many chains, plus the control panel
+/// (docs/design.md section 15). `indexer run` is untouched by it.
+async fn run_fleet(config: FleetConfig) -> Result<()> {
+    info!("Starting EVM Indexer.");
+    info!("{}", fleet::describe(&config));
+
+    fleet::run(config).await
+}
+
+/// Lowers the coverage floor to `from_block`, but only when everything
+/// between there and the old floor is actually stored and gap-free
+/// (docs/design.md section 16).
+///
+/// This is the ONLY way the floor moves earlier, and it is deliberately
+/// a check rather than a claim: the floor is what this database promises,
+/// so it may only follow the data, never lead it. A range that is not
+/// complete leaves the floor exactly where it was and says why.
+///
+/// Note what this does NOT do: it does not fetch anything. `indexer
+/// backfill` re-decodes logs this database already has, so the floor moves
+/// down only over blocks that are already stored - which is the case an
+/// operator actually hits, having indexed deeper with an older version or
+/// with an explicit `--start-block` before the floor was ever written.
+async fn lower_the_floor_if_earned(
+    db: &Database,
+    from_block: u64,
+) -> Result<()> {
+    use evm_indexer::coverage::store;
+
+    let Some(floor) = store::stored(db).await? else { return Ok(()) };
+    if from_block >= floor.block {
+        return Ok(());
+    }
+
+    let report =
+        pipeline::verify::verify(db, Some(from_block), floor.block)
+            .await?;
+
+    if !report.gaps.is_empty() {
+        let missing: u64 = report.gaps.iter().map(|gap| gap.len()).sum();
+        println!(
+            "The coverage floor stays at block {} ({}). Blocks \
+             [{from_block}, {}) are not all stored - {missing} are \
+             missing - and the floor is a promise, so it only ever follows \
+             the data. `indexer verify --start-block {from_block} \
+             --end-block {}` lists the holes.",
+            floor.block,
+            floor.date(),
+            floor.block,
+            floor.block
+        );
+        return Ok(());
+    }
+
+    let timestamp = pipeline::verify::block_timestamp(db, from_block)
+        .await
+        .unwrap_or(0);
+
+    store::lower_to(
+        db,
+        // No lease: this writes one row of `chain_coverage`, which the
+        // engine resolves in favour of the LOWEST block whatever else is
+        // writing (see the migration header).
+        &evm_indexer::pipeline::lease::Fence::open(),
+        store::Floor {
+            block: from_block,
+            timestamp,
+            reason: store::Reason::Backfill,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `indexer backfill --module predictions --registry-only`.
+///
+/// Reads the blocks below this chain's coverage floor, filtered to the
+/// operator's own trusted addresses, and stores what a market needs to be
+/// describable: its metadata, its question, its outcome tokens and the
+/// split / merge / redeem events open interest is made of. No trade below
+/// the floor is stored, on purpose (docs/design.md section 16).
+///
+/// The same pass `indexer run` starts by itself, run on demand and in the
+/// foreground so the operator watches it finish.
+async fn run_registry_history(
+    db: &Database,
+    config: &BackfillConfig,
+) -> Result<()> {
+    use evm_indexer::predictions::history;
+
+    if config.module != "predictions" {
+        anyhow::bail!(
+            "--registry-only is only for --module predictions. It reads \
+             the blocks below the coverage floor for the market metadata \
+             and the split/merge/redeem events open interest is made of, \
+             which no other module needs."
+        );
+    }
+
+    let Some(floor) = evm_indexer::coverage::store::stored(db).await?
+    else {
+        anyhow::bail!(
+            "chain {} has no coverage floor yet, so there is nothing \
+             below it to read. Run `indexer run` once first.",
+            config.chain_id
+        );
+    };
+
+    // The pass READS FROM THE SOURCE - these logs are below the floor, so
+    // this database has never had them - which is what makes it different
+    // from every other backfill.
+    let token = std::env::var("ENVIO_API_TOKEN").unwrap_or_default();
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!(
+            "this pass reads blocks below the coverage floor from the \
+             source, so it needs ENVIO_API_TOKEN in the environment. \
+             (Every other `indexer backfill` re-decodes logs this \
+             database already has and needs no token.)"
+        );
+    }
+
+    // By default the pass goes as far down as the source will serve these
+    // addresses; it remembers how far it got in `prediction_history`.
+    let source = evm_indexer::source::evm::Source::new(
+        config.chain_id,
+        None,
+        token,
+    )?;
+
+    let report = history::run(
+        db,
+        // No lease is taken: the pass writes only below the floor, where
+        // the live indexer never writes, and a second copy of it is
+        // idempotent rather than harmful.
+        &evm_indexer::pipeline::lease::Fence::open(),
+        &source,
+        floor.block,
+        config.chunk_blocks.max(history::CHUNK_BLOCKS),
+    )
+    .await?;
+
+    println!("{report}");
+    Ok(())
+}
+
+/// Read only. Exit code 0 = consistent, 1 = problems found.
+///
+/// Solana gets its own checks: "every block number has a row" would report
+/// every skipped slot as a gap for ever (`pipeline::solana_verify`).
+async fn run_verify(config: VerifyConfig) -> Result<ExitCode> {
+    let db = Database::new(&config.database_url, config.chain_id).await?;
+
+    // What the operator asked for, as a block. `None` here means they
+    // asked for nothing, and `verify` then starts at the coverage floor -
+    // the whole point of the floor being that nothing below it is
+    // promised, so nothing below it is missing (docs/design.md section 16).
+    let start = match (config.start_block, config.start_date) {
+        (Some(block), _) => Some(block),
+        (None, Some(date)) => {
+            match pipeline::verify::block_at_date(&db, date).await? {
+                Some(block) => {
+                    println!(
+                        "--start-date {date} is block {block}, the first \
+                         one stored on that day or later."
+                    );
+                    Some(block)
                 }
-                None => continue,
+                None => {
+                    println!(
+                        "Nothing is stored on {date} or later, so there is \
+                         nothing to verify from there."
+                    );
+                    return Ok(ExitCode::SUCCESS);
+                }
             }
         }
+        (None, None) => None,
+    };
 
-        db.store_data(&fetched_data).await;
-
-        for block in fetched_data.blocks.iter() {
-            indexed_blocks.insert(block.number);
+    let consistent = if is_solana(config.chain_id) {
+        // The coverage promise, in the same words as everywhere else
+        // (docs/design.md section 16). Printed here rather than inside the
+        // Solana report because slots have no timestamps to date the head
+        // with, so the line is the floor and the tiled head and nothing
+        // that would need a second query.
+        if let Ok(Some(coverage)) =
+            evm_indexer::coverage::store::coverage(&db).await
+        {
+            println!(
+                "{}",
+                evm_indexer::coverage::store::sentence(
+                    &coverage,
+                    evm_indexer::coverage::store::unit_of(config.chain_id),
+                    None,
+                    None,
+                )
+            );
         }
+
+        let report =
+            pipeline::solana::verify(&db, start, config.end_block).await?;
+
+        println!("{report}");
+        report.is_consistent()
+    } else {
+        let report =
+            pipeline::verify::verify(&db, start, config.end_block).await?;
+
+        println!("{report}");
+        report.is_consistent()
+    };
+
+    Ok(if consistent {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_PROBLEMS_FOUND)
+    })
+}
+
+/// Where `indexer backfill` starts, as a block.
+///
+/// `--from-block` wins; `--from-date` becomes the first block stored on
+/// that day or later; and with neither the answer is the **coverage
+/// floor**, not block 0. A backfill re-decodes logs this database already
+/// has, and below the floor it has none: starting at 0 meant thousands of
+/// guaranteed-empty chunk queries before the first stored log, and then a
+/// floor check that printed "blocks [0, N) are not all stored" about
+/// blocks nobody ever asked for.
+///
+/// `--from-block 0` still means genesis, which is how an operator asks to
+/// lower the floor - the flag having no default is what keeps the two
+/// apart.
+async fn backfill_start(
+    db: &Database,
+    config: &BackfillConfig,
+) -> Result<u64> {
+    if let Some(block) = config.from_block {
+        return Ok(block);
     }
+
+    if let Some(date) = config.from_date {
+        // Silently ignored before this: `--from-date` was parsed, stored
+        // and never read, so the backfill ran from block 0 instead.
+        return match pipeline::verify::block_at_date(db, date).await? {
+            Some(block) => {
+                println!(
+                    "--from-date {date} is block {block}, the first one \
+                     stored on that day or later."
+                );
+                Ok(block)
+            }
+            None => anyhow::bail!(
+                "nothing is stored on {date} or later, so there are no \
+                 logs to re-decode from there. `indexer verify` prints the \
+                 window this database covers."
+            ),
+        };
+    }
+
+    let floor = evm_indexer::coverage::store::stored(db)
+        .await?
+        .map(|floor| floor.block)
+        .unwrap_or(0);
+
+    if floor > 0 {
+        println!(
+            "Starting at block {floor}, this chain's coverage floor: \
+             below it this database stores no logs to re-decode. Pass \
+             --from-block to start somewhere else."
+        );
+    }
+
+    Ok(floor)
+}
+
+async fn run_backfill(config: BackfillConfig) -> Result<()> {
+    let db = Database::new(&config.database_url, config.chain_id).await?;
+
+    // `--registry-only` is a different job from every other backfill: the
+    // rest re-decode logs this database already has, and this one fetches
+    // logs from BELOW the coverage floor that it has never had
+    // (docs/design.md section 16).
+    if config.registry_only {
+        return run_registry_history(&db, &config).await;
+    }
+
+    let from_block = backfill_start(&db, &config).await?;
+
+    let report = pipeline::backfill::backfill(
+        &db,
+        &config.module,
+        from_block,
+        config.to_block,
+        config.chunk_blocks,
+    )
+    .await?;
+
+    // A backfill that reached below the coverage floor may have made the
+    // promise bigger - but only if the older range really is complete
+    // (docs/design.md section 16). Checked, never assumed.
+    lower_the_floor_if_earned(&db, from_block).await?;
+
+    match report.rewritten {
+        None => println!(
+            "{}: blocks {} already match the stored logs ({} logs \
+             checked). Nothing was written.",
+            report.module, report.range, report.logs
+        ),
+        Some(range) => println!(
+            "{}: blocks {range} re-decoded from the stored logs: {} rows \
+             replaced by {}. Epoch is now {}.",
+            report.module,
+            report.rows_tombstoned,
+            report.rows_written,
+            report.epoch
+        ),
+    }
+
+    Ok(())
+}
+
+async fn run_migrate(config: MigrateConfig) -> Result<()> {
+    if config.dry_run {
+        let status = migrate::status(&config.database_url).await?;
+
+        if !status.database_exists {
+            println!(
+                "The database does not exist yet; it would be created."
+            );
+        }
+
+        println!(
+            "{} migration(s) applied, {} pending.",
+            status.applied,
+            status.pending.len()
+        );
+        for label in &status.pending {
+            println!("pending: {label}");
+        }
+
+        return Ok(());
+    }
+
+    let report = migrate::run(&config.database_url).await?;
+
+    info!(
+        "Migrations done: {} applied now, {} applied before, {} applied \
+         concurrently by another process.",
+        report.applied.len(),
+        report.already_applied,
+        report.applied_elsewhere.len()
+    );
+
+    Ok(())
 }

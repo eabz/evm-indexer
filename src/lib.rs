@@ -1,4 +1,15 @@
+pub mod admin;
 pub mod configs;
+pub mod core;
+pub mod coverage;
 pub mod db;
-pub mod rpc;
-pub mod utils;
+pub mod dex;
+pub mod fleet;
+pub mod launchpads;
+pub mod metrics;
+pub mod pipeline;
+pub mod predictions;
+pub mod reorg;
+pub mod source;
+pub mod svm;
+pub mod tokens;

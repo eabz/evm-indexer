@@ -1,4 +1,19 @@
 /target
+
+# Local configuration / secrets
 .env
+.env.*
+!.env.example
+
+# Editors, OS and tooling
 .idea
-hasura_metadata/
+.DS_Store
+.serena/
+.claude/settings.local.json
+
+# Local agent tooling
+.tirith/
+.claude/
+
+# ClickHouse test servers started from the repo root
+preprocessed_configs/

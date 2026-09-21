@@ -1,0 +1,360 @@
+//! Incremental aggregates and how to repair them.
+//!
+//! Aggregates are `AggregatingMergeTree` tables fed by materialized views
+//! (`migrations/0003_core_aggregates.sql`, DEX: `0010+`). A view only ever
+//! ADDS what an insert brings, it can not take back the rows a rollback
+//! tombstones, and nothing is ever deleted (docs/design.md, section 2). So
+//! every contribution is filed under the `epoch` of the rows it came from,
+//! and a purge repairs the aggregates by epoch:
+//!
+//! ```text
+//! epoch   = the chain's highest epoch + 1
+//! from_ts = start of day (UTC) of the earliest purged row
+//! to_ts   = start of the day AFTER the latest purged row
+//! 1. INSERT INTO reorgs (chain, epoch, from_ts, to_ts, ...)
+//! 2. table.rebuild_statements(chain, from_ts, to_ts, epoch, ...)
+//!                                               -- for every DerivedTable
+//! ```
+//!
+//! The `*_v` views (`0004`, through `epoch_floor_v`) then apply the
+//! validity rule: a contribution with epoch `e` in bucket `b` counts iff
+//! `e >= max(r.epoch)` over the `reorgs` rows of the chain with
+//! `r.from_ts <= b AND b < r.to_ts` (0 when none covers `b`). Blocks
+//! streamed afterwards carry the new epoch and flow through the views as
+//! usual.
+//!
+//! The window is what makes the repair BOUNDED: a purge only invalidates
+//! the buckets its own rows contributed to, so it hides and rebuilds
+//! `[from_ts, to_ts)` and nothing else. A gap heal deep in history used to
+//! re-aggregate the chain from that day to the head, on every pass.
+//!
+//! `from_ts` must be a start of day for EVERY table, whatever its bucket
+//! width: the validity rule hides a whole bucket, so a rebuild has to cover
+//! every bucket it hides, from its first second on.
+//!
+//! Amounts are aggregated as `Float64`, never as raw `UInt256` sums (the
+//! "256-bit arithmetic rule" of docs/design.md: `sum(UInt256)` wraps
+//! silently and hostile tokens emit `2^256-1`). A unit test rejects any
+//! `sum(` over a 256 bit column in a view or in `rebuild_sql`.
+//!
+//! Buckets are computed from the unix timestamp with integer arithmetic
+//! (`intDiv(ts, N) * N`) both here and in SQL, so they never depend on the
+//! server time zone.
+
+/// An aggregate table that needs bucket repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedTable {
+    /// Target table of the materialized view.
+    pub name: &'static str,
+    /// Bucket width: 60, 3600, 86400.
+    pub bucket_seconds: u32,
+    /// `DateTime` column holding the bucket start.
+    pub bucket_column: &'static str,
+    /// `INSERT INTO <name> SELECT ..., toUInt32({epoch}) AS epoch, ... FROM
+    /// <base> FINAL WHERE is_deleted = 0 AND chain = {chain} AND timestamp
+    /// >= {from_ts} GROUP BY ...`. Must produce exactly what the view
+    /// produces. `{chain}` and `{epoch}` are rendered as integers,
+    /// `{from_ts}` as unix seconds.
+    pub rebuild_sql: &'static str,
+}
+
+/// The widest bucket in play: `reorgs.from_ts` is a start of day (UTC).
+pub const REPAIR_ALIGNMENT_SECONDS: u32 = 86_400;
+
+/// `reorgs.from_ts` for a purge whose earliest row is at `timestamp`.
+pub fn repair_start(timestamp: u32) -> u32 {
+    timestamp - timestamp % REPAIR_ALIGNMENT_SECONDS
+}
+
+impl DerivedTable {
+    /// Start of the bucket `timestamp` (unix seconds) falls into.
+    pub fn bucket_start(&self, timestamp: u32) -> u32 {
+        timestamp - timestamp % self.bucket_seconds.max(1)
+    }
+
+    /// `rebuild_sql` for `chain` over the buckets of `[from_ts, to_ts)`,
+    /// as ONE statement. `from_ts` is aligned down with [`repair_start`],
+    /// the same value `reorgs.from_ts` holds; `to_ts` is exclusive and is
+    /// what `reorgs.to_ts` holds.
+    ///
+    /// **The upper bound is not an optimization.** The `reorgs` row raises
+    /// the epoch floor of exactly `[from_ts, to_ts)`. A rebuild that
+    /// reaches PAST `to_ts` files new-epoch contributions into buckets
+    /// whose floor was not raised, where they are counted ON TOP of the
+    /// old ones - a silent doubling. A rebuild that stops SHORT of `to_ts`
+    /// leaves hidden buckets nobody refilled - a silent zero.
+    ///
+    /// `purged_from..purged_to` (open ended when `None`) is the block range
+    /// of the purge this repair belongs to, which the rebuild must NOT
+    /// count: the canonical blocks streamed afterwards add themselves
+    /// through the view. Relying on the tombstones for that is not enough:
+    ///
+    /// - `blocks` is tombstoned LAST, after the repair (that is what makes
+    ///   a crashed purge detectable), so its orphaned rows are still alive
+    ///   when the rebuild runs;
+    /// - ClickHouse gives no read-your-writes guarantee right after an
+    ///   INSERT returns (seen on 25.12: a part can stay invisible to the
+    ///   next query for a few ms), so a rebuild issued right after the
+    ///   tombstones may not see them yet.
+    ///
+    /// So every `rebuild_sql` excludes the range itself, with the
+    /// `{purge_from}` / `{purge_to}` placeholders. (A `rebuild_sql` without
+    /// them is rendered unchanged.)
+    pub fn rebuild_slice(
+        &self,
+        chain: u64,
+        from_ts: u32,
+        to_ts: u32,
+        epoch: u32,
+        purged_from: u64,
+        purged_to: Option<u64>,
+    ) -> String {
+        self.render_slice(
+            chain,
+            repair_start(from_ts),
+            to_ts,
+            epoch,
+            purged_from,
+            purged_to,
+        )
+    }
+
+    /// The rebuild as ONE INSERT PER UTC MONTH of `[from_ts, to_ts)`,
+    /// oldest first. The aggregates are `PARTITION BY toYYYYMM(bucket)` and
+    /// ClickHouse refuses an insert block that touches more than 100
+    /// partitions (code 252): a single open ended INSERT would make a purge
+    /// deep in history (a gap heal while backfilling old blocks) fail at
+    /// this step on every restart, for ever.
+    ///
+    /// `to_ts` is exclusive and is `reorgs.to_ts`: the start of the day
+    /// after the newest row the purge removed (NEVER `u32::MAX` - see
+    /// [`Self::rebuild_slice`] on why both bounds are load bearing).
+    /// A `rebuild_sql` without a `{to_ts}` placeholder can not be bounded
+    /// or sliced at all; `every_aggregate_can_be_bounded_and_sliced`
+    /// asserts no declared aggregate is like that.
+    pub fn rebuild_statements(
+        &self,
+        chain: u64,
+        from_ts: u32,
+        to_ts: u32,
+        epoch: u32,
+        purged_from: u64,
+        purged_to: Option<u64>,
+    ) -> Vec<String> {
+        if !self.rebuild_sql.contains("{to_ts}") {
+            return vec![self.rebuild_slice(
+                chain,
+                from_ts,
+                to_ts,
+                epoch,
+                purged_from,
+                purged_to,
+            )];
+        }
+
+        let mut statements = Vec::new();
+        let mut start = repair_start(from_ts);
+
+        while start < to_ts {
+            let end = next_month_start(start).min(u64::from(to_ts)) as u32;
+            statements.push(self.render_slice(
+                chain,
+                start,
+                end,
+                epoch,
+                purged_from,
+                purged_to,
+            ));
+            start = end;
+        }
+
+        statements
+    }
+
+    fn render_slice(
+        &self,
+        chain: u64,
+        from_ts: u32,
+        to_ts: u32,
+        epoch: u32,
+        purged_from: u64,
+        purged_to: Option<u64>,
+    ) -> String {
+        render(self.rebuild_sql, chain, from_ts, epoch)
+            .replace("{to_ts}", &to_ts.to_string())
+            .replace("{purge_from}", &purged_from.to_string())
+            .replace(
+                "{purge_to}",
+                &purged_to.unwrap_or(u64::MAX).to_string(),
+            )
+    }
+}
+
+/// Unix seconds of the first instant of the UTC month after the one
+/// `timestamp` falls into (civil-from-days, proleptic Gregorian).
+pub fn next_month_start(timestamp: u32) -> u64 {
+    let days = i64::from(timestamp / 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1_460
+        + day_of_era / 36_524
+        - day_of_era / 146_096)
+        / 365;
+    let day_of_year = day_of_era
+        - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+
+    let (next_year, next_month) =
+        if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+
+    // days-from-civil of the first of the next month
+    let y = if next_month <= 2 { next_year - 1 } else { next_year };
+    let era = y.div_euclid(400);
+    let year_of_era = y.rem_euclid(400);
+    let shifted = (next_month + 9) % 12;
+    let day_of_year = (153 * shifted + 2) / 5;
+    let day_of_era = year_of_era * 365 + year_of_era / 4
+        - year_of_era / 100
+        + day_of_year;
+
+    ((era * 146_097 + day_of_era - 719_468) * 86_400) as u64
+}
+
+/// Fills the `{chain}`, `{from_ts}` and `{epoch}` placeholders.
+fn render(sql: &str, chain: u64, from_ts: u32, epoch: u32) -> String {
+    sql.replace("{chain}", &chain.to_string())
+        .replace("{from_ts}", &from_ts.to_string())
+        .replace("{epoch}", &epoch.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::derived::CORE_DERIVED;
+
+    #[test]
+    fn rebuilds_are_sliced_by_utc_month() {
+        let table = DerivedTable {
+            name: "t",
+            bucket_seconds: 86_400,
+            bucket_column: "day",
+            rebuild_sql: "ts >= {from_ts} AND ts < {to_ts} e{epoch} \
+                          NOT [{purge_from}, {purge_to})",
+        };
+
+        // 2023-11-14 22:13:20 .. 2024-02-10: Nov (from the start of the
+        // day), Dec, Jan, Feb (up to `to_ts`).
+        let statements = table.rebuild_statements(
+            1,
+            1_700_000_000,
+            1_707_523_200,
+            3,
+            10,
+            Some(20),
+        );
+        assert_eq!(
+            statements,
+            vec![
+                "ts >= 1699920000 AND ts < 1701388800 e3 NOT [10, 20)",
+                "ts >= 1701388800 AND ts < 1704067200 e3 NOT [10, 20)",
+                "ts >= 1704067200 AND ts < 1706745600 e3 NOT [10, 20)",
+                "ts >= 1706745600 AND ts < 1707523200 e3 NOT [10, 20)",
+            ]
+        );
+
+        // 15 years: far more than the 100 partitions one INSERT may touch,
+        // and every slice stays inside one month.
+        let statements = table.rebuild_statements(
+            1,
+            1_438_269_973,
+            1_911_655_573,
+            1,
+            0,
+            None,
+        );
+        assert_eq!(statements.len(), 181);
+
+        // Nothing to rebuild.
+        assert!(table
+            .rebuild_statements(
+                1,
+                1_700_000_000,
+                1_600_000_000,
+                1,
+                0,
+                None
+            )
+            .is_empty());
+
+        // Every core aggregate can be sliced.
+        for table in CORE_DERIVED {
+            assert!(
+                table.rebuild_sql.contains("{to_ts}"),
+                "{}",
+                table.name
+            );
+        }
+
+        assert_eq!(next_month_start(0), 2_678_400);
+        assert_eq!(next_month_start(1_709_164_800), 1_709_251_200); // leap Feb 29
+        assert_eq!(next_month_start(1_703_980_800), 1_704_067_200); // Dec -> Jan
+    }
+
+    #[test]
+    fn renders_placeholders_and_aligns_to_the_day() {
+        let table = DerivedTable {
+            name: "t",
+            bucket_seconds: 3_600,
+            bucket_column: "hour",
+            rebuild_sql:
+                "INSERT INTO t SELECT {epoch} FROM b FINAL WHERE \
+                          chain = {chain} AND timestamp >= {from_ts}",
+        };
+
+        assert_eq!(table.bucket_start(7_200), 7_200);
+        assert_eq!(table.bucket_start(7_201), 7_200);
+        assert_eq!(table.bucket_start(10_799), 7_200);
+        assert_eq!(table.bucket_start(0), 0);
+        assert_eq!(
+            table.bucket_start(u32::MAX),
+            u32::MAX - u32::MAX % 3_600
+        );
+
+        // Whatever the bucket width, a repair starts at a start of day:
+        // it is what `reorgs.from_ts` holds and what the views hide from.
+        assert_eq!(repair_start(86_400 + 7_201), 86_400);
+        assert_eq!(repair_start(86_399), 0);
+        assert_eq!(
+            table.rebuild_slice(
+                137,
+                86_400 + 7_201,
+                u32::MAX,
+                4,
+                10,
+                Some(20)
+            ),
+            "INSERT INTO t SELECT 4 FROM b FINAL WHERE chain = 137 AND \
+             timestamp >= 86400"
+        );
+
+        let blocks = DerivedTable {
+            rebuild_sql: "number >= {purge_from} AND number < {purge_to}",
+            ..table
+        };
+        assert_eq!(
+            blocks.rebuild_slice(1, 0, u32::MAX, 1, 10, Some(20)),
+            "number >= 10 AND number < 20"
+        );
+        assert_eq!(
+            blocks.rebuild_slice(1, 0, u32::MAX, 1, 10, None),
+            format!("number >= 10 AND number < {}", u64::MAX)
+        );
+    }
+}
